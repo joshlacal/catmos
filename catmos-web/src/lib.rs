@@ -162,7 +162,7 @@ struct AppState {
     /// WASM-native MLS crypto context (OpenMLS + sqlite-wasm-rs + sqlite3mc).
     /// `None` if `WasmMLSContext::open` failed (logged as a warning; non-crypto
     /// commands continue to work).
-    mls_context: Option<WasmMLSContext>,
+    mls_context: Option<Rc<WasmMLSContext>>,
 }
 
 thread_local! {
@@ -250,18 +250,19 @@ fn array_to_strings(arr: &Array) -> Vec<String> {
 
 /// Get (or generate and persist) a 256-bit hex key for the MLS SQLite database.
 ///
-/// The key is stored in `localStorage` under `"catmos_mls_db_key"`. This
-/// means the key is origin-scoped and survives browser restarts. For a
-/// production deployment the key should be migrated to a secure enclave /
-/// OS keychain; localStorage is used here for simplicity.
+/// The key is stored in `sessionStorage` under `"catmos_mls_db_key"`. Using
+/// sessionStorage instead of localStorage limits XSS exposure — the key is
+/// cleared when the tab/window closes.
+///
+/// TODO: Migrate to WebCrypto non-extractable key for proper key protection
 fn get_or_create_mls_key() -> Result<String, JsValue> {
-    let ls = web_sys::window()
+    let ss = web_sys::window()
         .ok_or_else(|| js_err!("No global window"))?
-        .local_storage()
-        .map_err(|e| js_err!("localStorage unavailable: {:?}", e))?
-        .ok_or_else(|| js_err!("No localStorage available"))?;
+        .session_storage()
+        .map_err(|e| js_err!("sessionStorage unavailable: {:?}", e))?
+        .ok_or_else(|| js_err!("No sessionStorage available"))?;
 
-    if let Some(key) = ls.get_item("catmos_mls_db_key").ok().flatten() {
+    if let Some(key) = ss.get_item("catmos_mls_db_key").ok().flatten() {
         return Ok(key);
     }
 
@@ -270,7 +271,7 @@ fn get_or_create_mls_key() -> Result<String, JsValue> {
     getrandom::getrandom(&mut key_bytes)
         .map_err(|e| js_err!("Failed to generate MLS key: {}", e))?;
     let key_hex: String = key_bytes.iter().map(|b| format!("{:02x}", b)).collect();
-    ls.set_item("catmos_mls_db_key", &key_hex)
+    ss.set_item("catmos_mls_db_key", &key_hex)
         .map_err(|e| js_err!("Failed to persist MLS key: {:?}", e))?;
     Ok(key_hex)
 }
@@ -283,7 +284,7 @@ fn get_or_create_mls_key() -> Result<String, JsValue> {
 ///
 /// `base_url` — base URL of the catmos/nest backend, e.g. `"https://api.catbird.blue"`.
 ///
-/// MLS crypto is initialized automatically from a key stored in `localStorage`.
+/// MLS crypto is initialized automatically from a key stored in `sessionStorage`.
 /// If SQLite fails to open (e.g. outside a Worker where OPFS SAH is unavailable)
 /// the rest of the app continues without crypto; commands that require it return
 /// an error.
@@ -312,8 +313,8 @@ pub async fn wasm_init(base_url: String) -> Result<(), JsValue> {
     let credentials = SqliteCredentialStore::new(Rc::clone(&shared_conn));
 
     // Create the MLS context using the same shared connection for OpenMLS storage.
-    let mls_context = match WasmMLSContext::open_with_conn(Rc::clone(&shared_conn)) {
-        Ok(ctx) => Some(ctx),
+    let mls_context: Option<Rc<WasmMLSContext>> = match WasmMLSContext::open_with_conn(Rc::clone(&shared_conn)) {
+        Ok(ctx) => Some(Rc::new(ctx)),
         Err(e) => {
             web_sys::console::warn_1(&js_err!(
                 "catmos-web: MLS context unavailable ({}). \
@@ -324,6 +325,11 @@ pub async fn wasm_init(base_url: String) -> Result<(), JsValue> {
             None
         }
     };
+
+    // Share the MLS context with the API client for confirmation tag derivation.
+    if let Some(ref ctx) = mls_context {
+        api_client.set_confirmation_tag_provider(Rc::clone(ctx) as Rc<dyn api_client::ConfirmationTagProvider>);
+    }
 
     // Reload persisted MLS groups into the in-memory cache so they survive
     // page refreshes.  Group IDs in the `group_states` SQLite table are
@@ -416,7 +422,7 @@ pub fn wasm_start_login(identifier: String) -> Result<(), JsValue> {
         let redirect_uri = format!("{}/oauth-callback", origin);
 
         let login_url = format!(
-            "{}/auth/login?identifier={}&client=catmos-web&redirect_uri={}",
+            "{}/auth/login?identifier={}&client=catmos-web&redirect_to={}",
             state.base_url,
             js_sys::encode_uri_component(&identifier),
             js_sys::encode_uri_component(&redirect_uri),
@@ -807,20 +813,16 @@ pub async fn wasm_send_message(convo_id: String, content: String) -> Result<JsVa
         match first_try {
             Ok(result) => result,
             Err(()) => {
-                // Group not found locally — auto-join via Welcome or External Commit.
+                // Spec §5.3: Do NOT perform External Commit in send path.
+                // Flag for deferred recovery and return error to UI.
                 web_sys::console::log_1(
-                    &"[catmos-web] Group not found locally, attempting auto-join...".into(),
+                    &"[catmos-web] Group not found locally — flagging for deferred rejoin".into(),
                 );
-                auto_join_group(&api_client, &user_did, &convo_id, &group_id_bytes).await?;
-
-                // Retry encryption after joining.
-                with_state(|s| {
-                    let ctx = s.mls_context.as_ref().ok_or_else(|| {
-                        js_err!("MLS context not initialized")
-                    })?;
-                    ctx.encrypt_message(group_id_bytes.clone(), payload_bytes)
-                        .map_err(|e| js_err!("encrypt_message failed after auto-join: {:?}", e))
-                })?
+                let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+                let _ = storage.mark_needs_rejoin(&convo_id).await;
+                return Err(js_err!(
+                    "Group not found locally — sync in progress, please retry"
+                ));
             }
         }
     };
@@ -982,19 +984,44 @@ pub async fn wasm_get_messages(
     let messages: Vec<Message> = stored
         .into_iter()
         .filter(|m| !m.text.trim().is_empty())
-        .map(|m| Message {
-            id: m.id,
-            conversation_id: m.conversation_id,
-            sender_did: m.sender_did,
-            sender_handle: String::new(),
-            content: m.text,
-            timestamp: m.timestamp.to_rfc3339(),
-            status: if m.is_own {
-                "sent".to_string()
+        .map(|m| {
+            use catbird_mls::orchestrator::types::MLSMessageType;
+
+            let (message_type, content) = if let Some(payload) = m.payload() {
+                if payload.message_type == MLSMessageType::System {
+                    let display_text = match payload.text.as_deref() {
+                        Some("history_boundary.new_member") => {
+                            "You joined this conversation".to_string()
+                        }
+                        Some("history_boundary.device_rejoined") => {
+                            "Messages before this point aren't available on this device"
+                                .to_string()
+                        }
+                        Some(other) => other.to_string(),
+                        None => m.text.clone(),
+                    };
+                    ("system".to_string(), display_text)
+                } else {
+                    ("text".to_string(), m.text.clone())
+                }
             } else {
-                "delivered".to_string()
-            },
-            message_type: "text".to_string(),
+                ("text".to_string(), m.text.clone())
+            };
+
+            Message {
+                id: m.id,
+                conversation_id: m.conversation_id,
+                sender_did: m.sender_did,
+                sender_handle: String::new(),
+                content,
+                timestamp: m.timestamp.to_rfc3339(),
+                status: if m.is_own {
+                    "sent".to_string()
+                } else {
+                    "delivered".to_string()
+                },
+                message_type,
+            }
         })
         .collect();
 
@@ -1124,9 +1151,143 @@ pub async fn wasm_fetch_new_messages(convo_id: String) -> Result<JsValue, JsValu
     to_js(&messages)
 }
 
-/// Send a reaction to a message.
+/// Send an encrypted image message.
+///
+/// Encrypts the image blob client-side (AES-256-GCM), uploads ciphertext to the
+/// server, then sends an MLS-encrypted message containing the blob reference.
+#[wasm_bindgen]
+pub async fn wasm_send_image(
+    conversation_id: String,
+    content: String,
+    data: Vec<u8>,
+    content_type: String,
+    width: u32,
+    height: u32,
+    alt_text: Option<String>,
+) -> Result<JsValue, JsValue> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use catbird_mls::blob_crypto::encrypt_blob;
+    use catbird_mls::orchestrator::api_client::MLSAPIClient;
+    use catbird_mls::orchestrator::types::{MLSEmbedData, MLSImageEmbed, MLSMessagePayload};
+
+    let (api_client, user_did) = with_state(|s| {
+        let did = s
+            .user_did
+            .clone()
+            .ok_or_else(|| js_err!("Not authenticated"))?;
+        Ok((Arc::clone(&s.api_client), did))
+    })?;
+
+    if !content_type.starts_with("image/") {
+        return Err(js_err!("Unsupported image content type: {}", content_type));
+    }
+    if data.len() > 10 * 1024 * 1024 {
+        return Err(js_err!("Image too large (max 10MB)"));
+    }
+
+    // Encrypt blob client-side.
+    let encrypted = encrypt_blob(&data)
+        .map_err(|e| js_err!("Failed to encrypt image: {:?}", e))?;
+
+    // Upload encrypted blob to server.
+    let (blob_id, _uploaded_size) = api_client
+        .upload_blob(&encrypted.ciphertext, &conversation_id)
+        .await
+        .map_err(|e| js_err!("Blob upload failed: {:?}", e))?;
+
+    // Build image embed.
+    let embed = MLSEmbedData::image(MLSImageEmbed {
+        blob_id,
+        key: encrypted.key,
+        iv: encrypted.iv,
+        sha256: encrypted.sha256,
+        content_type: content_type.clone(),
+        size: data.len(),
+        width,
+        height,
+        alt_text,
+        blurhash: None,
+    })
+    .map_err(|e| js_err!("Failed to create image embed: {:?}", e))?;
+
+    // Encode as MLSMessagePayload with embed.
+    let payload = MLSMessagePayload::text_with_embed(&content, embed);
+    let payload_bytes = payload
+        .encode()
+        .map_err(|e| js_err!("Failed to encode message payload: {:?}", e))?;
+
+    // Decode convo_id to group_id bytes.
+    let group_id_bytes = URL_SAFE_NO_PAD
+        .decode(&conversation_id)
+        .map_err(|e| js_err!("Invalid convo_id '{}': {}", conversation_id, e))?;
+
+    // Encrypt via MLS — auto-join if group not found locally.
+    let encrypt_result = {
+        let first_try = with_state(|s| {
+            let ctx = s.mls_context.as_ref().ok_or_else(|| {
+                js_err!("MLS context not initialized — run wasm_init() inside a Worker")
+            })?;
+            match ctx.encrypt_message(group_id_bytes.clone(), payload_bytes.clone()) {
+                Ok(r) => Ok(Ok(r)),
+                Err(catbird_mls::MLSError::GroupNotFound { .. }) => Ok(Err(())),
+                Err(e) => Err(js_err!("encrypt_message failed: {:?}", e)),
+            }
+        })?;
+
+        match first_try {
+            Ok(result) => result,
+            Err(()) => {
+                // Spec §5.3: Do NOT perform External Commit in send path.
+                web_sys::console::log_1(
+                    &"[catmos-web] Group not found locally for image — flagging for deferred rejoin"
+                        .into(),
+                );
+                let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+                let _ = storage.mark_needs_rejoin(&conversation_id).await;
+                return Err(js_err!(
+                    "Group not found locally — sync in progress, please retry"
+                ));
+            }
+        }
+    };
+
+    // Get the current epoch.
+    let epoch = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.get_epoch(group_id_bytes.clone())
+            .map_err(|e| js_err!("get_epoch failed: {:?}", e))
+    })?;
+
+    // Send to server.
+    api_client
+        .send_message(&conversation_id, &encrypt_result.ciphertext, epoch)
+        .await
+        .map_err(|e| js_err!("send_message API call failed: {:?}", e))?;
+
+    let message = Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        conversation_id,
+        sender_did: user_did,
+        sender_handle: String::new(),
+        content,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        status: "sent".to_string(),
+        message_type: "image".to_string(),
+    };
+
+    to_js(&message)
+}
+
+/// Send an encrypted reaction to a message.
 ///
 /// `action` should be `"add"` or `"remove"`.
+///
+/// The reaction is MLS-encrypted as an application message with
+/// `messageType: "reaction"`, matching the iOS `sendEncryptedReaction` path.
 #[wasm_bindgen]
 pub async fn wasm_send_reaction(
     conversation_id: String,
@@ -1134,52 +1295,81 @@ pub async fn wasm_send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), JsValue> {
-    let (base_url, auth_token) = with_state(|s| {
-        let token = s
-            .auth_token
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use catbird_mls::orchestrator::api_client::MLSAPIClient;
+    use catbird_mls::orchestrator::types::{MLSMessagePayload, ReactionAction};
+
+    let (api_client, user_did) = with_state(|s| {
+        let did = s
+            .user_did
             .clone()
             .ok_or_else(|| js_err!("Not authenticated"))?;
-        Ok((s.base_url.clone(), token))
+        Ok((Arc::clone(&s.api_client), did))
     })?;
 
-    let client = reqwest::Client::new();
-    let action_name = if action == "remove" {
-        "removeReaction"
+    let reaction_action = if action == "remove" {
+        ReactionAction::Remove
     } else {
-        "addReaction"
+        ReactionAction::Add
     };
 
-    // The sendMessage endpoint requires a no-op ciphertext for reaction sub-actions.
-    let no_op_ciphertext = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 512]);
+    // Build reaction payload (matches iOS MLSMessagePayload.reaction()).
+    let payload = MLSMessagePayload::reaction(&message_id, &emoji, reaction_action);
+    let payload_bytes = payload
+        .encode()
+        .map_err(|e| js_err!("Failed to encode reaction payload: {:?}", e))?;
 
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "delivery": "ephemeral",
-        "action": action_name,
-        "targetMessageId": message_id,
-        "reactionEmoji": emoji,
-        "msgId": uuid::Uuid::new_v4().to_string(),
-        "epoch": 0,
-        "paddedSize": 512,
-        "ciphertext": { "$bytes": no_op_ciphertext },
-    });
+    // Decode convo_id (URL-safe base64 no-padding) to group_id bytes.
+    let group_id_bytes = URL_SAFE_NO_PAD
+        .decode(&conversation_id)
+        .map_err(|e| js_err!("Invalid convo_id '{}': {}", conversation_id, e))?;
 
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.mlsChat.sendMessage",
-            base_url
-        ))
-        .bearer_auth(&auth_token)
-        .json(&input)
-        .send()
+    // Encrypt via MLS — auto-join if group not found locally.
+    let encrypt_result = {
+        let first_try = with_state(|s| {
+            let ctx = s.mls_context.as_ref().ok_or_else(|| {
+                js_err!("MLS context not initialized — run wasm_init() inside a Worker")
+            })?;
+            match ctx.encrypt_message(group_id_bytes.clone(), payload_bytes.clone()) {
+                Ok(r) => Ok(Ok(r)),
+                Err(catbird_mls::MLSError::GroupNotFound { .. }) => Ok(Err(())),
+                Err(e) => Err(js_err!("encrypt_message failed: {:?}", e)),
+            }
+        })?;
+
+        match first_try {
+            Ok(result) => result,
+            Err(()) => {
+                // Spec §5.3: Do NOT perform External Commit in send path.
+                web_sys::console::log_1(
+                    &"[catmos-web] Group not found locally for reaction — flagging for deferred rejoin"
+                        .into(),
+                );
+                let storage = with_state(|s| Ok(Arc::clone(&s.storage)))?;
+                let _ = storage.mark_needs_rejoin(&conversation_id).await;
+                return Err(js_err!(
+                    "Group not found locally — sync in progress, please retry"
+                ));
+            }
+        }
+    };
+
+    // Get the current epoch.
+    let epoch = with_state(|s| {
+        let ctx = s
+            .mls_context
+            .as_ref()
+            .ok_or_else(|| js_err!("MLS context not initialized"))?;
+        ctx.get_epoch(group_id_bytes.clone())
+            .map_err(|e| js_err!("get_epoch failed: {:?}", e))
+    })?;
+
+    // Send encrypted reaction to delivery service.
+    api_client
+        .send_message(&conversation_id, &encrypt_result.ciphertext, epoch)
         .await
-        .map_err(|e| js_err!("Reaction update failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("Reaction update failed ({}): {}", status, body));
-    }
+        .map_err(|e| js_err!("Reaction send failed: {:?}", e))?;
 
     Ok(())
 }
@@ -1231,11 +1421,11 @@ pub async fn wasm_send_typing(conversation_id: String, is_typing: bool) -> Resul
     Ok(())
 }
 
-/// Mark a conversation (or a specific message) as read.
+/// Update the read cursor for a conversation.
 #[wasm_bindgen]
-pub async fn wasm_mark_as_read(
+pub async fn wasm_update_cursor(
     conversation_id: String,
-    message_id: Option<String>,
+    cursor: String,
 ) -> Result<(), JsValue> {
     let (base_url, auth_token) = with_state(|s| {
         let token = s
@@ -1245,13 +1435,10 @@ pub async fn wasm_mark_as_read(
         Ok((s.base_url.clone(), token))
     })?;
 
-    let mut input = serde_json::json!({
+    let input = serde_json::json!({
         "convoId": conversation_id,
-        "markRead": true,
+        "cursor": cursor,
     });
-    if let Some(ref mid) = message_id {
-        input["messageId"] = serde_json::Value::String(mid.clone());
-    }
 
     let client = reqwest::Client::new();
     let resp = client
@@ -1263,12 +1450,12 @@ pub async fn wasm_mark_as_read(
         .json(&input)
         .send()
         .await
-        .map_err(|e| js_err!("Mark as read failed: {}", e))?;
+        .map_err(|e| js_err!("Update cursor failed: {}", e))?;
 
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
-        return Err(js_err!("Mark as read failed ({}): {}", status, body));
+        return Err(js_err!("Update cursor failed ({}): {}", status, body));
     }
 
     Ok(())
@@ -1412,6 +1599,21 @@ pub async fn wasm_remove_group_member(
         .remove_members(&conversation_id, &[target_did], &[])
         .await
         .map_err(|e| js_err!("remove_group_member failed: {:?}", e))?;
+
+    Ok(())
+}
+
+/// Leave a conversation.
+#[wasm_bindgen]
+pub async fn wasm_leave_conversation(conversation_id: String) -> Result<(), JsValue> {
+    use catbird_mls::orchestrator::api_client::MLSAPIClient;
+
+    let api_client = with_state(|s| Ok(Arc::clone(&s.api_client)))?;
+
+    api_client
+        .leave_conversation(&conversation_id)
+        .await
+        .map_err(|e| js_err!("leave_conversation failed: {:?}", e))?;
 
     Ok(())
 }
