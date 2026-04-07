@@ -122,7 +122,11 @@ pub async fn subscribe_conversation(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let convo_id = conversation_id.clone();
-    let mut last_cursor: Option<String> = None;
+    // Load persisted cursor from storage (spec §7.1)
+    let mut last_cursor: Option<String> = orchestrator.storage().get_ws_cursor(&convo_id);
+    if last_cursor.is_some() {
+        log_ws!("Loaded persisted cursor for {}", convo_id);
+    }
     let mut attempt = 0u32;
 
     loop {
@@ -232,7 +236,10 @@ async fn do_subscribe(
                     Some(Ok(WsMessage::Binary(data))) => {
                         log_ws!("Received binary frame: {} bytes", data.len());
                         match handle_binary_frame(app, orchestrator, &data, convo_id).await {
-                            Ok(Some(cur)) => last_cursor = Some(cur),
+                            Ok(Some(cur)) => {
+                                orchestrator.storage().set_ws_cursor(convo_id, &cur);
+                                last_cursor = Some(cur);
+                            }
                             Ok(None) => {},
                             Err(e) => log_ws!("Frame error: {}", e),
                         }
