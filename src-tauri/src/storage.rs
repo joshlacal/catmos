@@ -189,19 +189,20 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT group_id, epoch, members_json, metadata_json, created_at, updated_at
+                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at
                  FROM conversations WHERE conversation_id = ?1 AND user_did = ?2",
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
         let result = stmt
             .query_row(rusqlite::params![conversation_id, user_did], |row| {
-                let group_id: String = row.get(0)?;
-                let epoch: u64 = row.get(1)?;
-                let members_json: String = row.get(2)?;
-                let metadata_json: Option<String> = row.get(3)?;
-                let created_at: Option<String> = row.get(4)?;
-                let updated_at: Option<String> = row.get(5)?;
+                let conversation_id: String = row.get(0)?;
+                let group_id: String = row.get(1)?;
+                let epoch: u64 = row.get(2)?;
+                let members_json: String = row.get(3)?;
+                let metadata_json: Option<String> = row.get(4)?;
+                let created_at: Option<String> = row.get(5)?;
+                let updated_at: Option<String> = row.get(6)?;
 
                 let members: Vec<MemberView> =
                     serde_json::from_str(&members_json).unwrap_or_default();
@@ -212,6 +213,7 @@ impl MLSStorageBackend for SqliteStorage {
 
                 Ok(ConversationView {
                     group_id,
+                    conversation_id,
                     epoch,
                     members,
                     metadata,
@@ -228,19 +230,20 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT group_id, epoch, members_json, metadata_json, created_at, updated_at
+                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at
                  FROM conversations WHERE user_did = ?1",
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
         let rows = stmt
             .query_map(rusqlite::params![user_did], |row| {
-                let group_id: String = row.get(0)?;
-                let epoch: u64 = row.get(1)?;
-                let members_json: String = row.get(2)?;
-                let metadata_json: Option<String> = row.get(3)?;
-                let created_at: Option<String> = row.get(4)?;
-                let updated_at: Option<String> = row.get(5)?;
+                let conversation_id: String = row.get(0)?;
+                let group_id: String = row.get(1)?;
+                let epoch: u64 = row.get(2)?;
+                let members_json: String = row.get(3)?;
+                let metadata_json: Option<String> = row.get(4)?;
+                let created_at: Option<String> = row.get(5)?;
+                let updated_at: Option<String> = row.get(6)?;
 
                 let members: Vec<MemberView> =
                     serde_json::from_str(&members_json).unwrap_or_default();
@@ -250,6 +253,7 @@ impl MLSStorageBackend for SqliteStorage {
 
                 Ok(ConversationView {
                     group_id,
+                    conversation_id,
                     epoch,
                     members,
                     metadata,

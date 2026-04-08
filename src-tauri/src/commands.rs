@@ -1571,8 +1571,8 @@ pub async fn search_messages(
     let lower_query = query.to_lowercase();
 
     for convo in &conversations {
-        // group_id is used as conversation_id in messages table
-        let convo_id = &convo.group_id;
+        // Use stable conversation_id for message lookups
+        let convo_id = &convo.conversation_id;
         if let Ok(all_msgs) = state
             .orchestrator
             .storage()
