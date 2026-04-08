@@ -163,8 +163,8 @@ pub async fn subscribe_conversation(
             break;
         }
 
-        // Exponential backoff: 1s, 2s, 4s, 8s, max 15s
-        let delay = std::cmp::min(1 << attempt.min(4), 15);
+        // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s (spec §10)
+        let delay = std::cmp::min(1 << attempt.min(5), 30);
         log_ws!("Reconnecting in {}s for convo {}", delay, convo_id);
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {},
@@ -478,8 +478,28 @@ async fn handle_binary_frame(
                 short_id(&reset_by)
             );
 
-            // Flag for deferred recovery — spec §8.5: External Commits only in
-            // deferred recovery, never inline in event handlers.
+            // Spec §8.5: groupReset is a RESET_PENDING trigger — reset the
+            // recovery tracker's attempt counter to 0 so the deferred recovery
+            // treats this as a fresh attempt (no accumulated backoff/cooldown).
+            orchestrator
+                .recovery_tracker()
+                .lock()
+                .await
+                .clear(convo_id);
+            log_ws!(
+                "Reset recovery tracker for {} (groupReset → fresh attempt)",
+                convo_id
+            );
+
+            // Flag for deferred recovery — External Commits only in deferred
+            // recovery, never inline in event handlers.
+            if let Err(e) = orchestrator
+                .storage()
+                .mark_needs_rejoin(convo_id)
+                .await
+            {
+                log_ws!("Failed to mark_needs_rejoin for {}: {:?}", convo_id, e);
+            }
             if let Err(e) = orchestrator
                 .storage()
                 .set_conversation_state(
@@ -488,7 +508,7 @@ async fn handle_binary_frame(
                 )
                 .await
             {
-                log_ws!("Failed to set NeedsRejoin for {}: {:?}", convo_id, e);
+                log_ws!("Failed to set NeedsRejoin state for {}: {:?}", convo_id, e);
             } else {
                 log_ws!("Flagged {} for deferred rejoin after group reset", convo_id);
             }

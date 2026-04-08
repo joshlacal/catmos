@@ -158,7 +158,10 @@ pub struct AuthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
+    /// Stable conversation identifier (survives group resets). Use for API calls and storage.
     pub id: String,
+    /// Current MLS group identifier (hex). Changes on group reset. For display/debug only.
+    pub group_id: String,
     pub display_name: String,
     pub description: Option<String>,
     pub members: Vec<String>,
@@ -689,7 +692,8 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
                 .or_else(|| cached_metadata.and_then(|m| m.description.clone()))
                 .or_else(|| c.metadata.as_ref().and_then(|m| m.description.clone()));
             Conversation {
-                id: c.group_id,
+                id: c.conversation_id.clone(),
+                group_id: c.group_id,
                 display_name,
                 description,
                 members: member_dids.clone(),
@@ -744,7 +748,8 @@ pub async fn create_group(
     let desc = convo.metadata.as_ref().and_then(|m| m.description.clone());
 
     Ok(Conversation {
-        id: convo.group_id,
+        id: convo.conversation_id.clone(),
+        group_id: convo.group_id,
         display_name,
         description: desc,
         members: member_list.clone(),

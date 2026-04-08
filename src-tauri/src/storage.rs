@@ -87,6 +87,12 @@ impl SqliteStorage {
                 conversation_id TEXT PRIMARY KEY,
                 cursor TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS pending_messages (
+                message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
             ",
         )?;
         Self::ensure_messages_delivery_status_column(&conn)?;
@@ -504,6 +510,35 @@ impl MLSStorageBackend for SqliteStorage {
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    // -- Pending Messages (self-echo dedup across restarts, spec §5) --
+
+    async fn store_pending_message(
+        &self,
+        conversation_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT OR IGNORE INTO pending_messages (message_id, conversation_id, created_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![message_id, conversation_id, now],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn remove_pending_message(&self, message_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let rows = conn
+            .execute(
+                "DELETE FROM pending_messages WHERE message_id = ?1",
+                rusqlite::params![message_id],
+            )
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(rows > 0)
     }
 }
 
