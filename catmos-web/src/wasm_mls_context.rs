@@ -83,9 +83,17 @@ pub struct WasmMLSContext {
     /// Cached signing keys: identity bytes → SignatureKeyPair.
     signers: RefCell<HashMap<Vec<u8>, SignatureKeyPair>>,
     /// Per-group metadata encryption keys (MEK), cached in memory.
+    #[allow(dead_code)]
     metadata_keys: RefCell<HashMap<Vec<u8>, [u8; 32]>>,
 }
 
+impl crate::api_client::ConfirmationTagProvider for WasmMLSContext {
+    fn get_confirmation_tag(&self, group_id_bytes: Vec<u8>) -> Option<Vec<u8>> {
+        self.get_confirmation_tag(group_id_bytes).ok()
+    }
+}
+
+#[allow(dead_code)]
 impl WasmMLSContext {
     /// Open (or create) the MLS SQLite database.
     ///
@@ -292,6 +300,7 @@ fn strip_padding(data: &[u8]) -> &[u8] {
 // MlsCryptoContext implementation
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 impl WasmMLSContext {
     // ------------------------------------------------------------------
     // Group lifecycle
@@ -318,7 +327,12 @@ impl WasmMLSContext {
         let group_id = group.group_id().as_slice().to_vec();
         self.groups.borrow_mut().insert(group_id.clone(), group);
 
-        Ok(GroupCreationResult { group_id })
+        Ok(GroupCreationResult {
+            group_id,
+            encrypted_metadata_blob: None,
+            metadata_reference_json: None,
+            metadata_blob_locator: None,
+        })
     }
 
     pub(crate) fn delete_group(&self, group_id: Vec<u8>) -> Result<(), MLSError> {
@@ -477,6 +491,22 @@ impl WasmMLSContext {
         Ok(group.epoch().as_u64())
     }
 
+    pub(crate) fn get_confirmation_tag(&self, group_id: Vec<u8>) -> Result<Vec<u8>, MLSError> {
+        self.ensure_loaded(&group_id)?;
+        let gid = GroupId::from_slice(&group_id);
+        let tag: Option<ConfirmationTag> = self
+            .provider
+            .storage()
+            .confirmation_tag(&gid)
+            .map_err(|_| MLSError::StorageError)?;
+        match tag {
+            Some(t) => t
+                .tls_serialize_detached()
+                .map_err(|e| MLSError::Internal(format!("TLS serialize: {}", e))),
+            None => Err(MLSError::Internal("No confirmation tag found".to_string())),
+        }
+    }
+
     pub(crate) fn export_group_info(
         &self,
         group_id: Vec<u8>,
@@ -542,6 +572,7 @@ impl WasmMLSContext {
         Ok(WelcomeResult { group_id })
     }
 
+    #[allow(deprecated)]
     pub(crate) fn create_external_commit(
         &self,
         group_info_bytes: Vec<u8>,
@@ -744,6 +775,7 @@ impl WasmMLSContext {
         Ok(KeyPackageResult {
             key_package_data,
             hash_ref,
+            signature_public_key: signer.public().to_vec(),
         })
     }
 
@@ -796,14 +828,7 @@ impl WasmMLSContext {
             .get(&group_id)
             .expect("ensure_loaded guarantees presence");
 
-        let mek = self.get_metadata_key(&group_id);
-
-        let meta = match mek {
-            Some(key) => {
-                catbird_mls::group_metadata::decrypt_metadata_from_group_with_key(group, &key)
-            }
-            None => catbird_mls::group_metadata::GroupMetadata::from_group(group),
-        };
+        let meta = catbird_mls::group_metadata::GroupMetadata::from_group(group);
 
         match meta {
             Some(m) => m
@@ -814,36 +839,16 @@ impl WasmMLSContext {
     }
 
     /// Update group metadata by proposing + committing a GroupContextExtensions change.
-    /// Encrypts the metadata with ChaCha20-Poly1305 using a stable per-group MEK.
     /// Returns the commit message bytes that must be sent to the server.
     pub(crate) fn update_group_metadata(
         &self,
         group_id: Vec<u8>,
         metadata_json: Vec<u8>,
     ) -> Result<Vec<u8>, MLSError> {
-        use catbird_mls::group_metadata::{
-            encrypt_metadata_with_key, GroupMetadata, CATBIRD_METADATA_EXTENSION_TYPE,
-        };
-        use openmls_traits::random::OpenMlsRand;
+        use catbird_mls::group_metadata::{GroupMetadata, CATBIRD_METADATA_EXTENSION_TYPE};
 
         let metadata = GroupMetadata::from_extension_bytes(&metadata_json)
             .map_err(|e| MLSError::invalid_input(format!("Invalid metadata JSON: {}", e)))?;
-
-        // Get or generate MEK
-        let mek = match self.get_metadata_key(&group_id) {
-            Some(key) => key,
-            None => {
-                let key_bytes = self
-                    .provider
-                    .rand()
-                    .random_vec(32)
-                    .map_err(|e| MLSError::Internal(format!("MEK generation: {:?}", e)))?;
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&key_bytes);
-                self.store_metadata_key(&group_id, &key);
-                key
-            }
-        };
 
         self.ensure_loaded(&group_id)?;
         let mut groups = self.groups.borrow_mut();
@@ -863,13 +868,11 @@ impl WasmMLSContext {
         };
         let signer = self.signer_from_identity(identity, pub_key)?;
 
-        // Encrypt metadata with stable per-group MEK
-        let envelope = encrypt_metadata_with_key(&mek, &metadata, self.provider.rand())
-            .map_err(|e| MLSError::Internal(format!("encrypt metadata: {}", e)))?;
-        let envelope_bytes = serde_json::to_vec(&envelope)
-            .map_err(|e| MLSError::Internal(format!("serialize envelope: {}", e)))?;
+        let extension_bytes = metadata
+            .to_extension_bytes()
+            .map_err(|e| MLSError::Internal(format!("serialize metadata: {}", e)))?;
 
-        // Clone existing extensions and add/replace the encrypted metadata extension.
+        // Browser path still stores the legacy metadata extension directly in group context.
         let mut extensions = group.extensions().clone();
 
         // Read existing RequiredCapabilities and merge our extension type
@@ -896,11 +899,7 @@ impl WasmMLSContext {
 
         extensions
             .add_or_replace(Extension::RequiredCapabilities(
-                RequiredCapabilitiesExtension::new(
-                    &ext_types,
-                    &proposal_types,
-                    &credential_types,
-                ),
+                RequiredCapabilitiesExtension::new(&ext_types, &proposal_types, &credential_types),
             ))
             .map_err(|e| {
                 MLSError::Internal(format!(
@@ -912,7 +911,7 @@ impl WasmMLSContext {
         extensions
             .add_or_replace(Extension::Unknown(
                 CATBIRD_METADATA_EXTENSION_TYPE,
-                UnknownExtension(envelope_bytes),
+                UnknownExtension(extension_bytes),
             ))
             .map_err(|e| {
                 MLSError::Internal(format!("Failed to add metadata extension: {:?}", e))
@@ -920,9 +919,7 @@ impl WasmMLSContext {
 
         let (commit_msg, _welcome, _group_info) = group
             .update_group_context_extensions(&self.provider, extensions, &signer)
-            .map_err(|e| {
-                MLSError::OpenMLS(format!("update_group_context_extensions: {:?}", e))
-            })?;
+            .map_err(|e| MLSError::OpenMLS(format!("update_group_context_extensions: {:?}", e)))?;
 
         commit_msg
             .tls_serialize_detached()

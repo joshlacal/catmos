@@ -122,6 +122,12 @@ pub fn run() {
     )
     .expect("Failed to initialize MLS context");
 
+    // Clear leftover WAL from previous session — ensures all committed data is
+    // checkpointed into the main database file before we start reading.
+    if let Err(e) = mls_context.launch_checkpoint() {
+        eprintln!("[catmos] Warning: launch checkpoint failed (non-fatal): {:?}", e);
+    }
+
     // Share the MLS context with the API client so it can derive confirmation tags.
     api_client.set_mls_context(mls_context.clone());
 

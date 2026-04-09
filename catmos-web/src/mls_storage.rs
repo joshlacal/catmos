@@ -97,12 +97,7 @@ impl WasmSqliteStorage {
     }
 
     /// Write a single value.
-    fn write_kv(
-        &self,
-        label: &[u8],
-        key: &[u8],
-        value: Vec<u8>,
-    ) -> Result<(), WasmSqliteError> {
+    fn write_kv(&self, label: &[u8], key: &[u8], value: Vec<u8>) -> Result<(), WasmSqliteError> {
         let storage_key = Self::build_key(label, key.to_vec());
         self.conn.put(&storage_key, &value)
     }
@@ -211,6 +206,7 @@ const OWN_LEAF_NODE_INDEX_LABEL: &[u8] = b"OwnLeafNodeIndex";
 const EPOCH_SECRETS_LABEL: &[u8] = b"EpochSecrets";
 const RESUMPTION_PSK_STORE_LABEL: &[u8] = b"ResumptionPsk";
 const MESSAGE_SECRETS_LABEL: &[u8] = b"MessageSecrets";
+const APPLICATION_EXPORT_TREE_LABEL: &[u8] = b"ApplicationExportTree";
 
 // ---------------------------------------------------------------------------
 // Helper: epoch key pairs composite key
@@ -262,10 +258,7 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<ProposalRef>, Self::Error> {
-        self.read_list(
-            PROPOSAL_QUEUE_REFS_LABEL,
-            &serde_json::to_vec(group_id)?,
-        )
+        self.read_list(PROPOSAL_QUEUE_REFS_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn queued_proposals<
@@ -282,9 +275,8 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         refs.into_iter()
             .map(|proposal_ref| {
                 let key = serde_json::to_vec(&(group_id, &proposal_ref))?;
-                let proposal: QueuedProposal = self
-                    .read_kv(QUEUED_PROPOSAL_LABEL, &key)?
-                    .ok_or_else(|| {
+                let proposal: QueuedProposal =
+                    self.read_kv(QUEUED_PROPOSAL_LABEL, &key)?.ok_or_else(|| {
                         WasmSqliteError::Serialization("missing queued proposal".into())
                     })?;
                 Ok((proposal_ref, proposal))
@@ -466,10 +458,7 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete_kv(
-            CONFIRMATION_TAG_LABEL,
-            &serde_json::to_vec(group_id)?,
-        )
+        self.delete_kv(CONFIRMATION_TAG_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     // -- Signature key pair --
@@ -507,10 +496,7 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         &self,
         public_key: &SignaturePublicKey,
     ) -> Result<(), Self::Error> {
-        self.delete_kv(
-            SIGNATURE_KEY_PAIR_LABEL,
-            &serde_json::to_vec(public_key)?,
-        )
+        self.delete_kv(SIGNATURE_KEY_PAIR_LABEL, &serde_json::to_vec(public_key)?)
     }
 
     // -- Key package --
@@ -562,10 +548,7 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         )
     }
 
-    fn psk<
-        PskBundle: traits::PskBundle<CURRENT_VERSION>,
-        PskId: traits::PskId<CURRENT_VERSION>,
-    >(
+    fn psk<PskBundle: traits::PskBundle<CURRENT_VERSION>, PskId: traits::PskId<CURRENT_VERSION>>(
         &self,
         psk_id: &PskId,
     ) -> Result<Option<PskBundle>, Self::Error> {
@@ -603,20 +586,14 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         &self,
         public_key: &EncryptionKey,
     ) -> Result<Option<HpkeKeyPair>, Self::Error> {
-        self.read_kv(
-            ENCRYPTION_KEY_PAIR_LABEL,
-            &serde_json::to_vec(public_key)?,
-        )
+        self.read_kv(ENCRYPTION_KEY_PAIR_LABEL, &serde_json::to_vec(public_key)?)
     }
 
     fn delete_encryption_key_pair<EncryptionKey: traits::EncryptionKey<CURRENT_VERSION>>(
         &self,
         public_key: &EncryptionKey,
     ) -> Result<(), Self::Error> {
-        self.delete_kv(
-            ENCRYPTION_KEY_PAIR_LABEL,
-            &serde_json::to_vec(public_key)?,
-        )
+        self.delete_kv(ENCRYPTION_KEY_PAIR_LABEL, &serde_json::to_vec(public_key)?)
     }
 
     // -- Group state --
@@ -711,20 +688,14 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<ResumptionPskStore>, Self::Error> {
-        self.read_kv(
-            RESUMPTION_PSK_STORE_LABEL,
-            &serde_json::to_vec(group_id)?,
-        )
+        self.read_kv(RESUMPTION_PSK_STORE_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn delete_all_resumption_psk_secrets<GroupId: traits::GroupId<CURRENT_VERSION>>(
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete_kv(
-            RESUMPTION_PSK_STORE_LABEL,
-            &serde_json::to_vec(group_id)?,
-        )
+        self.delete_kv(RESUMPTION_PSK_STORE_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     // -- Own leaf index --
@@ -758,10 +729,7 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete_kv(
-            OWN_LEAF_NODE_INDEX_LABEL,
-            &serde_json::to_vec(group_id)?,
-        )
+        self.delete_kv(OWN_LEAF_NODE_INDEX_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     // -- Group epoch secrets --
@@ -911,5 +879,46 @@ impl StorageProvider<CURRENT_VERSION> for WasmSqliteStorage {
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
         self.delete_kv(OWN_LEAF_NODES_LABEL, &serde_json::to_vec(group_id)?)
+    }
+
+    fn write_application_export_tree<
+        GroupId: traits::GroupId<CURRENT_VERSION>,
+        ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+        application_export_tree: &ApplicationExportTree,
+    ) -> Result<(), Self::Error> {
+        self.write_kv(
+            APPLICATION_EXPORT_TREE_LABEL,
+            &serde_json::to_vec(group_id)?,
+            serde_json::to_vec(application_export_tree)?,
+        )
+    }
+
+    fn application_export_tree<
+        GroupId: traits::GroupId<CURRENT_VERSION>,
+        ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<Option<ApplicationExportTree>, Self::Error> {
+        self.read_kv(
+            APPLICATION_EXPORT_TREE_LABEL,
+            &serde_json::to_vec(group_id)?,
+        )
+    }
+
+    fn delete_application_export_tree<
+        GroupId: traits::GroupId<CURRENT_VERSION>,
+        ApplicationExportTree: traits::ApplicationExportTree<CURRENT_VERSION>,
+    >(
+        &self,
+        group_id: &GroupId,
+    ) -> Result<(), Self::Error> {
+        self.delete_kv(
+            APPLICATION_EXPORT_TREE_LABEL,
+            &serde_json::to_vec(group_id)?,
+        )
     }
 }
