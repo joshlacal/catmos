@@ -1684,3 +1684,153 @@ pub async fn reset_group(
     log_catmos!("reset_group success: {:?}", result);
     Ok(result)
 }
+
+/// Publish an `app.bsky.graph.block` record to the user's PDS via the nest BFF.
+/// Returns the record's AT-URI on success.
+#[tauri::command]
+pub async fn create_block(
+    state: State<'_, AppState>,
+    subject_did: String,
+) -> Result<String, String> {
+    log_catmos!("create_block: subject={}", subject_did);
+
+    let token = state
+        .api_client
+        .get_auth_token()
+        .ok_or("Not authenticated")?;
+    let did = state
+        .api_client
+        .current_did()
+        .await
+        .ok_or("Not authenticated")?;
+
+    let nest_url =
+        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+
+    let body = serde_json::json!({
+        "repo": did,
+        "collection": "app.bsky.graph.block",
+        "record": {
+            "$type": "app.bsky.graph.block",
+            "subject": subject_did,
+            "createdAt": chrono::Utc::now().to_rfc3339(),
+        },
+    });
+
+    // Build a fresh client without the atproto-proxy default header — this is a
+    // standard PDS operation, not an MLS service call.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/xrpc/com.atproto.repo.createRecord", nest_url))
+        .bearer_auth(&token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            log_catmos!("create_block request failed: {}", e);
+            format!("createBlock request failed: {}", e)
+        })?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        log_catmos!("create_block non-success {}: {}", status, body);
+        return Err(format!("createBlock failed: {} {}", status, body));
+    }
+
+    let result: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse createBlock response: {}", e))?;
+
+    let uri = result
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "createBlock response missing `uri`".to_string())?
+        .to_string();
+
+    log_catmos!("create_block success: uri={}", uri);
+    Ok(uri)
+}
+
+/// List every DID currently blocked by the authenticated user by paginating
+/// `com.atproto.repo.listRecords` over the `app.bsky.graph.block` collection.
+#[tauri::command]
+pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let token = state
+        .api_client
+        .get_auth_token()
+        .ok_or("Not authenticated")?;
+    let did = state
+        .api_client
+        .current_did()
+        .await
+        .ok_or("Not authenticated")?;
+
+    log_catmos!("list_own_blocks: did={}", did);
+
+    let nest_url =
+        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+
+    let client = reqwest::Client::new();
+    let mut blocked: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    // Safety cap matches the browser path (1000 pages * 100 per page = 100k DIDs).
+    for _page in 0..1000 {
+        let mut req = client
+            .get(format!("{}/xrpc/com.atproto.repo.listRecords", nest_url))
+            .bearer_auth(&token)
+            .query(&[
+                ("repo", did.as_str()),
+                ("collection", "app.bsky.graph.block"),
+                ("limit", "100"),
+            ]);
+        if let Some(c) = cursor.as_deref() {
+            req = req.query(&[("cursor", c)]);
+        }
+
+        let resp = req.send().await.map_err(|e| {
+            log_catmos!("list_own_blocks request failed: {}", e);
+            format!("listOwnBlocks request failed: {}", e)
+        })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            log_catmos!("list_own_blocks non-success {}: {}", status, body);
+            return Err(format!("listOwnBlocks failed: {} {}", status, body));
+        }
+
+        let page: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse listRecords page: {}", e))?;
+
+        let records = page.get("records").and_then(|v| v.as_array());
+        let record_count = records.map(|r| r.len()).unwrap_or(0);
+        if let Some(recs) = records {
+            for rec in recs {
+                if let Some(subject) = rec
+                    .get("value")
+                    .and_then(|v| v.get("subject"))
+                    .and_then(|v| v.as_str())
+                {
+                    blocked.push(subject.to_string());
+                }
+            }
+        }
+
+        let next = page
+            .get("cursor")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if next.is_none() || record_count == 0 {
+            break;
+        }
+        cursor = next;
+    }
+
+    log_catmos!("list_own_blocks success: count={}", blocked.len());
+    Ok(blocked)
+}

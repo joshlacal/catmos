@@ -734,21 +734,19 @@ export async function reportSpam(
 // ---------------------------------------------------------------------------
 // Blocks (app.bsky.graph.block)
 //
-// catmos has no existing block commands on either runtime. These helpers
-// go through the nest BFF for browser mode (same bearer-token pattern used
-// by reportSpam / resetGroup above). Tauri desktop is not yet wired —
-// the Rust backend holds the session in keychain and would need a dedicated
-// command; until then these log a warning and no-op in Tauri mode. The
-// block user -> leave groups flow therefore only runs in web mode today.
+// Both runtimes call `com.atproto.repo.createRecord` / `listRecords` via the
+// nest BFF. Browser mode uses the session bearer directly from sessionStorage;
+// Tauri mode routes through dedicated IPC commands that use the keychained
+// session on the Rust side.
 // ---------------------------------------------------------------------------
 
 /**
  * Publish an `app.bsky.graph.block` record for `targetDid`.
- * Uses `com.atproto.repo.createRecord` via the nest BFF.
+ * Uses `com.atproto.repo.createRecord` via the nest BFF. Returns the AT-URI.
  */
 export async function createBlock(targetDid: string): Promise<void> {
 	if (isTauri) {
-		console.warn('[catmos] createBlock: not yet implemented on Tauri desktop');
+		await tauriInvoke<string>('create_block', { subjectDid: targetDid });
 		return;
 	}
 	const saved = readBrowserAuth();
@@ -784,7 +782,8 @@ export async function createBlock(targetDid: string): Promise<void> {
 export async function listOwnBlocks(): Promise<Set<string>> {
 	const blocked = new Set<string>();
 	if (isTauri) {
-		console.warn('[catmos] listOwnBlocks: not yet implemented on Tauri desktop');
+		const dids = await tauriInvoke<string[]>('list_own_blocks');
+		for (const d of dids) blocked.add(d);
 		return blocked;
 	}
 	const saved = readBrowserAuth();

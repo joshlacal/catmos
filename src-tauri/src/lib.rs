@@ -182,6 +182,8 @@ pub fn run() {
             commands::search_messages,
             commands::report_spam,
             commands::reset_group,
+            commands::create_block,
+            commands::list_own_blocks,
         ])
         .setup(|_app| Ok(()))
         .run(tauri::generate_context!())
