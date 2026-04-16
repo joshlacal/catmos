@@ -1,0 +1,5 @@
+step	exit_code	log_file
+catmos cargo check	0	docs/compat-runs/20260216-104007-post-fixes/catmos_cargo_check.log
+catmos cargo test	0	docs/compat-runs/20260216-104007-post-fixes/catmos_cargo_test.log
+catmos npm run check	0	docs/compat-runs/20260216-104007-post-fixes/catmos_npm_run_check.log
+mls-ds server sqlx offline cargo test	101	docs/compat-runs/20260216-104007-post-fixes/mls-ds_server_sqlx_offline_cargo_test.log

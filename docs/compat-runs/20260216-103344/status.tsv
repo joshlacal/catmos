@@ -1,0 +1,10 @@
+step	exit_code	log_file
+catmos npm run check	0	docs/compat-runs/20260216-103344/catmos_npm_run_check.log
+catmos npm run build	0	docs/compat-runs/20260216-103344/catmos_npm_run_build.log
+catmos cargo check	0	docs/compat-runs/20260216-103344/catmos_cargo_check.log
+catmos cargo build	0	docs/compat-runs/20260216-103344/catmos_cargo_build.log
+catmos cargo test	0	docs/compat-runs/20260216-103344/catmos_cargo_test.log
+catbird-mls cargo check	0	docs/compat-runs/20260216-103344/catbird-mls_cargo_check.log
+catbird-mls cargo test	0	docs/compat-runs/20260216-103344/catbird-mls_cargo_test.log
+mls-ds server cargo check	0	docs/compat-runs/20260216-103344/mls-ds_server_cargo_check.log
+mls-ds server cargo test	101	docs/compat-runs/20260216-103344/mls-ds_server_cargo_test.log

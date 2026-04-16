@@ -1,0 +1,14 @@
+node_modules/
+.DS_Store
+
+# SvelteKit
+.svelte-kit/
+build/
+src/lib/wasm-pkg/
+
+# Cargo / Rust
+target/
+
+# Editor / local state
+.vscode/
+.idea/

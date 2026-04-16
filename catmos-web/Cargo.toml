@@ -1,0 +1,81 @@
+[package]
+name = "catmos-web"
+version = "0.1.0"
+edition = "2021"
+description = "Catmos Web - Browser WASM target using catbird-mls orchestrator"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Shared MLS orchestrator — same crate as Tauri desktop
+catbird_mls = { path = "../../catbird-mls", default-features = false, features = ["browser"] }
+
+# WASM bindings
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Navigator",
+    "Storage",
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "ErrorEvent",
+    "Event",
+    "EventTarget",
+    "Blob",
+    "BinaryType",
+    "console",
+]}
+serde-wasm-bindgen = "0.6"
+
+# Shared lexicon types
+catbird-atproto = { path = "../../catbird-atproto" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP (uses fetch in WASM)
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots",
+] }
+
+# SQLite for WASM — raw FFI bindings with sqlite3mc encryption
+sqlite-wasm-rs = { version = "0.5", default-features = false, features = ["sqlite3mc"] }
+
+# OpenMLS — same versions as catbird-mls
+openmls = { version = "0.8", features = ["js"] }
+openmls_traits = "0.5"
+openmls_libcrux_crypto = "0.3"
+openmls_basic_credential = "0.5"
+tls_codec = "0.4"
+
+# Utilities
+base64 = "0.22"
+ciborium = "0.2"
+chrono = { version = "0.4", features = ["serde", "wasmbind"] }
+uuid = { version = "1", features = ["v4", "js"] }
+async-trait = "0.1"
+tracing = "0.1"
+console_error_panic_hook = "0.1"
+thiserror = "1.0"
+
+# WASM-compatible getrandom.
+# getrandom 0.2 (direct) uses features = ["js"] for WASM.
+# getrandom 0.3+ (pulled via hpke-rs/rand 0.9) requires the `wasm_js` feature.
+# We declare both so Cargo unifies features correctly across semver-incompatible versions.
+getrandom = { version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "s"     # Optimize for size in WASM
+lto = true

@@ -1,0 +1,491 @@
+[CMD] cd /Users/joshlacalamito/Developer/Catbird+Petrel/mls-ds/server && cargo check
+[START] 2026-02-16T15:34:55Z
+warning: unused import: `error`
+  --> server/src/block_sync.rs:14:22
+   |
+14 | use tracing::{debug, error, info, warn};
+   |                      ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `TicketClaims`
+  --> server/src/realtime/websocket.rs:32:52
+   |
+32 |     handlers::subscription_ticket::{verify_ticket, TicketClaims},
+   |                                                    ^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `streaming`
+  --> server/src/generated/blue_catbird/mlsChat.rs:30:7
+   |
+30 | #[cfg(feature = "streaming")]
+   |       ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default` and `namespace-bluecatbird`
+   = help: consider adding `streaming` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:340:39
+    |
+340 |                     p256::FieldBytes::from_slice(&x),
+    |                                       ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:341:39
+    |
+341 |                     p256::FieldBytes::from_slice(&y),
+    |                                       ^^^^^^^^^^
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:631:39
+    |
+631 |                     p256::FieldBytes::from_slice(&x),
+    |                                       ^^^^^^^^^^
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:632:39
+    |
+632 |                     p256::FieldBytes::from_slice(&y),
+    |                                       ^^^^^^^^^^
+
+warning: unused variable: `message_type`
+    --> server/src/actors/conversation.rs:1062:5
+     |
+1062 |     message_type: &str,
+     |     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_message_type`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `sse_state` is never read
+   --> server/src/actors/conversation.rs:275:5
+    |
+270 | pub struct ConversationActorState {
+    |            ---------------------- field in this struct
+...
+275 |     sse_state: Arc<SseState>,
+    |     ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `cached_at` is never read
+   --> server/src/auth.rs:185:5
+    |
+183 | pub struct CachedDidDoc {
+    |            ------------ field in this struct
+184 |     doc: DidDocument,
+185 |     cached_at: DateTime<Utc>,
+    |     ^^^^^^^^^
+    |
+    = note: `CachedDidDoc` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `cache_ttl_seconds` is never read
+   --> server/src/auth.rs:202:5
+    |
+197 | pub struct AuthMiddleware {
+    |            -------------- field in this struct
+...
+202 |     cache_ttl_seconds: u64,
+    |     ^^^^^^^^^^^^^^^^^
+    |
+    = note: `AuthMiddleware` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `record_type` is never read
+  --> server/src/block_sync.rs:90:5
+   |
+88 | struct BlockValue {
+   |        ---------- field in this struct
+89 |     #[serde(rename = "$type")]
+90 |     record_type: Option<String>,
+   |     ^^^^^^^^^^^
+   |
+   = note: `BlockValue` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: structure field `createdAt` should have a snake case name
+  --> server/src/federation/declaration_client.rs:22:9
+   |
+22 |     pub createdAt: String,
+   |         ^^^^^^^^^ help: convert the identifier to snake case: `created_at`
+   |
+   = note: `#[warn(non_snake_case)]` (part of `#[warn(nonstandard_style)]`) on by default
+
+warning: structure field `deviceId` should have a snake case name
+  --> server/src/federation/declaration_client.rs:40:9
+   |
+40 |         deviceId: Option<String>,
+   |         ^^^^^^^^ help: convert the identifier to snake case: `device_id`
+
+warning: structure field `deviceKey` should have a snake case name
+  --> server/src/federation/declaration_client.rs:41:9
+   |
+41 |         deviceKey: String,
+   |         ^^^^^^^^^ help: convert the identifier to snake case: `device_key`
+
+warning: structure field `deviceId` should have a snake case name
+  --> server/src/federation/declaration_client.rs:45:9
+   |
+45 |         deviceId: Option<String>,
+   |         ^^^^^^^^ help: convert the identifier to snake case: `device_id`
+
+warning: structure field `deviceKey` should have a snake case name
+  --> server/src/federation/declaration_client.rs:46:9
+   |
+46 |         deviceKey: Option<String>,
+   |         ^^^^^^^^^ help: convert the identifier to snake case: `device_key`
+
+warning: structure field `newRoot` should have a snake case name
+  --> server/src/federation/declaration_client.rs:51:9
+   |
+51 |         newRoot: String,
+   |         ^^^^^^^ help: convert the identifier to snake case: `new_root`
+
+warning: structure field `newRootAlg` should have a snake case name
+  --> server/src/federation/declaration_client.rs:52:9
+   |
+52 |         newRootAlg: String,
+   |         ^^^^^^^^^^ help: convert the identifier to snake case: `new_root_alg`
+
+warning: structure field `sigAlg` should have a snake case name
+  --> server/src/federation/declaration_client.rs:70:9
+   |
+70 |     pub sigAlg: String,
+   |         ^^^^^^ help: convert the identifier to snake case: `sig_alg`
+
+warning: structure field `coSig` should have a snake case name
+  --> server/src/federation/declaration_client.rs:71:9
+   |
+71 |     pub coSig: Option<BytesWrapper>,
+   |         ^^^^^ help: convert the identifier to snake case: `co_sig`
+
+warning: structure field `coSigAlg` should have a snake case name
+  --> server/src/federation/declaration_client.rs:72:9
+   |
+72 |     pub coSigAlg: Option<String>,
+   |         ^^^^^^^^ help: convert the identifier to snake case: `co_sig_alg`
+
+warning: structure field `deviceProof` should have a snake case name
+  --> server/src/federation/declaration_client.rs:73:9
+   |
+73 |     pub deviceProof: Option<BytesWrapper>,
+   |         ^^^^^^^^^^^ help: convert the identifier to snake case: `device_proof`
+
+warning: module `mlsChat` should have a snake case name
+ --> server/src/generated/blue_catbird.rs:7:9
+  |
+7 | pub mod mlsChat;
+  |         ^^^^^^^ help: convert the identifier to snake case: `mls_chat`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_defs` should have a snake case name
+  --> server/src/generated/blue_catbird/mlsChat.rs:59:4
+   |
+59 | fn lexicon_doc_blue_catbird_mlsChat_defs() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static> {
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_defs`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_blocks` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/blocks.rs:228:4
+    |
+228 | fn lexicon_doc_blue_catbird_mlsChat_blocks() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_blocks`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_commitGroupChange` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/commit_group_change.rs:162:4
+    |
+162 | fn lexicon_doc_blue_catbird_mlsChat_commitGroupChange(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_commit_group_change`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_createConvo` should have a snake case name
+  --> server/src/generated/blue_catbird/mlsChat/create_convo.rs:31:4
+   |
+31 | fn lexicon_doc_blue_catbird_mlsChat_createConvo() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static>
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_create_convo`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_declaration` should have a snake case name
+  --> server/src/generated/blue_catbird/mlsChat/declaration.rs:33:4
+   |
+33 | fn lexicon_doc_blue_catbird_mlsChat_declaration() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static>
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_declaration`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_getKeyPackageStatus` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/get_key_package_status.rs:159:4
+    |
+159 | fn lexicon_doc_blue_catbird_mlsChat_getKeyPackageStatus(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_get_key_package_status`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_getMessages` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/get_messages.rs:199:4
+    |
+199 | fn lexicon_doc_blue_catbird_mlsChat_getMessages() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static>
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_get_messages`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_getPendingDevices` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/get_pending_devices.rs:355:4
+    |
+355 | fn lexicon_doc_blue_catbird_mlsChat_getPendingDevices(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_get_pending_devices`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_getReports` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/get_reports.rs:615:4
+    |
+615 | fn lexicon_doc_blue_catbird_mlsChat_getReports() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static>
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_get_reports`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_listDevices` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/list_devices.rs:370:4
+    |
+370 | fn lexicon_doc_blue_catbird_mlsChat_listDevices() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static>
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_list_devices`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_optIn` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/opt_in.rs:352:4
+    |
+352 | fn lexicon_doc_blue_catbird_mlsChat_optIn() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_opt_in`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_publishKeyPackages` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/publish_key_packages.rs:161:4
+    |
+161 | fn lexicon_doc_blue_catbird_mlsChat_publishKeyPackages(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_publish_key_packages`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_registerDevice` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/register_device.rs:201:4
+    |
+201 | fn lexicon_doc_blue_catbird_mlsChat_registerDevice(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_register_device`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_report` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/report.rs:646:4
+    |
+646 | fn lexicon_doc_blue_catbird_mlsChat_report() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static> {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_report`
+
+warning: function `lexicon_doc_blue_catbird_mlsChat_updateConvo` should have a snake case name
+   --> server/src/generated/blue_catbird/mlsChat/update_convo.rs:240:4
+    |
+240 | fn lexicon_doc_blue_catbird_mlsChat_updateConvo() -> ::jacquard_lexicon::lexicon::LexiconDoc<'static>
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: convert the identifier to snake case: `lexicon_doc_blue_catbird_mls_chat_update_convo`
+
+warning: `catbird-server` (lib) generated 39 warnings (run `cargo fix --lib -p catbird-server` to apply 3 suggestions)
+warning: unused imports: `crypto`, `fanout`, `storage`, and `util`
+  --> server/src/main.rs:15:31
+   |
+15 |     actors, auth, block_sync, crypto, db, fanout, federation, handlers, health, metrics,
+   |                               ^^^^^^      ^^^^^^
+16 |     middleware, models, realtime, storage, util,
+   |                                   ^^^^^^^  ^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `anyhow::Result`
+ --> server/src/jobs/data_compaction.rs:1:5
+  |
+1 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `anyhow::Result`
+ --> server/src/jobs/key_package_cleanup.rs:1:5
+  |
+1 | use anyhow::Result;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused imports: `CompactionConfig` and `run_compaction_worker`
+ --> server/src/jobs/mod.rs:7:27
+  |
+7 | pub use compact_cursors::{run_compaction_worker, CompactionConfig};
+  |                           ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^
+
+warning: unused import: `mark_inactive_devices::run_mark_inactive_devices_worker`
+  --> server/src/jobs/mod.rs:11:9
+   |
+11 | pub use mark_inactive_devices::run_mark_inactive_devices_worker;
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `jacquard_axum::IntoRouter`
+ --> server/src/main.rs:6:5
+  |
+6 | use jacquard_axum::IntoRouter;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `PromoteAdminInput` is never constructed
+  --> server/src/admin_system.rs:41:12
+   |
+41 | pub struct PromoteAdminInput {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `PromoteAdminOutput` is never constructed
+  --> server/src/admin_system.rs:50:12
+   |
+50 | pub struct PromoteAdminOutput {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `DemoteAdminInput` is never constructed
+  --> server/src/admin_system.rs:59:12
+   |
+59 | pub struct DemoteAdminInput {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: struct `DemoteAdminOutput` is never constructed
+  --> server/src/admin_system.rs:68:12
+   |
+68 | pub struct DemoteAdminOutput {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: struct `RemoveMemberInput` is never constructed
+  --> server/src/admin_system.rs:77:12
+   |
+77 | pub struct RemoveMemberInput {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: struct `RemoveMemberOutput` is never constructed
+  --> server/src/admin_system.rs:88:12
+   |
+88 | pub struct RemoveMemberOutput {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `ReportMemberInput` is never constructed
+  --> server/src/admin_system.rs:97:12
+   |
+97 | pub struct ReportMemberInput {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: struct `ReportMemberOutput` is never constructed
+   --> server/src/admin_system.rs:109:12
+    |
+109 | pub struct ReportMemberOutput {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `GetReportsInput` is never constructed
+   --> server/src/admin_system.rs:118:12
+    |
+118 | pub struct GetReportsInput {
+    |            ^^^^^^^^^^^^^^^
+
+warning: struct `GetReportsOutput` is never constructed
+   --> server/src/admin_system.rs:127:12
+    |
+127 | pub struct GetReportsOutput {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: struct `ResolveReportInput` is never constructed
+   --> server/src/admin_system.rs:134:12
+    |
+134 | pub struct ResolveReportInput {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: struct `ResolveReportOutput` is never constructed
+   --> server/src/admin_system.rs:143:12
+    |
+143 | pub struct ResolveReportOutput {
+    |            ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `MemberView` is never constructed
+   --> server/src/admin_system.rs:154:12
+    |
+154 | pub struct MemberView {
+    |            ^^^^^^^^^^
+
+warning: struct `ReportView` is never constructed
+   --> server/src/admin_system.rs:165:12
+    |
+165 | pub struct ReportView {
+    |            ^^^^^^^^^^
+
+warning: function `promote_admin` is never used
+   --> server/src/admin_system.rs:186:14
+    |
+186 | pub async fn promote_admin(
+    |              ^^^^^^^^^^^^^
+
+warning: function `demote_admin` is never used
+   --> server/src/admin_system.rs:282:14
+    |
+282 | pub async fn demote_admin(
+    |              ^^^^^^^^^^^^
+
+warning: function `remove_member` is never used
+   --> server/src/admin_system.rs:371:14
+    |
+371 | pub async fn remove_member(
+    |              ^^^^^^^^^^^^^
+
+warning: function `report_member` is never used
+   --> server/src/admin_system.rs:482:14
+    |
+482 | pub async fn report_member(
+    |              ^^^^^^^^^^^^^
+
+warning: function `get_reports` is never used
+   --> server/src/admin_system.rs:540:14
+    |
+540 | pub async fn get_reports(
+    |              ^^^^^^^^^^^
+
+warning: function `resolve_report` is never used
+   --> server/src/admin_system.rs:596:14
+    |
+596 | pub async fn resolve_report(
+    |              ^^^^^^^^^^^^^^
+
+warning: function `verify_is_admin` is never used
+   --> server/src/admin_system.rs:652:14
+    |
+652 | pub async fn verify_is_admin(pool: &PgPool, convo_id: &str, did: &str) -> Result<(), StatusCode> {
+    |              ^^^^^^^^^^^^^^^
+
+warning: function `verify_is_member` is never used
+   --> server/src/admin_system.rs:678:10
+    |
+678 | async fn verify_is_member(pool: &PgPool, convo_id: &str, did: &str) -> Result<(), StatusCode> {
+    |          ^^^^^^^^^^^^^^^^
+
+warning: function `generate_id` is never used
+   --> server/src/admin_system.rs:704:4
+    |
+704 | fn generate_id() -> String {
+    |    ^^^^^^^^^^^
+
+warning: function `parse_device_did` is never used
+  --> server/src/device_utils.rs:19:8
+   |
+19 | pub fn parse_device_did(device_did: &str) -> Result<(String, String), String> {
+   |        ^^^^^^^^^^^^^^^^
+
+warning: function `construct_device_did` is never used
+  --> server/src/device_utils.rs:43:8
+   |
+43 | pub fn construct_device_did(user_did: &str, device_id: &str) -> String {
+   |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `CompactionConfig` is never constructed
+ --> server/src/jobs/compact_cursors.rs:8:12
+  |
+8 | pub struct CompactionConfig {
+  |            ^^^^^^^^^^^^^^^^
+
+warning: function `run_compaction_worker` is never used
+  --> server/src/jobs/compact_cursors.rs:31:14
+   |
+31 | pub async fn run_compaction_worker(pool: PgPool, config: CompactionConfig) {
+   |              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `compact_events` is never used
+  --> server/src/jobs/compact_cursors.rs:53:10
+   |
+53 | async fn compact_events(pool: &PgPool, config: &CompactionConfig) -> Result<()> {
+   |          ^^^^^^^^^^^^^^
+
+warning: function `run_mark_inactive_devices_worker` is never used
+  --> server/src/jobs/mark_inactive_devices.rs:10:14
+   |
+10 | pub async fn run_mark_inactive_devices_worker(pool: PgPool) {
+   |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `catbird-server` (bin "catbird-server") generated 35 warnings (run `cargo fix --bin "catbird-server" -p catbird-server` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.68s
+warning: the following packages contain code that will be rejected by a future version of Rust: num-bigint-dig v0.8.4, sqlx-postgres v0.7.4
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 2`
+[END] 2026-02-16T15:34:56Z

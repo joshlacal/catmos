@@ -1,0 +1,128 @@
+[CMD] cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos && npm run check
+[START] 2026-02-16T15:33:44Z
+
+> catmos@0.1.0 check
+> svelte-kit sync && svelte-check --tsconfig ./tsconfig.json
+
+Loading svelte-check in workspace: /Users/joshlacalamito/Developer/Catbird+Petrel/catmos
+Getting Svelte diagnostics...
+
+/Users/joshlacalamito/Developer/Catbird+Petrel/catmos/src/lib/components/MemberList.svelte:154:3
+Warn: Elements with the 'dialog' interactive role must have a tabindex value
+https://svelte.dev/e/a11y_interactive_supports_focus (svelte)
+	<div class="confirm-overlay" onclick={cancelAction} role="presentation">
+		<div class="confirm-dialog" onclick={(e) => e.stopPropagation()} role="dialog">
+			<p class="confirm-text">
+				{#if confirmAction.type === 'promote'}
+					Promote <strong>{confirmAction.name}</strong> to Admin?
+				{:else if confirmAction.type === 'demote'}
+					Demote <strong>{confirmAction.name}</strong> to Member?
+				{:else}
+					Remove <strong>{confirmAction.name}</strong> from the group?
+				{/if}
+			</p>
+			<div class="confirm-actions">
+				<button class="dialog-btn cancel" onclick={cancelAction}>Cancel</button>
+				<button
+					class="dialog-btn"
+					class:danger={confirmAction.type === 'remove'}
+					class:primary={confirmAction.type !== 'remove'}
+					onclick={executeAction}
+				>
+					{confirmAction.type === 'remove' ? 'Remove' : 'Confirm'}
+				</button>
+			</div>
+		</div>
+	</div>
+
+/Users/joshlacalamito/Developer/Catbird+Petrel/catmos/src/lib/components/MemberList.svelte:154:3
+Warn: Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events (svelte)
+	<div class="confirm-overlay" onclick={cancelAction} role="presentation">
+		<div class="confirm-dialog" onclick={(e) => e.stopPropagation()} role="dialog">
+			<p class="confirm-text">
+				{#if confirmAction.type === 'promote'}
+					Promote <strong>{confirmAction.name}</strong> to Admin?
+				{:else if confirmAction.type === 'demote'}
+					Demote <strong>{confirmAction.name}</strong> to Member?
+				{:else}
+					Remove <strong>{confirmAction.name}</strong> from the group?
+				{/if}
+			</p>
+			<div class="confirm-actions">
+				<button class="dialog-btn cancel" onclick={cancelAction}>Cancel</button>
+				<button
+					class="dialog-btn"
+					class:danger={confirmAction.type === 'remove'}
+					class:primary={confirmAction.type !== 'remove'}
+					onclick={executeAction}
+				>
+					{confirmAction.type === 'remove' ? 'Remove' : 'Confirm'}
+				</button>
+			</div>
+		</div>
+	</div>
+
+/Users/joshlacalamito/Developer/Catbird+Petrel/catmos/src/lib/components/Sidebar.svelte:108:3
+Warn: Elements with the 'dialog' interactive role must have a tabindex value
+https://svelte.dev/e/a11y_interactive_supports_focus (svelte)
+	<div class="dialog-overlay" onclick={() => (showCreateDialog = false)} role="presentation">
+		<div class="dialog" onclick={(e) => e.stopPropagation()} role="dialog">
+			<h3>New Group</h3>
+			<form onsubmit={handleCreateGroup}>
+				<input
+					type="text"
+					placeholder="Group name"
+					bind:value={newGroupName}
+					class="dialog-input"
+				/>
+				<div class="dialog-label">Add Members</div>
+				<UserSearch bind:selected={selectedMembers} />
+				{#if createError}
+					<p class="dialog-error">{createError}</p>
+				{/if}
+				<div class="dialog-actions">
+					<button type="button" class="dialog-btn cancel" onclick={() => (showCreateDialog = false)}>
+						Cancel
+					</button>
+					<button type="submit" class="dialog-btn primary" disabled={creating || !newGroupName.trim()}>
+						{creating ? 'Creating...' : 'Create'}
+					</button>
+				</div>
+			</form>
+		</div>
+	</div>
+
+/Users/joshlacalamito/Developer/Catbird+Petrel/catmos/src/lib/components/Sidebar.svelte:108:3
+Warn: Visible, non-interactive elements with a click event must be accompanied by a keyboard event handler. Consider whether an interactive element such as `<button type="button">` or `<a>` might be more appropriate
+https://svelte.dev/e/a11y_click_events_have_key_events (svelte)
+	<div class="dialog-overlay" onclick={() => (showCreateDialog = false)} role="presentation">
+		<div class="dialog" onclick={(e) => e.stopPropagation()} role="dialog">
+			<h3>New Group</h3>
+			<form onsubmit={handleCreateGroup}>
+				<input
+					type="text"
+					placeholder="Group name"
+					bind:value={newGroupName}
+					class="dialog-input"
+				/>
+				<div class="dialog-label">Add Members</div>
+				<UserSearch bind:selected={selectedMembers} />
+				{#if createError}
+					<p class="dialog-error">{createError}</p>
+				{/if}
+				<div class="dialog-actions">
+					<button type="button" class="dialog-btn cancel" onclick={() => (showCreateDialog = false)}>
+						Cancel
+					</button>
+					<button type="submit" class="dialog-btn primary" disabled={creating || !newGroupName.trim()}>
+						{creating ? 'Creating...' : 'Create'}
+					</button>
+				</div>
+			</form>
+		</div>
+	</div>
+
+====================================
+svelte-check found 0 errors and 4 warnings in 2 files
+[END] 2026-02-16T15:33:46Z

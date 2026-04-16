@@ -1,0 +1,438 @@
+[CMD] cd /Users/joshlacalamito/Developer/Catbird+Petrel/mls-ds/server && cargo test
+[START] 2026-02-16T15:34:56Z
+   Compiling catbird-server v0.1.0 (/Users/joshlacalamito/Developer/Catbird+Petrel/mls-ds/server)
+error: error returned from database: password authentication failed for user "catbird"
+   --> server/src/actors/conversation.rs:958:30
+    |
+958 |           let members_result = sqlx::query!(
+    |  ______________________________^
+959 | |             r#"
+960 | |             SELECT member_did
+961 | |             FROM members
+...   |
+964 | |             convo_id
+965 | |         )
+    | |_________^
+    |
+    = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+   --> server/src/actors/conversation.rs:979:43
+    |
+979 |                       let envelope_result = sqlx::query!(
+    |  ___________________________________________^
+980 | |                         r#"
+981 | |                         INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+982 | |                         VALUES ($1, $2, $3, $4, NOW())
+...   |
+988 | |                         msg_id,
+989 | |                     )
+    | |_____________________^
+    |
+    = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/actors/conversation.rs:1069:26
+     |
+1069 |       let members_result = sqlx::query!(
+     |  __________________________^
+1070 | |         r#"
+1071 | |         SELECT member_did
+1072 | |         FROM members
+...    |
+1075 | |         convo_id
+1076 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/actors/conversation.rs:1083:21
+     |
+1083 |               let _ = sqlx::query!(
+     |  _____________________^
+1084 | |                 r#"
+1085 | |                 INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+1086 | |                 VALUES ($1, $2, $3, $4, NOW())
+...    |
+1092 | |                 msg_id,
+1093 | |             )
+     | |_____________^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1387:15
+     |
+1387 |       let row = sqlx::query!(
+     |  _______________^
+1388 | |         r#"
+1389 | |         SELECT
+1390 | |             COUNT(*) as "total!",
+...    |
+1405 | |         reservation_timeout
+1406 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1491:18
+     |
+1491 |       let result = sqlx::query!(
+     |  __________________^
+1492 | |         r#"
+1493 | |         UPDATE key_packages
+1494 | |         SET reserved_at = $4, reserved_by_convo = $5
+...    |
+1504 | |         convo_id
+1505 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1760:5
+     |
+1760 | /     sqlx::query!(
+1761 | |         r#"
+1762 | |         INSERT INTO cursors (user_did, convo_id, last_seen_cursor, updated_at)
+1763 | |         VALUES ($1, $2, $3, NOW())
+...    |
+1771 | |         cursor,
+1772 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1786:18
+     |
+1786 |       let result = sqlx::query!(
+     |  __________________^
+1787 | |         r#"
+1788 | |         SELECT last_seen_cursor
+1789 | |         FROM cursors
+...    |
+1793 | |         convo_id,
+1794 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1815:5
+     |
+1815 | /     sqlx::query!(
+1816 | |         r#"
+1817 | |         INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+1818 | |         VALUES ($1, $2, $3, $4, NOW())
+...    |
+1825 | |         message_id,
+1826 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1863:5
+     |
+1863 | /     sqlx::query!(
+1864 | |         r#"
+1865 | |         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
+1866 | |         VALUES ($1, $2, $3, $4, NOW())
+...    |
+1871 | |         envelope,
+1872 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+    --> server/src/db.rs:1899:5
+     |
+1899 | /     sqlx::query!(
+1900 | |         r#"
+1901 | |         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
+1902 | |         VALUES ($1, $2, 'reactionEvent', $3, NOW())
+...    |
+1906 | |         envelope,
+1907 | |     )
+     | |_____^
+     |
+     = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+  --> server/src/middleware/device_activity.rs:27:30
+   |
+27 |                   let result = sqlx::query!(
+   |  ______________________________^
+28 | |                     r#"
+29 | |                     UPDATE devices
+30 | |                     SET last_seen_at = $1
+...  |
+34 | |                     device_id_clone
+35 | |                 )
+   | |_________________^
+   |
+   = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+  --> server/src/middleware/mls_auth.rs:11:18
+   |
+11 |       let member = sqlx::query!(
+   |  __________________^
+12 | |         r#"
+13 | |         SELECT member_did 
+14 | |         FROM members 
+...  |
+20 | |         user_did
+21 | |     )
+   | |_____^
+   |
+   = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+  --> server/src/middleware/mls_auth.rs:38:24
+   |
+38 |       let conversation = sqlx::query!(
+   |  ________________________^
+39 | |         r#"
+40 | |         SELECT creator_did 
+41 | |         FROM conversations 
+...  |
+44 | |         convo_id
+45 | |     )
+   | |_____^
+   |
+   = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: error returned from database: password authentication failed for user "catbird"
+  --> server/src/middleware/mls_auth.rs:89:18
+   |
+89 |       let result = sqlx::query!(
+   |  __________________^
+90 | |         r#"
+91 | |         SELECT current_epoch
+92 | |         FROM conversations
+...  |
+95 | |         convo_id
+96 | |     )
+   | |_____^
+   |
+   = note: this error originates in the macro `$crate::sqlx_macros::expand_query` which comes from the expansion of the macro `sqlx::query` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused import: `error`
+  --> server/src/block_sync.rs:14:22
+   |
+14 | use tracing::{debug, error, info, warn};
+   |                      ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `KeyPackageHashEntry`
+ --> server/src/actors/tests/conversation_tests.rs:3:74
+  |
+3 |     use crate::actors::{ConversationActor, ConvoActorArgs, ConvoMessage, KeyPackageHashEntry};
+  |                                                                          ^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `super::*`
+  --> server/src/atproto_bytes.rs:94:9
+   |
+94 |     use super::*;
+   |         ^^^^^^^^
+
+warning: unused import: `super::*`
+    --> server/src/auth.rs:1179:9
+     |
+1179 |     use super::*;
+     |         ^^^^^^^^
+
+warning: unused import: `error`
+  --> server/src/block_sync.rs:14:22
+   |
+14 | use tracing::{debug, error, info, warn};
+   |                      ^^^^^
+
+warning: unused import: `TicketClaims`
+  --> server/src/realtime/websocket.rs:32:52
+   |
+32 |     handlers::subscription_ticket::{verify_ticket, TicketClaims},
+   |                                                    ^^^^^^^^^^^^
+
+warning: unexpected `cfg` condition value: `streaming`
+  --> server/src/generated/blue_catbird/mlsChat.rs:30:7
+   |
+30 | #[cfg(feature = "streaming")]
+   |       ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: expected values for `feature` are: `default` and `namespace-bluecatbird`
+   = help: consider adding `streaming` as a feature in `Cargo.toml`
+   = note: see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration
+   = note: `#[warn(unexpected_cfgs)]` on by default
+
+warning: unused import: `super::*`
+   --> server/src/middleware/mls_auth.rs:105:9
+    |
+105 |     use super::*;
+    |         ^^^^^^^^
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:340:39
+    |
+340 |                     p256::FieldBytes::from_slice(&x),
+    |                                       ^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:341:39
+    |
+341 |                     p256::FieldBytes::from_slice(&y),
+    |                                       ^^^^^^^^^^
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1387:15
+     |
+1387 |       let row = sqlx::query!(
+     |  _______________^
+1388 | |         r#"
+1389 | |         SELECT
+1390 | |             COUNT(*) as "total!",
+...    |
+1407 | |     .fetch_one(pool)
+1408 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1491:18
+     |
+1491 |       let result = sqlx::query!(
+     |  __________________^
+1492 | |         r#"
+1493 | |         UPDATE key_packages
+1494 | |         SET reserved_at = $4, reserved_by_convo = $5
+...    |
+1506 | |     .execute(pool)
+1507 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1760:5
+     |
+1760 | /     sqlx::query!(
+1761 | |         r#"
+1762 | |         INSERT INTO cursors (user_did, convo_id, last_seen_cursor, updated_at)
+1763 | |         VALUES ($1, $2, $3, NOW())
+...    |
+1773 | |     .execute(pool)
+1774 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1786:18
+     |
+1786 |       let result = sqlx::query!(
+     |  __________________^
+1787 | |         r#"
+1788 | |         SELECT last_seen_cursor
+1789 | |         FROM cursors
+...    |
+1795 | |     .fetch_optional(pool)
+1796 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1815:5
+     |
+1815 | /     sqlx::query!(
+1816 | |         r#"
+1817 | |         INSERT INTO envelopes (id, convo_id, recipient_did, message_id, created_at)
+1818 | |         VALUES ($1, $2, $3, $4, NOW())
+...    |
+1827 | |     .fetch_optional(pool)
+1828 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1863:5
+     |
+1863 | /     sqlx::query!(
+1864 | |         r#"
+1865 | |         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
+1866 | |         VALUES ($1, $2, $3, $4, NOW())
+...    |
+1873 | |     .execute(pool)
+1874 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed
+    --> server/src/db.rs:1899:5
+     |
+1899 | /     sqlx::query!(
+1900 | |         r#"
+1901 | |         INSERT INTO event_stream (id, convo_id, event_type, payload, emitted_at)
+1902 | |         VALUES ($1, $2, 'reactionEvent', $3, NOW())
+...    |
+1908 | |     .execute(pool)
+1909 | |     .await
+     | |__________^ cannot infer type
+
+error[E0282]: type annotations needed for `Result<_, _>`
+  --> server/src/middleware/device_activity.rs:27:21
+   |
+27 |                 let result = sqlx::query!(
+   |                     ^^^^^^
+...
+40 |                     Ok(r) if r.rows_affected() > 0 => {
+   |                              - type must be known at this point
+   |
+help: consider giving `result` an explicit type, where the placeholders `_` are specified
+   |
+27 |                 let result: Result<_, E> = sqlx::query!(
+   |                           ++++++++++++++
+
+error[E0282]: type annotations needed
+  --> server/src/middleware/mls_auth.rs:11:9
+   |
+11 |     let member = sqlx::query!(
+   |         ^^^^^^
+...
+25 |     if member.is_none() {
+   |        ------ type must be known at this point
+   |
+help: consider giving `member` an explicit type
+   |
+11 |     let member: /* Type */ = sqlx::query!(
+   |               ++++++++++++
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:631:39
+    |
+631 |                     p256::FieldBytes::from_slice(&x),
+    |                                       ^^^^^^^^^^
+
+warning: use of deprecated associated function `sha2::digest::generic_array::GenericArray::<T, N>::from_slice`: please upgrade to generic-array 1.x
+   --> server/src/auth.rs:632:39
+    |
+632 |                     p256::FieldBytes::from_slice(&y),
+    |                                       ^^^^^^^^^^
+
+For more information about this error, try `rustc --explain E0282`.
+warning: `catbird-server` (lib) generated 7 warnings
+error: could not compile `catbird-server` (lib) due to 24 previous errors; 7 warnings emitted
+warning: build failed, waiting for other jobs to finish...
+error: implementation of `admin_system::_::_serde::Deserialize` is not general enough
+   --> server/src/handlers/mls_chat/send_ephemeral.rs:144:36
+    |
+144 |         let input: SendEphemeral = serde_json::from_value(json).unwrap();
+    |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ implementation of `admin_system::_::_serde::Deserialize` is not general enough
+    |
+    = note: `SendEphemeral<'_>` must implement `admin_system::_::_serde::Deserialize<'0>`, for any lifetime `'0`...
+    = note: ...but `SendEphemeral<'_>` actually implements `admin_system::_::_serde::Deserialize<'1>`, for some specific lifetime `'1`
+
+warning: `catbird-server` (lib test) generated 11 warnings (6 duplicates)
+error: could not compile `catbird-server` (lib test) due to 25 previous errors; 11 warnings emitted
+[END] 2026-02-16T15:35:09Z

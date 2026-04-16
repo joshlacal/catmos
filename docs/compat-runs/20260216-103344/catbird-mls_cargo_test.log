@@ -1,0 +1,301 @@
+[CMD] cd /Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls && cargo test
+[START] 2026-02-16T15:34:36Z
+   Compiling catbird_mls v0.1.0 (/Users/joshlacalamito/Developer/Catbird+Petrel/catbird-mls)
+warning: unused import: `super::*`
+  --> src/atproto_bytes.rs:94:9
+   |
+94 |     use super::*;
+   |         ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `conversation_id` and `group_id` are never read
+  --> tests/mock_storage.rs:22:5
+   |
+21 | struct ConversationRecord {
+   |        ------------------ fields in this struct
+22 |     conversation_id: String,
+   |     ^^^^^^^^^^^^^^^
+23 |     user_did: String,
+24 |     group_id: String,
+   |     ^^^^^^^^
+   |
+   = note: `ConversationRecord` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `provider`
+  --> tests/persistence_repro.rs:32:5
+   |
+32 |     provider: &OpenMlsRustCrypto,
+   |     ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_provider`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `identity` is never read
+  --> tests/persistence_repro.rs:24:5
+   |
+23 | struct TestUser {
+   |        -------- field in this struct
+24 |     identity: Vec<u8>,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> tests/member_removal_test.rs:557:9
+    |
+557 |     let mut bob_group = StagedWelcome::new_from_welcome(
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `bob_group`
+   --> tests/member_removal_test.rs:557:9
+    |
+557 |     let mut bob_group = StagedWelcome::new_from_welcome(
+    |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bob_group`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `add_ref`
+   --> tests/member_removal_test.rs:580:24
+    |
+580 |     let (add_proposal, add_ref) = alice_group
+    |                        ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_add_ref`
+
+warning: unused variable: `update_ref`
+   --> tests/member_removal_test.rs:599:27
+    |
+599 |     let (update_proposal, update_ref) = alice_group
+    |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_update_ref`
+
+warning: unused variable: `remove_ref`
+   --> tests/member_removal_test.rs:619:27
+    |
+619 |     let (remove_proposal, remove_ref) = alice_group
+    |                           ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_remove_ref`
+
+warning: unused variable: `commit`
+   --> tests/member_removal_test.rs:637:10
+    |
+637 |     let (commit, welcome_option, _) = alice_group
+    |          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_commit`
+
+warning: unused variable: `welcome_option`
+   --> tests/member_removal_test.rs:637:18
+    |
+637 |     let (commit, welcome_option, _) = alice_group
+    |                  ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_welcome_option`
+
+warning: variable does not need to be mutable
+   --> tests/member_removal_test.rs:676:9
+    |
+676 |     let mut alice_group = MlsGroup::new(
+    |         ----^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `name` is never read
+  --> tests/member_removal_test.rs:24:5
+   |
+23 | struct TestUser {
+   |        -------- field in this struct
+24 |     name: String,
+   |     ^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `sent`
+   --> tests/state_machine_tests.rs:114:9
+    |
+114 |     let sent = alice
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_sent`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `fetched`
+   --> tests/state_machine_tests.rs:194:10
+    |
+194 |     let (fetched, _) = alice
+    |          ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fetched`
+
+warning: `catbird_mls` (test "persistence_repro") generated 2 warnings (run `cargo fix --test "persistence_repro" -p catbird_mls` to apply 1 suggestion)
+warning: `catbird_mls` (test "member_removal_test") generated 9 warnings (run `cargo fix --test "member_removal_test" -p catbird_mls` to apply 8 suggestions)
+warning: `catbird_mls` (test "mock_storage") generated 1 warning
+warning: `catbird_mls` (test "state_machine_tests") generated 2 warnings (run `cargo fix --test "state_machine_tests" -p catbird_mls` to apply 2 suggestions)
+warning: `catbird_mls` (lib test) generated 1 warning (run `cargo fix --lib -p catbird_mls --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.59s
+     Running unittests src/lib.rs (target/debug/deps/catbird_mls-d15360aa830dcee6)
+
+running 20 tests
+test api::padding_tests::test_strip_padding_short_data ... ok
+test api::padding_tests::test_strip_padding_mls_ciphertext ... ok
+test api::padding_tests::test_pad_strip_roundtrip_small ... ok
+test api::padding_tests::test_padding_bucket_sizes ... ok
+test api::padding_tests::test_strip_padding_unpadded_data ... ok
+test atproto_bytes::tests::test_optional_deserialize_missing ... ok
+test atproto_bytes::tests::test_optional_deserialize_null ... ok
+test atproto_bytes::tests::test_optional_serialize_none ... ok
+test atproto_bytes::tests::test_deserialize ... ok
+test atproto_bytes::tests::test_optional_deserialize_some ... ok
+test atproto_bytes::tests::test_optional_roundtrip ... ok
+test atproto_bytes::tests::test_optional_serialize_some ... ok
+test atproto_bytes::tests::test_serialize ... ok
+test orchestrator::types::tests::extract_text_empty_payload ... ok
+test orchestrator::types::tests::extract_text_invalid_bytes ... ok
+test orchestrator::types::tests::extract_text_json_payload ... ok
+test orchestrator::types::tests::extract_text_raw_utf8_fallback ... ok
+test orchestrator::types::tests::payload_json_matches_ios_format ... ok
+test orchestrator::types::tests::payload_roundtrip ... ok
+test api::padding_tests::test_pad_strip_roundtrip_various_sizes ... ok
+
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests uniffi-bindgen.rs (target/debug/deps/uniffi_bindgen-8186e01d4ea3c22e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e_harness.rs (target/debug/deps/e2e_harness-424624067614d722)
+
+running 21 tests
+test mock_storage::tests::ensure_conversation_is_idempotent ... ok
+test mock_api_client::tests::test_auth ... ok
+test mock_storage::tests::message_exists_check ... ok
+test mock_api_client::tests::test_device_registration ... ok
+test mock_api_client::tests::test_create_and_list_conversations ... ok
+test mock_api_client::tests::test_failure_injection ... ok
+test mock_credentials::tests::clear_all_resets_state ... ok
+test mock_api_client::tests::test_group_info ... ok
+test mock_api_client::tests::test_leave_conversation ... ok
+test mock_api_client::tests::test_add_and_remove_members ... ok
+test mock_api_client::tests::test_send_and_receive_messages ... ok
+test mock_api_client::tests::test_key_packages_fifo ... ok
+test mock_credentials::tests::store_and_retrieve ... ok
+test mock_credentials::tests::delete_signing_key ... ok
+test mock_credentials::tests::per_user_isolation ... ok
+test mock_storage::tests::rejoin_flag_lifecycle ... ok
+test mock_api_client::tests::test_message_pagination ... ok
+test mock_storage::tests::state_transitions_tracked ... ok
+test mock_storage::tests::store_and_retrieve_messages ... ok
+test smoke_test_two_clients ... ok
+test smoke_test_initialize_clients ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s
+
+     Running tests/member_removal_test.rs (target/debug/deps/member_removal_test-53a175ecea526dd4)
+
+running 5 tests
+test test_remove_nonexistent_member_graceful ... ok
+test test_remove_multiple_members ... ok
+test test_proposal_creation_apis ... ok
+test test_basic_member_removal ... ok
+test test_removed_member_cannot_decrypt ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s
+
+     Running tests/mock_api_client.rs (target/debug/deps/mock_api_client-84886acb1c18aa55)
+
+running 10 tests
+test tests::test_auth ... ok
+test tests::test_leave_conversation ... ok
+test tests::test_key_packages_fifo ... ok
+test tests::test_send_and_receive_messages ... ok
+test tests::test_device_registration ... ok
+test tests::test_group_info ... ok
+test tests::test_add_and_remove_members ... ok
+test tests::test_create_and_list_conversations ... ok
+test tests::test_failure_injection ... ok
+test tests::test_message_pagination ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mock_credentials.rs (target/debug/deps/mock_credentials-bc6e2c9f70c6eb0f)
+
+running 4 tests
+test tests::clear_all_resets_state ... ok
+test tests::delete_signing_key ... ok
+test tests::store_and_retrieve ... ok
+test tests::per_user_isolation ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mock_storage.rs (target/debug/deps/mock_storage-0dd5353ff9a42660)
+
+running 5 tests
+test tests::ensure_conversation_is_idempotent ... ok
+test tests::rejoin_flag_lifecycle ... ok
+test tests::message_exists_check ... ok
+test tests::state_transitions_tracked ... ok
+test tests::store_and_retrieve_messages ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/persistence_repro.rs (target/debug/deps/persistence_repro-858865efb72332b3)
+
+running 3 tests
+test test_creator_can_decrypt_after_restart ... ok
+test test_both_sides_can_decrypt_after_restart ... ok
+test test_serialize_at_different_stages ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+     Running tests/state_machine_tests.rs (target/debug/deps/state_machine_tests-4fe6963d7405f24c)
+
+running 34 tests
+test e2e_harness::mock_credentials::tests::delete_signing_key ... ok
+test e2e_harness::mock_credentials::tests::store_and_retrieve ... ok
+test e2e_harness::mock_api_client::tests::test_auth ... ok
+test e2e_harness::mock_api_client::tests::test_key_packages_fifo ... ok
+test e2e_harness::mock_credentials::tests::per_user_isolation ... ok
+test e2e_harness::mock_storage::tests::message_exists_check ... ok
+test e2e_harness::mock_credentials::tests::clear_all_resets_state ... ok
+test e2e_harness::mock_api_client::tests::test_create_and_list_conversations ... ok
+test e2e_harness::mock_storage::tests::ensure_conversation_is_idempotent ... ok
+test e2e_harness::mock_api_client::tests::test_failure_injection ... ok
+test e2e_harness::mock_api_client::tests::test_send_and_receive_messages ... ok
+test e2e_harness::mock_api_client::tests::test_device_registration ... ok
+test e2e_harness::mock_api_client::tests::test_add_and_remove_members ... ok
+test e2e_harness::mock_api_client::tests::test_leave_conversation ... ok
+test e2e_harness::mock_api_client::tests::test_group_info ... ok
+test e2e_harness::mock_storage::tests::rejoin_flag_lifecycle ... ok
+test e2e_harness::mock_api_client::tests::test_message_pagination ... ok
+test e2e_harness::mock_storage::tests::state_transitions_tracked ... ok
+test e2e_harness::mock_storage::tests::store_and_retrieve_messages ... ok
+test e2e_harness::smoke_test_initialize_clients ... ok
+test e2e_harness::smoke_test_two_clients ... ok
+test test_force_rejoin_cooldown_suppresses_immediate_retry ... ok
+test test_self_message_echo ... ok
+test test_commit_messages_advance_epoch ... ok
+test test_circuit_breaker_recovery ... ok
+test test_concurrent_sync_not_blocked ... ok
+test test_force_rejoin_cleans_state ... ok
+test test_join_or_rejoin_cooldown_suppresses_immediate_retry ... ok
+test test_message_after_epoch_advance ... ok
+test test_concurrent_force_rejoin_deduped ... ok
+test test_concurrent_join_or_rejoin_deduped ... ok
+test test_sync_rejoin_skips_when_attempt_in_flight ... ok
+test test_send_message_basic ... ok
+test test_add_members_server_rejection_cleanup ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.77s
+
+     Running tests/two_user_messaging_test.rs (target/debug/deps/two_user_messaging_test-c26cc7b230e2ee60)
+
+running 3 tests
+test test_two_user_rapid_messaging ... ok
+test test_two_user_out_of_order_messages ... ok
+test test_two_user_multiple_messages ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+   Doc-tests catbird_mls
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[END] 2026-02-16T15:34:55Z

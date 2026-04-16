@@ -1,0 +1,2345 @@
+[CMD] cd /Users/joshlacalamito/Developer/Catbird+Petrel/catmos/src-tauri && cargo test
+[START] 2026-02-16T15:34:26Z
+warning: use of deprecated method `tauri_plugin_shell::Shell::<R>::open`: Use tauri-plugin-opener instead.
+   --> src/commands.rs:285:10
+    |
+285 |         .open(&login_url, None)
+    |          ^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/accept_chat_request.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.acceptChatRequest";
+  |           ^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/accept_chat_request.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/accept_chat_request.rs:15:10
+   |
+15 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/accept_chat_request.rs:18:12
+   |
+18 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/accept_chat_request.rs:26:10
+   |
+26 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/accept_chat_request.rs:29:10
+   |
+29 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `DeliveredMessageData` is never constructed
+  --> src/catbird/mls/accept_chat_request.rs:61:12
+   |
+61 | pub struct DeliveredMessageData {
+   |            ^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `DeliveredMessage` is never used
+  --> src/catbird/mls/accept_chat_request.rs:77:10
+   |
+77 | pub type DeliveredMessage = crate::types::Object<DeliveredMessageData>;
+   |          ^^^^^^^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/add_members.rs:37:10
+   |
+37 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/block_chat_sender.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.blockChatSender";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/block_chat_sender.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/block_chat_sender.rs:16:10
+   |
+16 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/block_chat_sender.rs:19:12
+   |
+19 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/block_chat_sender.rs:24:10
+   |
+24 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/block_chat_sender.rs:27:10
+   |
+27 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/check_blocks.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.checkBlocks";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/check_blocks.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/check_blocks.rs:11:10
+   |
+11 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/check_blocks.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/check_blocks.rs:20:10
+   |
+20 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/check_blocks.rs:23:10
+   |
+23 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `BlockRelationshipData` is never constructed
+  --> src/catbird/mls/check_blocks.rs:51:12
+   |
+51 | pub struct BlockRelationshipData {
+   |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `BlockRelationship` is never used
+  --> src/catbird/mls/check_blocks.rs:62:10
+   |
+62 | pub type BlockRelationship = crate::types::Object<BlockRelationshipData>;
+   |          ^^^^^^^^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/claim_pending_device_addition.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.claimPendingDeviceAddition";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/claim_pending_device_addition.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/claim_pending_device_addition.rs:11:10
+   |
+11 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/claim_pending_device_addition.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/claim_pending_device_addition.rs:30:10
+   |
+30 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/claim_pending_device_addition.rs:33:10
+   |
+33 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/complete_pending_device_addition.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.completePendingDeviceAddition";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/complete_pending_device_addition.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/complete_pending_device_addition.rs:13:10
+   |
+13 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/complete_pending_device_addition.rs:16:12
+   |
+16 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/complete_pending_device_addition.rs:23:10
+   |
+23 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/complete_pending_device_addition.rs:26:10
+   |
+26 | pub enum Error {
+   |          ^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/create_convo.rs:35:10
+   |
+35 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/create_invite.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.createInvite";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/create_invite.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/create_invite.rs:22:10
+   |
+22 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/create_invite.rs:25:12
+   |
+25 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/create_invite.rs:31:10
+   |
+31 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/create_invite.rs:34:10
+   |
+34 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `InviteViewData` is never constructed
+  --> src/catbird/mls/create_invite.rs:78:12
+   |
+78 | pub struct InviteViewData {
+   |            ^^^^^^^^^^^^^^
+
+warning: type alias `InviteView` is never used
+   --> src/catbird/mls/create_invite.rs:109:10
+    |
+109 | pub type InviteView = crate::types::Object<InviteViewData>;
+    |          ^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/decline_chat_request.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.declineChatRequest";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/decline_chat_request.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/decline_chat_request.rs:16:10
+   |
+16 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/decline_chat_request.rs:19:12
+   |
+19 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/decline_chat_request.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/decline_chat_request.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/delete_device.rs:13:12
+   |
+13 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/delete_device.rs:19:10
+   |
+19 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/delete_device.rs:22:10
+   |
+22 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/demote_admin.rs:16:12
+   |
+16 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/demote_admin.rs:20:10
+   |
+20 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/demote_admin.rs:23:10
+   |
+23 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/demote_moderator.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.demoteModerator";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/demote_moderator.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/demote_moderator.rs:13:10
+   |
+13 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/demote_moderator.rs:16:12
+   |
+16 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/demote_moderator.rs:20:10
+   |
+20 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/demote_moderator.rs:23:10
+   |
+23 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_admin_stats.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getAdminStats";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_admin_stats.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_admin_stats.rs:15:10
+   |
+15 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_admin_stats.rs:18:12
+   |
+18 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_admin_stats.rs:26:10
+   |
+26 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_admin_stats.rs:29:10
+   |
+29 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `ModerationStatsData` is never constructed
+  --> src/catbird/mls/get_admin_stats.rs:57:12
+   |
+57 | pub struct ModerationStatsData {
+   |            ^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ModerationStats` is never used
+  --> src/catbird/mls/get_admin_stats.rs:75:10
+   |
+75 | pub type ModerationStats = crate::types::Object<ModerationStatsData>;
+   |          ^^^^^^^^^^^^^^^
+
+warning: struct `ReportCategoryCountsData` is never constructed
+  --> src/catbird/mls/get_admin_stats.rs:79:12
+   |
+79 | pub struct ReportCategoryCountsData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ReportCategoryCounts` is never used
+  --> src/catbird/mls/get_admin_stats.rs:97:10
+   |
+97 | pub type ReportCategoryCounts = crate::types::Object<ReportCategoryCountsData>;
+   |          ^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_block_status.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getBlockStatus";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_block_status.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_block_status.rs:11:10
+   |
+11 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_block_status.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_block_status.rs:27:10
+   |
+27 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_block_status.rs:30:10
+   |
+30 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_chat_request_settings.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.getChatRequestSettings";
+  |           ^^^^
+
+warning: struct `OutputData` is never constructed
+ --> src/catbird/mls/get_chat_request_settings.rs:6:12
+  |
+6 | pub struct OutputData {
+  |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_chat_request_settings.rs:14:10
+   |
+14 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_chat_request_settings.rs:17:10
+   |
+17 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_commits.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.getCommits";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_commits.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_commits.rs:15:10
+   |
+15 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_commits.rs:18:12
+   |
+18 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_commits.rs:24:10
+   |
+24 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_commits.rs:27:10
+   |
+27 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `CommitMessageData` is never constructed
+  --> src/catbird/mls/get_commits.rs:63:12
+   |
+63 | pub struct CommitMessageData {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: type alias `CommitMessage` is never used
+  --> src/catbird/mls/get_commits.rs:74:10
+   |
+74 | pub type CommitMessage = crate::types::Object<CommitMessageData>;
+   |          ^^^^^^^^^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_convos.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_convos.rs:15:10
+   |
+15 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_convos.rs:28:10
+   |
+28 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_epoch.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.getEpoch";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_epoch.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_epoch.rs:10:10
+   |
+10 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_epoch.rs:13:12
+   |
+13 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_epoch.rs:19:10
+   |
+19 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_epoch.rs:22:10
+   |
+22 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_expected_conversations.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getExpectedConversations";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_expected_conversations.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_expected_conversations.rs:12:10
+   |
+12 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_expected_conversations.rs:15:12
+   |
+15 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_expected_conversations.rs:19:10
+   |
+19 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_expected_conversations.rs:22:10
+   |
+22 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `ExpectedConversationData` is never constructed
+  --> src/catbird/mls/get_expected_conversations.rs:41:12
+   |
+41 | pub struct ExpectedConversationData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ExpectedConversation` is never used
+  --> src/catbird/mls/get_expected_conversations.rs:60:10
+   |
+60 | pub type ExpectedConversation = crate::types::Object<ExpectedConversationData>;
+   |          ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_group_info.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_group_info.rs:10:10
+   |
+10 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_group_info.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_key_package_history.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.getKeyPackageHistory";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_key_package_history.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_key_package_history.rs:14:10
+   |
+14 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_key_package_history.rs:17:12
+   |
+17 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_key_package_history.rs:23:10
+   |
+23 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_key_package_history.rs:26:10
+   |
+26 | pub enum Error {}
+   |          ^^^^^
+
+warning: struct `KeyPackageHistoryEntryData` is never constructed
+  --> src/catbird/mls/get_key_package_history.rs:34:12
+   |
+34 | pub struct KeyPackageHistoryEntryData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `KeyPackageHistoryEntry` is never used
+  --> src/catbird/mls/get_key_package_history.rs:57:10
+   |
+57 | pub type KeyPackageHistoryEntry = crate::types::Object<KeyPackageHistoryEntryData>;
+   |          ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_key_package_stats.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_key_package_stats.rs:14:10
+   |
+14 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_key_package_stats.rs:47:10
+   |
+47 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_key_package_status.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.getKeyPackageStatus";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_key_package_status.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_key_package_status.rs:14:10
+   |
+14 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_key_package_status.rs:17:12
+   |
+17 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_key_package_status.rs:34:10
+   |
+34 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_key_package_status.rs:37:10
+   |
+37 | pub enum Error {}
+   |          ^^^^^
+
+warning: struct `ConsumedPackageViewData` is never constructed
+  --> src/catbird/mls/get_key_package_status.rs:46:12
+   |
+46 | pub struct ConsumedPackageViewData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ConsumedPackageView` is never used
+  --> src/catbird/mls/get_key_package_status.rs:58:10
+   |
+58 | pub type ConsumedPackageView = crate::types::Object<ConsumedPackageViewData>;
+   |          ^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_key_packages.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_key_packages.rs:13:10
+   |
+13 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_key_packages.rs:26:10
+   |
+26 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_messages.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_messages.rs:16:10
+   |
+16 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_messages.rs:32:10
+   |
+32 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_opt_in_status.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_opt_in_status.rs:11:10
+   |
+11 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_opt_in_status.rs:20:10
+   |
+20 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_pending_device_additions.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getPendingDeviceAdditions";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_pending_device_additions.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_pending_device_additions.rs:15:10
+   |
+15 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_pending_device_additions.rs:18:12
+   |
+18 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_pending_device_additions.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_pending_device_additions.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `PendingDeviceAdditionData` is never constructed
+  --> src/catbird/mls/get_pending_device_additions.rs:45:12
+   |
+45 | pub struct PendingDeviceAdditionData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `PendingDeviceAddition` is never used
+  --> src/catbird/mls/get_pending_device_additions.rs:67:10
+   |
+67 | pub type PendingDeviceAddition = crate::types::Object<PendingDeviceAdditionData>;
+   |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_policy.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getPolicy";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_policy.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_policy.rs:11:10
+   |
+11 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_policy.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_policy.rs:18:10
+   |
+18 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_policy.rs:21:10
+   |
+21 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_reports.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getReports";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/get_reports.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/get_reports.rs:17:10
+   |
+17 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_reports.rs:20:12
+   |
+20 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_reports.rs:24:10
+   |
+24 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_reports.rs:27:10
+   |
+27 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `ReportViewData` is never constructed
+  --> src/catbird/mls/get_reports.rs:55:12
+   |
+55 | pub struct ReportViewData {
+   |            ^^^^^^^^^^^^^^
+
+warning: type alias `ReportView` is never used
+  --> src/catbird/mls/get_reports.rs:76:10
+   |
+76 | pub type ReportView = crate::types::Object<ReportViewData>;
+   |          ^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_request_count.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.getRequestCount";
+  |           ^^^^
+
+warning: struct `OutputData` is never constructed
+ --> src/catbird/mls/get_request_count.rs:7:12
+  |
+7 | pub struct OutputData {
+  |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_request_count.rs:14:10
+   |
+14 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_request_count.rs:17:10
+   |
+17 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/get_subscription_ticket.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.getSubscriptionTicket";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/get_subscription_ticket.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/get_subscription_ticket.rs:11:10
+   |
+11 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/get_subscription_ticket.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/get_subscription_ticket.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/get_subscription_ticket.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/group_info_refresh.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.groupInfoRefresh";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/group_info_refresh.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/group_info_refresh.rs:10:10
+   |
+10 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/group_info_refresh.rs:13:12
+   |
+13 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/group_info_refresh.rs:20:10
+   |
+20 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/group_info_refresh.rs:23:10
+   |
+23 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/handle_block_change.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.handleBlockChange";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/handle_block_change.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/handle_block_change.rs:18:10
+   |
+18 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/handle_block_change.rs:21:12
+   |
+21 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/handle_block_change.rs:25:10
+   |
+25 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/handle_block_change.rs:28:10
+   |
+28 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `AffectedConvoData` is never constructed
+  --> src/catbird/mls/handle_block_change.rs:48:12
+   |
+48 | pub struct AffectedConvoData {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: type alias `AffectedConvo` is never used
+  --> src/catbird/mls/handle_block_change.rs:59:10
+   |
+59 | pub type AffectedConvo = crate::types::Object<AffectedConvoData>;
+   |          ^^^^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/invalidate_welcome.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.invalidateWelcome";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/invalidate_welcome.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/invalidate_welcome.rs:12:10
+   |
+12 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/invalidate_welcome.rs:15:12
+   |
+15 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/invalidate_welcome.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/invalidate_welcome.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/leave_convo.rs:19:12
+   |
+19 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/leave_convo.rs:25:10
+   |
+25 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/leave_convo.rs:28:10
+   |
+28 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/list_chat_requests.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.listChatRequests";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/list_chat_requests.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/list_chat_requests.rs:17:10
+   |
+17 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/list_chat_requests.rs:20:12
+   |
+20 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/list_chat_requests.rs:26:10
+   |
+26 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/list_chat_requests.rs:29:10
+   |
+29 | pub enum Error {}
+   |          ^^^^^
+
+warning: struct `ChatRequestData` is never constructed
+  --> src/catbird/mls/list_chat_requests.rs:37:12
+   |
+37 | pub struct ChatRequestData {
+   |            ^^^^^^^^^^^^^^^
+
+warning: type alias `ChatRequest` is never used
+  --> src/catbird/mls/list_chat_requests.rs:59:10
+   |
+59 | pub type ChatRequest = crate::types::Object<ChatRequestData>;
+   |          ^^^^^^^^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/list_devices.rs:6:12
+  |
+6 | pub struct ParametersData {}
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+ --> src/catbird/mls/list_devices.rs:7:10
+  |
+7 | pub type Parameters = crate::types::Object<ParametersData>;
+  |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/list_devices.rs:17:10
+   |
+17 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/list_invites.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.listInvites";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/list_invites.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/list_invites.rs:14:10
+   |
+14 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/list_invites.rs:17:12
+   |
+17 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/list_invites.rs:21:10
+   |
+21 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/list_invites.rs:24:10
+   |
+24 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `AdminActionData` is never constructed
+ --> src/catbird/mls/message/defs.rs:7:12
+  |
+7 | pub struct AdminActionData {
+  |            ^^^^^^^^^^^^^^^
+
+warning: type alias `AdminAction` is never used
+  --> src/catbird/mls/message/defs.rs:18:10
+   |
+18 | pub type AdminAction = crate::types::Object<AdminActionData>;
+   |          ^^^^^^^^^^^
+
+warning: struct `AdminRosterData` is never constructed
+  --> src/catbird/mls/message/defs.rs:22:12
+   |
+22 | pub struct AdminRosterData {
+   |            ^^^^^^^^^^^^^^^
+
+warning: type alias `AdminRoster` is never used
+  --> src/catbird/mls/message/defs.rs:31:10
+   |
+31 | pub type AdminRoster = crate::types::Object<AdminRosterData>;
+   |          ^^^^^^^^^^^
+
+warning: struct `GifEmbedData` is never constructed
+  --> src/catbird/mls/message/defs.rs:35:12
+   |
+35 | pub struct GifEmbedData {
+   |            ^^^^^^^^^^^^
+
+warning: type alias `GifEmbed` is never used
+  --> src/catbird/mls/message/defs.rs:53:10
+   |
+53 | pub type GifEmbed = crate::types::Object<GifEmbedData>;
+   |          ^^^^^^^^
+
+warning: struct `LinkEmbedData` is never constructed
+  --> src/catbird/mls/message/defs.rs:57:12
+   |
+57 | pub struct LinkEmbedData {
+   |            ^^^^^^^^^^^^^
+
+warning: type alias `LinkEmbed` is never used
+  --> src/catbird/mls/message/defs.rs:73:10
+   |
+73 | pub type LinkEmbed = crate::types::Object<LinkEmbedData>;
+   |          ^^^^^^^^^
+
+warning: struct `PayloadViewData` is never constructed
+  --> src/catbird/mls/message/defs.rs:77:12
+   |
+77 | pub struct PayloadViewData {
+   |            ^^^^^^^^^^^^^^^
+
+warning: type alias `PayloadView` is never used
+   --> src/catbird/mls/message/defs.rs:104:10
+    |
+104 | pub type PayloadView = crate::types::Object<PayloadViewData>;
+    |          ^^^^^^^^^^^
+
+warning: struct `ReactionPayloadData` is never constructed
+   --> src/catbird/mls/message/defs.rs:108:12
+    |
+108 | pub struct ReactionPayloadData {
+    |            ^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ReactionPayload` is never used
+   --> src/catbird/mls/message/defs.rs:116:10
+    |
+116 | pub type ReactionPayload = crate::types::Object<ReactionPayloadData>;
+    |          ^^^^^^^^^^^^^^^
+
+warning: struct `ReadReceiptPayloadData` is never constructed
+   --> src/catbird/mls/message/defs.rs:120:12
+    |
+120 | pub struct ReadReceiptPayloadData {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ReadReceiptPayload` is never used
+   --> src/catbird/mls/message/defs.rs:124:10
+    |
+124 | pub type ReadReceiptPayload = crate::types::Object<ReadReceiptPayloadData>;
+    |          ^^^^^^^^^^^^^^^^^^
+
+warning: struct `RecordEmbedData` is never constructed
+   --> src/catbird/mls/message/defs.rs:128:12
+    |
+128 | pub struct RecordEmbedData {
+    |            ^^^^^^^^^^^^^^^
+
+warning: type alias `RecordEmbed` is never used
+   --> src/catbird/mls/message/defs.rs:143:10
+    |
+143 | pub type RecordEmbed = crate::types::Object<RecordEmbedData>;
+    |          ^^^^^^^^^^^
+
+warning: struct `TypingPayloadData` is never constructed
+   --> src/catbird/mls/message/defs.rs:147:12
+    |
+147 | pub struct TypingPayloadData {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: type alias `TypingPayload` is never used
+   --> src/catbird/mls/message/defs.rs:154:10
+    |
+154 | pub type TypingPayload = crate::types::Object<TypingPayloadData>;
+    |          ^^^^^^^^^^^^^
+
+warning: enum `PayloadViewEmbedRefs` is never used
+   --> src/catbird/mls/message/defs.rs:157:10
+    |
+157 | pub enum PayloadViewEmbedRefs {
+    |          ^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/opt_in.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/opt_in.rs:18:10
+   |
+18 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/opt_in.rs:21:10
+   |
+21 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/opt_out.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.optOut";
+  |           ^^^^
+
+warning: struct `OutputData` is never constructed
+ --> src/catbird/mls/opt_out.rs:6:12
+  |
+6 | pub struct OutputData {
+  |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+ --> src/catbird/mls/opt_out.rs:9:10
+  |
+9 | pub type Output = crate::types::Object<OutputData>;
+  |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/opt_out.rs:12:10
+   |
+12 | pub enum Error {}
+   |          ^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/process_external_commit.rs:30:10
+   |
+30 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/promote_admin.rs:16:12
+   |
+16 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/promote_admin.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/promote_admin.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/promote_moderator.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.promoteModerator";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/promote_moderator.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/promote_moderator.rs:13:10
+   |
+13 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/promote_moderator.rs:16:12
+   |
+16 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/promote_moderator.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/promote_moderator.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/publish_key_package.rs:21:12
+   |
+21 | pub struct OutputData {}
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/publish_key_package.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/publish_key_package.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/publish_key_packages.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.publishKeyPackages";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/publish_key_packages.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/publish_key_packages.rs:10:10
+   |
+10 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/publish_key_packages.rs:13:12
+   |
+13 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/publish_key_packages.rs:22:10
+   |
+22 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/publish_key_packages.rs:25:10
+   |
+25 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `BatchErrorData` is never constructed
+  --> src/catbird/mls/publish_key_packages.rs:53:12
+   |
+53 | pub struct BatchErrorData {
+   |            ^^^^^^^^^^^^^^
+
+warning: type alias `BatchError` is never used
+  --> src/catbird/mls/publish_key_packages.rs:59:10
+   |
+59 | pub type BatchError = crate::types::Object<BatchErrorData>;
+   |          ^^^^^^^^^^
+
+warning: struct `KeyPackageItemData` is never constructed
+  --> src/catbird/mls/publish_key_packages.rs:63:12
+   |
+63 | pub struct KeyPackageItemData {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: type alias `KeyPackageItem` is never used
+  --> src/catbird/mls/publish_key_packages.rs:74:10
+   |
+74 | pub type KeyPackageItem = crate::types::Object<KeyPackageItemData>;
+   |          ^^^^^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/readdition.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.readdition";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/readdition.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/readdition.rs:10:10
+   |
+10 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/readdition.rs:13:12
+   |
+13 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/readdition.rs:20:10
+   |
+20 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/readdition.rs:23:10
+   |
+23 | pub enum Error {
+   |          ^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/register_device.rs:35:10
+   |
+35 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/register_device_token.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.registerDeviceToken";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/register_device_token.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/register_device_token.rs:17:10
+   |
+17 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/register_device_token.rs:20:12
+   |
+20 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/register_device_token.rs:23:10
+   |
+23 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/register_device_token.rs:26:10
+   |
+26 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/rejoin.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.rejoin";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/rejoin.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/rejoin.rs:15:10
+   |
+15 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/rejoin.rs:18:12
+   |
+18 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/rejoin.rs:27:10
+   |
+27 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/rejoin.rs:30:10
+   |
+30 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/remove_member.rs:24:12
+   |
+24 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/remove_member.rs:31:10
+   |
+31 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/remove_member.rs:34:10
+   |
+34 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/report_member.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.reportMember";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/report_member.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/report_member.rs:21:10
+   |
+21 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/report_member.rs:24:12
+   |
+24 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/report_member.rs:30:10
+   |
+30 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/report_member.rs:33:10
+   |
+33 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/resolve_report.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.resolveReport";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/resolve_report.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/resolve_report.rs:16:10
+   |
+16 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/resolve_report.rs:19:12
+   |
+19 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/resolve_report.rs:23:10
+   |
+23 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/resolve_report.rs:26:10
+   |
+26 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/revoke_invite.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.revokeInvite";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/revoke_invite.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/revoke_invite.rs:11:10
+   |
+11 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/revoke_invite.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/revoke_invite.rs:18:10
+   |
+18 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/revoke_invite.rs:21:10
+   |
+21 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/send_chat_request.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.sendChatRequest";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/send_chat_request.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/send_chat_request.rs:22:10
+   |
+22 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/send_chat_request.rs:25:12
+   |
+25 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/send_chat_request.rs:38:10
+   |
+38 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/send_chat_request.rs:41:10
+   |
+41 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `HeldMessageData` is never constructed
+  --> src/catbird/mls/send_chat_request.rs:87:12
+   |
+87 | pub struct HeldMessageData {
+   |            ^^^^^^^^^^^^^^^
+
+warning: type alias `HeldMessage` is never used
+  --> src/catbird/mls/send_chat_request.rs:99:10
+   |
+99 | pub type HeldMessage = crate::types::Object<HeldMessageData>;
+   |          ^^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/send_message.rs:28:12
+   |
+28 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/send_message.rs:38:10
+   |
+38 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/send_message.rs:41:10
+   |
+41 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/subscribe_convo_events.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.subscribeConvoEvents";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/subscribe_convo_events.rs:7:12
+  |
+7 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:15:10
+   |
+15 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:18:10
+   |
+18 | pub enum Error {}
+   |          ^^^^^
+
+warning: struct `EventWrapperData` is never constructed
+  --> src/catbird/mls/subscribe_convo_events.rs:27:12
+   |
+27 | pub struct EventWrapperData {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: type alias `EventWrapper` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:31:10
+   |
+31 | pub type EventWrapper = crate::types::Object<EventWrapperData>;
+   |          ^^^^^^^^^^^^
+
+warning: struct `GroupInfoRefreshRequestedEventData` is never constructed
+  --> src/catbird/mls/subscribe_convo_events.rs:35:12
+   |
+35 | pub struct GroupInfoRefreshRequestedEventData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `GroupInfoRefreshRequestedEvent` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:45:10
+   |
+45 | pub type GroupInfoRefreshRequestedEvent = crate::types::Object<GroupInfoRefreshRequestedEventData>;
+   |          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `InfoEventData` is never constructed
+  --> src/catbird/mls/subscribe_convo_events.rs:49:12
+   |
+49 | pub struct InfoEventData {
+   |            ^^^^^^^^^^^^^
+
+warning: type alias `InfoEvent` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:55:10
+   |
+55 | pub type InfoEvent = crate::types::Object<InfoEventData>;
+   |          ^^^^^^^^^
+
+warning: struct `MembershipChangeEventData` is never constructed
+  --> src/catbird/mls/subscribe_convo_events.rs:59:12
+   |
+59 | pub struct MembershipChangeEventData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `MembershipChangeEvent` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:77:10
+   |
+77 | pub type MembershipChangeEvent = crate::types::Object<MembershipChangeEventData>;
+   |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `MessageEventData` is never constructed
+  --> src/catbird/mls/subscribe_convo_events.rs:81:12
+   |
+81 | pub struct MessageEventData {
+   |            ^^^^^^^^^^^^^^^^
+
+warning: type alias `MessageEvent` is never used
+  --> src/catbird/mls/subscribe_convo_events.rs:86:10
+   |
+86 | pub type MessageEvent = crate::types::Object<MessageEventData>;
+   |          ^^^^^^^^^^^^
+
+warning: struct `NewDeviceEventData` is never constructed
+  --> src/catbird/mls/subscribe_convo_events.rs:90:12
+   |
+90 | pub struct NewDeviceEventData {
+   |            ^^^^^^^^^^^^^^^^^^
+
+warning: type alias `NewDeviceEvent` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:107:10
+    |
+107 | pub type NewDeviceEvent = crate::types::Object<NewDeviceEventData>;
+    |          ^^^^^^^^^^^^^^
+
+warning: struct `ReactionEventData` is never constructed
+   --> src/catbird/mls/subscribe_convo_events.rs:111:12
+    |
+111 | pub struct ReactionEventData {
+    |            ^^^^^^^^^^^^^^^^^
+
+warning: type alias `ReactionEvent` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:125:10
+    |
+125 | pub type ReactionEvent = crate::types::Object<ReactionEventData>;
+    |          ^^^^^^^^^^^^^
+
+warning: struct `ReadEventData` is never constructed
+   --> src/catbird/mls/subscribe_convo_events.rs:129:12
+    |
+129 | pub struct ReadEventData {
+    |            ^^^^^^^^^^^^^
+
+warning: type alias `ReadEvent` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:142:10
+    |
+142 | pub type ReadEvent = crate::types::Object<ReadEventData>;
+    |          ^^^^^^^^^
+
+warning: struct `ReadditionRequestedEventData` is never constructed
+   --> src/catbird/mls/subscribe_convo_events.rs:146:12
+    |
+146 | pub struct ReadditionRequestedEventData {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `ReadditionRequestedEvent` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:156:10
+    |
+156 | pub type ReadditionRequestedEvent = crate::types::Object<ReadditionRequestedEventData>;
+    |          ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `TypingEventData` is never constructed
+   --> src/catbird/mls/subscribe_convo_events.rs:160:12
+    |
+160 | pub struct TypingEventData {
+    |            ^^^^^^^^^^^^^^^
+
+warning: type alias `TypingEvent` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:170:10
+    |
+170 | pub type TypingEvent = crate::types::Object<TypingEventData>;
+    |          ^^^^^^^^^^^
+
+warning: enum `EventWrapperEventRefs` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:173:10
+    |
+173 | pub enum EventWrapperEventRefs {
+    |          ^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `Message` is never used
+   --> src/catbird/mls/subscribe_convo_events.rs:195:10
+    |
+195 | pub enum Message {
+    |          ^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/sync_key_packages.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.syncKeyPackages";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/sync_key_packages.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/sync_key_packages.rs:12:10
+   |
+12 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/sync_key_packages.rs:15:12
+   |
+15 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/sync_key_packages.rs:31:10
+   |
+31 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/sync_key_packages.rs:34:10
+   |
+34 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/unregister_device_token.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.unregisterDeviceToken";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/unregister_device_token.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+ --> src/catbird/mls/unregister_device_token.rs:9:10
+  |
+9 | pub type Input = crate::types::Object<InputData>;
+  |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/unregister_device_token.rs:12:12
+   |
+12 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/unregister_device_token.rs:15:10
+   |
+15 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/unregister_device_token.rs:18:10
+   |
+18 | pub enum Error {}
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/update_chat_request_settings.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.updateChatRequestSettings";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/update_chat_request_settings.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/update_chat_request_settings.rs:17:10
+   |
+17 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/update_chat_request_settings.rs:20:12
+   |
+20 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/update_chat_request_settings.rs:25:10
+   |
+25 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/update_chat_request_settings.rs:28:10
+   |
+28 | pub enum Error {}
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/update_group_info.rs:17:12
+   |
+17 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/update_group_info.rs:20:10
+   |
+20 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/update_group_info.rs:23:10
+   |
+23 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/update_policy.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.updatePolicy";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/update_policy.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/update_policy.rs:29:10
+   |
+29 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/update_policy.rs:32:12
+   |
+32 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/update_policy.rs:36:10
+   |
+36 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/update_policy.rs:39:10
+   |
+39 | pub enum Error {
+   |          ^^^^^
+
+warning: struct `PolicyViewData` is never constructed
+  --> src/catbird/mls/update_policy.rs:91:12
+   |
+91 | pub struct PolicyViewData {
+   |            ^^^^^^^^^^^^^^
+
+warning: type alias `PolicyView` is never used
+   --> src/catbird/mls/update_policy.rs:112:10
+    |
+112 | pub type PolicyView = crate::types::Object<PolicyViewData>;
+    |          ^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/validate_device_state.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.validateDeviceState";
+  |           ^^^^
+
+warning: struct `ParametersData` is never constructed
+ --> src/catbird/mls/validate_device_state.rs:6:12
+  |
+6 | pub struct ParametersData {
+  |            ^^^^^^^^^^^^^^
+
+warning: type alias `Parameters` is never used
+  --> src/catbird/mls/validate_device_state.rs:11:10
+   |
+11 | pub type Parameters = crate::types::Object<ParametersData>;
+   |          ^^^^^^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/validate_device_state.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/validate_device_state.rs:33:10
+   |
+33 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/validate_device_state.rs:36:10
+   |
+36 | pub enum Error {}
+   |          ^^^^^
+
+warning: struct `KeyPackageInventoryData` is never constructed
+  --> src/catbird/mls/validate_device_state.rs:44:12
+   |
+44 | pub struct KeyPackageInventoryData {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type alias `KeyPackageInventory` is never used
+  --> src/catbird/mls/validate_device_state.rs:55:10
+   |
+55 | pub type KeyPackageInventory = crate::types::Object<KeyPackageInventoryData>;
+   |          ^^^^^^^^^^^^^^^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/validate_welcome.rs:3:11
+  |
+3 | pub const NSID: &str = "blue.catbird.mlsChat.validateWelcome";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/validate_welcome.rs:6:12
+  |
+6 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/validate_welcome.rs:11:10
+   |
+11 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/validate_welcome.rs:14:12
+   |
+14 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/validate_welcome.rs:32:10
+   |
+32 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/validate_welcome.rs:35:10
+   |
+35 | pub enum Error {
+   |          ^^^^^
+
+warning: constant `NSID` is never used
+ --> src/catbird/mls/warn_member.rs:4:11
+  |
+4 | pub const NSID: &str = "blue.catbird.mlsChat.warnMember";
+  |           ^^^^
+
+warning: struct `InputData` is never constructed
+ --> src/catbird/mls/warn_member.rs:7:12
+  |
+7 | pub struct InputData {
+  |            ^^^^^^^^^
+
+warning: type alias `Input` is never used
+  --> src/catbird/mls/warn_member.rs:18:10
+   |
+18 | pub type Input = crate::types::Object<InputData>;
+   |          ^^^^^
+
+warning: struct `OutputData` is never constructed
+  --> src/catbird/mls/warn_member.rs:21:12
+   |
+21 | pub struct OutputData {
+   |            ^^^^^^^^^^
+
+warning: type alias `Output` is never used
+  --> src/catbird/mls/warn_member.rs:27:10
+   |
+27 | pub type Output = crate::types::Object<OutputData>;
+   |          ^^^^^^
+
+warning: enum `Error` is never used
+  --> src/catbird/mls/warn_member.rs:30:10
+   |
+30 | pub enum Error {
+   |          ^^^^^
+
+   Compiling catmos v0.1.0 (/Users/joshlacalamito/Developer/Catbird+Petrel/catmos/src-tauri)
+warning: `catmos` (lib) generated 386 warnings
+warning: `catmos` (lib test) generated 386 warnings (386 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.56s
+     Running unittests src/lib.rs (target/debug/deps/catmos_lib-aef01e870f2c33ed)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/catmos-64fa1e83166f13fb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests catmos_lib
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+[END] 2026-02-16T15:34:34Z

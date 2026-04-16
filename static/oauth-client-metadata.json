@@ -1,0 +1,16 @@
+{
+  "client_id": "https://catmos.catbird.blue/oauth-client-metadata.json",
+  "client_name": "Catmos",
+  "client_uri": "https://catmos.catbird.blue",
+  "application_type": "web",
+  "redirect_uris": [
+    "https://api.catbird.blue/auth/callback"
+  ],
+  "response_types": ["code"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "scope": "atproto transition:generic",
+  "token_endpoint_auth_method": "private_key_jwt",
+  "token_endpoint_auth_signing_alg": "ES256",
+  "jwks_uri": "https://api.catbird.blue/.well-known/jwks.json",
+  "dpop_bound_access_tokens": true
+}
