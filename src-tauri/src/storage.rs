@@ -129,6 +129,26 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Adopt a new MLS group id for a conversation after a server-initiated
+    /// group reset (spec §8.5). catmos stays in the deferred-recovery
+    /// architecture: the websocket handler flags `needs_rejoin` and sets
+    /// `ConversationState::NeedsRejoin`; this method additionally rewrites
+    /// `conversations.group_id` so the subsequent External Commit in the sync
+    /// loop targets the new group instead of re-deriving the old one.
+    pub fn update_conversation_group_id(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET group_id = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![new_group_id_hex, conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     /// Persist a per-conversation WebSocket cursor (spec §7.1).
     pub fn set_ws_cursor(&self, conversation_id: &str, cursor: &str) {
         let conn = self.conn.lock().unwrap();

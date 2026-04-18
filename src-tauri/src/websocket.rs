@@ -513,6 +513,29 @@ async fn handle_binary_frame(
                 log_ws!("Flagged {} for deferred rejoin after group reset", convo_id);
             }
 
+            // Adopt the new group id locally so the deferred rejoin targets
+            // the post-reset MLS group. Empty = server didn't send one; fall
+            // back to the pre-reset lookup-by-conversation-id heuristic.
+            if !new_group_id.is_empty() {
+                if let Err(e) = orchestrator
+                    .storage()
+                    .update_conversation_group_id(convo_id, &new_group_id)
+                {
+                    log_ws!(
+                        "Failed to update group_id for {} to {}: {:?}",
+                        convo_id,
+                        new_group_id,
+                        e
+                    );
+                } else {
+                    log_ws!(
+                        "Adopted new group_id {} for convo {}",
+                        new_group_id,
+                        convo_id
+                    );
+                }
+            }
+
             // Emit event to frontend
             let _ = app.emit(
                 "mls:group-reset",

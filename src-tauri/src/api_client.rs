@@ -501,6 +501,73 @@ impl ReqwestApiClient {
         })
     }
 
+    /// Internal helper that POSTs a recovery failure report to the server.
+    /// Matches the `MLSAPIClient::report_recovery_failure` impl but lives on the
+    /// concrete struct so it can be reused by `opt_in` / admin flows later.
+    async fn post_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+    ) -> Result<()> {
+        let token = self.auth_header()?;
+
+        let mut body = serde_json::json!({
+            "convoId": convo_id,
+            "failureType": failure_type,
+        });
+        // TODO(ADR-002 A7): once task #26 lands (`epochAuthenticator` in the
+        // `reportRecoveryFailure` lexicon + generated type), switch to the
+        // typed lexicon input instead of a raw JSON map. For now we only send
+        // the field when the orchestrator produced one so pre-A7 servers keep
+        // accepting our reports unchanged.
+        if let Some(auth) = epoch_authenticator {
+            body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(self.xrpc_url("blue.catbird.mlsChat.reportRecoveryFailure"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+
+        let status_code = status.as_u16();
+        let body_text = resp.text().await.unwrap_or_default();
+
+        // 403 = caller is no longer a member (stale membership state on this
+        // device). There's nothing actionable server-side; treat as a soft
+        // ack so we don't spin the retry loop.
+        if status_code == 403 {
+            tracing::info!(
+                convo_id,
+                failure_type,
+                body = %body_text,
+                "report_recovery_failure: 403 (stale membership) — ignoring"
+            );
+            return Ok(());
+        }
+
+        tracing::warn!(
+            convo_id,
+            failure_type,
+            status = status_code,
+            body = %body_text,
+            "report_recovery_failure: server rejected report"
+        );
+        Err(OrchestratorError::ServerError {
+            status: status_code,
+            body: body_text,
+        })
+    }
+
     /// Report a member as spam in an MLS conversation.
     pub async fn report_spam(
         &self,
@@ -1210,6 +1277,16 @@ impl MLSAPIClient for ReqwestApiClient {
     ) -> Result<Vec<(String, DeliveryStatus)>> {
         let _ = (convo_id, message_ids);
         Ok(vec![])
+    }
+
+    async fn report_recovery_failure(
+        &self,
+        convo_id: &str,
+        failure_type: &str,
+        epoch_authenticator: Option<&str>,
+    ) -> Result<()> {
+        self.post_recovery_failure(convo_id, failure_type, epoch_authenticator)
+            .await
     }
 
     async fn process_external_commit(
