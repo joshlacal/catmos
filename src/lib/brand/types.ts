@@ -5,6 +5,10 @@
 export interface Palette {
   accentLight: string;
   accentDark: string;
+  /** Text-safe accent for light mode — clears WCAG AA-normal on white. */
+  accentText: string;
+  /** Text-safe accent for dark mode. */
+  accentTextDark: string;
   gradientPartner: string;
 }
 
