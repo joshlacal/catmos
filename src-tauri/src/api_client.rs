@@ -793,6 +793,11 @@ impl MLSAPIClient for ReqwestApiClient {
             pending_addition_id: None,
             welcome: welcome_data.map(|data| B64.encode(data)),
             confirmation_tag: self.get_confirmation_tag_b64(convo_id),
+            // TODO(ADR-002 A7.4): thread the real hex epoch_authenticator
+            // (RFC 9420 §8.7) once catmos migrates to the orchestrator's
+            // commit path that exposes it. Desktop doesn't have a direct
+            // authenticator source today; pre-A7 servers accept None.
+            epoch_authenticator: None,
         }
         .into();
 
@@ -846,6 +851,8 @@ impl MLSAPIClient for ReqwestApiClient {
             pending_addition_id: None,
             welcome: None,
             confirmation_tag: self.get_confirmation_tag_b64(convo_id),
+            // TODO(ADR-002 A7.4): see addMembers note above.
+            epoch_authenticator: None,
         }
         .into();
 
@@ -1190,6 +1197,10 @@ impl MLSAPIClient for ReqwestApiClient {
             pending_addition_id: None,
             welcome: None,
             confirmation_tag: self.get_confirmation_tag_b64(convo_id),
+            // TODO(ADR-002 A7.4): updateGroupInfo does not advance the
+            // epoch, so no authenticator is required on this path — but
+            // the struct field is mandatory. Leaving None is correct.
+            epoch_authenticator: None,
         }
         .into();
 
@@ -1311,6 +1322,8 @@ impl MLSAPIClient for ReqwestApiClient {
             confirmation_tag: confirmation_tag
                 .map(|t| t.to_string())
                 .or_else(|| self.get_confirmation_tag_b64(convo_id)),
+            // TODO(ADR-002 A7.4): see addMembers note above.
+            epoch_authenticator: None,
         }
         .into();
 
