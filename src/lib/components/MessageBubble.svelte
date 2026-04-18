@@ -408,7 +408,7 @@
 	.reply-quote-sender {
 		font-size: 11px;
 		font-weight: 600;
-		color: var(--accent);
+		color: var(--text-link);
 	}
 
 	.own .reply-quote-sender {
@@ -459,7 +459,7 @@
 	}
 
 	.reply-btn:hover {
-		color: var(--accent);
+		color: var(--text-link);
 		background: var(--bg-hover);
 	}
 

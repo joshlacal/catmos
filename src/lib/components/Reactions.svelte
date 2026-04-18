@@ -150,7 +150,7 @@
 	}
 
 	.reaction-pill.reacted .reaction-count {
-		color: var(--accent);
+		color: var(--text-link);
 	}
 
 	.reaction-add-wrapper {

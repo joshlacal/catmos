@@ -420,7 +420,7 @@
 	}
 
 	.convo-preview.draft-preview {
-		color: var(--accent);
+		color: var(--text-link);
 		font-style: italic;
 		opacity: 0.8;
 	}

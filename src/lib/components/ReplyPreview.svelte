@@ -50,7 +50,7 @@
   .reply-sender {
     font-size: 12px;
     font-weight: 600;
-    color: var(--accent);
+    color: var(--text-link);
   }
 
   .reply-text {

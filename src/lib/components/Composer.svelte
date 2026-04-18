@@ -389,7 +389,7 @@
 	}
 
 	.composer-btn.send.active {
-		color: var(--accent);
+		color: var(--text-link);
 	}
 
 	.composer-btn.send:disabled {
@@ -422,7 +422,7 @@
 		border: 2px dashed var(--accent);
 		border-radius: var(--radius-lg);
 		z-index: 10;
-		color: var(--accent);
+		color: var(--text-link);
 		font-size: 14px;
 		font-weight: 600;
 		pointer-events: none;

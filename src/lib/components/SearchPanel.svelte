@@ -350,7 +350,7 @@
   .result-convo {
     font-size: 13px;
     font-weight: 600;
-    color: var(--accent);
+    color: var(--text-link);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
