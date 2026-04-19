@@ -899,6 +899,8 @@ impl MLSAPIClient for ReqwestApiClient {
         cursor: Option<&str>,
         limit: u32,
         message_type: Option<&str>,
+        from_epoch: Option<u32>,
+        to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let token = self.auth_header()?;
         let mut url = format!(
@@ -912,6 +914,12 @@ impl MLSAPIClient for ReqwestApiClient {
         }
         if let Some(t) = message_type {
             url.push_str(&format!("&type={}", t));
+        }
+        if let Some(from) = from_epoch {
+            url.push_str(&format!("&fromEpoch={}", from));
+        }
+        if let Some(to) = to_epoch {
+            url.push_str(&format!("&toEpoch={}", to));
         }
 
         let resp = self

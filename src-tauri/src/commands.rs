@@ -1003,7 +1003,7 @@ pub async fn fetch_new_messages(
 ) -> Result<Vec<Message>, String> {
     let (msgs, _cursor) = state
         .orchestrator
-        .fetch_messages(&conversation_id, None, 50, Some("app"))
+        .fetch_messages(&conversation_id, None, 50, Some("app"), None, None)
         .await
         .map_err(|e| format!("{:?}", e))?;
 

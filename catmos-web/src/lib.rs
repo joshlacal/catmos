@@ -1050,7 +1050,7 @@ pub async fn wasm_fetch_new_messages(convo_id: String) -> Result<JsValue, JsValu
     })?;
 
     let (envelopes, _cursor) = api_client
-        .get_messages(&convo_id, None, 50)
+        .get_messages(&convo_id, None, 50, None, None, None)
         .await
         .map_err(|e| js_err!("fetch_new_messages failed: {:?}", e))?;
 
