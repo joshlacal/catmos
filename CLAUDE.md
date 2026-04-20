@@ -34,18 +34,22 @@ cd src-tauri && cargo fmt && cargo clippy
 
 Requires: `wasm-pack` (install via `cargo install wasm-pack` or the official installer).
 
+The WASM backend is `catbird-mls-web`, which lives in its own sibling repo at the workspace root (not under `catmos/`). It is a standalone crate consumed by catmos, catbird-mls-web's own web demo, and any future browser clients.
+
 ```bash
 # Build WASM package (release, with wasm-opt if available)
-cd catmos/catmos-web && ./build.sh
+cd ../catbird-mls-web && ./build.sh
 
 # Build WASM package (dev mode, faster, debug symbols)
-cd catmos/catmos-web && ./build-dev.sh
+cd ../catbird-mls-web && ./build-dev.sh
 
-# Run SvelteKit frontend pointing at WASM backend
+# Run the SvelteKit frontend pointing at the WASM backend
 cd catmos && npm run dev
 ```
 
-The build scripts output to `src/lib/wasm-pkg/` which is gitignored. The SvelteKit frontend auto-detects Tauri vs browser at runtime via `$lib/wasm.ts`.
+Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through `vite.config.ts` (bundling) + `svelte.config.js` `kit.alias` (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract.
+
+The SvelteKit frontend auto-detects Tauri vs browser at runtime via `$lib/wasm.ts`.
 
 ## Architecture
 
@@ -66,34 +70,19 @@ src-tauri/src/
 └── catbird/         # Catbird-specific types
 ```
 
-### Web WASM Backend (`catmos-web/`)
+### Web WASM Backend (`../catbird-mls-web/`)
 
-Compiles the `catbird-mls` orchestrator to WebAssembly. Implements the same three orchestrator traits using browser-native APIs instead of OS services.
+Single-crate WASM wrapper exposing `#[wasm_bindgen]` entry points directly, compiled to WebAssembly via wasm-pack. catmos consumes the generated `pkg/` output via a Vite alias + SvelteKit `kit.alias`; no hand-declared shim is needed.
 
-```
-catmos-web/
-├── Cargo.toml           # cdylib crate targeting wasm32-unknown-unknown
-├── rust-toolchain.toml  # Pins stable + wasm32 target
-├── build.sh             # Release build (wasm-pack + wasm-opt)
-├── build-dev.sh         # Dev build (faster, debug symbols)
-└── src/
-    ├── lib.rs           # Module root + wasm_bindgen(start) panic hook
-    ├── api_client.rs    # WasmApiClient (MLSAPIClient via reqwest/fetch)
-    ├── storage.rs       # WasmStorageBackend (MLSStorageBackend via IndexedDB)
-    ├── credentials.rs   # IndexedDbCredentialStore (CredentialStore via IndexedDB)
-    └── websocket.rs     # Browser WebSocket via web-sys
-```
+Storage model is a unified encrypted SQLite database (OPFS-backed via `wa-sqlite`), shared across credentials, conversation state, and MLS group state — there's no separate IndexedDB layer.
 
-Platform trait mapping:
-
-| Orchestrator Trait | Desktop (Tauri) | Web (WASM) |
-|--------------------|----------------|------------|
-| `MLSAPIClient` | `ReqwestApiClient` (reqwest/native) | `WasmApiClient` (reqwest/fetch) |
-| `MLSStorageBackend` | SQLCipher via `rusqlite` | IndexedDB via `web-sys` |
-| `CredentialStore` | OS keychain via `keyring` | IndexedDB via `web-sys` |
-| WebSocket | `tokio-tungstenite` | `web-sys::WebSocket` |
-
-All trait impls use `#[async_trait(?Send)]` because WASM is single-threaded.
+| Feature | Desktop (Tauri) | Web (catbird-mls-web) |
+|---------|----------------|------------------------|
+| Client construction | Direct Rust via `MLSOrchestrator` | `catbird_mls_init({ baseUrl, storagePrefix?, dbPrefix? })` |
+| Auth | `keyring` → OS keychain | `catbird_mls_set_auth(did, token)` → localStorage |
+| Storage | SQLCipher via `rusqlite` | OPFS SQLite (wa-sqlite) |
+| WebSocket | `tokio-tungstenite` | `catbird_mls_subscribe` → browser WebSocket via `web-sys` |
+| HTTP | `reqwest` (native) | `reqwest` (browser fetch backend) |
 
 ### SvelteKit Frontend (`src/`)
 
@@ -105,7 +94,6 @@ src/
 │   ├── +layout.svelte   # App shell layout
 │   ├── +layout.ts       # SSR disabled (ssr = false)
 │   └── +page.svelte     # Main page
-├── catmos-web.d.ts      # Type declarations for WASM package
 └── lib/
     ├── components/
     │   ├── Sidebar.svelte       # Conversation list
@@ -119,16 +107,18 @@ src/
     │   ├── messages.ts          # Message state
     │   └── profiles.ts          # Profile cache with batching
     ├── tauri.ts                 # Tauri IPC types + invoke wrappers
-    ├── wasm.ts                  # Unified bridge (Tauri ↔ WASM)
-    └── wasm-pkg/                # WASM build output (gitignored)
+    ├── wasm.ts                  # Unified bridge (Tauri ↔ catbird-mls-web)
+    └── mls-worker.ts            # Dedicated Worker that owns the WASM instance
 ```
+
+WASM types come from `../catbird-mls-web/pkg/catbird_mls_web.d.ts` via the `kit.alias` in `svelte.config.js`.
 
 ### Runtime Detection
 
 `src/lib/wasm.ts` provides a unified API surface:
 - Detects `window.__TAURI_INTERNALS__` at module load
 - **Tauri**: lazy-imports `@tauri-apps/api/core` invoke()
-- **Browser**: lazy-imports + caches the `catmos-web` WASM module
+- **Browser**: spawns `mls-worker.ts` (Comlink-wrapped) that loads the `catbird-mls-web` WASM module from OPFS-backed SQLite storage
 - Stores should import from `$lib/wasm` instead of `$lib/tauri`
 
 ### IPC Commands
@@ -150,13 +140,15 @@ Frontend calls backend via the unified bridge (17 commands):
 - **keyring** - OS-native credential storage
 - **tokio-tungstenite** - WebSocket for real-time delivery
 
-### Rust (Web — `catmos-web/`)
-- **catbird_mls** with `browser` feature - Same orchestrator, WASM-compatible mode
-- **wasm-bindgen** / **js-sys** / **web-sys** - WASM ↔ JS interop
-- **reqwest** (default-features off) - HTTP via browser fetch
-- **getrandom** with `js` feature - Crypto RNG in WASM
-- **chrono** with `wasmbind` - Date/time in WASM
-- **console-error-panic-hook** - Better panic messages in browser console
+### Rust (Web — `../catbird-mls-web/`)
+
+Lives in its own sibling repo. catmos does not take a Rust dependency on it — it consumes the wasm-pack-generated JS/TS artifacts at `../catbird-mls-web/pkg/`.
+
+Notable crate-level pieces (see catbird-mls-web's own CLAUDE.md for detail):
+- **wasm-bindgen** / **js-sys** / **web-sys** — WASM ↔ JS interop
+- **wa-sqlite** — OPFS-backed synchronous SQLite for unified encrypted storage (credentials + conversation state + MLS groups in one DB)
+- **reqwest** (default-features off) — HTTP via browser fetch
+- **console-error-panic-hook** — better panic messages in the browser console
 
 ### Frontend
 - **SvelteKit** + Svelte 5 - UI framework
@@ -166,16 +158,11 @@ Frontend calls backend via the unified bridge (17 commands):
 
 ## Relationship to catbird-mls
 
-Both targets use `catbird_mls` directly as a Rust dependency (no UniFFI). The same `mls-orchestrator` crate powers all three:
-- **Catmos Desktop**: Direct Rust API via Tauri IPC
-- **Catmos Web**: Same Rust crate compiled to WASM via `wasm-pack`
-- **Catbird iOS**: Via UniFFI Swift bindings
-
-The `browser` feature flag in `catbird-mls/Cargo.toml` gates WASM-incompatible code (e.g., SQLCipher, tokio multi-thread). Source-level `cfg(target_arch = "wasm32")` handles the rest.
+- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../catbird-mls`). The orchestrator + MLSContext are linked into the Tauri binary; no UniFFI.
+- **Catmos Web**: does *not* depend on `catbird-mls` directly. The WASM work lives in the sibling `catbird-mls-web` crate, which owns its own `wasm_bindgen` surface and its own adapted storage/network layers. catmos only consumes the generated `pkg/` artifacts.
+- **Catbird iOS**: bridges to `catbird-mls` via UniFFI Swift bindings (outside catmos's scope).
 
 ## Known Issues
 
 - SQLCipher requires `PRAGMA key` after opening connection (StorageFailed panic if missing)
-- IPC commands are currently stubs pending Phase 3 implementation
-- catmos-web trait impls are stubs — build compiles but methods return `not yet implemented`
 - Stores still import from `$lib/tauri` — migration to `$lib/wasm` pending

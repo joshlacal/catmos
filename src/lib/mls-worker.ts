@@ -5,7 +5,8 @@ import init, * as wasm from 'catbird-mls-web';
 // Initialize the WASM binary when the worker starts.
 // Stored as a module-level promise — each exposed method awaits it before calling WASM.
 // NOT exposed as a property (Promises can't be structured-cloned across the Worker boundary).
-const wasmReady: Promise<void> = init();
+// Runtime returns `InitOutput`, but the worker only awaits readiness — discard the value.
+const wasmReady = init().then(() => undefined);
 
 // Active WebSocket subscriptions keyed by conversation ID.
 // WsSubscription structs can't cross the Worker boundary, so we track them here.
@@ -84,15 +85,19 @@ const api = {
 		await wasm.catbird_mls_update_cursor(convoId, cursor);
 	},
 
-	// Subscribe — callbacks proxied via Comlink.proxy() from main thread
+	// Subscribe — callbacks proxied via Comlink.proxy() from main thread.
+	// Accepts an optional `cursor` to match the Tauri IPC contract, but the
+	// current catbird-mls-web WASM binding does not plumb it through:
+	// subscription state is persisted on the Rust side, so the cursor hint
+	// is dropped here and the worker relies on that persisted state instead.
 	subscribe: async (
 		convoId: string,
 		onMessage: (data: unknown) => void,
 		onEvent: (data: unknown) => void,
 		onStatus: (status: unknown) => void,
-		cursor?: string
+		_cursor?: string
 	) => {
-		const sub = await wasm.catbird_mls_subscribe(convoId, onMessage, onEvent, onStatus, cursor);
+		const sub = await wasm.catbird_mls_subscribe(convoId, onMessage, onEvent, onStatus);
 		if (sub) subscriptions.set(convoId, sub);
 	},
 	unsubscribe: (convoId: string) => {
