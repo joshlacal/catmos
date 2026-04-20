@@ -36,6 +36,7 @@ catbird-atproto = { path = "../../catbird-atproto" }
 urlencoding = "2.1.3"
 httparse = "1"
 getrandom = "0.2"
+hex = "0.4"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }

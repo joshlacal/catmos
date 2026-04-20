@@ -327,8 +327,35 @@ async fn handle_binary_frame(
                 server_message_id: Some(id.clone()),
             };
 
-            // Decrypt via orchestrator
-            match orchestrator.process_incoming(&envelope).await {
+            // Decrypt via orchestrator. `decrypt_message` (task #33) no longer
+            // auto-merges incoming commits — it stages them in
+            // `pending_incoming_merges` keyed by `(group_id, target_epoch)`.
+            // We must explicitly call `merge_incoming_commit` after
+            // `process_incoming` so the local MLS group actually advances.
+            let process_result = orchestrator.process_incoming(&envelope).await;
+
+            // Merge any staged incoming commit for this (group, epoch). The
+            // key in `pending_incoming_merges` is the target (post-merge)
+            // epoch, which the server records as `message.epoch`. Returns an
+            // error for app messages / dedup / own-echoes (no staged entry);
+            // treat that as a no-op.
+            if epoch >= 0 {
+                if let Ok(gid_bytes) = hex::decode(convo_id) {
+                    if let Err(e) = orchestrator
+                        .mls_context()
+                        .merge_incoming_commit(gid_bytes, epoch as u64)
+                    {
+                        log_ws!(
+                            "merge_incoming_commit no-op for {} epoch {}: {}",
+                            id,
+                            epoch,
+                            e
+                        );
+                    }
+                }
+            }
+
+            match process_result {
                 Ok(Some(decrypted)) => {
                     if !decrypted.has_displayable_body() {
                         log_ws!(
