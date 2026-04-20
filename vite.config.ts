@@ -24,7 +24,6 @@ export default defineConfig({
 	clearScreen: false,
 	resolve: {
 		alias: {
-			'catmos-web': resolve(__dirname, 'src/lib/wasm-pkg/catmos_web.js'),
 			'catbird-mls-web': resolve(__dirname, '../catbird-mls-web/pkg/catbird_mls_web.js')
 		}
 	},

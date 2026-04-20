@@ -216,7 +216,7 @@ export async function startLogin(identifier: string): Promise<void> {
 	const loginUrl =
 		`${NEST_URL}/auth/login` +
 		`?identifier=${encodeURIComponent(identifier)}` +
-		`&client=catmos-web` +
+		`&client=catmos` +
 		`&redirect_to=${encodeURIComponent(redirectTo)}`;
 	window.location.href = loginUrl;
 }

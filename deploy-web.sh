@@ -27,10 +27,6 @@ echo "==> Building catbird-mls-web WASM..."
 cd "$SAFE_PARENT_LINK/catbird-mls-web"
 bash build.sh
 
-echo "==> Building catmos-web WASM..."
-cd "$SAFE_LINK"
-bash catmos-web/build.sh
-
 echo "==> Building SvelteKit..."
 cd "$SAFE_LINK"
 npm run build

@@ -1,85 +1,22 @@
 /**
- * Type declarations for the catmos-web WASM package.
+ * Type declarations for the catbird-mls-web WASM package.
  *
- * These mirror the wasm-bindgen exports from catmos/catmos-web/src/.
- * Update this file when new functions are exposed from the Rust WASM crate.
+ * Vite resolves `import ... from 'catbird-mls-web'` to
+ * `../catbird-mls-web/pkg/catbird_mls_web.js` via its alias config in
+ * `vite.config.ts`. svelte-check / tsserver does NOT follow Vite aliases,
+ * so this ambient module declaration hand-mirrors the wasm-bindgen exports.
+ *
+ * Preserved from the pre-task-#45 `catmos-web.d.ts` shim during the port
+ * from `catmos-web` to `catbird-mls-web`. Update when new functions are
+ * added to the Rust WASM crate.
+ *
+ * Known drift between this shim and the generated `pkg/catbird_mls_web.d.ts`:
+ *   - `catbird_mls_update_cursor`: declared here but not currently exported
+ *     by the WASM module. Caller in `mls-worker.ts` still invokes it.
+ *   - `catbird_mls_subscribe`: declared with 5 args; WASM exports 4.
+ * Both are pre-existing bugs to reconcile against the live WASM API in a
+ * follow-up, together with the `mls-worker.ts` call sites.
  */
-declare module 'catmos-web' {
-	// wasm-pack default export: initializes the WASM binary before use.
-	export default function init(): Promise<void>;
-
-	// App-level init (sets up MLS context, credentials, API client).
-	export function wasm_init(base_url: string): Promise<void>;
-
-	import type {
-		Conversation,
-		Message,
-		AuthState,
-		GroupMember,
-		ProfileView,
-		SearchResult,
-		OptInStatus
-	} from '$lib/tauri';
-
-	// Auth
-	export function wasm_start_login(identifier: string): Promise<void>;
-	export function wasm_complete_login(session_id: string): Promise<AuthState>;
-	export function wasm_try_restore_session(): Promise<AuthState | null>;
-	export function wasm_logout(): Promise<void>;
-
-	// Conversations
-	export function wasm_get_conversations(): Promise<Conversation[]>;
-	export function wasm_create_group(name: string, member_dids: string[]): Promise<Conversation>;
-	export function wasm_subscribe_conversation(conversation_id: string): Promise<void>;
-	export function wasm_unsubscribe_conversation(conversation_id: string): Promise<void>;
-
-	// Messages
-	export function wasm_send_message(conversation_id: string, content: string): Promise<Message>;
-	export function wasm_send_image(
-		conversation_id: string,
-		content: string,
-		data: Uint8Array,
-		content_type: string,
-		width: number,
-		height: number,
-		alt_text?: string
-	): Promise<Message>;
-	export function wasm_get_messages(conversation_id: string, before?: string): Promise<Message[]>;
-	export function wasm_fetch_new_messages(conversation_id: string): Promise<Message[]>;
-	export function wasm_send_reaction(
-		conversation_id: string,
-		message_id: string,
-		emoji: string,
-		action: 'add' | 'remove'
-	): Promise<void>;
-	export function wasm_send_typing(conversation_id: string, is_typing: boolean): Promise<void>;
-	export function wasm_update_cursor(conversation_id: string, cursor: string): Promise<void>;
-
-	// Members
-	export function wasm_get_group_members(conversation_id: string): Promise<GroupMember[]>;
-	export function wasm_promote_member(conversation_id: string, target_did: string): Promise<void>;
-	export function wasm_demote_member(conversation_id: string, target_did: string): Promise<void>;
-	export function wasm_remove_group_member(
-		conversation_id: string,
-		target_did: string
-	): Promise<void>;
-	export function wasm_leave_conversation(conversation_id: string): Promise<void>;
-
-	// Profiles & Search
-	export function wasm_get_profiles(dids: string[]): Promise<ProfileView[]>;
-	export function wasm_search_users(query: string): Promise<SearchResult[]>;
-	export function wasm_check_opt_in_status(dids: string[]): Promise<OptInStatus[]>;
-
-	// Group metadata
-	export function wasm_get_group_metadata(conversation_id: string): Promise<unknown>;
-	export function wasm_update_group_metadata(
-		conversation_id: string,
-		name: string | null,
-		description: string | null,
-		avatar_hash: string | null
-	): Promise<void>;
-}
-
 declare module 'catbird-mls-web' {
 	import type {
 		AuthState,

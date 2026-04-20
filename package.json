@@ -18,8 +18,8 @@
     "check:android": "bash ./scripts/check-android.sh",
     "check:linux": "cd src-tauri && cargo check --target x86_64-unknown-linux-gnu",
     "check:windows": "cd src-tauri && cargo check --target x86_64-pc-windows-msvc",
-    "build:wasm": "bash catmos-web/build.sh",
-    "build:wasm:dev": "bash catmos-web/build-dev.sh"
+    "build:wasm": "bash ../catbird-mls-web/build.sh",
+    "build:wasm:dev": "bash ../catbird-mls-web/build-dev.sh"
   },
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.0",
