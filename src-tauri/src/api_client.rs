@@ -174,6 +174,51 @@ fn parse_commit_group_change_receipt(
     }
 }
 
+/// Build a `CommitGroupChange<'static>` for the wire **without** going through
+/// the buggy `InputData → Input` adapter in `catbird-atproto`.
+///
+/// Why not use `crate::catbird::mls_chat::commit_group_change::InputData`?
+/// That adapter types `commit` / `welcome` / `group_info` / `confirmation_tag`
+/// as `Option<String>`, and its `From<InputData> for Input` impl maps them via
+/// `String → bytes::Bytes`. `bytes::Bytes::from(String)` takes the UTF-8 bytes
+/// of the string verbatim — so when callers pass a pre-base64 string, the
+/// bytes field ends up containing the ASCII of the base64 text and the
+/// jacquard serializer then wraps it as `{"$bytes": base64(ASCII-base64)}`,
+/// producing double-encoded commits the server rejects or silently
+/// mis-decodes. Building the lexicon struct directly lets us pass raw
+/// `bytes::Bytes::from(Vec<u8>)` so the single serializer layer does the one
+/// correct base64 encode.
+///
+/// Bug tracking: catmos task #66 (April 2026). See catmos-cli commit
+/// `1ecf9e4` for the reference fix pattern.
+#[allow(clippy::too_many_arguments)]
+fn build_commit_group_change(
+    convo_id: &str,
+    action: &str,
+    commit: Option<Vec<u8>>,
+    welcome: Option<Vec<u8>>,
+    group_info: Option<Vec<u8>>,
+    confirmation_tag: Option<Vec<u8>>,
+    member_dids: Option<Vec<Did<'static>>>,
+    idempotency_key: Option<String>,
+) -> blue_catbird::mlsChat::commit_group_change::CommitGroupChange<'static> {
+    blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
+        action: action.to_string().into(),
+        commit: commit.map(bytes::Bytes::from),
+        confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
+        convo_id: convo_id.to_string().into(),
+        device_id: None,
+        epoch_authenticator: None,
+        group_info: group_info.map(bytes::Bytes::from),
+        idempotency_key: idempotency_key.map(Into::into),
+        key_package_hashes: None,
+        member_dids,
+        pending_addition_id: None,
+        welcome: welcome.map(bytes::Bytes::from),
+        ..Default::default()
+    }
+}
+
 /// HTTP API client for the mls-ds delivery service using reqwest.
 pub struct ReqwestApiClient {
     client: Client,
@@ -213,6 +258,21 @@ impl ReqwestApiClient {
         ctx.get_confirmation_tag(group_id_bytes)
             .map(|tag| B64.encode(&tag))
             .ok()
+    }
+
+    /// Get the raw (un-encoded) confirmation tag bytes for a conversation.
+    ///
+    /// Use this on `commitGroupChange` call sites that construct
+    /// `CommitGroupChange<'static>` directly (where `confirmation_tag` is
+    /// `Option<bytes::Bytes>` and the lexicon serializer base64-encodes
+    /// once). Do NOT use with the `InputData` adapter — that adapter expects
+    /// a pre-base64 string and re-encodes as UTF-8 bytes, producing
+    /// double-encoded wire output (see `build_commit_group_change` docs).
+    fn get_confirmation_tag_raw(&self, convo_id: &str) -> Option<Vec<u8>> {
+        let ctx = self.mls_context.read().unwrap();
+        let ctx = ctx.as_ref()?;
+        let group_id_bytes = decode_hex_bytes(convo_id).ok()?;
+        ctx.get_confirmation_tag(group_id_bytes).ok()
     }
 
     pub fn set_auth(&self, did: String, token: String) {
@@ -781,25 +841,23 @@ impl MLSAPIClient for ReqwestApiClient {
         welcome_data: Option<&[u8]>,
     ) -> Result<AddMembersServerResult> {
         let token = self.auth_header()?;
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "addMembers".to_string(),
-            commit: Some(B64.encode(commit_data)),
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            group_info: None,
-            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-            key_package_hashes: None,
-            member_dids: Some(member_dids.iter().map(|did| parse_did(did)).collect()),
-            pending_addition_id: None,
-            welcome: welcome_data.map(|data| B64.encode(data)),
-            confirmation_tag: self.get_confirmation_tag_b64(convo_id),
-            // TODO(ADR-002 A7.4): thread the real hex epoch_authenticator
-            // (RFC 9420 §8.7) once catmos migrates to the orchestrator's
-            // commit path that exposes it. Desktop doesn't have a direct
-            // authenticator source today; pre-A7 servers accept None.
-            epoch_authenticator: None,
-        }
-        .into();
+        // Bypass the buggy `InputData → Input` adapter that double-encodes
+        // byte fields. Build the lexicon struct directly with raw bytes.
+        // See `build_commit_group_change` docs for the full bug writeup.
+        // TODO(ADR-002 A7.4): thread the real hex epoch_authenticator
+        // (RFC 9420 §8.7) once catmos migrates to the orchestrator's
+        // commit path that exposes it. Desktop doesn't have a direct
+        // authenticator source today; pre-A7 servers accept None.
+        let input = build_commit_group_change(
+            convo_id,
+            "addMembers",
+            Some(commit_data.to_vec()),
+            welcome_data.map(|data| data.to_vec()),
+            None,
+            self.get_confirmation_tag_raw(convo_id),
+            Some(member_dids.iter().map(|did| parse_did(did)).collect()),
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
 
         let resp = self
             .client
@@ -839,22 +897,19 @@ impl MLSAPIClient for ReqwestApiClient {
         commit_data: &[u8],
     ) -> Result<()> {
         let token = self.auth_header()?;
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "removeMember".to_string(),
-            commit: Some(B64.encode(commit_data)),
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            group_info: None,
-            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-            key_package_hashes: None,
-            member_dids: Some(member_dids.iter().map(|did| parse_did(did)).collect()),
-            pending_addition_id: None,
-            welcome: None,
-            confirmation_tag: self.get_confirmation_tag_b64(convo_id),
-            // TODO(ADR-002 A7.4): see addMembers note above.
-            epoch_authenticator: None,
-        }
-        .into();
+        // Bypass the buggy `InputData → Input` adapter (see
+        // `build_commit_group_change` docs).
+        // TODO(ADR-002 A7.4): see addMembers note above.
+        let input = build_commit_group_change(
+            convo_id,
+            "removeMember",
+            Some(commit_data.to_vec()),
+            None,
+            None,
+            self.get_confirmation_tag_raw(convo_id),
+            Some(member_dids.iter().map(|did| parse_did(did)).collect()),
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
 
         let resp = self
             .client
@@ -1193,24 +1248,21 @@ impl MLSAPIClient for ReqwestApiClient {
 
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
         let token = self.auth_header()?;
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "updateGroupInfo".to_string(),
-            commit: None,
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            group_info: Some(B64.encode(group_info)),
-            idempotency_key: None,
-            key_package_hashes: None,
-            member_dids: None,
-            pending_addition_id: None,
-            welcome: None,
-            confirmation_tag: self.get_confirmation_tag_b64(convo_id),
-            // TODO(ADR-002 A7.4): updateGroupInfo does not advance the
-            // epoch, so no authenticator is required on this path — but
-            // the struct field is mandatory. Leaving None is correct.
-            epoch_authenticator: None,
-        }
-        .into();
+        // Bypass the buggy `InputData → Input` adapter (see
+        // `build_commit_group_change` docs).
+        // TODO(ADR-002 A7.4): updateGroupInfo does not advance the
+        // epoch, so no authenticator is required on this path — but
+        // the struct field is mandatory. Leaving None is correct.
+        let input = build_commit_group_change(
+            convo_id,
+            "updateGroupInfo",
+            None,
+            None,
+            Some(group_info.to_vec()),
+            self.get_confirmation_tag_raw(convo_id),
+            None,
+            None,
+        );
 
         let resp = self
             .client
@@ -1316,24 +1368,29 @@ impl MLSAPIClient for ReqwestApiClient {
         confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
         let token = self.auth_header()?;
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "externalCommit".to_string(),
-            commit: Some(B64.encode(commit_data)),
-            convo_id: convo_id.to_string(),
-            device_id: None,
-            group_info: group_info.map(|value| B64.encode(value)),
-            idempotency_key: Some(uuid::Uuid::new_v4().to_string()),
-            key_package_hashes: None,
-            member_dids: None,
-            pending_addition_id: None,
-            welcome: None,
-            confirmation_tag: confirmation_tag
-                .map(|t| t.to_string())
-                .or_else(|| self.get_confirmation_tag_b64(convo_id)),
-            // TODO(ADR-002 A7.4): see addMembers note above.
-            epoch_authenticator: None,
-        }
-        .into();
+        // Caller-supplied `confirmation_tag` is a base64-encoded string (kept
+        // as-is for the public signature); decode it back to raw bytes so the
+        // Jacquard serializer does the single correct base64 encode on the
+        // wire. If the caller didn't provide one, fall back to the MLS-derived
+        // raw bytes for this conversation.
+        let confirmation_tag_raw: Option<Vec<u8>> = match confirmation_tag {
+            Some(s) => B64.decode(s).ok(),
+            None => self.get_confirmation_tag_raw(convo_id),
+        };
+
+        // Bypass the buggy `InputData → Input` adapter (see
+        // `build_commit_group_change` docs).
+        // TODO(ADR-002 A7.4): see addMembers note above.
+        let input = build_commit_group_change(
+            convo_id,
+            "externalCommit",
+            Some(commit_data.to_vec()),
+            None,
+            group_info.map(|v| v.to_vec()),
+            confirmation_tag_raw,
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+        );
 
         let resp = self
             .client
@@ -1370,5 +1427,111 @@ impl MLSAPIClient for ReqwestApiClient {
             rejoined_at,
             receipt: parse_commit_group_change_receipt(&output, "process_external_commit"),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-level regression tests for the double-base64 bug (task #66).
+    //!
+    //! History: catmos Tauri was constructing `commitGroupChange` inputs via
+    //! the `catbird_atproto::catbird::mls_chat::commit_group_change::InputData`
+    //! adapter. That adapter types byte fields as `Option<String>` and maps
+    //! them to the generated `CommitGroupChange<'static>` struct via
+    //! `bytes::Bytes::from(String)`, which copies the UTF-8 bytes of the
+    //! string verbatim. Callers that pre-base64-encoded their commit bytes
+    //! (the `Some(B64.encode(data))` pattern) therefore ended up with
+    //! `Bytes(<ASCII-of-base64>)`, which Jacquard then base64-encoded AGAIN
+    //! on the wire — yielding `{"$bytes": "<BASE64(ASCII-OF-BASE64)>"}`
+    //! instead of `{"$bytes": "<BASE64(RAW)>"}`.
+    //!
+    //! The fix is `build_commit_group_change`, which constructs
+    //! `CommitGroupChange<'static>` directly with
+    //! `bytes::Bytes::from(Vec<u8>)`. These tests assert the wire output
+    //! is singly-encoded (good) and explicitly check the old double-encoded
+    //! output the buggy adapter would have produced (regression protection).
+    use super::*;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+
+    /// Nine bytes containing both printable-ASCII low values and non-ASCII
+    /// high values so the single-encode vs double-encode distinction shows
+    /// up unambiguously in base64.
+    const KNOWN_BYTES: &[u8] = &[0, 1, 2, 3, 4, 0xde, 0xad, 0xbe, 0xef];
+    /// Standard base64 of KNOWN_BYTES. This is what the wire should carry
+    /// under `{"$bytes": ...}` after a single correct encode.
+    const SINGLE_ENCODED: &str = "AAECAwTerb7v";
+    /// Standard base64 of the ASCII bytes of SINGLE_ENCODED — the bogus
+    /// output the old `InputData` path would produce (regression tripwire).
+    const DOUBLE_ENCODED: &str = "QUFFQ0F3VGVyYjd2";
+
+    #[test]
+    fn build_commit_group_change_produces_single_base64_on_wire() {
+        // Sanity-check the oracle.
+        assert_eq!(B64.encode(KNOWN_BYTES), SINGLE_ENCODED);
+        assert_eq!(B64.encode(SINGLE_ENCODED.as_bytes()), DOUBLE_ENCODED);
+
+        let input = build_commit_group_change(
+            "deadbeef",
+            "addMembers",
+            Some(KNOWN_BYTES.to_vec()),
+            Some(KNOWN_BYTES.to_vec()),
+            Some(KNOWN_BYTES.to_vec()),
+            Some(KNOWN_BYTES.to_vec()),
+            None,
+            Some("idem-key".to_string()),
+        );
+
+        let json = serde_json::to_value(&input).expect("serialize CommitGroupChange");
+        for field in ["commit", "welcome", "groupInfo", "confirmationTag"] {
+            let wrapped = json
+                .get(field)
+                .unwrap_or_else(|| panic!("missing field {field}"));
+            let encoded = wrapped
+                .get("$bytes")
+                .and_then(|v| v.as_str())
+                .unwrap_or_else(|| panic!("field {field} is not a $bytes envelope: {wrapped}"));
+            assert_eq!(
+                encoded, SINGLE_ENCODED,
+                "field {field} was double-encoded (got {encoded}, want {SINGLE_ENCODED})"
+            );
+            assert_ne!(
+                encoded, DOUBLE_ENCODED,
+                "field {field} matched the known bad output — regression!"
+            );
+        }
+    }
+
+    /// Demonstrates the bug the new path fixes: construct through the
+    /// `InputData` adapter with a `B64.encode` string and observe the
+    /// double-encoded wire output. If this ever starts producing
+    /// `SINGLE_ENCODED` it means the upstream `InputData` adapter was fixed
+    /// and the workaround helper is no longer load-bearing.
+    #[test]
+    fn legacy_inputdata_adapter_still_double_encodes() {
+        let input: lexicon::commit_group_change::Input =
+            lexicon::commit_group_change::InputData {
+                action: "addMembers".to_string(),
+                commit: Some(B64.encode(KNOWN_BYTES)),
+                confirmation_tag: None,
+                convo_id: "deadbeef".to_string(),
+                device_id: None,
+                epoch_authenticator: None,
+                group_info: None,
+                idempotency_key: None,
+                key_package_hashes: None,
+                member_dids: None,
+                pending_addition_id: None,
+                welcome: None,
+            }
+            .into();
+        let json = serde_json::to_value(&input).expect("serialize InputData path");
+        let encoded = json["commit"]["$bytes"]
+            .as_str()
+            .expect("commit $bytes envelope");
+        assert_eq!(
+            encoded, DOUBLE_ENCODED,
+            "legacy InputData path no longer double-encodes — re-evaluate fix"
+        );
     }
 }

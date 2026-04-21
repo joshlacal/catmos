@@ -27,6 +27,7 @@ rusqlite = { version = "0.32", default-features = false }
 base64 = "0.22"
 async-trait = "0.1"
 tracing = "0.1"
+bytes = "1"
 
 dirs = "6"
 ciborium = "0.2"
