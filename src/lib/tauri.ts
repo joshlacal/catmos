@@ -182,6 +182,14 @@ export async function unsubscribeConversation(conversationId: string): Promise<v
 	return invoke('unsubscribe_conversation', { conversationId });
 }
 
+export async function subscribeAllEvents(): Promise<void> {
+	return invoke('subscribe_all_events');
+}
+
+export async function unsubscribeAllEvents(): Promise<void> {
+	return invoke('unsubscribe_all_events');
+}
+
 export async function fetchNewMessages(conversationId: string): Promise<Message[]> {
 	return invoke('fetch_new_messages', { conversationId });
 }

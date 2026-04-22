@@ -996,6 +996,67 @@ pub async fn unsubscribe_conversation(
     Ok(())
 }
 
+/// Open a single WebSocket that receives events for EVERY conversation the
+/// authenticated user is a member of. This is the preferred wiring — it
+/// matches iOS/Android/CLI and ensures messages in background conversations
+/// aren't dropped waiting for the user to navigate into them. Per-convo
+/// subscribe_conversation remains available for targeted re-subscription.
+#[tauri::command]
+pub async fn subscribe_all_events(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    const GLOBAL_KEY: &str = "__global__";
+
+    {
+        let handles = state.ws_handles.lock().await;
+        if handles.contains_key(GLOBAL_KEY) {
+            return Ok(());
+        }
+    }
+
+    let token = state
+        .api_client
+        .get_auth_token()
+        .ok_or("Not authenticated")?;
+
+    let base_url =
+        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let orchestrator = state.orchestrator.clone();
+
+    state.ws_handles.lock().await.insert(
+        GLOBAL_KEY.to_string(),
+        WsHandle {
+            shutdown: shutdown_tx,
+        },
+    );
+
+    tokio::spawn(async move {
+        crate::websocket::subscribe_all(app, orchestrator, base_url, token, shutdown_rx).await;
+    });
+
+    log_catmos!(" subscribe_all_events: global WS opened");
+    Ok(())
+}
+
+/// Tear down the global WebSocket started by `subscribe_all_events`.
+/// Call on logout; leaving it running after auth teardown leaks the stream.
+#[tauri::command]
+pub async fn unsubscribe_all_events(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(handle) = state
+        .ws_handles
+        .lock()
+        .await
+        .remove("__global__")
+    {
+        let _ = handle.shutdown.send(true);
+        log_catmos!(" unsubscribe_all_events: global WS torn down");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn fetch_new_messages(
     state: State<'_, AppState>,

@@ -404,6 +404,25 @@ export async function unsubscribeConversation(conversationId: string): Promise<v
 	await w.unsubscribe(conversationId);
 }
 
+/**
+ * Open a global WebSocket that receives events for every conversation the
+ * signed-in user belongs to. Only supported on Tauri — the WASM target still
+ * relies on per-convo subscriptions. Call once after login.
+ */
+export async function subscribeAllEvents(): Promise<void> {
+	if (isTauri) {
+		return tauriInvoke('subscribe_all_events');
+	}
+	// Browser/WASM: no-op for now. Per-convo subscribe still works; full
+	// parity is tracked separately.
+}
+
+export async function unsubscribeAllEvents(): Promise<void> {
+	if (isTauri) {
+		return tauriInvoke('unsubscribe_all_events');
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------

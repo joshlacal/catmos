@@ -165,6 +165,8 @@ pub fn run() {
             commands::get_group_members,
             commands::subscribe_conversation,
             commands::unsubscribe_conversation,
+            commands::subscribe_all_events,
+            commands::unsubscribe_all_events,
             commands::fetch_new_messages,
             commands::get_profiles,
             commands::send_reaction,

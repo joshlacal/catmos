@@ -9,7 +9,7 @@
 	import { messages } from '$lib/stores/messages';
 	import { saveCursor, getCursor } from '$lib/stores/cursors';
 	import * as api from '$lib/wasm';
-	import { listenForEvent } from '$lib/wasm';
+	import { listenForEvent, isTauri } from '$lib/wasm';
 	import type {
 		Message,
 		PreparedImageUpload,
@@ -97,48 +97,55 @@
 
 	async function subscribeToConversation(convoId: string, force = false) {
 		if (!force && subscribedConvoId === convoId) return;
+		// On Tauri, the global WS started on login already covers this convo;
+		// spawning an extra per-convo WS here would just open a duplicate
+		// connection. Still tear down any prior per-convo handle and update
+		// the read cursor.
 		if (subscribedConvoId) {
 			await api.unsubscribeConversation(subscribedConvoId).catch(() => {});
 		}
 		subscribedConvoId = convoId;
 
-		// Restore saved cursor so we resume from last-seen position
-		const savedCursor = getCursor(convoId);
-		await api
-			.subscribeConversation(
-				convoId,
-				(msg) => {
-					const m = msg as Message;
-					messages.addIncoming(m);
-					saveCursor(convoId, m.id);
-					notifyIncomingMessage(m.senderHandle, m.content, convoId);
-				},
-				(event) => {
-					const e = event as { type: string; data: unknown };
-					if (e?.type === 'reaction') {
-						messages.applyReaction(e.data as ReactionEvent);
-					} else if (e?.type === 'typing') {
-						messages.applyTyping(e.data as TypingEvent);
-					} else if (e?.type === 'fetchNeeded') {
-						const reason = (e as { reason?: string }).reason ?? 'unknown';
-						console.warn(`[catmos] WS decrypt failed (${reason}), fetching via HTTP`);
-						messages.fetchFromServer(convoId);
-					}
-				},
-				(status) => {
-					const s = status as { type?: string };
-					if (s?.type === 'connected' || s?.type === 'open') {
-						connection.setConnected();
-					} else if (s?.type === 'closed' || s?.type === 'error') {
-						connection.setDisconnected(s.type);
-					}
-				},
-				savedCursor ?? undefined
-			)
-			.catch((e: unknown) => {
-				console.error('WebSocket subscribe failed:', e);
-				connection.setDisconnected(String(e));
-			});
+		if (!isTauri) {
+			// Browser/WASM path: no global WS yet, keep using per-convo
+			// subscribeConversation with its callback-driven delivery.
+			const savedCursor = getCursor(convoId);
+			await api
+				.subscribeConversation(
+					convoId,
+					(msg) => {
+						const m = msg as Message;
+						messages.addIncoming(m);
+						saveCursor(convoId, m.id);
+						notifyIncomingMessage(m.senderHandle, m.content, convoId);
+					},
+					(event) => {
+						const e = event as { type: string; data: unknown };
+						if (e?.type === 'reaction') {
+							messages.applyReaction(e.data as ReactionEvent);
+						} else if (e?.type === 'typing') {
+							messages.applyTyping(e.data as TypingEvent);
+						} else if (e?.type === 'fetchNeeded') {
+							const reason = (e as { reason?: string }).reason ?? 'unknown';
+							console.warn(`[catmos] WS decrypt failed (${reason}), fetching via HTTP`);
+							messages.fetchFromServer(convoId);
+						}
+					},
+					(status) => {
+						const s = status as { type?: string };
+						if (s?.type === 'connected' || s?.type === 'open') {
+							connection.setConnected();
+						} else if (s?.type === 'closed' || s?.type === 'error') {
+							connection.setDisconnected(s.type);
+						}
+					},
+					savedCursor ?? undefined
+				)
+				.catch((e: unknown) => {
+					console.error('WebSocket subscribe failed:', e);
+					connection.setDisconnected(String(e));
+				});
+		}
 		connection.setConnected();
 		api.updateCursor(convoId, '').catch(() => {});
 		conversations.markConversationRead(convoId);
@@ -159,6 +166,15 @@
 
 	$effect(() => {
 		if ($auth.user) {
+			// Open a single global WS so we receive events for every convo
+			// the user belongs to, not just the currently-selected one.
+			// Matches iOS/Android/CLI; without it, messages landing in a
+			// background conversation were invisible until the user clicked
+			// into it, which caused the "only see messages from same-account
+			// other-device" symptom.
+			api.subscribeAllEvents().catch((e) =>
+				console.warn('[catmos] subscribeAllEvents failed', e)
+			);
 			conversations.load().then(() => {
 				// Startup reconciliation: leave any group containing a DID the
 				// user has blocked (from another client or a previous interrupted

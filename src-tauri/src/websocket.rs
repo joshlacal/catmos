@@ -143,7 +143,7 @@ pub async fn subscribe_conversation(
             &orchestrator,
             &api_base_url,
             &auth_token,
-            &convo_id,
+            Some(&convo_id),
             last_cursor.as_deref(),
             &mut shutdown,
         )
@@ -176,24 +176,103 @@ pub async fn subscribe_conversation(
     }
 }
 
+/// Subscribe globally (across all the user's conversations). Matches the
+/// iOS/Android/CLI wiring — omitting convoId gives a single connection that
+/// receives every event the server would fan out to this user. The per-convo
+/// subscribe_conversation path stayed working for a single selected convo,
+/// but any message landing in a convo the user wasn't currently viewing got
+/// dropped because no subscription existed for it.
+pub async fn subscribe_all(
+    app: AppHandle,
+    orchestrator: Arc<CatmosOrchestrator>,
+    api_base_url: String,
+    auth_token: String,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    const GLOBAL_CURSOR_KEY: &str = "__global__";
+    let mut last_cursor: Option<String> = orchestrator.storage().get_ws_cursor(GLOBAL_CURSOR_KEY);
+    if last_cursor.is_some() {
+        log_ws!("Loaded persisted global cursor");
+    }
+    let mut attempt = 0u32;
+
+    loop {
+        if *shutdown.borrow() {
+            log_ws!("Shutdown detected (global)");
+            break;
+        }
+
+        attempt += 1;
+        log_ws!("Connecting attempt {} (global)", attempt);
+
+        match do_subscribe(
+            &app,
+            &orchestrator,
+            &api_base_url,
+            &auth_token,
+            None,
+            last_cursor.as_deref(),
+            &mut shutdown,
+        )
+        .await
+        {
+            Ok(cursor) => {
+                last_cursor = cursor;
+                attempt = 0;
+            }
+            Err(e) => {
+                log_ws!("Error (global): {}", e);
+            }
+        }
+
+        if *shutdown.borrow() {
+            log_ws!("Shutdown detected after disconnect (global)");
+            break;
+        }
+
+        let delay = std::cmp::min(1 << attempt.min(5), 30);
+        log_ws!("Reconnecting in {}s (global)", delay);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {},
+            _ = shutdown.changed() => {
+                log_ws!("Shutdown during backoff (global)");
+                break;
+            },
+        }
+    }
+}
+
 /// Single WebSocket connection session. Returns the last cursor on clean disconnect.
+/// `convo_id` = Some(id) subscribes to a single conversation; `None` subscribes
+/// globally to every event the server fans out to the authenticated user.
 async fn do_subscribe(
     app: &AppHandle,
     orchestrator: &Arc<CatmosOrchestrator>,
     api_base_url: &str,
     auth_token: &str,
-    convo_id: &str,
+    convo_id: Option<&str>,
     cursor: Option<&str>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<String>, String> {
+    const GLOBAL_CURSOR_KEY: &str = "__global__";
+    let cursor_key = convo_id.unwrap_or(GLOBAL_CURSOR_KEY);
+    let label_owned: String = convo_id
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "*".to_string());
+    let label: &str = &label_owned;
+
     // 1. Get subscription ticket
     let client = reqwest::Client::new();
+    let ticket_body = match convo_id {
+        Some(c) => serde_json::json!({ "convoId": c }),
+        None => serde_json::json!({}),
+    };
     let ticket_resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
         "{}/xrpc/blue.catbird.mlsChat.getSubscriptionTicket",
         api_base_url
     )))
     .bearer_auth(auth_token)
-    .json(&serde_json::json!({ "convoId": convo_id }))
+    .json(&ticket_body)
     .send()
     .await
     .map_err(|e| format!("Ticket request failed: {}", e))?;
@@ -214,8 +293,12 @@ async fn do_subscribe(
         .as_str()
         .ok_or("No endpoint in response")?;
 
-    // 2. Connect to WebSocket
-    let mut ws_url = format!("{}?convoId={}&ticket={}", ws_endpoint, convo_id, ticket);
+    // 2. Connect to WebSocket. Omit convoId in global mode so the server sends
+    //    events from every conversation the user is a member of on one stream.
+    let mut ws_url = match convo_id {
+        Some(c) => format!("{}?convoId={}&ticket={}", ws_endpoint, c, ticket),
+        None => format!("{}?ticket={}", ws_endpoint, ticket),
+    };
     if let Some(cur) = cursor {
         ws_url.push_str(&format!("&cursor={}", cur));
     }
@@ -224,8 +307,8 @@ async fn do_subscribe(
         .await
         .map_err(|e| format!("WebSocket connect failed: {}", e))?;
 
-    log_ws!("Connected to {}", convo_id);
-    let _ = app.emit("mls-ws-connected", convo_id);
+    log_ws!("Connected to {}", label);
+    let _ = app.emit("mls-ws-connected", label);
 
     let mut last_cursor: Option<String> = cursor.map(String::from);
 
@@ -234,10 +317,10 @@ async fn do_subscribe(
             msg = ws_stream.next() => {
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
-                        log_ws!("Received binary frame: {} bytes", data.len());
-                        match handle_binary_frame(app, orchestrator, &data, convo_id).await {
+                        log_ws!("Received binary frame: {} bytes ({})", data.len(), label);
+                        match handle_binary_frame(app, orchestrator, &data, label).await {
                             Ok(Some(cur)) => {
-                                orchestrator.storage().set_ws_cursor(convo_id, &cur);
+                                orchestrator.storage().set_ws_cursor(cursor_key, &cur);
                                 last_cursor = Some(cur);
                             }
                             Ok(None) => {},
@@ -248,7 +331,7 @@ async fn do_subscribe(
                         let _ = ws_stream.send(WsMessage::Pong(data)).await;
                     }
                     Some(Ok(WsMessage::Close(_))) => {
-                        log_ws!("Closed by server for {}", convo_id);
+                        log_ws!("Closed by server for {}", label);
                         break;
                     }
                     Some(Err(e)) => {
@@ -267,7 +350,7 @@ async fn do_subscribe(
         }
     }
 
-    let _ = app.emit("mls-ws-disconnected", convo_id);
+    let _ = app.emit("mls-ws-disconnected", label);
     Ok(last_cursor)
 }
 
@@ -309,11 +392,44 @@ async fn handle_binary_frame(
             let ciphertext =
                 cbor_bytes(msg_map, "ciphertext").ok_or("Missing or invalid message.ciphertext")?;
 
+            // Diagnostic: first 8 bytes + predicted strip_padding decision. A valid
+            // MlsMessage starts with `0x00 0x01 0x00 0x0[1-5]` (version 1, wire
+            // format Public/Private/Welcome/GroupInfo/KeyPackage). Anything else
+            // means this payload was never wrapped as an MlsMessage, and the MLS
+            // layer will bail with `SerializationError`. We also predict what
+            // `strip_padding` (in catbird-mls/src/api.rs) will do by mirroring
+            // its check: claimed_len > 0 && ≤ len-4 && first body byte 0x00..=0x04.
+            let head_hex: String = ciphertext
+                .iter()
+                .take(8)
+                .map(|b| format!("{:02x}", b))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let strip_decision: &'static str = if ciphertext.len() >= 5 {
+                let claimed_len = u32::from_be_bytes([
+                    ciphertext[0],
+                    ciphertext[1],
+                    ciphertext[2],
+                    ciphertext[3],
+                ]) as usize;
+                if claimed_len > 0
+                    && claimed_len <= ciphertext.len().saturating_sub(4)
+                    && matches!(ciphertext[4], 0x00..=0x04)
+                {
+                    "STRIP"
+                } else {
+                    "PASS"
+                }
+            } else {
+                "TOOSMALL"
+            };
             log_ws!(
-                "Parsed message {} epoch={} ct_len={}",
+                "Parsed message {} epoch={} ct_len={} head={} strip={}",
                 id,
                 epoch,
-                ciphertext.len()
+                ciphertext.len(),
+                head_hex,
+                strip_decision
             );
 
             // Build envelope for orchestrator
@@ -650,6 +766,44 @@ async fn handle_binary_frame(
                 typing_data.conversation_id
             );
 
+            Ok(cursor)
+        }
+        "#treeChanged" => {
+            // Server signals the canonical MLS tree has moved forward. Payload is
+            // metadata-only (cursor, convoId, confirmationTag, epoch); the actual
+            // commit arrives either as a separate #messageEvent (messageType=commit)
+            // or is fetched by the HTTP sync path. Trust the HTTP path — the WS
+            // commit payload is currently unreliable (orphan/malformed bytes delivered
+            // by the server for heavily-inflated groups). Kick an async sync so the
+            // orchestrator walks commits from its local epoch forward.
+            let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
+                .map_err(|e| format!("Failed to decode treeChanged CBOR: {}", e))?;
+            let CborValue::Map(ref top) = payload else {
+                return Ok(cbor_str_from_cbor(&payload, "cursor"));
+            };
+            let cursor = cbor_str(top, "cursor");
+            let server_epoch = cbor_int(top, "epoch").unwrap_or(0);
+            log_ws!(
+                "Tree changed for {} — server epoch {}, scheduling sync",
+                convo_id,
+                server_epoch
+            );
+            let orch = Arc::clone(orchestrator);
+            let app_clone = app.clone();
+            let convo_id_owned = convo_id.to_string();
+            tokio::spawn(async move {
+                if let Err(e) = orch.sync_with_server(false).await {
+                    let line = format!(
+                        "[catmos {}] [WS] treeChanged sync failed for {}: {:?}\n",
+                        chrono::Local::now().format("%H:%M:%S%.3f"),
+                        convo_id_owned,
+                        e
+                    );
+                    commands::append_log_line(&line);
+                } else {
+                    let _ = app_clone.emit("mls-tree-changed", &convo_id_owned);
+                }
+            });
             Ok(cursor)
         }
         _ => {
