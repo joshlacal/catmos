@@ -569,6 +569,7 @@ impl ReqwestApiClient {
         convo_id: &str,
         failure_type: &str,
         epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
     ) -> Result<()> {
         let token = self.auth_header()?;
 
@@ -583,6 +584,12 @@ impl ReqwestApiClient {
         // accepting our reports unchanged.
         if let Some(auth) = epoch_authenticator {
             body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
+        }
+        // ADR-008 D1 (spec §8.6.1): include failureMode when the orchestrator
+        // produced one. Servers without D1 enforcement ignore the field;
+        // servers with D1 enforcement use it to filter Mode A from quorum.
+        if let Some(mode) = failure_mode {
+            body["failureMode"] = serde_json::Value::String(mode.to_string());
         }
 
         let resp = self
@@ -1355,8 +1362,9 @@ impl MLSAPIClient for ReqwestApiClient {
         convo_id: &str,
         failure_type: &str,
         epoch_authenticator: Option<&str>,
+        failure_mode: Option<&str>,
     ) -> Result<()> {
-        self.post_recovery_failure(convo_id, failure_type, epoch_authenticator)
+        self.post_recovery_failure(convo_id, failure_type, epoch_authenticator, failure_mode)
             .await
     }
 

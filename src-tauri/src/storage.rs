@@ -51,6 +51,9 @@ impl SqliteStorage {
                 metadata_json TEXT,
                 created_at TEXT,
                 updated_at TEXT,
+                reset_new_group_id TEXT,
+                reset_generation INTEGER,
+                reset_notified_at_ms INTEGER,
                 PRIMARY KEY (conversation_id, user_did)
             );
 
@@ -96,6 +99,46 @@ impl SqliteStorage {
             ",
         )?;
         Self::ensure_messages_delivery_status_column(&conn)?;
+        Self::ensure_conversations_reset_pending_columns(&conn)?;
+        Ok(())
+    }
+
+    fn ensure_conversations_reset_pending_columns(
+        conn: &Connection,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(conversations)")?;
+        let mut has_reset_new_group_id = false;
+        let mut has_reset_generation = false;
+        let mut has_reset_notified_at_ms = false;
+        let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+        for column_name in column_names {
+            match column_name?.as_str() {
+                "reset_new_group_id" => has_reset_new_group_id = true,
+                "reset_generation" => has_reset_generation = true,
+                "reset_notified_at_ms" => has_reset_notified_at_ms = true,
+                _ => {}
+            }
+        }
+
+        if !has_reset_new_group_id {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN reset_new_group_id TEXT",
+                [],
+            )?;
+        }
+        if !has_reset_generation {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN reset_generation INTEGER",
+                [],
+            )?;
+        }
+        if !has_reset_notified_at_ms {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN reset_notified_at_ms INTEGER",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -147,6 +190,44 @@ impl SqliteStorage {
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Rehydrate a `ConversationState::ResetPending` payload from the
+    /// persisted columns (spec §8.5). Returns `Some(ResetPending { .. })`
+    /// only when all three reset columns are non-NULL — partial rows are
+    /// treated as "no payload" and yield `None`. Callers that need to
+    /// repopulate the orchestrator's in-memory `conversation_states` map
+    /// after restart should consult this helper.
+    pub fn get_reset_pending(&self, conversation_id: &str) -> Option<ConversationState> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT reset_new_group_id, reset_generation, reset_notified_at_ms
+             FROM conversations WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+            |row| {
+                let new_group_id: Option<String> = row.get(0)?;
+                let reset_generation: Option<i64> = row.get(1)?;
+                let notified_at_ms: Option<i64> = row.get(2)?;
+                Ok((new_group_id, reset_generation, notified_at_ms))
+            },
+        )
+        .ok()
+        .and_then(
+            |(new_group_id, reset_generation, notified_at_ms)| match (
+                new_group_id,
+                reset_generation,
+                notified_at_ms,
+            ) {
+                (Some(new_group_id), Some(reset_generation), Some(notified_at_ms)) => {
+                    Some(ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation: reset_generation as i32,
+                        notified_at_ms,
+                    })
+                }
+                _ => None,
+            },
+        )
     }
 
     /// Persist a per-conversation WebSocket cursor (spec §7.1).
@@ -324,6 +405,34 @@ impl MLSStorageBackend for SqliteStorage {
         Ok(())
     }
 
+    /// Read the persisted conversation state (spec §8.2). The `state` column
+    /// stores a JSON-serialized `ConversationState`, so we round-trip through
+    /// serde and the full payload (including `ResetPending {..}`) survives.
+    /// Returns `Ok(None)` when the row is missing or the column is NULL/empty.
+    async fn get_conversation_state(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationState>> {
+        let conn = self.conn.lock().unwrap();
+        let state_str: Option<String> = conn
+            .query_row(
+                "SELECT state FROM conversations WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let Some(s) = state_str else {
+            return Ok(None);
+        };
+        if s.is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str::<ConversationState>(&s)
+            .map(Some)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
+    }
+
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -350,6 +459,48 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE conversations SET needs_rejoin = 0 WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist the RESET_PENDING payload (spec §8.5) so a `groupReset`
+    /// observed before a restart survives the restart and the deferred
+    /// recovery loop can resume Phase 1 against the new group id.
+    async fn mark_reset_pending(
+        &self,
+        conversation_id: &str,
+        new_group_id_hex: &str,
+        reset_generation: i32,
+        notified_at_ms: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET reset_new_group_id = ?1,
+                 reset_generation = ?2,
+                 reset_notified_at_ms = ?3
+             WHERE conversation_id = ?4",
+            rusqlite::params![
+                new_group_id_hex,
+                reset_generation as i64,
+                notified_at_ms,
+                conversation_id,
+            ],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL
+             WHERE conversation_id = ?1",
             rusqlite::params![conversation_id],
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;

@@ -635,7 +635,12 @@ async fn handle_binary_frame(
             );
 
             // Flag for deferred recovery — External Commits only in deferred
-            // recovery, never inline in event handlers.
+            // recovery, never inline in event handlers. Recovery dispatch
+            // reads the `needs_rejoin` boolean (recovery.rs), so we keep
+            // marking it; in addition we persist the RESET_PENDING payload
+            // (spec §8.5) so the new group id + reset generation survive a
+            // restart even if the orchestrator's in-memory
+            // `conversation_states` map is empty on next boot.
             if let Err(e) = orchestrator
                 .storage()
                 .mark_needs_rejoin(convo_id)
@@ -643,17 +648,69 @@ async fn handle_binary_frame(
             {
                 log_ws!("Failed to mark_needs_rejoin for {}: {:?}", convo_id, e);
             }
-            if let Err(e) = orchestrator
-                .storage()
-                .set_conversation_state(
-                    convo_id,
-                    catbird_mls::orchestrator::types::ConversationState::NeedsRejoin,
-                )
-                .await
-            {
-                log_ws!("Failed to set NeedsRejoin state for {}: {:?}", convo_id, e);
+
+            let notified_at_ms = chrono::Utc::now().timestamp_millis();
+            if !new_group_id.is_empty() {
+                if let Err(e) = orchestrator
+                    .storage()
+                    .set_conversation_state(
+                        convo_id,
+                        catbird_mls::orchestrator::types::ConversationState::ResetPending {
+                            new_group_id: new_group_id.clone(),
+                            reset_generation,
+                            notified_at_ms,
+                        },
+                    )
+                    .await
+                {
+                    log_ws!(
+                        "Failed to set ResetPending state for {}: {:?}",
+                        convo_id,
+                        e
+                    );
+                }
+                if let Err(e) = orchestrator
+                    .storage()
+                    .mark_reset_pending(
+                        convo_id,
+                        &new_group_id,
+                        reset_generation,
+                        notified_at_ms,
+                    )
+                    .await
+                {
+                    log_ws!(
+                        "Failed to persist ResetPending payload for {}: {:?}",
+                        convo_id,
+                        e
+                    );
+                } else {
+                    log_ws!(
+                        "Flagged {} for deferred rejoin after group reset (newGroupId={}, gen={})",
+                        convo_id,
+                        new_group_id,
+                        reset_generation
+                    );
+                }
             } else {
-                log_ws!("Flagged {} for deferred rejoin after group reset", convo_id);
+                // Server didn't send a new group id; fall back to NeedsRejoin
+                // state so the recovery loop still picks this up via the
+                // pre-reset lookup-by-conversation-id heuristic.
+                if let Err(e) = orchestrator
+                    .storage()
+                    .set_conversation_state(
+                        convo_id,
+                        catbird_mls::orchestrator::types::ConversationState::NeedsRejoin,
+                    )
+                    .await
+                {
+                    log_ws!("Failed to set NeedsRejoin state for {}: {:?}", convo_id, e);
+                } else {
+                    log_ws!(
+                        "Flagged {} for deferred rejoin after group reset (no newGroupId in payload)",
+                        convo_id
+                    );
+                }
             }
 
             // Adopt the new group id locally so the deferred rejoin targets
