@@ -1542,4 +1542,167 @@ mod tests {
             "legacy InputData path no longer double-encodes — re-evaluate fix"
         );
     }
+
+    // -------------------------------------------------------------------
+    // reportRecoveryFailure wire test (Phase 1 / plan task 15)
+    // -------------------------------------------------------------------
+    //
+    // Verifies that ReqwestApiClient::report_recovery_failure produces a
+    // POST against the right xrpc path with the correct camelCase body
+    // (including the optional epochAuthenticator + failureMode discriminators
+    // from spec §8.6 / ADR-008 D1) and a Bearer auth header. Spawns an
+    // in-process loopback HTTP listener so we exercise the actual reqwest
+    // client end-to-end without bringing in wiremock.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    struct CapturedRequest {
+        method: String,
+        path: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    /// Spawn a single-shot loopback HTTP server. Returns (base_url, recv).
+    /// The server accepts ONE connection, parses one request, replies 200,
+    /// and forwards the captured request to the channel. Bind to port 0 so
+    /// tests run in parallel without collisions.
+    fn spawn_capture_server() -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            // Read until we see the end-of-headers marker, then drain
+            // Content-Length more bytes for the body.
+            let mut buf = Vec::with_capacity(4096);
+            let mut chunk = [0u8; 1024];
+            let header_end = loop {
+                let n = stream.read(&mut chunk).expect("read headers");
+                if n == 0 {
+                    break buf.len();
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let mut headers_buf = [httparse::EMPTY_HEADER; 32];
+            let mut req = httparse::Request::new(&mut headers_buf);
+            req.parse(&buf[..header_end]).expect("parse request");
+            let method = req.method.unwrap_or("").to_string();
+            let path = req.path.unwrap_or("").to_string();
+            let mut content_length = 0usize;
+            let headers: Vec<(String, String)> = req
+                .headers
+                .iter()
+                .map(|h| {
+                    let name = h.name.to_string();
+                    let value = std::str::from_utf8(h.value).unwrap_or("").to_string();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse().unwrap_or(0);
+                    }
+                    (name, value)
+                })
+                .collect();
+            let mut body = buf[header_end..].to_vec();
+            while body.len() < content_length {
+                let n = stream.read(&mut chunk).expect("read body");
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&chunk[..n]);
+            }
+            body.truncate(content_length);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n{}",
+            );
+            let _ = tx.send(CapturedRequest {
+                method,
+                path,
+                headers,
+                body,
+            });
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    #[tokio::test]
+    async fn report_recovery_failure_posts_correct_xrpc_request() {
+        let (base_url, rx) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+
+        client
+            .report_recovery_failure(
+                "convo-x",
+                "external_commit_exhausted",
+                Some("deadbeefcafe1234"),
+                Some("local_state_loss"),
+            )
+            .await
+            .expect("report_recovery_failure should succeed against 200 OK");
+
+        let captured = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server received request");
+
+        assert_eq!(captured.method, "POST");
+        assert_eq!(
+            captured.path, "/xrpc/blue.catbird.mlsChat.reportRecoveryFailure",
+            "must POST to the reportRecoveryFailure XRPC NSID"
+        );
+
+        let auth_header = captured
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .expect("Authorization header must be present");
+        assert_eq!(auth_header.1, "Bearer test-token");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("body is JSON");
+        assert_eq!(body["convoId"], "convo-x");
+        assert_eq!(body["failureType"], "external_commit_exhausted");
+        // ADR-002 / spec §8.6: epoch_authenticator is hex-encoded and bound
+        // to the reporter's current epoch so stale clients can't forge votes.
+        assert_eq!(body["epochAuthenticator"], "deadbeefcafe1234");
+        // ADR-008 D1 / spec §8.6.1: failureMode discriminator. Must round-trip
+        // verbatim so the server-side D1 filter can exclude Mode A votes from
+        // quorum auto-reset.
+        assert_eq!(body["failureMode"], "local_state_loss");
+    }
+
+    #[tokio::test]
+    async fn report_recovery_failure_omits_optional_fields_when_none() {
+        let (base_url, rx) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+
+        client
+            .report_recovery_failure("convo-y", "remote_data_error", None, None)
+            .await
+            .expect("report_recovery_failure should succeed against 200 OK");
+
+        let captured = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server received request");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&captured.body).expect("body is JSON");
+        assert_eq!(body["convoId"], "convo-y");
+        assert_eq!(body["failureType"], "remote_data_error");
+        // Both optional discriminators must be absent (not null) when not
+        // supplied — matches the lexicon's `skip_serializing_if = is_none`.
+        assert!(
+            body.get("epochAuthenticator").is_none(),
+            "epochAuthenticator must be omitted when caller passes None"
+        );
+        assert!(
+            body.get("failureMode").is_none(),
+            "failureMode must be omitted when caller passes None"
+        );
+    }
 }
