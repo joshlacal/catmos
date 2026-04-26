@@ -816,6 +816,68 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
+    async fn bootstrap_reset_group(
+        &self,
+        original_convo_id: &str,
+        new_group_id: &str,
+        cipher_suite: &str,
+        group_info: &[u8],
+        members: &[String],
+        welcome_message: Option<&[u8]>,
+    ) -> Result<CreateConversationResult> {
+        let token = self.auth_header()?;
+
+        // Build the request body directly. catmos-cli-impl's notes on
+        // ad50a0d/7bb8565 flag that going through the catbird-atproto
+        // InputData adapter double-encodes byte fields; constructing JSON
+        // directly is the safe path until a per-endpoint shim lands.
+        // Mirrors the pattern catmos itself uses for commitGroupChange
+        // (see task #66 fix `catmos: fix double-base64 bug in
+        // commitGroupChange wire encoding`).
+        let body = serde_json::json!({
+            "originalConvoId": original_convo_id,
+            "newGroupId": new_group_id,
+            "cipherSuite": cipher_suite,
+            "groupInfo": B64.encode(group_info),
+            "members": members
+                .iter()
+                .map(|d| serde_json::Value::String(d.clone()))
+                .collect::<Vec<_>>(),
+            "welcomeMessage": welcome_message.map(|w| B64.encode(w)),
+            // Bootstrap epoch is always 1 (fresh group at epoch 1); server
+            // hard-sets current_epoch = 1 anyway, this is telemetry per the
+            // lexicon.
+            "currentEpoch": 1,
+        });
+
+        let resp = self
+            .client
+            .post(self.xrpc_url("blue.catbird.mlsChat.bootstrapResetGroup"))
+            .bearer_auth(&token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(self.handle_error(resp).await);
+        }
+
+        let body_bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output = parse_lexicon_json::<
+            blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupOutput<'_>,
+        >(body_bytes.as_ref())?;
+
+        Ok(CreateConversationResult {
+            conversation: convo_view_to_conversation(&output.convo),
+            commit_data: None,
+            welcome_data: None,
+        })
+    }
+
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
         let token = self.auth_header()?;
         let input: lexicon::leave_convo::Input = lexicon::leave_convo::InputData {
