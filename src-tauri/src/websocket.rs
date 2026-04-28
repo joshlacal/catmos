@@ -853,7 +853,13 @@ async fn handle_binary_frame(
             // Hand to the shared Rust core. `record_reset_requested` is
             // idempotent against (convo_id, reset_generation) so duplicate
             // SSE deliveries (reconnect / cursor replay) collapse to a
-            // single state transition.
+            // single state transition. The orchestrator (a) writes
+            // ResetPending state, (b) deletes the old MLS group, (c)
+            // resets the recovery tracker, (d) rebinds `group_states`
+            // and `mark_needs_rejoin`, and (e) persists the new group
+            // id (server-supplied OR orchestrator-minted for indirect
+            // triggers per Phase 2.5 §1) into the reset_pending payload
+            // via `mark_reset_pending`.
             if let Err(e) = orchestrator
                 .record_reset_requested(
                     convo_id,
@@ -861,7 +867,7 @@ async fn handle_binary_frame(
                     parsed.reset_generation,
                     &parsed.trigger,
                     &parsed.request_event_id,
-                    parsed.expected_new_mls_group_id,
+                    parsed.expected_new_mls_group_id.clone(),
                 )
                 .await
             {
@@ -871,6 +877,74 @@ async fn handle_binary_frame(
                     parsed.reset_generation,
                     parsed.trigger,
                     e
+                );
+                // Don't proceed with the local mirror — leave
+                // `conversations.group_id` pointing at the pre-reset
+                // value so a retry on the next delivery has consistent
+                // state to overwrite.
+                return Ok(parsed.cursor);
+            }
+
+            // Mirror the new group id into `conversations.group_id`
+            // (catmos-specific table; not in the orchestrator's
+            // `MLSStorageBackend` trait surface). The existing
+            // `#groupResetEvent` handler does the same via
+            // `update_conversation_group_id`. Without this mirror,
+            // `get_conversation`/`list_conversations` would return the
+            // pre-reset group_id while `group_states` already holds the
+            // new one — divergence between the two tables that
+            // surfaces as wrong group ids in any UI / sync path that
+            // joins on `conversations`.
+            //
+            // We read the authoritative value back from
+            // `get_reset_pending` because for indirect-trigger paths
+            // (`expectedNewMlsGroupId == null`) the orchestrator mints
+            // the id internally and doesn't return it. For
+            // server-supplied paths the SSE field and the persisted
+            // value are identical.
+            let new_group_id_for_mirror = orchestrator
+                .storage()
+                .get_reset_pending(convo_id)
+                .and_then(|state| match state {
+                    catbird_mls::orchestrator::types::ConversationState::ResetPending {
+                        new_group_id,
+                        ..
+                    } => Some(new_group_id),
+                    _ => None,
+                })
+                .or_else(|| parsed.expected_new_mls_group_id.clone());
+
+            if let Some(ref new_group_id) = new_group_id_for_mirror {
+                if !new_group_id.is_empty() {
+                    if let Err(e) = orchestrator
+                        .storage()
+                        .update_conversation_group_id(convo_id, new_group_id)
+                    {
+                        log_ws!(
+                            "Failed to update conversations.group_id for {} to {}: {:?}",
+                            convo_id,
+                            new_group_id,
+                            e
+                        );
+                    } else {
+                        log_ws!(
+                            "Adopted new group_id {} for convo {} (Phase 2.5 indirect)",
+                            new_group_id,
+                            convo_id
+                        );
+                    }
+                }
+            } else {
+                // Should not happen — `record_reset_requested` always
+                // persists ResetPending unless it short-circuited on
+                // idempotency, in which case the existing row already
+                // has the right group id and we don't need to touch
+                // `conversations`. Log so we notice if this assumption
+                // ever breaks.
+                log_ws!(
+                    "resetRequested: no ResetPending payload after record_reset_requested for {} \
+                     (idempotent dup or storage gap?) — skipping conversations.group_id mirror",
+                    convo_id
                 );
             }
 
