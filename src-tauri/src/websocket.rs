@@ -112,6 +112,54 @@ fn split_frame(data: &[u8]) -> Option<(FrameHeader, &[u8])> {
     Some((header, &data[consumed..]))
 }
 
+/// Fields extracted from a `#resetRequestedEvent` CBOR payload (Phase 2.5).
+/// Matches the lexicon-generated `ResetRequestedEvent` shape (camelCase wire
+/// fields → snake_case Rust). See plan §2 for the wire schema and
+/// `catbird-mls/src/orchestrator/recovery.rs::record_reset_requested` for
+/// the consumer signature.
+#[derive(Debug, PartialEq, Eq)]
+struct ResetRequestedPayload {
+    cursor: Option<String>,
+    crypto_session_id: String,
+    reset_generation: i32,
+    trigger: String,
+    request_event_id: String,
+    expected_new_mls_group_id: Option<String>,
+    reason: Option<String>,
+}
+
+/// Decode a `#resetRequestedEvent` CBOR payload into the
+/// `ResetRequestedPayload` projection consumed by the SSE dispatcher and
+/// shared Rust core.
+///
+/// Returns `None` if the payload isn't a CBOR map (caller falls back to
+/// `cbor_str_from_cbor` for cursor extraction). Missing optional fields
+/// default per the orchestrator contract:
+///   - `cryptoSessionId`, `trigger`, `requestEventId` → `""`
+///   - `generation` → `0` (saturated to `i32::MAX` on overflow; the
+///     lexicon types `generation: i64` while the orchestrator stores
+///     `reset_generation: i32`)
+///   - `expectedNewMlsGroupId`, `reason` → `None`
+///
+/// Idempotency on the orchestrator side is keyed on
+/// `(convoId, generation)`; duplicate deliveries via SSE reconnect or
+/// `event_stream` cursor replay collapse there.
+fn parse_reset_requested_payload(payload: &CborValue) -> Option<ResetRequestedPayload> {
+    let CborValue::Map(ref top) = payload else {
+        return None;
+    };
+    let generation = cbor_int(top, "generation").unwrap_or(0);
+    Some(ResetRequestedPayload {
+        cursor: cbor_str(top, "cursor"),
+        crypto_session_id: cbor_str(top, "cryptoSessionId").unwrap_or_default(),
+        reset_generation: i32::try_from(generation).unwrap_or(i32::MAX),
+        trigger: cbor_str(top, "trigger").unwrap_or_default(),
+        request_event_id: cbor_str(top, "requestEventId").unwrap_or_default(),
+        expected_new_mls_group_id: cbor_str(top, "expectedNewMlsGroupId"),
+        reason: cbor_str(top, "reason"),
+    })
+}
+
 /// Subscribe to a conversation via WebSocket and process incoming messages.
 pub async fn subscribe_conversation(
     app: AppHandle,
@@ -771,6 +819,63 @@ async fn handle_binary_frame(
 
             Ok(cursor)
         }
+        // Phase 2.5 (`docs/plans/phase-2-5-indirect-funneling.md` §2 / §4):
+        // server-emitted indirect-trigger reset. Server hands us
+        // `cryptoSessionId`, `generation`, `trigger`, `requestEventId`, and
+        // (usually null) `expectedNewMlsGroupId`. We hand the whole bundle to
+        // `record_reset_requested`, which mirrors `GroupResetEvent` handling
+        // (ResetPending state, group-state rebinding, recovery-tracker reset,
+        // `mark_needs_rejoin`). The deferred-recovery sync loop then drives
+        // first-responder bootstrap via `join_or_rejoin`. This is *silent*
+        // recovery infra — no UI surface beyond the structured log line and
+        // whatever the eventual rejoin emits.
+        "#resetRequestedEvent" => {
+            log_ws!("Reset requested event for {}", convo_id);
+            let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
+                .map_err(|e| format!("Failed to decode resetRequestedEvent CBOR: {}", e))?;
+
+            let parsed = match parse_reset_requested_payload(&payload) {
+                Some(p) => p,
+                None => return Ok(cbor_str_from_cbor(&payload, "cursor")),
+            };
+
+            log_ws!(
+                "resetRequested: convo={} cryptoSession={} gen={} trigger={} requestEventId={} expectedNewGroupId={} reason={}",
+                convo_id,
+                short_id(&parsed.crypto_session_id),
+                parsed.reset_generation,
+                parsed.trigger,
+                short_id(&parsed.request_event_id),
+                parsed.expected_new_mls_group_id.as_deref().unwrap_or("<none>"),
+                parsed.reason.as_deref().unwrap_or("<none>")
+            );
+
+            // Hand to the shared Rust core. `record_reset_requested` is
+            // idempotent against (convo_id, reset_generation) so duplicate
+            // SSE deliveries (reconnect / cursor replay) collapse to a
+            // single state transition.
+            if let Err(e) = orchestrator
+                .record_reset_requested(
+                    convo_id,
+                    &parsed.crypto_session_id,
+                    parsed.reset_generation,
+                    &parsed.trigger,
+                    &parsed.request_event_id,
+                    parsed.expected_new_mls_group_id,
+                )
+                .await
+            {
+                log_ws!(
+                    "record_reset_requested failed for {} (gen={} trigger={}): {:?}",
+                    convo_id,
+                    parsed.reset_generation,
+                    parsed.trigger,
+                    e
+                );
+            }
+
+            Ok(parsed.cursor)
+        }
         "#reactionEvent" => {
             log_ws!("Reaction event for {}", convo_id);
             let payload: CborValue = ciborium::from_reader(Cursor::new(payload_bytes))
@@ -884,5 +989,182 @@ fn cbor_str_from_cbor(val: &CborValue, key: &str) -> Option<String> {
     match val {
         CborValue::Map(ref entries) => cbor_str(entries, key),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Wire-format coverage for `#resetRequestedEvent` (Phase 2.5,
+    //! `docs/plans/phase-2-5-indirect-funneling.md` §2 / §4).
+    //!
+    //! These tests pin the CBOR → `ResetRequestedPayload` projection that
+    //! feeds `MLSOrchestrator::record_reset_requested`. The orchestrator
+    //! itself is exercised by `catbird-mls` tests; here we only assert that
+    //! catmos's SSE handler reads the lexicon-defined fields correctly.
+    //!
+    //! If the lexicon (`blue.catbird.mlsChat.subscribeEvents#resetRequestedEvent`)
+    //! changes shape, these tests should be the first thing that fails.
+    use super::*;
+
+    /// Build a minimal CBOR map for a reset_requested_event payload. Only
+    /// fields we want under test are passed; everything else is omitted to
+    /// match the optional-field behavior of the real wire format.
+    fn cbor_map_payload(entries: Vec<(&str, CborValue)>) -> CborValue {
+        CborValue::Map(
+            entries
+                .into_iter()
+                .map(|(k, v)| (CborValue::Text(k.into()), v))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn parse_reset_requested_full_payload() {
+        // Server emits all required fields plus optional reason +
+        // expectedNewMlsGroupId set (admin / direct-flow path). Verify
+        // every field plumbs through.
+        let payload = cbor_map_payload(vec![
+            ("cursor", CborValue::Text("seq-000123".into())),
+            ("convoId", CborValue::Text("c-abc".into())),
+            (
+                "cryptoSessionId",
+                CborValue::Text("did:plc:foo:cs-9".into()),
+            ),
+            ("generation", CborValue::Integer(17.into())),
+            ("trigger", CborValue::Text("inlineGroupInfo404".into())),
+            (
+                "requestEventId",
+                CborValue::Text("req-inline-404:c-abc:5:42".into()),
+            ),
+            (
+                "expectedNewMlsGroupId",
+                CborValue::Text("deadbeefcafebabe".into()),
+            ),
+            ("reason", CborValue::Text("groupinfo 404 threshold".into())),
+        ]);
+
+        let parsed = parse_reset_requested_payload(&payload).expect("payload is a CBOR map");
+
+        assert_eq!(parsed.cursor.as_deref(), Some("seq-000123"));
+        assert_eq!(parsed.crypto_session_id, "did:plc:foo:cs-9");
+        assert_eq!(parsed.reset_generation, 17);
+        assert_eq!(parsed.trigger, "inlineGroupInfo404");
+        assert_eq!(parsed.request_event_id, "req-inline-404:c-abc:5:42");
+        assert_eq!(
+            parsed.expected_new_mls_group_id.as_deref(),
+            Some("deadbeefcafebabe")
+        );
+        assert_eq!(parsed.reason.as_deref(), Some("groupinfo 404 threshold"));
+    }
+
+    #[test]
+    fn parse_reset_requested_indirect_trigger_no_group_id() {
+        // The Phase 2.5 indirect path: server does NOT mint a group id, so
+        // `expectedNewMlsGroupId` is absent. `record_reset_requested` then
+        // mints a client-side candidate. This is the dominant case in
+        // production once Phase 2.5 ships.
+        let payload = cbor_map_payload(vec![
+            ("cursor", CborValue::Text("seq-000124".into())),
+            ("convoId", CborValue::Text("c-xyz".into())),
+            ("cryptoSessionId", CborValue::Text("cs-prior".into())),
+            ("generation", CborValue::Integer(3.into())),
+            ("trigger", CborValue::Text("quorumVote".into())),
+            (
+                "requestEventId",
+                CborValue::Text("req-quorum:c-xyz:vote-7".into()),
+            ),
+        ]);
+
+        let parsed = parse_reset_requested_payload(&payload).expect("payload is a CBOR map");
+
+        assert!(parsed.expected_new_mls_group_id.is_none());
+        assert!(parsed.reason.is_none());
+        assert_eq!(parsed.reset_generation, 3);
+        assert_eq!(parsed.trigger, "quorumVote");
+        assert_eq!(parsed.request_event_id, "req-quorum:c-xyz:vote-7");
+    }
+
+    #[test]
+    fn parse_reset_requested_missing_required_fields_default_safely() {
+        // Defense in depth: if the server sends a malformed payload, we
+        // don't want to panic. Required strings default to "" and the
+        // orchestrator's idempotency check still functions on
+        // (convo_id, generation).
+        let payload = cbor_map_payload(vec![
+            ("cursor", CborValue::Text("seq-broken".into())),
+            ("generation", CborValue::Integer(5.into())),
+        ]);
+
+        let parsed = parse_reset_requested_payload(&payload).expect("payload is a CBOR map");
+
+        assert_eq!(parsed.crypto_session_id, "");
+        assert_eq!(parsed.trigger, "");
+        assert_eq!(parsed.request_event_id, "");
+        assert_eq!(parsed.reset_generation, 5);
+        assert!(parsed.expected_new_mls_group_id.is_none());
+    }
+
+    #[test]
+    fn parse_reset_requested_generation_overflow_saturates() {
+        // Lexicon types `generation: i64`; we saturate to `i32::MAX` rather
+        // than wrap or panic. In production generations are tiny but a
+        // server bug or attacker-supplied value should not crash the
+        // dispatcher.
+        let payload = cbor_map_payload(vec![
+            ("cursor", CborValue::Text("seq-x".into())),
+            ("generation", CborValue::Integer(i64::MAX.into())),
+            ("trigger", CborValue::Text("systemSweep".into())),
+            ("cryptoSessionId", CborValue::Text("cs".into())),
+            ("requestEventId", CborValue::Text("req".into())),
+        ]);
+
+        let parsed = parse_reset_requested_payload(&payload).expect("payload is a CBOR map");
+
+        assert_eq!(parsed.reset_generation, i32::MAX);
+    }
+
+    #[test]
+    fn parse_reset_requested_non_map_returns_none() {
+        // Non-map payloads can't be parsed; the dispatcher falls back to
+        // `cbor_str_from_cbor` for cursor extraction. Verify the helper
+        // signals that path correctly rather than producing a default
+        // payload that would still try to invoke `record_reset_requested`.
+        let payload = CborValue::Text("not a map".into());
+        assert!(parse_reset_requested_payload(&payload).is_none());
+
+        let payload = CborValue::Array(vec![]);
+        assert!(parse_reset_requested_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_reset_requested_round_trip_via_ciborium_serde() {
+        // Mirror the dispatcher's actual decode path: bytes → ciborium →
+        // CborValue → parse. This guards against subtle CBOR encoding
+        // mismatches between the test fixture (built by hand) and the
+        // server's serializer.
+        let payload = cbor_map_payload(vec![
+            ("cursor", CborValue::Text("seq-rt".into())),
+            ("convoId", CborValue::Text("c-rt".into())),
+            ("cryptoSessionId", CborValue::Text("cs-rt".into())),
+            ("generation", CborValue::Integer(42.into())),
+            ("trigger", CborValue::Text("inlineCommit409".into())),
+            (
+                "requestEventId",
+                CborValue::Text("req-inline-409:c-rt:9:11".into()),
+            ),
+        ]);
+
+        let mut buf = Vec::new();
+        ciborium::into_writer(&payload, &mut buf).expect("encode CBOR fixture");
+        let decoded: CborValue =
+            ciborium::from_reader(Cursor::new(&buf[..])).expect("decode CBOR fixture");
+
+        let parsed = parse_reset_requested_payload(&decoded).expect("payload is a CBOR map");
+        assert_eq!(parsed.cursor.as_deref(), Some("seq-rt"));
+        assert_eq!(parsed.crypto_session_id, "cs-rt");
+        assert_eq!(parsed.reset_generation, 42);
+        assert_eq!(parsed.trigger, "inlineCommit409");
+        assert_eq!(parsed.request_event_id, "req-inline-409:c-rt:9:11");
+        assert!(parsed.expected_new_mls_group_id.is_none());
     }
 }
