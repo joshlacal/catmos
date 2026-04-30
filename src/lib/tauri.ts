@@ -2,6 +2,8 @@ import { invoke } from '@tauri-apps/api/core';
 
 export interface Conversation {
 	id: string;
+	/** Current MLS group identifier (hex). Changes on group reset. */
+	groupId?: string;
 	displayName: string;
 	description?: string;
 	members: string[];
@@ -10,6 +12,13 @@ export interface Conversation {
 	unreadCount: number;
 	isGroup: boolean;
 	mutedUntil?: string;
+	/**
+	 * Decrypted avatar rendered as a `data:` URL by the Tauri backend after
+	 * `bootstrap_group_metadata` succeeds. Frontend embeds it directly into
+	 * an `<img src>`. `undefined` means the group has no avatar (or
+	 * bootstrap hasn't run yet).
+	 */
+	avatarDataUrl?: string;
 }
 
 export interface Message {

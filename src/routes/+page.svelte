@@ -352,6 +352,13 @@
 						<polyline points="15 18 9 12 15 6" />
 					</svg>
 				</button>
+				{#if currentConversation.avatarDataUrl}
+					<img
+						class="chat-header-avatar"
+						src={currentConversation.avatarDataUrl}
+						alt=""
+					/>
+				{/if}
 				<div class="chat-header-info">
 					<h2 class="chat-title">{currentDisplayName}</h2>
 					<div class="chat-subtitle">
@@ -615,6 +622,14 @@
 
 	.chat-header-info {
 		min-width: 0;
+	}
+
+	.chat-header-avatar {
+		width: 32px;
+		height: 32px;
+		border-radius: 50%;
+		object-fit: cover;
+		flex-shrink: 0;
 	}
 
 	.chat-title {

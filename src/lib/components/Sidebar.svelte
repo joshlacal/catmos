@@ -153,7 +153,9 @@
 				onclick={() => selectConversation(convo.id)}
 			>
 				<div class="convo-avatar" class:group={convo.isGroup}>
-					{#if convo.isGroup}
+					{#if convo.avatarDataUrl}
+						<img class="convo-avatar-img" src={convo.avatarDataUrl} alt="" />
+					{:else if convo.isGroup}
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" opacity="0.7">
 							<path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
 						</svg>
@@ -170,6 +172,8 @@
 						<p class="convo-preview draft-preview">Draft</p>
 					{:else if convo.lastMessage}
 						<p class="convo-preview">{convo.lastMessage}</p>
+					{:else if convo.description}
+						<p class="convo-preview">{convo.description}</p>
 					{:else}
 						<p class="convo-preview empty">No messages yet</p>
 					{/if}
@@ -376,6 +380,13 @@
 		background: var(--bg-elevated);
 		color: var(--text-secondary);
 		border: 1px solid var(--border);
+	}
+
+	.convo-avatar-img {
+		width: 100%;
+		height: 100%;
+		border-radius: inherit;
+		object-fit: cover;
 	}
 
 	.convo-body {

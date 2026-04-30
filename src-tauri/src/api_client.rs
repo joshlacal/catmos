@@ -389,18 +389,28 @@ impl ReqwestApiClient {
         Ok((output.blob_locator.to_string(), size))
     }
 
-    /// Fetch an encrypted group metadata blob by locator.
+    /// Fetch an encrypted group metadata blob by locator. The `kind` arg is
+    /// forwarded as the lexicon's `kind` query param (`metadata` vs
+    /// `avatar`); pass `None` to fall back to the server's default
+    /// (currently "metadata"). Avatars MUST set `Some("avatar")` so the
+    /// server returns the correct ciphertext — and so the AAD-bound
+    /// decryption below uses the matching domain separator.
     pub async fn get_group_metadata_blob(
         &self,
         blob_locator: &str,
         group_id: &str,
+        kind: Option<&str>,
     ) -> Result<Vec<u8>> {
         let token = self.auth_header()?;
-        let resp = self
+        let mut req = self
             .client
             .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
             .bearer_auth(&token)
-            .query(&[("blobLocator", blob_locator), ("groupId", group_id)])
+            .query(&[("blobLocator", blob_locator), ("groupId", group_id)]);
+        if let Some(k) = kind {
+            req = req.query(&[("kind", k)]);
+        }
+        let resp = req
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -766,22 +776,23 @@ impl MLSAPIClient for ReqwestApiClient {
         &self,
         group_id: &str,
         initial_members: Option<&[String]>,
-        metadata: Option<&ConversationMetadata>,
+        _metadata: Option<&ConversationMetadata>,
         _commit_data: Option<&[u8]>,
         welcome_data: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
+        // Encrypted-metadata cutover (Phase C): catmos no longer sends
+        // plaintext title/description on createConvo. The orchestrator
+        // already passes `metadata = None` here, but we drop the
+        // server-bound field unconditionally so a future regression cannot
+        // re-introduce a leak. Authoritative metadata flows through
+        // `putGroupMetadataBlob` after the new group's first epoch is
+        // established.
         let token = self.auth_header()?;
         let input: lexicon::create_convo::Input = lexicon::create_convo::InputData {
             group_id: group_id.to_string(),
             cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
             initial_members: initial_members.map(|m| m.iter().map(|d| parse_did(d)).collect()),
-            metadata: metadata.map(|m| {
-                lexicon::create_convo::MetadataInputData {
-                    name: m.name.clone(),
-                    description: m.description.clone(),
-                }
-                .into()
-            }),
+            metadata: None,
             welcome_message: welcome_data.map(|d| B64.encode(d)),
             current_epoch: None,
             key_package_hashes: None,
@@ -1100,6 +1111,7 @@ impl MLSAPIClient for ReqwestApiClient {
         let input: lexicon::publish_key_packages::Input =
             lexicon::publish_key_packages::InputData {
                 action: "publish".to_string(),
+                convo_id: None,
                 device_id: None,
                 key_packages: Some(vec![lexicon::publish_key_packages::KeyPackageItemData {
                     cipher_suite: cipher_suite.to_string(),
@@ -1108,6 +1120,8 @@ impl MLSAPIClient for ReqwestApiClient {
                 }
                 .into()]),
                 local_hashes: None,
+                reason: None,
+                target_dids: None,
             }
             .into();
 

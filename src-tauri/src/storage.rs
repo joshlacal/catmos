@@ -6,6 +6,18 @@ use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::orchestrator::types::*;
 
+/// Locally cached encrypted-metadata snapshot for a conversation. Mirrors
+/// what `bootstrap_group_metadata` writes after a successful blob fetch +
+/// decrypt: the JSON-serialized `GroupMetadataV1` payload, the bound
+/// `metadata_version`, and the locator pointing at the server-stored
+/// ciphertext. Used by the bootstrap path to detect "blob already in sync at
+/// this version" and skip a redundant fetch.
+pub struct LocalMetadataSnapshot {
+    pub metadata_json: Option<String>,
+    pub metadata_version: Option<i64>,
+    pub metadata_blob_locator: Option<String>,
+}
+
 /// SQLite-backed storage for Catmos desktop.
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
@@ -49,6 +61,11 @@ impl SqliteStorage {
                 needs_rejoin INTEGER NOT NULL DEFAULT 0,
                 members_json TEXT NOT NULL DEFAULT '[]',
                 metadata_json TEXT,
+                metadata_version INTEGER,
+                metadata_blob_locator TEXT,
+                avatar_blob_locator TEXT,
+                avatar_bytes BLOB,
+                avatar_content_type TEXT,
                 created_at TEXT,
                 updated_at TEXT,
                 reset_new_group_id TEXT,
@@ -100,6 +117,66 @@ impl SqliteStorage {
         )?;
         Self::ensure_messages_delivery_status_column(&conn)?;
         Self::ensure_conversations_reset_pending_columns(&conn)?;
+        Self::ensure_conversations_metadata_columns(&conn)?;
+        Ok(())
+    }
+
+    /// Add the encrypted-metadata bookkeeping columns to `conversations` for
+    /// pre-cutover databases. New schemas already include these columns from
+    /// `CREATE TABLE`, but existing installs need an in-place migration.
+    /// Each ALTER is guarded by a PRAGMA inspection so re-running is a no-op.
+    fn ensure_conversations_metadata_columns(
+        conn: &Connection,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(conversations)")?;
+        let mut has_metadata_version = false;
+        let mut has_metadata_blob_locator = false;
+        let mut has_avatar_blob_locator = false;
+        let mut has_avatar_bytes = false;
+        let mut has_avatar_content_type = false;
+        let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+        for column_name in column_names {
+            match column_name?.as_str() {
+                "metadata_version" => has_metadata_version = true,
+                "metadata_blob_locator" => has_metadata_blob_locator = true,
+                "avatar_blob_locator" => has_avatar_blob_locator = true,
+                "avatar_bytes" => has_avatar_bytes = true,
+                "avatar_content_type" => has_avatar_content_type = true,
+                _ => {}
+            }
+        }
+
+        if !has_metadata_version {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN metadata_version INTEGER",
+                [],
+            )?;
+        }
+        if !has_metadata_blob_locator {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN metadata_blob_locator TEXT",
+                [],
+            )?;
+        }
+        if !has_avatar_blob_locator {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN avatar_blob_locator TEXT",
+                [],
+            )?;
+        }
+        if !has_avatar_bytes {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN avatar_bytes BLOB",
+                [],
+            )?;
+        }
+        if !has_avatar_content_type {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN avatar_content_type TEXT",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -228,6 +305,101 @@ impl SqliteStorage {
                 _ => None,
             },
         )
+    }
+
+    /// Persist the decrypted `GroupMetadataV1` payload (as JSON) along with
+    /// the version and blob locator that produced it. Avatars are persisted
+    /// separately via [`update_avatar_bytes`] so a metadata-only update does
+    /// not invalidate cached avatar bytes.
+    pub fn update_metadata_json(
+        &self,
+        conversation_id: &str,
+        metadata_json: &str,
+        metadata_version: u64,
+        metadata_blob_locator: &str,
+        avatar_blob_locator: Option<&str>,
+        avatar_content_type: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET metadata_json = ?1,
+                 metadata_version = ?2,
+                 metadata_blob_locator = ?3,
+                 avatar_blob_locator = ?4,
+                 avatar_content_type = COALESCE(?5, avatar_content_type)
+             WHERE conversation_id = ?6",
+            rusqlite::params![
+                metadata_json,
+                metadata_version as i64,
+                metadata_blob_locator,
+                avatar_blob_locator,
+                avatar_content_type,
+                conversation_id,
+            ],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist decrypted avatar bytes alongside their MIME type so the
+    /// SvelteKit frontend can render them as a `data:` URL without a second
+    /// IPC round-trip per render.
+    pub fn update_avatar_bytes(
+        &self,
+        conversation_id: &str,
+        avatar_bytes: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET avatar_bytes = ?1,
+                 avatar_content_type = COALESCE(?2, avatar_content_type)
+             WHERE conversation_id = ?3",
+            rusqlite::params![avatar_bytes, content_type, conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read the cached metadata snapshot for a conversation (decrypted JSON +
+    /// version + locator). Returns `None` only when the conversation row is
+    /// missing; otherwise an all-`None`-fields snapshot indicates "no
+    /// bootstrap has run yet for this conversation".
+    pub fn get_metadata_snapshot(&self, conversation_id: &str) -> Option<LocalMetadataSnapshot> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT metadata_json, metadata_version, metadata_blob_locator
+             FROM conversations WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+            |row| {
+                Ok(LocalMetadataSnapshot {
+                    metadata_json: row.get(0)?,
+                    metadata_version: row.get(1)?,
+                    metadata_blob_locator: row.get(2)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Read raw avatar bytes + MIME type for a conversation. Returns `None`
+    /// when no avatar has been bootstrapped (or has been cleared).
+    pub fn get_avatar(&self, conversation_id: &str) -> Option<(Vec<u8>, Option<String>)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT avatar_bytes, avatar_content_type
+             FROM conversations WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+            |row| {
+                let bytes: Option<Vec<u8>> = row.get(0)?;
+                let ct: Option<String> = row.get(1)?;
+                Ok(bytes.map(|b| (b, ct)))
+            },
+        )
+        .ok()
+        .flatten()
     }
 
     /// Persist a per-conversation WebSocket cursor (spec §7.1).

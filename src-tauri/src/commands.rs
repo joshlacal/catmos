@@ -169,6 +169,12 @@ pub struct Conversation {
     pub last_message_at: Option<String>,
     pub unread_count: u32,
     pub is_group: bool,
+    /// Decrypted avatar rendered as a `data:` URL. Populated from the
+    /// `avatar_bytes` column when the encrypted-metadata bootstrap fetched
+    /// + decrypted an avatar blob; `None` otherwise. Frontend renders this
+    /// directly into an `<img src>` slot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_data_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -665,45 +671,81 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
         .await
         .map_err(|e| e.to_string())?;
 
-    // Snapshot the orchestrator's in-memory conversations cache (populated by sync).
-    // This serves as a fallback for metadata when MLS extension reads fail.
-    let cached_convos = state.orchestrator.conversations().lock().await.clone();
+    // Encrypted-metadata cutover: titles/descriptions/avatars come from the
+    // local SQLite cache populated by `bootstrap_group_metadata` after every
+    // Welcome / commit-merge that touches metadata. The server no longer
+    // exposes plaintext title (post-Phase-E), and the plaintext 0xff00
+    // extension is gone (Wave 1). For any row where the bootstrap has not
+    // yet run (first observation post-restart or a freshly-joined group
+    // whose Welcome arrived during this same tick), opportunistically
+    // bootstrap inline so the very next render has a real title.
+    let mut convos: Vec<Conversation> = Vec::with_capacity(page.conversations.len());
+    for c in page.conversations.into_iter() {
+        let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
 
-    let convos = page
-        .conversations
-        .into_iter()
-        .map(|c| {
-            let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
-            // Try reading metadata from MLS group context extensions first
-            let mls_metadata = state.orchestrator.get_group_metadata(&c.group_id).ok().flatten();
-            // Fall back to orchestrator's in-memory cache (updated during sync/commit processing)
-            let cached_metadata = cached_convos
-                .get(&c.group_id)
-                .and_then(|cv| cv.metadata.as_ref());
-            let display_name = mls_metadata
-                .as_ref()
-                .and_then(|m| m.name.clone())
-                .or_else(|| cached_metadata.and_then(|m| m.name.clone()))
-                .or_else(|| c.metadata.as_ref().and_then(|m| m.name.clone()))
-                .unwrap_or_else(|| member_dids.join(", "));
-            let description = mls_metadata
-                .as_ref()
-                .and_then(|m| m.description.clone())
-                .or_else(|| cached_metadata.and_then(|m| m.description.clone()))
-                .or_else(|| c.metadata.as_ref().and_then(|m| m.description.clone()));
-            Conversation {
-                id: c.conversation_id.clone(),
-                group_id: c.group_id,
-                display_name,
-                description,
-                members: member_dids.clone(),
-                last_message: None,
-                last_message_at: None,
-                unread_count: 0,
-                is_group: member_dids.len() > 2,
+        // Lazy bootstrap on miss. Best-effort; failure leaves the snapshot
+        // empty and we fall back to a member-DID join below.
+        let mut snapshot = state
+            .orchestrator
+            .storage()
+            .get_metadata_snapshot(&c.conversation_id);
+        let needs_bootstrap = snapshot
+            .as_ref()
+            .map(|s| s.metadata_json.is_none())
+            .unwrap_or(true);
+        if needs_bootstrap {
+            if let Err(e) =
+                bootstrap_group_metadata(&state, &c.group_id, &c.conversation_id).await
+            {
+                log_catmos!(
+                    "get_conversations: lazy bootstrap failed for {}: {}",
+                    c.conversation_id,
+                    e
+                );
             }
-        })
-        .collect();
+            snapshot = state
+                .orchestrator
+                .storage()
+                .get_metadata_snapshot(&c.conversation_id);
+        }
+
+        let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
+            .as_ref()
+            .and_then(|s| s.metadata_json.as_deref())
+            .and_then(|j| serde_json::from_str(j).ok());
+
+        let display_name = payload
+            .as_ref()
+            .map(|p| p.title.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| member_dids.join(", "));
+        let description = payload
+            .as_ref()
+            .map(|p| p.description.clone())
+            .filter(|d| !d.is_empty());
+
+        let avatar_data_url = state
+            .orchestrator
+            .storage()
+            .get_avatar(&c.conversation_id)
+            .map(|(bytes, ct)| {
+                let mime = ct.unwrap_or_else(|| "image/jpeg".to_string());
+                format!("data:{};base64,{}", mime, B64.encode(&bytes))
+            });
+
+        convos.push(Conversation {
+            id: c.conversation_id.clone(),
+            group_id: c.group_id,
+            display_name,
+            description,
+            members: member_dids.clone(),
+            last_message: None,
+            last_message_at: None,
+            unread_count: 0,
+            is_group: member_dids.len() > 2,
+            avatar_data_url,
+        });
+    }
 
     Ok(convos)
 }
@@ -740,12 +782,59 @@ pub async fn create_group(
     log_catmos!(" create_group success: group_id={}", convo.group_id);
 
     let member_list: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
-    let display_name = convo
-        .metadata
+
+    // Encrypted-metadata cutover: server-plaintext `convo.metadata` is gone
+    // post-cutover. The orchestrator's create flow has already produced an
+    // epoch-0 group with a `MetadataReference` in AppDataDictionary 0x8001
+    // (when name/description were supplied). Run the bootstrap to fetch +
+    // decrypt the freshly-uploaded blob so the local SQLite cache has the
+    // title/description before the Tauri command returns to the UI.
+    if let Err(e) = bootstrap_group_metadata(&state, &convo.group_id, &convo.conversation_id).await
+    {
+        log_catmos!(
+            " create_group: bootstrap_group_metadata failed for {}: {}",
+            convo.conversation_id,
+            e
+        );
+    }
+
+    let snapshot = state
+        .orchestrator
+        .storage()
+        .get_metadata_snapshot(&convo.conversation_id);
+    let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
         .as_ref()
-        .and_then(|m| m.name.clone())
-        .unwrap_or_else(|| member_list.join(", "));
-    let desc = convo.metadata.as_ref().and_then(|m| m.description.clone());
+        .and_then(|s| s.metadata_json.as_deref())
+        .and_then(|j| serde_json::from_str(j).ok());
+
+    let display_name = payload
+        .as_ref()
+        .map(|p| p.title.clone())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| {
+            // Fall back to the requested name (the bootstrap may not have
+            // run yet if the orchestrator hasn't uploaded the blob in this
+            // build) — never expose the server's plaintext field.
+            if !name.is_empty() {
+                name.clone()
+            } else {
+                member_list.join(", ")
+            }
+        });
+    let desc = payload
+        .as_ref()
+        .map(|p| p.description.clone())
+        .filter(|d| !d.is_empty())
+        .or_else(|| description.clone());
+
+    let avatar_data_url = state
+        .orchestrator
+        .storage()
+        .get_avatar(&convo.conversation_id)
+        .map(|(bytes, ct)| {
+            let mime = ct.unwrap_or_else(|| "image/jpeg".to_string());
+            format!("data:{};base64,{}", mime, B64.encode(&bytes))
+        });
 
     Ok(Conversation {
         id: convo.conversation_id.clone(),
@@ -757,6 +846,7 @@ pub async fn create_group(
         last_message_at: None,
         unread_count: 0,
         is_group: member_list.len() > 2,
+        avatar_data_url,
     })
 }
 
@@ -968,10 +1058,12 @@ pub async fn subscribe_conversation(
         .insert(conversation_id.clone(), handle);
 
     let convo_id = conversation_id.clone();
+    let api_client = state.api_client.clone();
     tokio::spawn(async move {
         crate::websocket::subscribe_conversation(
             app,
             orchestrator,
+            api_client,
             base_url,
             token,
             convo_id,
@@ -1033,8 +1125,9 @@ pub async fn subscribe_all_events(
         },
     );
 
+    let api_client = state.api_client.clone();
     tokio::spawn(async move {
-        crate::websocket::subscribe_all(app, orchestrator, base_url, token, shutdown_rx).await;
+        crate::websocket::subscribe_all(app, orchestrator, api_client, base_url, token, shutdown_rx).await;
     });
 
     log_catmos!(" subscribe_all_events: global WS opened");
@@ -1494,22 +1587,515 @@ pub async fn get_group_metadata(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    let meta = state
+    // Post-cutover, group titles / descriptions live in the encrypted blob
+    // path persisted by `bootstrap_group_metadata`. The plaintext 0xff00
+    // extension is gone; serve everything from local SQLite.
+    let snapshot = state
         .orchestrator
-        .get_group_metadata(&conversation_id)
-        .map_err(|e| format!("{:?}", e))?;
+        .storage()
+        .get_metadata_snapshot(&conversation_id);
+    Ok(snapshot.and_then(|s| s.metadata_json).and_then(|json| {
+        serde_json::from_str::<serde_json::Value>(&json).ok()
+    }))
+}
 
-    match meta {
-        Some(m) => {
-            let json = serde_json::json!({
-                "name": m.name,
-                "description": m.description,
-                "avatarHash": m.avatar_hash,
-            });
-            Ok(Some(json))
+/// Fetch + decrypt the encrypted group metadata blob for a group at its
+/// current epoch and persist title/description/avatar into local SQLite.
+///
+/// Mirrors iOS `MLSConversationManager+Metadata.swift::bootstrapMetadataAfterJoin`.
+/// Call after:
+///   - `create_group` succeeds (we authored the first commit at epoch 0)
+///   - a Welcome lands and the orchestrator joins a new group
+///   - any commit merges that may have updated metadata
+///
+/// Reuses `catbird_mls::metadata::decrypt_metadata_blob` /
+/// `decrypt_avatar_blob` for crypto. AAD = group_id || epoch ||
+/// metadata_version, so the call is idempotent: re-running at the same
+/// (epoch, version) produces the same plaintext and silently overwrites
+/// the SQLite row.
+async fn bootstrap_group_metadata(
+    state: &AppState,
+    group_id_hex: &str,
+    convo_id: &str,
+) -> std::result::Result<(), String> {
+    bootstrap_group_metadata_for_ws(
+        &state.orchestrator,
+        &state.api_client,
+        group_id_hex,
+        convo_id,
+    )
+    .await
+}
+
+/// `bootstrap_group_metadata` variant that takes the orchestrator + API
+/// client directly so the websocket task — which doesn't carry an
+/// `AppState` reference — can drive the same flow inline after a successful
+/// `merge_incoming_commit`.
+pub(crate) async fn bootstrap_group_metadata_for_ws(
+    orchestrator: &Arc<CatmosOrchestrator>,
+    api_client: &Arc<crate::api_client::ReqwestApiClient>,
+    group_id_hex: &str,
+    convo_id: &str,
+) -> std::result::Result<(), String> {
+    let group_id_bytes = hex::decode(group_id_hex)
+        .map_err(|e| format!("Invalid group_id hex {group_id_hex}: {e}"))?;
+
+    let info = match orchestrator
+        .mls_context()
+        .get_current_metadata(group_id_bytes.clone())
+        .map_err(|e| format!("get_current_metadata failed: {e:?}"))?
+    {
+        Some(info) => info,
+        None => {
+            log_catmos!(
+                "bootstrap_group_metadata: no metadata key for {} (group not found locally)",
+                group_id_hex
+            );
+            return Ok(());
         }
-        None => Ok(None),
+    };
+
+    let Some(reference_json) = info.metadata_reference_json.as_ref() else {
+        // No MetadataReference at AppDataDictionary 0x8001 for this group at
+        // its current epoch. Two cases:
+        //   (a) Newly-joined group whose first metadata commit has not yet
+        //       landed — there is genuinely nothing to fetch.
+        //   (b) Post-reset group: the conversation_id has a cached
+        //       title/description from before the reset, but the new group
+        //       (different group_id) has no `MetadataReference` because the
+        //       reset created a fresh MLS group at epoch 0 with no metadata
+        //       commit. Without action here, the user sees the title
+        //       evaporate on every reset — a regression vs the pre-cutover
+        //       behaviour where server plaintext survived. Detect this via
+        //       "cached snapshot has a non-empty title" and re-publish under
+        //       the new group's epoch exporter. The new group's
+        //       `MetadataReference` will be installed by a subsequent
+        //       `update_group_metadata` GroupContextExtensions commit (out
+        //       of scope for Stream F — Phase A core parity), but the blob
+        //       is uploaded immediately so other clients can fetch + decrypt
+        //       it once the reference lands.
+        if let Some(snapshot) = orchestrator.storage().get_metadata_snapshot(convo_id) {
+            if let Some(payload) = snapshot
+                .metadata_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(j).ok())
+            {
+                let has_title = !payload.title.is_empty();
+                let has_description = !payload.description.is_empty();
+                if has_title || has_description {
+                    log_catmos!(
+                        "bootstrap_group_metadata: no MetadataReference at epoch {} for {}, but cached title={:?} present — auto-republishing",
+                        info.epoch,
+                        group_id_hex,
+                        payload.title
+                    );
+
+                    let avatar_pair = orchestrator.storage().get_avatar(convo_id);
+                    let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
+                    let avatar_content_type =
+                        avatar_pair.as_ref().and_then(|(_, ct)| ct.clone());
+
+                    let key_arr: [u8; 32] = info
+                        .metadata_key
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| "metadata key length != 32".to_string())?;
+
+                    // Bump metadata_version monotonically. Use the prior
+                    // cached version + 1 (defaulting to 1 when absent).
+                    let metadata_version: u64 = snapshot
+                        .metadata_version
+                        .map(|v| (v as u64).saturating_add(1))
+                        .unwrap_or(1);
+
+                    let avatar_locator =
+                        avatar_bytes.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+
+                    let new_payload = catbird_mls::metadata::GroupMetadataV1 {
+                        version: 1,
+                        title: payload.title.clone(),
+                        description: payload.description.clone(),
+                        avatar_blob_locator: avatar_locator.clone(),
+                        avatar_content_type: avatar_content_type.clone(),
+                    };
+
+                    match catbird_mls::metadata::encrypt_metadata_blob(
+                        &key_arr,
+                        &group_id_bytes,
+                        info.epoch,
+                        metadata_version,
+                        &new_payload,
+                    ) {
+                        Ok(metadata_ct) => {
+                            let metadata_locator = uuid::Uuid::new_v4().to_string();
+                            if let Err(e) = api_client
+                                .put_group_metadata_blob(
+                                    &metadata_locator,
+                                    group_id_hex,
+                                    &metadata_ct,
+                                )
+                                .await
+                            {
+                                log_catmos!(
+                                    "bootstrap_group_metadata: post-reset metadata blob upload failed for {}: {:?}",
+                                    convo_id,
+                                    e
+                                );
+                            } else {
+                                log_catmos!(
+                                    "bootstrap_group_metadata: post-reset metadata blob {} uploaded for convo={} (epoch={} version={})",
+                                    metadata_locator,
+                                    convo_id,
+                                    info.epoch,
+                                    metadata_version
+                                );
+
+                                // Persist the new locator + version locally
+                                // so subsequent `bootstrap_group_metadata`
+                                // calls observe "in sync at this version"
+                                // and skip a redundant fetch.
+                                let payload_json = serde_json::to_string(&new_payload)
+                                    .unwrap_or_default();
+                                let _ = orchestrator.storage().update_metadata_json(
+                                    convo_id,
+                                    &payload_json,
+                                    metadata_version,
+                                    &metadata_locator,
+                                    avatar_locator.as_deref(),
+                                    avatar_content_type.as_deref(),
+                                );
+
+                                // Optionally re-encrypt + upload the avatar.
+                                if let (Some(locator), Some(bytes)) =
+                                    (avatar_locator.as_deref(), avatar_bytes.as_deref())
+                                {
+                                    match catbird_mls::metadata::encrypt_avatar_blob(
+                                        &key_arr,
+                                        &group_id_bytes,
+                                        info.epoch,
+                                        metadata_version,
+                                        bytes,
+                                    ) {
+                                        Ok(avatar_ct) => {
+                                            if let Err(e) = api_client
+                                                .put_group_metadata_blob(
+                                                    locator,
+                                                    group_id_hex,
+                                                    &avatar_ct,
+                                                )
+                                                .await
+                                            {
+                                                log_catmos!(
+                                                    "bootstrap_group_metadata: post-reset avatar upload failed for {}: {:?}",
+                                                    convo_id,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log_catmos!(
+                                                "bootstrap_group_metadata: post-reset avatar encrypt failed for {}: {}",
+                                                convo_id,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log_catmos!(
+                                "bootstrap_group_metadata: post-reset metadata encrypt failed for {}: {}",
+                                convo_id,
+                                e
+                            );
+                        }
+                    }
+
+                    return Ok(());
+                }
+            }
+        }
+        log_catmos!(
+            "bootstrap_group_metadata: no MetadataReference at AppDataDictionary 0x8001 for {} (epoch={}); nothing to fetch yet",
+            group_id_hex,
+            info.epoch
+        );
+        return Ok(());
+    };
+
+    let reference: catbird_mls::metadata::MetadataReference =
+        serde_json::from_slice(reference_json)
+            .map_err(|e| format!("MetadataReference deserialize failed: {e}"))?;
+
+    // Skip the round-trip if local SQLite is already at this version with the
+    // same locator — nothing has changed since the last bootstrap.
+    if let Some(snapshot) = orchestrator.storage().get_metadata_snapshot(convo_id) {
+        if snapshot.metadata_version == Some(reference.metadata_version as i64)
+            && snapshot.metadata_blob_locator.as_deref() == Some(reference.blob_locator.as_str())
+            && snapshot.metadata_json.is_some()
+        {
+            log_catmos!(
+                "bootstrap_group_metadata: {} already in sync at version {} (locator {})",
+                convo_id,
+                reference.metadata_version,
+                reference.blob_locator
+            );
+            return Ok(());
+        }
     }
+
+    let key_arr: [u8; 32] = info
+        .metadata_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "metadata key length != 32".to_string())?;
+
+    let blob = api_client
+        .get_group_metadata_blob(&reference.blob_locator, group_id_hex, Some("metadata"))
+        .await
+        .map_err(|e| format!("get_group_metadata_blob failed: {e:?}"))?;
+
+    let payload = catbird_mls::metadata::decrypt_metadata_blob(
+        &key_arr,
+        &group_id_bytes,
+        info.epoch,
+        reference.metadata_version,
+        &blob,
+    )
+    .map_err(|e| format!("decrypt_metadata_blob failed: {e}"))?;
+
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|e| format!("metadata payload serialize failed: {e}"))?;
+
+    orchestrator
+        .storage()
+        .update_metadata_json(
+            convo_id,
+            &payload_json,
+            reference.metadata_version,
+            &reference.blob_locator,
+            payload.avatar_blob_locator.as_deref(),
+            payload.avatar_content_type.as_deref(),
+        )
+        .map_err(|e| format!("update_metadata_json failed: {e:?}"))?;
+
+    log_catmos!(
+        "bootstrap_group_metadata: persisted title={:?} description_len={} for {} (epoch={} version={})",
+        payload.title,
+        payload.description.len(),
+        convo_id,
+        info.epoch,
+        reference.metadata_version
+    );
+
+    if let Some(avatar_locator) = payload.avatar_blob_locator.as_deref() {
+        match api_client
+            .get_group_metadata_blob(avatar_locator, group_id_hex, Some("avatar"))
+            .await
+        {
+            Ok(avatar_ct) => {
+                match catbird_mls::metadata::decrypt_avatar_blob(
+                    &key_arr,
+                    &group_id_bytes,
+                    info.epoch,
+                    reference.metadata_version,
+                    &avatar_ct,
+                ) {
+                    Ok(avatar_bytes) => {
+                        if let Err(e) = orchestrator.storage().update_avatar_bytes(
+                            convo_id,
+                            &avatar_bytes,
+                            payload.avatar_content_type.as_deref(),
+                        ) {
+                            log_catmos!(
+                                "bootstrap_group_metadata: avatar persist failed for {}: {:?}",
+                                convo_id,
+                                e
+                            );
+                        } else {
+                            log_catmos!(
+                                "bootstrap_group_metadata: persisted {} avatar bytes for {}",
+                                avatar_bytes.len(),
+                                convo_id
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log_catmos!(
+                            "bootstrap_group_metadata: decrypt_avatar_blob failed for {}: {}",
+                            convo_id,
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log_catmos!(
+                    "bootstrap_group_metadata: avatar fetch failed for {}: {:?}",
+                    convo_id,
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-encrypt the locally-known group metadata (title / description /
+/// avatar bytes) under the freshly-reset group's epoch exporter and upload
+/// the resulting blob — and, when an avatar is set, a second avatar blob —
+/// to the server. Wired into the `reset_group` Tauri command's success path
+/// so a reset preserves the user-visible group identity instead of
+/// reverting to "did:plc:abc, did:plc:def".
+///
+/// The plan calls this `republish_group_metadata_after_reset`. It must be
+/// invoked after the new group has been created locally and the
+/// orchestrator has switched its in-memory state to the new group_id —
+/// i.e. after a successful `bootstrap_reset_group` round trip + first
+/// External Commit. We do a best-effort attempt; failure is logged but
+/// non-fatal so a metadata-republish hiccup never blocks the user from
+/// sending messages on the freshly-reset group.
+async fn republish_group_metadata_after_reset(
+    state: &AppState,
+    convo_id: &str,
+    new_group_id_hex: &str,
+    new_reset_generation: i64,
+    title: Option<String>,
+    description: Option<String>,
+    avatar_bytes: Option<Vec<u8>>,
+    avatar_content_type: Option<String>,
+) -> std::result::Result<(), String> {
+    let group_id_bytes = hex::decode(new_group_id_hex)
+        .map_err(|e| format!("Invalid new_group_id hex: {e}"))?;
+
+    let info = state
+        .orchestrator
+        .mls_context()
+        .get_current_metadata(group_id_bytes.clone())
+        .map_err(|e| format!("get_current_metadata failed: {e:?}"))?
+        .ok_or_else(|| {
+            format!(
+                "no metadata key for new group {} (post-reset)",
+                new_group_id_hex
+            )
+        })?;
+
+    let key_arr: [u8; 32] = info
+        .metadata_key
+        .as_slice()
+        .try_into()
+        .map_err(|_| "metadata key length != 32".to_string())?;
+
+    // Bump the metadata_version monotonically across the reset so old clients
+    // that observed the pre-reset blob can detect "this is fresh content,
+    // not the cached pre-reset payload". We piggyback on
+    // `reset_generation` — server-side it monotonically increases on every
+    // reset, and locally we bind the new version to it.
+    let metadata_version: u64 = (new_reset_generation as u64).max(1);
+
+    let avatar_locator = avatar_bytes.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+
+    let payload = catbird_mls::metadata::GroupMetadataV1 {
+        version: 1,
+        title: title.unwrap_or_default(),
+        description: description.unwrap_or_default(),
+        avatar_blob_locator: avatar_locator.clone(),
+        avatar_content_type: avatar_content_type.clone(),
+    };
+
+    let metadata_ct = catbird_mls::metadata::encrypt_metadata_blob(
+        &key_arr,
+        &group_id_bytes,
+        info.epoch,
+        metadata_version,
+        &payload,
+    )
+    .map_err(|e| format!("encrypt_metadata_blob failed: {e}"))?;
+
+    let metadata_locator = uuid::Uuid::new_v4().to_string();
+    state
+        .api_client
+        .put_group_metadata_blob(&metadata_locator, new_group_id_hex, &metadata_ct)
+        .await
+        .map_err(|e| format!("put_group_metadata_blob failed: {e:?}"))?;
+
+    log_catmos!(
+        "republish_group_metadata_after_reset: uploaded metadata blob {} for convo={} (epoch={} version={})",
+        metadata_locator,
+        convo_id,
+        info.epoch,
+        metadata_version
+    );
+
+    if let (Some(locator), Some(bytes)) = (avatar_locator.as_deref(), avatar_bytes.as_deref()) {
+        match catbird_mls::metadata::encrypt_avatar_blob(
+            &key_arr,
+            &group_id_bytes,
+            info.epoch,
+            metadata_version,
+            bytes,
+        ) {
+            Ok(avatar_ct) => {
+                if let Err(e) = state
+                    .api_client
+                    .put_group_metadata_blob(locator, new_group_id_hex, &avatar_ct)
+                    .await
+                {
+                    log_catmos!(
+                        "republish_group_metadata_after_reset: avatar upload failed for {}: {:?}",
+                        convo_id,
+                        e
+                    );
+                }
+            }
+            Err(e) => {
+                log_catmos!(
+                    "republish_group_metadata_after_reset: encrypt_avatar_blob failed for {}: {}",
+                    convo_id,
+                    e
+                );
+            }
+        }
+    }
+
+    // Cache locally so the UI reflects the new title without waiting for the
+    // first incoming commit to trigger another bootstrap. Note: the actual
+    // commit that installs `MetadataReference { metadata_version, locator }`
+    // into AppDataDictionary 0x8001 is the responsibility of the
+    // post-reset MLS update_group_metadata flow (separate from this helper);
+    // here we only persist what the user already sees.
+    let payload_json = serde_json::to_string(&payload)
+        .map_err(|e| format!("metadata payload serialize failed: {e}"))?;
+    state
+        .orchestrator
+        .storage()
+        .update_metadata_json(
+            convo_id,
+            &payload_json,
+            metadata_version,
+            &metadata_locator,
+            avatar_locator.as_deref(),
+            avatar_content_type.as_deref(),
+        )
+        .map_err(|e| format!("update_metadata_json (post-reset) failed: {e:?}"))?;
+
+    if let Some(bytes) = avatar_bytes.as_deref() {
+        if let Err(e) = state.orchestrator.storage().update_avatar_bytes(
+            convo_id,
+            bytes,
+            avatar_content_type.as_deref(),
+        ) {
+            log_catmos!(
+                "republish_group_metadata_after_reset: local avatar persist failed for {}: {:?}",
+                convo_id,
+                e
+            );
+        }
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -1615,20 +2201,25 @@ pub async fn search_messages(
         .await
         .map_err(|e| format!("{:?}", e))?;
 
+    // Encrypted-metadata cutover: titles come from the local SQLite cache
+    // populated by `bootstrap_group_metadata`. Plaintext server metadata
+    // (`c.metadata`) and the 0xff00 extension are both gone. Fall back to
+    // the conversation_id when bootstrap hasn't run yet.
     let convo_names: std::collections::HashMap<String, String> = conversations
         .iter()
         .map(|c| {
-            // Try MLS group metadata first, then storage metadata, then fall back to group_id
-            let mls_name = state
+            let title = state
                 .orchestrator
-                .get_group_metadata(&c.group_id)
-                .ok()
-                .flatten()
-                .and_then(|m| m.name);
-            let name = mls_name
-                .or_else(|| c.metadata.as_ref().and_then(|m| m.name.clone()))
-                .unwrap_or_else(|| c.group_id.clone());
-            (c.group_id.clone(), name)
+                .storage()
+                .get_metadata_snapshot(&c.conversation_id)
+                .and_then(|s| s.metadata_json)
+                .and_then(|j| {
+                    serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(&j).ok()
+                })
+                .map(|p| p.title)
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| c.conversation_id.clone());
+            (c.conversation_id.clone(), title)
         })
         .collect();
 
@@ -1743,7 +2334,113 @@ pub async fn reset_group(
         .map_err(|e| format!("Failed to parse reset response: {}", e))?;
 
     log_catmos!("reset_group success: {:?}", result);
+
+    // Best-effort metadata re-emission. After the server returns success the
+    // orchestrator + websocket recovery path will eventually merge an
+    // External Commit that joins the new group. The new group's epoch
+    // exporter is only available locally AFTER that merge — there's no
+    // synchronous signal at this point. The caller (frontend) is expected
+    // to invoke `republish_group_metadata` once the
+    // `mls:group-reset` → first-merge cycle has completed; the helper here
+    // is a no-op-ish probe that succeeds only when the new group is already
+    // joined locally.
+    if let Some(title_or_desc) = state
+        .orchestrator
+        .storage()
+        .get_metadata_snapshot(&conversation_id)
+        .and_then(|s| s.metadata_json)
+        .and_then(|j| serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(&j).ok())
+    {
+        let avatar_pair = state
+            .orchestrator
+            .storage()
+            .get_avatar(&conversation_id);
+        let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
+        let avatar_content_type = avatar_pair.and_then(|(_, ct)| ct);
+        if let Err(e) = republish_group_metadata_after_reset(
+            &state,
+            &conversation_id,
+            &new_group_id,
+            // Use a wall-clock millis tick as the version floor when the
+            // server response doesn't expose `resetGeneration` — the server
+            // increments its own copy on every reset, and we just need a
+            // monotonically-fresh value bound to AAD.
+            chrono::Utc::now().timestamp_millis(),
+            Some(title_or_desc.title.clone())
+                .filter(|t| !t.is_empty()),
+            Some(title_or_desc.description.clone())
+                .filter(|d| !d.is_empty()),
+            avatar_bytes,
+            avatar_content_type,
+        )
+        .await
+        {
+            log_catmos!(
+                "reset_group: republish_group_metadata_after_reset deferred for convo={} (will retry via republish_group_metadata command): {}",
+                conversation_id,
+                e
+            );
+        }
+    }
+
     Ok(result)
+}
+
+/// Re-encrypt and re-upload the locally-known group metadata under the
+/// freshly-reset group's epoch exporter. Frontend calls this after observing
+/// `mls:group-reset` AND seeing the new group has been joined locally
+/// (e.g. on the first incoming message in the new conversation epoch). It
+/// is idempotent: if the new group hasn't been joined yet it returns an
+/// error and the caller can retry.
+#[tauri::command]
+pub async fn republish_group_metadata(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    new_group_id: String,
+    new_reset_generation: i64,
+) -> Result<(), String> {
+    log_catmos!(
+        "republish_group_metadata: convo={} newGroupId={} gen={}",
+        conversation_id,
+        new_group_id,
+        new_reset_generation
+    );
+
+    let snapshot = state
+        .orchestrator
+        .storage()
+        .get_metadata_snapshot(&conversation_id);
+    let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
+        .as_ref()
+        .and_then(|s| s.metadata_json.as_deref())
+        .and_then(|j| serde_json::from_str(j).ok());
+    let avatar_pair = state
+        .orchestrator
+        .storage()
+        .get_avatar(&conversation_id);
+    let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
+    let avatar_content_type = avatar_pair.and_then(|(_, ct)| ct);
+
+    let title = payload
+        .as_ref()
+        .map(|p| p.title.clone())
+        .filter(|t| !t.is_empty());
+    let description = payload
+        .as_ref()
+        .map(|p| p.description.clone())
+        .filter(|d| !d.is_empty());
+
+    republish_group_metadata_after_reset(
+        &state,
+        &conversation_id,
+        &new_group_id,
+        new_reset_generation,
+        title,
+        description,
+        avatar_bytes,
+        avatar_content_type,
+    )
+    .await
 }
 
 /// Publish an `app.bsky.graph.block` record to the user's PDS via the nest BFF.

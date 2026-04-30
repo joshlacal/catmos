@@ -184,6 +184,7 @@ pub fn run() {
             commands::search_messages,
             commands::report_spam,
             commands::reset_group,
+            commands::republish_group_metadata,
             commands::create_block,
             commands::list_own_blocks,
         ])

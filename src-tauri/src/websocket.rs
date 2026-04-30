@@ -11,6 +11,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use catbird_mls::orchestrator::types::IncomingEnvelope;
 use catbird_mls::orchestrator::MLSStorageBackend;
 
+use crate::api_client::ReqwestApiClient;
 use crate::{commands, CatmosOrchestrator};
 
 macro_rules! log_ws {
@@ -116,6 +117,7 @@ fn split_frame(data: &[u8]) -> Option<(FrameHeader, &[u8])> {
 pub async fn subscribe_conversation(
     app: AppHandle,
     orchestrator: Arc<CatmosOrchestrator>,
+    api_client: Arc<ReqwestApiClient>,
     api_base_url: String,
     auth_token: String,
     conversation_id: String,
@@ -141,6 +143,7 @@ pub async fn subscribe_conversation(
         match do_subscribe(
             &app,
             &orchestrator,
+            &api_client,
             &api_base_url,
             &auth_token,
             Some(&convo_id),
@@ -185,6 +188,7 @@ pub async fn subscribe_conversation(
 pub async fn subscribe_all(
     app: AppHandle,
     orchestrator: Arc<CatmosOrchestrator>,
+    api_client: Arc<ReqwestApiClient>,
     api_base_url: String,
     auth_token: String,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -208,6 +212,7 @@ pub async fn subscribe_all(
         match do_subscribe(
             &app,
             &orchestrator,
+            &api_client,
             &api_base_url,
             &auth_token,
             None,
@@ -248,6 +253,7 @@ pub async fn subscribe_all(
 async fn do_subscribe(
     app: &AppHandle,
     orchestrator: &Arc<CatmosOrchestrator>,
+    api_client: &Arc<ReqwestApiClient>,
     api_base_url: &str,
     auth_token: &str,
     convo_id: Option<&str>,
@@ -318,7 +324,7 @@ async fn do_subscribe(
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
                         log_ws!("Received binary frame: {} bytes ({})", data.len(), label);
-                        match handle_binary_frame(app, orchestrator, &data, label).await {
+                        match handle_binary_frame(app, orchestrator, api_client, &data, label).await {
                             Ok(Some(cur)) => {
                                 orchestrator.storage().set_ws_cursor(cursor_key, &cur);
                                 last_cursor = Some(cur);
@@ -358,6 +364,7 @@ async fn do_subscribe(
 async fn handle_binary_frame(
     app: &AppHandle,
     orchestrator: &Arc<CatmosOrchestrator>,
+    api_client: &Arc<ReqwestApiClient>,
     data: &[u8],
     convo_id: &str,
 ) -> Result<Option<String>, String> {
@@ -435,6 +442,14 @@ async fn handle_binary_frame(
             // Build envelope for orchestrator
             let timestamp = created_at.parse().unwrap_or_else(|_| chrono::Utc::now());
 
+            // Keep an owned copy of the message's convoId (the stable
+            // conversation_id) for downstream metadata bootstrap. The
+            // websocket-handler `convo_id` parameter is the subscription
+            // label (group_id-shaped pre-reset; "*" in global mode) and is
+            // not safe to use as the storage key after a reset has remapped
+            // the conversation to a new group_id.
+            let msg_convo_id_owned = msg_convo_id.clone();
+
             let envelope = IncomingEnvelope {
                 conversation_id: msg_convo_id,
                 sender_did: String::new(),
@@ -455,19 +470,53 @@ async fn handle_binary_frame(
             // epoch, which the server records as `message.epoch`. Returns an
             // error for app messages / dedup / own-echoes (no staged entry);
             // treat that as a no-op.
+            let mut commit_did_merge = false;
             if epoch >= 0 {
                 if let Ok(gid_bytes) = hex::decode(convo_id) {
-                    if let Err(e) = orchestrator
+                    match orchestrator
                         .mls_context()
                         .merge_incoming_commit(gid_bytes, epoch as u64)
                     {
-                        log_ws!(
-                            "merge_incoming_commit no-op for {} epoch {}: {}",
-                            id,
-                            epoch,
-                            e
-                        );
+                        Ok(_) => {
+                            commit_did_merge = true;
+                        }
+                        Err(e) => {
+                            log_ws!(
+                                "merge_incoming_commit no-op for {} epoch {}: {}",
+                                id,
+                                epoch,
+                                e
+                            );
+                        }
                     }
+                }
+            }
+
+            // Encrypted-metadata cutover: any commit can update the
+            // `MetadataReference` in AppDataDictionary 0x8001. We don't have
+            // a per-commit "metadata changed" signal at this layer, so we
+            // opportunistically re-run the bootstrap whenever a merge
+            // succeeded. The bootstrap short-circuits when the local cache
+            // is already in sync (matching `metadata_version` + locator), so
+            // the cost is one cheap SQLite read for unrelated commits.
+            if commit_did_merge {
+                let stable_convo_id = msg_convo_id_owned.as_str();
+                if let Err(e) =
+                    commands::bootstrap_group_metadata_for_ws(orchestrator, api_client, convo_id, stable_convo_id)
+                        .await
+                {
+                    log_ws!(
+                        "bootstrap_group_metadata after merge failed for convo={} (gid={}): {}",
+                        stable_convo_id,
+                        convo_id,
+                        e
+                    );
+                } else {
+                    log_ws!(
+                        "bootstrap_group_metadata refreshed for convo={} after merge to epoch {}",
+                        stable_convo_id,
+                        epoch
+                    );
                 }
             }
 
