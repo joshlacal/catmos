@@ -2104,10 +2104,11 @@ pub async fn update_group_metadata(
     conversation_id: String,
     name: Option<String>,
     description: Option<String>,
-    avatar_hash: Option<String>,
+    avatar_blob_locator: Option<String>,
+    avatar_content_type: Option<String>,
 ) -> Result<(), String> {
     log_catmos!(
-        "update_group_metadata: convo={}, name={:?}, description={:?}",
+        "update_group_metadata (encrypted Phase A.2): convo={}, name={:?}, description={:?}",
         conversation_id,
         name,
         description
@@ -2115,11 +2116,12 @@ pub async fn update_group_metadata(
 
     state
         .orchestrator
-        .update_group_metadata(
+        .update_group_metadata_encrypted(
             &conversation_id,
             name.as_deref(),
             description.as_deref(),
-            avatar_hash.as_deref(),
+            avatar_blob_locator.as_deref(),
+            avatar_content_type.as_deref(),
         )
         .await
         .map_err(|e| format!("{:?}", e))?;

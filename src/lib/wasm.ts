@@ -714,14 +714,23 @@ export async function updateGroupMetadata(
 	conversationId: string,
 	name?: string,
 	description?: string,
-	avatarHash?: string
+	avatarHash?: string,
+	avatarBlobLocator?: string,
+	avatarContentType?: string
 ): Promise<void> {
 	if (isTauri) {
+		// Tauri now uses Phase A.2 encrypted update — accepts avatar
+		// locator + content-type, not a content-addressed hash. Old
+		// callers passing only `avatarHash` get null avatar fields
+		// (rename / description still work; avatar must be uploaded
+		// via a separate flow once available on desktop).
+		void avatarHash;
 		return tauriInvoke('update_group_metadata', {
 			conversationId,
 			name,
 			description,
-			avatarHash
+			avatarBlobLocator: avatarBlobLocator ?? null,
+			avatarContentType: avatarContentType ?? null
 		});
 	}
 	// MLS metadata cutover: WASM `update_group_metadata` takes the richer

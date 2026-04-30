@@ -284,9 +284,16 @@ export async function updateGroupMetadata(
 	conversationId: string,
 	name?: string,
 	description?: string,
-	avatarHash?: string
+	avatarBlobLocator?: string,
+	avatarContentType?: string
 ): Promise<void> {
-	return invoke('update_group_metadata', { conversationId, name, description, avatarHash });
+	return invoke('update_group_metadata', {
+		conversationId,
+		name,
+		description,
+		avatarBlobLocator,
+		avatarContentType
+	});
 }
 
 export async function reportSpam(

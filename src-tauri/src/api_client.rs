@@ -1512,6 +1512,49 @@ impl MLSAPIClient for ReqwestApiClient {
             receipt: parse_commit_group_change_receipt(&output, "process_external_commit"),
         })
     }
+
+    async fn put_group_metadata_blob(
+        &self,
+        convo_id: &str,
+        group_id_hex: &str,
+        blob_locator: &str,
+        ciphertext: &[u8],
+        kind: &str,
+        metadata_version: u64,
+        reset_generation: Option<i32>,
+    ) -> Result<()> {
+        let token = self.auth_header()?;
+        let metadata_version_str = metadata_version.to_string();
+        let reset_generation_str = reset_generation.map(|n| n.to_string());
+
+        let mut req = self
+            .client
+            .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
+            .bearer_auth(&token)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        let mut params: Vec<(&str, &str)> = vec![
+            ("blobLocator", blob_locator),
+            ("groupId", group_id_hex),
+            ("convoId", convo_id),
+            ("kind", kind),
+            ("metadataVersion", metadata_version_str.as_str()),
+        ];
+        if let Some(gen) = reset_generation_str.as_deref() {
+            params.push(("resetGeneration", gen));
+        }
+        req = req.query(&params);
+
+        let resp = req
+            .body(ciphertext.to_vec())
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(self.handle_error(resp).await);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
