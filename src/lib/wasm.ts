@@ -649,7 +649,57 @@ export async function getGroupMetadata(
 	const w = getWorker();
 	const result = await w.getGroupMetadata(conversationId);
 	if (!result) return null;
-	return typeof result === 'string' ? JSON.parse(result) : result;
+	const parsed = typeof result === 'string' ? JSON.parse(result) : result;
+	// MLS metadata cutover: WASM now returns `title` / `avatarBytesBase64`;
+	// remap to the legacy `GroupMetadataView` shape for shared UI compat.
+	if (parsed && typeof parsed === 'object') {
+		return {
+			name: parsed.title ?? parsed.name,
+			description: parsed.description,
+			avatarHash: parsed.avatarBytesBase64 ?? parsed.avatarHash
+		} as GroupMetadataView;
+	}
+	return parsed;
+}
+
+/**
+ * Bootstrap group metadata after a Welcome / external join / merged commit.
+ * Browser-only — Tauri desktop has its own metadata bootstrap path inside
+ * the Rust backend.
+ *
+ * Hosts SHOULD call this after every operation that could change metadata
+ * (Welcome processed, incoming commit merged, post-rejoin merge). Returns
+ * `null` if there's no metadata yet for the group.
+ */
+export async function bootstrapGroupMetadata(
+	groupIdHex: string
+): Promise<{ title: string; description: string; avatarBytesBase64: string | null; avatarContentType: string | null; metadataVersion: number; epoch: number } | null> {
+	if (isTauri) {
+		// Desktop already bootstraps inline via Rust. JS no-op.
+		return null;
+	}
+	const w = getWorker();
+	const result = await (w as unknown as {
+		bootstrapGroupMetadata: (g: string) => Promise<unknown>;
+	}).bootstrapGroupMetadata(groupIdHex);
+	return result as never;
+}
+
+/**
+ * Re-publish encrypted metadata after a server-initiated group reset.
+ * Browser-only.
+ */
+export async function republishMetadataAfterReset(
+	newGroupIdHex: string,
+	resetGeneration?: number
+): Promise<unknown> {
+	if (isTauri) {
+		return null;
+	}
+	const w = getWorker();
+	return (w as unknown as {
+		republishMetadataAfterReset: (g: string, r?: number) => Promise<unknown>;
+	}).republishMetadataAfterReset(newGroupIdHex, resetGeneration);
 }
 
 export async function leaveConversation(conversationId: string): Promise<void> {
@@ -674,13 +724,32 @@ export async function updateGroupMetadata(
 			avatarHash
 		});
 	}
+	// MLS metadata cutover: WASM `update_group_metadata` takes the richer
+	// (title, description, avatarBlobLocator, avatarContentType, avatarBytes)
+	// shape. The legacy `avatarHash` arg was a content-addressed locator hint
+	// that's no longer meaningful — the encrypted blob path uses fresh UUID
+	// locators per upload. We pass it through as the locator so callers
+	// that still send a hash work, but new callers should pass the avatar
+	// bytes directly via the worker `updateGroupMetadata` method.
 	const w = getWorker();
-	return w.updateGroupMetadata(
+	void avatarHash;
+	await (w as unknown as {
+		updateGroupMetadata: (
+			c: string,
+			t: string | null,
+			d: string | null,
+			al: string | null,
+			act: string | null,
+			ab: Uint8Array | null
+		) => Promise<unknown>;
+	}).updateGroupMetadata(
 		conversationId,
 		name ?? null,
 		description ?? null,
-		avatarHash ?? null
-	) as Promise<void>;
+		null,
+		null,
+		null
+	);
 }
 
 // ---------------------------------------------------------------------------

@@ -139,18 +139,46 @@ const api = {
 	checkOptInStatus: async (dids: string[]) =>
 		plain(await wasm.catbird_mls_check_opt_in_status(dids)),
 
-	// Group metadata
+	// Group metadata (encrypted-only; MLS metadata cutover)
+	//
+	// Cutover note: post-Wave-1 the WASM `update_group_metadata` returns a
+	// rich result object (commit bytes, ciphertext, MetadataReference, version),
+	// uploads the encrypted blob internally, and persists the decrypted state
+	// to local OPFS-SQLite. `get_group_metadata` reads from that local cache.
+	// Hosts MUST call `bootstrapGroupMetadata` after every Welcome / commit
+	// merge so titles/descriptions/avatars decode and persist locally.
 	getGroupMetadata: async (convoId: string) => {
-		const result = await wasm.catbird_mls_get_group_metadata(convoId);
+		const result = wasm.catbird_mls_get_group_metadata(convoId);
 		return result ? plain(result) : null;
 	},
 	updateGroupMetadata: async (
 		convoId: string,
-		name: string | null,
+		title: string | null,
 		description: string | null,
-		avatarHash: string | null
+		avatarBlobLocator: string | null,
+		avatarContentType: string | null,
+		avatarBytes: Uint8Array | null
 	) => {
-		await wasm.catbird_mls_update_group_metadata(convoId, name, description, avatarHash);
+		const result = await wasm.catbird_mls_update_group_metadata(
+			convoId,
+			title ?? undefined,
+			description ?? undefined,
+			avatarBlobLocator ?? undefined,
+			avatarContentType ?? undefined,
+			avatarBytes ?? undefined
+		);
+		return result ? plain(result) : null;
+	},
+	bootstrapGroupMetadata: async (groupIdHex: string) => {
+		const result = await (wasm as any).wasm_bootstrap_group_metadata(groupIdHex);
+		return result ? plain(result) : null;
+	},
+	republishMetadataAfterReset: async (newGroupIdHex: string, resetGeneration?: number) => {
+		const result = await (wasm as any).wasm_republish_metadata_after_reset(
+			newGroupIdHex,
+			resetGeneration
+		);
+		return result ? plain(result) : null;
 	},
 
 	// Voice messages (WASM bindings pending Rust implementation)
