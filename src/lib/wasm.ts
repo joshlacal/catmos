@@ -29,7 +29,12 @@ export type {
 	SearchResult,
 	SearchHit,
 	OptInStatus,
-	GroupMetadataView
+	GroupMetadataView,
+	QuarantineReasonTag,
+	QuarantineExitTag,
+	QuarantineEnteredEvent,
+	QuarantineClearedEvent,
+	QuarantineState
 } from './tauri';
 
 import type {
@@ -982,4 +987,41 @@ export async function fetchAndDecryptBlob(
 	}
 	const w = getWorker();
 	return w.fetchAndDecryptBlob(blobId, key, iv, sha256) as Promise<Uint8Array>;
+}
+
+// ---------------------------------------------------------------------------
+// Layer 3 quarantine (Tauri-only; catbird-mls-web hasn't shipped this surface)
+// ---------------------------------------------------------------------------
+
+import type { QuarantineState } from './tauri';
+
+/**
+ * Snapshot quarantine state for a conversation, used by the conversation
+ * view to gate the composer + show the banner on first paint after restart.
+ * Returns `null` when the conversation is not quarantined.
+ *
+ * Browser/WASM: returns `null` until catbird-mls-web exposes the same
+ * surface — quarantine cascades cannot harm a browser tab today since the
+ * WASM client doesn't run the orchestrator (catmos web uses a thinner facade).
+ */
+export async function getQuarantineState(
+	conversationId: string
+): Promise<QuarantineState | null> {
+	if (isTauri) {
+		return tauriInvoke('get_quarantine_state', { conversationId });
+	}
+	return null;
+}
+
+/**
+ * User-confirmed manual reset. Reports the deliberate vote to the server's
+ * A7 reset pyramid AND clears local quarantine state. The follow-up
+ * server-pushed `groupResetEvent` is handled by the existing
+ * `mls:group-reset` listener in `+page.svelte`.
+ */
+export async function confirmManualReset(conversationId: string): Promise<void> {
+	if (isTauri) {
+		return tauriInvoke('confirm_manual_reset', { conversationId });
+	}
+	throw new Error('confirmManualReset is not yet implemented in browser builds');
 }

@@ -71,6 +71,8 @@ impl SqliteStorage {
                 reset_new_group_id TEXT,
                 reset_generation INTEGER,
                 reset_notified_at_ms INTEGER,
+                quarantine_reason_tag TEXT,
+                quarantine_since_ms INTEGER,
                 PRIMARY KEY (conversation_id, user_did)
             );
 
@@ -118,6 +120,42 @@ impl SqliteStorage {
         Self::ensure_messages_delivery_status_column(&conn)?;
         Self::ensure_conversations_reset_pending_columns(&conn)?;
         Self::ensure_conversations_metadata_columns(&conn)?;
+        Self::ensure_conversations_quarantine_columns(&conn)?;
+        Ok(())
+    }
+
+    /// Layer 3 quarantine: add `quarantine_reason_tag` + `quarantine_since_ms`
+    /// columns to existing installs. New schemas already have them via the
+    /// `CREATE TABLE` above; this idempotent migration covers upgrades.
+    /// Mirrors the `ensure_conversations_reset_pending_columns` pattern.
+    fn ensure_conversations_quarantine_columns(
+        conn: &Connection,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(conversations)")?;
+        let mut has_quarantine_reason_tag = false;
+        let mut has_quarantine_since_ms = false;
+        let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+        for column_name in column_names {
+            match column_name?.as_str() {
+                "quarantine_reason_tag" => has_quarantine_reason_tag = true,
+                "quarantine_since_ms" => has_quarantine_since_ms = true,
+                _ => {}
+            }
+        }
+
+        if !has_quarantine_reason_tag {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN quarantine_reason_tag TEXT",
+                [],
+            )?;
+        }
+        if !has_quarantine_since_ms {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN quarantine_since_ms INTEGER",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -672,6 +710,44 @@ impl MLSStorageBackend for SqliteStorage {
              SET reset_new_group_id = NULL,
                  reset_generation = NULL,
                  reset_notified_at_ms = NULL
+             WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Layer 3 quarantine persistence (spec MLS robustness Layer 3). Mirrors
+    /// `mark_reset_pending`: the orchestrator's `enter_quarantine` writes the
+    /// JSON-serialized `ConversationState::Quarantined` into `state` (via
+    /// `set_conversation_state`) AND calls this hook for the dedicated
+    /// columns, so reads (incl. `get_conversation_state`) round-trip through
+    /// the existing JSON path while the columns are available for direct UI
+    /// queries via `get_quarantine_state` without re-parsing JSON.
+    async fn mark_quarantined(
+        &self,
+        conversation_id: &str,
+        reason_tag: &str,
+        since_ms: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET quarantine_reason_tag = ?1,
+                 quarantine_since_ms = ?2
+             WHERE conversation_id = ?3",
+            rusqlite::params![reason_tag, since_ms, conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn clear_quarantine(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET quarantine_reason_tag = NULL,
+                 quarantine_since_ms = NULL
              WHERE conversation_id = ?1",
             rusqlite::params![conversation_id],
         )

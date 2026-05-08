@@ -2594,3 +2594,62 @@ pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, 
     log_catmos!("list_own_blocks success: count={}", blocked.len());
     Ok(blocked)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 3 quarantine UI surface (catbird-mls Layer 3 plan §3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuarantineStateView {
+    /// snake_case tag from `QuarantineReason::tag()` (`peer_bad_commit`,
+    /// `multi_peer_bad_commits`, `repeated_framing_failures`).
+    pub reason_tag: String,
+    /// Unix epoch milliseconds when the conversation entered quarantine.
+    pub since_ms: i64,
+    /// Peers Signal C identified as repeatedly producing peer-bad commits.
+    /// Empty when only Signal D (framing-failure burst) tripped quarantine.
+    pub suspected_dids: Vec<String>,
+}
+
+/// Snapshot the current quarantine state for a conversation, if any. Used by
+/// the SvelteKit conversation view to gate the composer + show the banner on
+/// first paint after restart (the `mls://quarantined` event only fires on
+/// transitions, so a restart with a pre-existing quarantined row needs this
+/// pull-based read to seed UI state).
+#[tauri::command]
+pub async fn get_quarantine_state(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Option<QuarantineStateView>, String> {
+    let snapshot = state
+        .orchestrator
+        .get_conversation_quarantine_state(&conversation_id)
+        .await;
+    Ok(snapshot.map(|q| QuarantineStateView {
+        reason_tag: q.reason.tag().to_string(),
+        since_ms: q.since_ms,
+        suspected_dids: q.suspected_dids,
+    }))
+}
+
+/// User-confirmed manual reset for a quarantined conversation (Layer 3
+/// banner's `[Reset conversation]` action). Distinct from `reset_group`,
+/// which is the bootstrap-reset (External Commit) path: this one routes
+/// through `MLSOrchestrator::user_confirmed_manual_reset`, which reports the
+/// deliberate user vote to the server's A7 reset pyramid AND clears local
+/// quarantine state (`exit_quarantine` → `Active`). The server emits a
+/// follow-up `groupResetEvent` if quorum is reached; the existing
+/// `mls:group-reset` listener picks that up.
+#[tauri::command]
+pub async fn confirm_manual_reset(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    log_catmos!("confirm_manual_reset: convo={}", conversation_id);
+    state
+        .orchestrator
+        .user_confirmed_manual_reset(&conversation_id)
+        .await
+        .map_err(|e| format!("{:?}", e))
+}

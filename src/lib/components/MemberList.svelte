@@ -7,7 +7,8 @@
 		addGroupMembers,
 		reportSpam,
 		type GroupMember,
-		type SearchResult
+		type SearchResult,
+		type QuarantineState
 	} from '$lib/wasm';
 	import { auth } from '$lib/stores/auth';
 	import { profiles } from '$lib/stores/profiles';
@@ -16,9 +17,17 @@
 		affectedConversationsFor,
 		blockAndLeave
 	} from '$lib/stores/conversations';
+	import { quarantineReasonCopy } from '$lib/stores/quarantine';
 	import UserSearch from './UserSearch.svelte';
 
-	let { conversationId }: { conversationId: string } = $props();
+	let {
+		conversationId,
+		quarantine = null
+	}: {
+		conversationId: string;
+		/** Layer 3 quarantine state for this conversation, if any. */
+		quarantine?: QuarantineState | null;
+	} = $props();
 	let members = $state<GroupMember[]>([]);
 	let processing = $state<string | null>(null);
 	let confirmAction = $state<
@@ -185,6 +194,30 @@
 			</button>
 		{/if}
 	</div>
+	{#if quarantine}
+		<div class="quarantine-card" role="status">
+			<div class="qc-title">Conversation paused</div>
+			<div class="qc-reason">{quarantineReasonCopy(quarantine.reasonTag)}</div>
+			<dl class="qc-meta">
+				<dt>Reason</dt>
+				<dd><code>{quarantine.reasonTag}</code></dd>
+				<dt>Paused since</dt>
+				<dd>{new Date(quarantine.sinceMs).toLocaleString()}</dd>
+				<dt>Suspected</dt>
+				<dd>
+					{#if quarantine.suspectedDids.length === 0}
+						<em>none identified</em>
+					{:else}
+						<ul>
+							{#each quarantine.suspectedDids as did (did)}
+								<li><code>{did}</code></li>
+							{/each}
+						</ul>
+					{/if}
+				</dd>
+			</dl>
+		</div>
+	{/if}
 	<div class="member-items">
 		{#each members as member (member.did)}
 			{@const name = memberDisplayName(member)}
@@ -727,5 +760,49 @@
 	.report-result.error {
 		background: rgba(255, 59, 48, 0.12);
 		color: var(--danger);
+	}
+
+	/* Layer 3 quarantine info card */
+	.quarantine-card {
+		margin: 8px 12px 4px;
+		padding: 10px 12px;
+		background: var(--bg-card, rgba(217, 119, 6, 0.08));
+		border-left: 3px solid var(--warning, #d97706);
+		border-radius: var(--radius-sm, 6px);
+		font-size: 12px;
+		color: var(--text-primary);
+	}
+	.quarantine-card .qc-title {
+		font-weight: 600;
+		margin-bottom: 4px;
+	}
+	.quarantine-card .qc-reason {
+		color: var(--text-secondary);
+		margin-bottom: 8px;
+	}
+	.quarantine-card .qc-meta {
+		display: grid;
+		grid-template-columns: max-content 1fr;
+		gap: 4px 10px;
+		margin: 0;
+	}
+	.quarantine-card dt {
+		font-weight: 600;
+		color: var(--text-secondary);
+	}
+	.quarantine-card dd {
+		margin: 0;
+	}
+	.quarantine-card ul {
+		list-style: none;
+		padding: 0;
+		margin: 0;
+	}
+	.quarantine-card code {
+		font-family: ui-monospace, SFMono-Regular, monospace;
+		font-size: 11px;
+		background: rgba(0, 0, 0, 0.04);
+		padding: 1px 4px;
+		border-radius: 3px;
 	}
 </style>

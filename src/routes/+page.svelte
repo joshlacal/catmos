@@ -15,7 +15,9 @@
 		PreparedImageUpload,
 		ReactionEvent,
 		TypingEvent,
-		GroupResetEvent
+		GroupResetEvent,
+		QuarantineEnteredEvent,
+		QuarantineClearedEvent
 	} from '$lib/tauri';
 	import MessageList from '$lib/components/MessageList.svelte';
 	import Composer from '$lib/components/Composer.svelte';
@@ -23,10 +25,12 @@
 	import ReplyPreview from '$lib/components/ReplyPreview.svelte';
 	import ConnectionStatus from '$lib/components/ConnectionStatus.svelte';
 	import SearchPanel from '$lib/components/SearchPanel.svelte';
+	import QuarantineBanner from '$lib/components/QuarantineBanner.svelte';
 	import type { ReplyInfo } from '$lib/components/MessageBubble.svelte';
 	import { connection } from '$lib/stores/connection';
 	import { notifyIncomingMessage } from '$lib/notifications';
 	import { profiles } from '$lib/stores/profiles';
+	import { quarantine } from '$lib/stores/quarantine';
 	import type { Conversation } from '$lib/tauri';
 
 	let loginIdentifier = $state('');
@@ -37,6 +41,8 @@
 	let unlistenReaction: (() => void) | null = null;
 	let unlistenTyping: (() => void) | null = null;
 	let unlistenGroupReset: (() => void) | null = null;
+	let unlistenQuarantined: (() => void) | null = null;
+	let unlistenQuarantineCleared: (() => void) | null = null;
 	let subscribedConvoId: string | null = null;
 	let blockReconcileRan = false;
 
@@ -92,6 +98,23 @@
 			}
 		}).then((unlisten) => {
 			unlistenGroupReset = unlisten;
+		});
+
+		// Layer 3 quarantine: live entry/exit events + a refresh on app load
+		// for the active conversation so a restart with a pre-existing
+		// quarantined row paints the banner on first frame.
+		listenForEvent<QuarantineEnteredEvent>('mls://quarantined', (payload) => {
+			console.warn('[catmos] Conversation quarantined:', payload);
+			quarantine.applyEnteredEvent(payload);
+		}).then((unlisten) => {
+			unlistenQuarantined = unlisten;
+		});
+
+		listenForEvent<QuarantineClearedEvent>('mls://quarantine-cleared', (payload) => {
+			console.log('[catmos] Quarantine cleared:', payload);
+			quarantine.applyClearedEvent(payload);
+		}).then((unlisten) => {
+			unlistenQuarantineCleared = unlisten;
 		});
 	});
 
@@ -224,9 +247,17 @@
 				await messages.load(convoId);
 				await messages.fetchFromServer(convoId);
 				await subscribeToConversation(convoId);
+				// Pull-based seed for Layer 3 quarantine state. Covers the
+				// restart-with-pre-existing-quarantine case where no
+				// `mls://quarantined` event ever fires.
+				await quarantine.refresh(convoId);
 			})();
 		}
 	});
+
+	let activeQuarantine = $derived(
+		currentConversation ? ($quarantine[currentConversation.id] ?? null) : null
+	);
 
 	onDestroy(() => {
 		window.removeEventListener('keydown', handleGlobalKeydown);
@@ -234,6 +265,8 @@
 		unlistenReaction?.();
 		unlistenTyping?.();
 		unlistenGroupReset?.();
+		unlistenQuarantined?.();
+		unlistenQuarantineCleared?.();
 		if (subscribedConvoId) {
 			api.unsubscribeConversation(subscribedConvoId).catch(() => {});
 		}
@@ -415,10 +448,16 @@
 			</div>
 		</header>
 		<ConnectionStatus />
+		{#if activeQuarantine}
+			<QuarantineBanner
+				conversationId={currentConversation.id}
+				quarantineState={activeQuarantine}
+			/>
+		{/if}
 		<div class="chat-body">
 			<MessageList messages={currentMessages} typingUsers={currentTypingUsers} onReply={(info) => { replyingTo = info; }} />
 			{#if showMembers && currentConversation.isGroup}
-				<MemberList conversationId={currentConversation.id} />
+				<MemberList conversationId={currentConversation.id} quarantine={activeQuarantine} />
 			{/if}
 		</div>
 		{#if replyingTo}
@@ -433,6 +472,8 @@
 			onSend={handleSend}
 			onSendImage={handleSendImage}
 			onTypingChanged={handleTypingChanged}
+			disabled={activeQuarantine !== null}
+			disabledPlaceholder={activeQuarantine ? 'Conversation paused. Reset to continue.' : undefined}
 		/>
 	</div>
 	<SearchPanel

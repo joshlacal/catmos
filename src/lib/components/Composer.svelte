@@ -7,12 +7,18 @@
 		conversationId,
 		onSend,
 		onSendImage,
-		onTypingChanged
+		onTypingChanged,
+		disabled = false,
+		disabledPlaceholder
 	}: {
 		conversationId: string | null;
 		onSend: (content: string) => void;
 		onSendImage?: (content: string, image: PreparedImageUpload) => void | Promise<void>;
 		onTypingChanged?: (isTyping: boolean) => void;
+		/** When true, the composer is locked (Layer 3 quarantine, etc.). */
+		disabled?: boolean;
+		/** Optional placeholder shown while `disabled`. */
+		disabledPlaceholder?: string;
 	} = $props();
 
 	let text = $state('');
@@ -86,6 +92,7 @@
 	}
 
 	function send() {
+		if (disabled) return;
 		const trimmed = text.trim();
 		if (!trimmed) return;
 		uploadError = null;
@@ -291,6 +298,7 @@
 				type="button"
 				onclick={() => fileInputEl?.click()}
 				aria-label="Send image"
+				disabled={disabled}
 			>
 				<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
@@ -304,14 +312,16 @@
 			bind:value={text}
 			oninput={handleInput}
 			onkeydown={handleKeydown}
-			placeholder="Message..."
+			placeholder={disabled ? (disabledPlaceholder ?? 'Sending is disabled.') : 'Message...'}
 			rows="1"
+			disabled={disabled}
+			aria-disabled={disabled}
 		></textarea>
 		<button
 			class="composer-btn send"
-			class:active={text.trim().length > 0}
+			class:active={text.trim().length > 0 && !disabled}
 			onclick={send}
-			disabled={!text.trim()}
+			disabled={disabled || !text.trim()}
 			aria-label="Send message"
 		>
 			<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">

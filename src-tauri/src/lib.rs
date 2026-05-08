@@ -5,6 +5,7 @@ mod commands;
 mod credentials;
 mod keychain;
 mod mls_proxy;
+mod quarantine_observer;
 mod storage;
 mod websocket;
 
@@ -15,7 +16,9 @@ use api_client::ReqwestApiClient;
 use catbird_mls::orchestrator::MLSOrchestrator;
 use credentials::KeyringCredentialStore;
 use keychain::KeyringKeychainAccess;
+use quarantine_observer::QuarantineObserver;
 use storage::SqliteStorage;
+use tauri::Manager;
 use tokio::sync::Mutex;
 
 /// Retrieve or generate a random 32-byte hex key stored in the OS keychain.
@@ -187,8 +190,27 @@ pub fn run() {
             commands::republish_group_metadata,
             commands::create_block,
             commands::list_own_blocks,
+            commands::get_quarantine_state,
+            commands::confirm_manual_reset,
         ])
-        .setup(|_app| Ok(()))
+        .setup(|app| {
+            // Layer 3 MLS quarantine: install the orchestrator event observer
+            // so quarantine entry/exit events become Tauri events
+            // (`mls://quarantined` / `mls://quarantine-cleared`) the
+            // SvelteKit frontend can listen for. Done inside `setup` because
+            // an `AppHandle` is required to emit, and one isn't available at
+            // `run()` time. The orchestrator's setter is async, so we
+            // block_on it from the Tauri runtime.
+            let app_handle = app.handle().clone();
+            let state = app.state::<AppState>();
+            let orchestrator = state.orchestrator.clone();
+            let observer: Arc<dyn catbird_mls::orchestrator::event_observer::OrchestratorEventObserver> =
+                Arc::new(QuarantineObserver::new(app_handle));
+            tauri::async_runtime::block_on(async move {
+                orchestrator.set_event_observer(Some(observer)).await;
+            });
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running Catmos");
 }

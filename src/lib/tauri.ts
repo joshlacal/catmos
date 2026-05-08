@@ -303,3 +303,45 @@ export async function reportSpam(
 ): Promise<void> {
 	return invoke('report_spam', { conversationId, reportedDid, reason });
 }
+
+// ── Layer 3 quarantine ───────────────────────────────────────────────────────
+// Wire format mirrors the Rust serde camelCase output from
+// `quarantine_observer::QuarantineEnteredPayload` /
+// `commands::QuarantineStateView`.
+
+export type QuarantineReasonTag =
+	| 'peer_bad_commit'
+	| 'multi_peer_bad_commits'
+	| 'repeated_framing_failures';
+
+export type QuarantineExitTag =
+	| 'peer_commit_succeeded'
+	| 'server_reset'
+	| 'user_confirmed_reset';
+
+export interface QuarantineEnteredEvent {
+	convoId: string;
+	reasonTag: QuarantineReasonTag;
+	suspectedDids: string[];
+}
+
+export interface QuarantineClearedEvent {
+	convoId: string;
+	viaTag: QuarantineExitTag;
+}
+
+export interface QuarantineState {
+	reasonTag: QuarantineReasonTag;
+	sinceMs: number;
+	suspectedDids: string[];
+}
+
+export async function getQuarantineState(
+	conversationId: string
+): Promise<QuarantineState | null> {
+	return invoke('get_quarantine_state', { conversationId });
+}
+
+export async function confirmManualReset(conversationId: string): Promise<void> {
+	return invoke('confirm_manual_reset', { conversationId });
+}
