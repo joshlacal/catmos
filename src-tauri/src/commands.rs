@@ -155,6 +155,52 @@ pub struct AuthResponse {
     pub avatar: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SessionInfo {
+    did: String,
+    handle: String,
+}
+
+fn clear_saved_session_credentials() {
+    if let Ok(entry) = keyring::Entry::new("catmos", "session_id") {
+        let _ = entry.delete_credential();
+    }
+    if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
+        let _ = entry.delete_credential();
+    }
+}
+
+async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
+    let nest_url =
+        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+
+    let resp = reqwest::Client::new()
+        .get(format!("{}/auth/session", nest_url))
+        .bearer_auth(session_id)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch session info: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Session rejected by nest ({}): {}", status, body));
+    }
+
+    let info: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to decode session info: {}", e))?;
+    let did = info["did"]
+        .as_str()
+        .filter(|did| !did.is_empty())
+        .ok_or_else(|| "Session response missing DID".to_string())?
+        .to_string();
+    let handle = info["handle"].as_str().unwrap_or(&did).to_string();
+
+    Ok(SessionInfo { did, handle })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
@@ -237,9 +283,7 @@ pub(crate) fn ui_message_from_orchestrator(message: OrchestratorMessage) -> Mess
     let (message_type, content) = if let Some(payload) = message.payload() {
         if payload.message_type == MLSMessageType::System {
             let display_text = match payload.text.as_deref() {
-                Some("history_boundary.new_member") => {
-                    "You joined this conversation".to_string()
-                }
+                Some("history_boundary.new_member") => "You joined this conversation".to_string(),
                 Some("history_boundary.device_rejoined") => {
                     "Messages before this point aren't available on this device".to_string()
                 }
@@ -476,9 +520,11 @@ async fn wait_for_callback(listener: TcpListener) -> Result<String, String> {
     let session_id = query
         .split('&')
         .find_map(|param| {
-            param
-                .strip_prefix("session_id=")
-                .map(|v| urlencoding::decode(v).unwrap_or_else(|_| v.into()).into_owned())
+            param.strip_prefix("session_id=").map(|v| {
+                urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned()
+            })
         })
         .ok_or_else(|| "No session_id in callback".to_string())?;
 
@@ -500,34 +546,19 @@ pub async fn complete_login(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<AuthResponse, String> {
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{}/auth/session", nest_url))
-        .bearer_auth(&session_id)
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if !resp.status().is_success() {
-        return Err("Failed to fetch session info".to_string());
-    }
-
-    let info: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let did = info["did"].as_str().unwrap_or("").to_string();
-    let handle = info["handle"].as_str().unwrap_or("").to_string();
+    let session = fetch_session_info(&session_id).await?;
 
     // Initialize orchestrator for this user
     state
         .orchestrator
-        .initialize(&did)
+        .initialize(&session.did)
         .await
         .map_err(|e| format!("{:?}", e))?;
 
     // Set auth on API client (before device registration and opt-in, which need auth)
-    state.api_client.set_auth(did.clone(), session_id.clone());
+    state
+        .api_client
+        .set_auth(session.did.clone(), session_id.clone());
 
     // Ensure device is registered with MLS service (generates keys, publishes key packages)
     state
@@ -550,12 +581,12 @@ pub async fn complete_login(
         let _ = entry.set_password(&session_id);
     }
     if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
-        let _ = entry.set_password(&did);
+        let _ = entry.set_password(&session.did);
     }
 
     Ok(AuthResponse {
-        did,
-        handle,
+        did: session.did,
+        handle: session.handle,
         display_name: None,
         avatar: None,
     })
@@ -573,14 +604,33 @@ pub async fn try_restore_session(
         .ok();
 
     match (session_id, did) {
-        (Some(sid), Some(d)) => {
-            log_catmos!("Restoring session for DID: {}", d);
-            state.api_client.set_auth(d.clone(), sid.clone());
+        (Some(sid), stored_did) => {
+            let session = match fetch_session_info(&sid).await {
+                Ok(session) => session,
+                Err(e) => {
+                    log_catmos!("Stored session is invalid; clearing saved login: {}", e);
+                    clear_saved_session_credentials();
+                    state.api_client.clear_auth();
+                    return Ok(None);
+                }
+            };
+
+            if let Some(ref d) = stored_did {
+                if d != &session.did {
+                    log_catmos!(
+                        "Saved DID {} did not match nest session DID {}; using nest session DID",
+                        d,
+                        session.did
+                    );
+                }
+            }
+            log_catmos!("Restoring session for DID: {}", session.did);
             state
                 .orchestrator
-                .initialize(&d)
+                .initialize(&session.did)
                 .await
                 .map_err(|e| format!("{:?}", e))?;
+            state.api_client.set_auth(session.did.clone(), sid.clone());
 
             // Ensure device is registered (idempotent — skips if already done)
             state
@@ -598,35 +648,14 @@ pub async fn try_restore_session(
             // Start periodic sync loop (spec §6.1)
             start_sync_loop(&state).await;
 
-            // Re-fetch handle from nest
-            let nest_url = std::env::var("NEST_URL")
-                .unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-            let handle = match reqwest::Client::new()
-                .get(format!("{}/auth/session", nest_url))
-                .bearer_auth(&sid)
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .ok()
-                    .and_then(|v| v["handle"].as_str().map(|s| s.to_string()))
-                    .unwrap_or_default(),
-                Ok(resp) => {
-                    log_catmos!("Session restore: got status {}", resp.status());
-                    String::new()
-                }
-                Err(e) => {
-                    log_catmos!("Session restore: fetch failed: {}", e);
-                    String::new()
-                }
-            };
-            log_catmos!("Session restored: handle={}", handle);
+            if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
+                let _ = entry.set_password(&session.did);
+            }
+            log_catmos!("Session restored: handle={}", session.handle);
 
             Ok(Some(AuthResponse {
-                did: d,
-                handle,
+                did: session.did,
+                handle: session.handle,
                 display_name: None,
                 avatar: None,
             }))
@@ -647,13 +676,7 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     }
     state.orchestrator.shutdown().await;
     state.api_client.clear_auth();
-    // Clear persisted session
-    if let Ok(entry) = keyring::Entry::new("catmos", "session_id") {
-        let _ = entry.delete_credential();
-    }
-    if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
-        let _ = entry.delete_credential();
-    }
+    clear_saved_session_credentials();
     Ok(())
 }
 
@@ -694,8 +717,7 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
             .map(|s| s.metadata_json.is_none())
             .unwrap_or(true);
         if needs_bootstrap {
-            if let Err(e) =
-                bootstrap_group_metadata(&state, &c.group_id, &c.conversation_id).await
+            if let Err(e) = bootstrap_group_metadata(&state, &c.group_id, &c.conversation_id).await
             {
                 log_catmos!(
                     "get_conversations: lazy bootstrap failed for {}: {}",
@@ -952,8 +974,7 @@ pub async fn get_image_attachment(
         .get_blob(&blob_id)
         .await
         .map_err(|e| format!("{:?}", e))?;
-    let plaintext =
-        decrypt_blob(&ciphertext, &key, &iv, &sha256).map_err(|e| e.to_string())?;
+    let plaintext = decrypt_blob(&ciphertext, &key, &iv, &sha256).map_err(|e| e.to_string())?;
 
     Ok(format!(
         "data:{};base64,{}",
@@ -1127,7 +1148,15 @@ pub async fn subscribe_all_events(
 
     let api_client = state.api_client.clone();
     tokio::spawn(async move {
-        crate::websocket::subscribe_all(app, orchestrator, api_client, base_url, token, shutdown_rx).await;
+        crate::websocket::subscribe_all(
+            app,
+            orchestrator,
+            api_client,
+            base_url,
+            token,
+            shutdown_rx,
+        )
+        .await;
     });
 
     log_catmos!(" subscribe_all_events: global WS opened");
@@ -1138,12 +1167,7 @@ pub async fn subscribe_all_events(
 /// Call on logout; leaving it running after auth teardown leaks the stream.
 #[tauri::command]
 pub async fn unsubscribe_all_events(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(handle) = state
-        .ws_handles
-        .lock()
-        .await
-        .remove("__global__")
-    {
+    if let Some(handle) = state.ws_handles.lock().await.remove("__global__") {
         let _ = handle.shutdown.send(true);
         log_catmos!(" unsubscribe_all_events: global WS torn down");
     }
@@ -1161,10 +1185,7 @@ pub async fn fetch_new_messages(
         .await
         .map_err(|e| format!("{:?}", e))?;
 
-    Ok(msgs
-        .into_iter()
-        .map(ui_message_from_orchestrator)
-        .collect())
+    Ok(msgs.into_iter().map(ui_message_from_orchestrator).collect())
 }
 
 #[tauri::command]
@@ -1594,9 +1615,9 @@ pub async fn get_group_metadata(
         .orchestrator
         .storage()
         .get_metadata_snapshot(&conversation_id);
-    Ok(snapshot.and_then(|s| s.metadata_json).and_then(|json| {
-        serde_json::from_str::<serde_json::Value>(&json).ok()
-    }))
+    Ok(snapshot
+        .and_then(|s| s.metadata_json)
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok()))
 }
 
 /// Fetch + decrypt the encrypted group metadata blob for a group at its
@@ -1675,11 +1696,9 @@ pub(crate) async fn bootstrap_group_metadata_for_ws(
         //       is uploaded immediately so other clients can fetch + decrypt
         //       it once the reference lands.
         if let Some(snapshot) = orchestrator.storage().get_metadata_snapshot(convo_id) {
-            if let Some(payload) = snapshot
-                .metadata_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(j).ok())
-            {
+            if let Some(payload) = snapshot.metadata_json.as_deref().and_then(|j| {
+                serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(j).ok()
+            }) {
                 let has_title = !payload.title.is_empty();
                 let has_description = !payload.description.is_empty();
                 if has_title || has_description {
@@ -1692,8 +1711,7 @@ pub(crate) async fn bootstrap_group_metadata_for_ws(
 
                     let avatar_pair = orchestrator.storage().get_avatar(convo_id);
                     let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
-                    let avatar_content_type =
-                        avatar_pair.as_ref().and_then(|(_, ct)| ct.clone());
+                    let avatar_content_type = avatar_pair.as_ref().and_then(|(_, ct)| ct.clone());
 
                     let key_arr: [u8; 32] = info
                         .metadata_key
@@ -1708,8 +1726,9 @@ pub(crate) async fn bootstrap_group_metadata_for_ws(
                         .map(|v| (v as u64).saturating_add(1))
                         .unwrap_or(1);
 
-                    let avatar_locator =
-                        avatar_bytes.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+                    let avatar_locator = avatar_bytes
+                        .as_ref()
+                        .map(|_| uuid::Uuid::new_v4().to_string());
 
                     let new_payload = catbird_mls::metadata::GroupMetadataV1 {
                         version: 1,
@@ -1754,8 +1773,8 @@ pub(crate) async fn bootstrap_group_metadata_for_ws(
                                 // so subsequent `bootstrap_group_metadata`
                                 // calls observe "in sync at this version"
                                 // and skip a redundant fetch.
-                                let payload_json = serde_json::to_string(&new_payload)
-                                    .unwrap_or_default();
+                                let payload_json =
+                                    serde_json::to_string(&new_payload).unwrap_or_default();
                                 let _ = orchestrator.storage().update_metadata_json(
                                     convo_id,
                                     &payload_json,
@@ -1967,8 +1986,8 @@ async fn republish_group_metadata_after_reset(
     avatar_bytes: Option<Vec<u8>>,
     avatar_content_type: Option<String>,
 ) -> std::result::Result<(), String> {
-    let group_id_bytes = hex::decode(new_group_id_hex)
-        .map_err(|e| format!("Invalid new_group_id hex: {e}"))?;
+    let group_id_bytes =
+        hex::decode(new_group_id_hex).map_err(|e| format!("Invalid new_group_id hex: {e}"))?;
 
     let info = state
         .orchestrator
@@ -1995,7 +2014,9 @@ async fn republish_group_metadata_after_reset(
     // reset, and locally we bind the new version to it.
     let metadata_version: u64 = (new_reset_generation as u64).max(1);
 
-    let avatar_locator = avatar_bytes.as_ref().map(|_| uuid::Uuid::new_v4().to_string());
+    let avatar_locator = avatar_bytes
+        .as_ref()
+        .map(|_| uuid::Uuid::new_v4().to_string());
 
     let payload = catbird_mls::metadata::GroupMetadataV1 {
         version: 1,
@@ -2315,10 +2336,9 @@ pub async fn reset_group(
     });
 
     let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.resetGroup",
-        nest_url
-    )))
+    let resp = crate::mls_proxy::with_mls_proxy_header(
+        client.post(format!("{}/xrpc/blue.catbird.mlsChat.resetGroup", nest_url)),
+    )
     .bearer_auth(&token)
     .json(&body)
     .send()
@@ -2353,10 +2373,7 @@ pub async fn reset_group(
         .and_then(|s| s.metadata_json)
         .and_then(|j| serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(&j).ok())
     {
-        let avatar_pair = state
-            .orchestrator
-            .storage()
-            .get_avatar(&conversation_id);
+        let avatar_pair = state.orchestrator.storage().get_avatar(&conversation_id);
         let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
         let avatar_content_type = avatar_pair.and_then(|(_, ct)| ct);
         if let Err(e) = republish_group_metadata_after_reset(
@@ -2368,10 +2385,8 @@ pub async fn reset_group(
             // increments its own copy on every reset, and we just need a
             // monotonically-fresh value bound to AAD.
             chrono::Utc::now().timestamp_millis(),
-            Some(title_or_desc.title.clone())
-                .filter(|t| !t.is_empty()),
-            Some(title_or_desc.description.clone())
-                .filter(|d| !d.is_empty()),
+            Some(title_or_desc.title.clone()).filter(|t| !t.is_empty()),
+            Some(title_or_desc.description.clone()).filter(|d| !d.is_empty()),
             avatar_bytes,
             avatar_content_type,
         )
@@ -2416,10 +2431,7 @@ pub async fn republish_group_metadata(
         .as_ref()
         .and_then(|s| s.metadata_json.as_deref())
         .and_then(|j| serde_json::from_str(j).ok());
-    let avatar_pair = state
-        .orchestrator
-        .storage()
-        .get_avatar(&conversation_id);
+    let avatar_pair = state.orchestrator.storage().get_avatar(&conversation_id);
     let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
     let avatar_content_type = avatar_pair.and_then(|(_, ct)| ct);
 

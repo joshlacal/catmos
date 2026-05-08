@@ -788,16 +788,20 @@ impl MLSAPIClient for ReqwestApiClient {
         // `putGroupMetadataBlob` after the new group's first epoch is
         // established.
         let token = self.auth_header()?;
-        let input: lexicon::create_convo::Input = lexicon::create_convo::InputData {
-            group_id: group_id.to_string(),
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
+        // Build the generated lexicon struct directly so byte fields stay raw.
+        // The local InputData convenience shim models `welcome_message` as a
+        // String and converts it to bytes as UTF-8, which double-encodes the
+        // Welcome in the same way the old commitGroupChange adapter did.
+        let input = blue_catbird::mlsChat::create_convo::CreateConvo {
+            group_id: group_id.to_string().into(),
+            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
             initial_members: initial_members.map(|m| m.iter().map(|d| parse_did(d)).collect()),
             metadata: None,
-            welcome_message: welcome_data.map(|d| B64.encode(d)),
-            current_epoch: None,
+            welcome_message: welcome_data.map(bytes::Bytes::copy_from_slice),
+            current_epoch: Some(if welcome_data.is_some() { 1 } else { 0 }),
             key_package_hashes: None,
-        }
-        .into();
+            ..Default::default()
+        };
 
         let resp = self
             .client
@@ -1233,7 +1237,6 @@ impl MLSAPIClient for ReqwestApiClient {
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
     ) -> Result<DeviceInfo> {
-        use base64::Engine;
         let token = self.auth_header()?;
         let kp_items: Vec<lexicon::register_device::KeyPackageItem> = key_packages
             .iter()
@@ -1629,6 +1632,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn create_convo_welcome_message_uses_raw_bytes() {
+        let input = blue_catbird::mlsChat::create_convo::CreateConvo {
+            group_id: "deadbeef".into(),
+            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+            welcome_message: Some(bytes::Bytes::copy_from_slice(KNOWN_BYTES)),
+            current_epoch: Some(1),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&input).expect("serialize CreateConvo");
+        let encoded = json["welcomeMessage"]["$bytes"]
+            .as_str()
+            .expect("welcomeMessage $bytes envelope");
+        assert_eq!(encoded, SINGLE_ENCODED);
+        assert_ne!(encoded, DOUBLE_ENCODED);
+    }
+
     /// Demonstrates the bug the new path fixes: construct through the
     /// `InputData` adapter with a `B64.encode` string and observe the
     /// double-encoded wire output. If this ever starts producing
@@ -1636,22 +1656,21 @@ mod tests {
     /// and the workaround helper is no longer load-bearing.
     #[test]
     fn legacy_inputdata_adapter_still_double_encodes() {
-        let input: lexicon::commit_group_change::Input =
-            lexicon::commit_group_change::InputData {
-                action: "addMembers".to_string(),
-                commit: Some(B64.encode(KNOWN_BYTES)),
-                confirmation_tag: None,
-                convo_id: "deadbeef".to_string(),
-                device_id: None,
-                epoch_authenticator: None,
-                group_info: None,
-                idempotency_key: None,
-                key_package_hashes: None,
-                member_dids: None,
-                pending_addition_id: None,
-                welcome: None,
-            }
-            .into();
+        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
+            action: "addMembers".to_string(),
+            commit: Some(B64.encode(KNOWN_BYTES)),
+            confirmation_tag: None,
+            convo_id: "deadbeef".to_string(),
+            device_id: None,
+            epoch_authenticator: None,
+            group_info: None,
+            idempotency_key: None,
+            key_package_hashes: None,
+            member_dids: None,
+            pending_addition_id: None,
+            welcome: None,
+        }
+        .into();
         let json = serde_json::to_value(&input).expect("serialize InputData path");
         let encoded = json["commit"]["$bytes"]
             .as_str()
@@ -1781,8 +1800,7 @@ mod tests {
             .expect("Authorization header must be present");
         assert_eq!(auth_header.1, "Bearer test-token");
 
-        let body: serde_json::Value =
-            serde_json::from_slice(&captured.body).expect("body is JSON");
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).expect("body is JSON");
         assert_eq!(body["convoId"], "convo-x");
         assert_eq!(body["failureType"], "external_commit_exhausted");
         // ADR-002 / spec §8.6: epoch_authenticator is hex-encoded and bound
@@ -1809,8 +1827,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("server received request");
 
-        let body: serde_json::Value =
-            serde_json::from_slice(&captured.body).expect("body is JSON");
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).expect("body is JSON");
         assert_eq!(body["convoId"], "convo-y");
         assert_eq!(body["failureType"], "remote_data_error");
         // Both optional discriminators must be absent (not null) when not
