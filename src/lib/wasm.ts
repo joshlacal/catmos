@@ -123,6 +123,85 @@ function getOrCreateMlsDbKey(): string {
 }
 
 // ---------------------------------------------------------------------------
+// MLS field-level encryption: per-DID content root key (localStorage)
+//
+// The 32-byte content root key feeds catbird-mls's field_encryption layer:
+//   - per-conversation AES-GCM content keys (envelope around `text`)
+//   - per-conversation HMAC chain keys (tamper-evident transcript)
+//
+// Persisted in localStorage so cold-starts on the same browser profile
+// can decrypt the existing transcript. Namespaced by sha256(did) so that
+// (a) DID strings don't end up readable in DevTools and (b) multi-account
+// scenarios stay isolated. Browser localStorage is per-origin so the key
+// never leaks across catmos / Bluesky / unrelated sites.
+//
+// This is intentionally separate from the SQLCipher DB key (sessionStorage)
+// so that compromise of the DB-at-rest key alone (where sealed rows live)
+// doesn't directly expose decrypted message bodies.
+// ---------------------------------------------------------------------------
+
+const CONTENT_ROOT_PREFIX = 'mls.content.root.';
+
+async function sha256Hex(input: string): Promise<string> {
+	const bytes = new TextEncoder().encode(input);
+	const digest = await crypto.subtle.digest('SHA-256', bytes);
+	return Array.from(new Uint8Array(digest))
+		.map((b) => b.toString(16).padStart(2, '0'))
+		.join('');
+}
+
+async function contentRootStorageKey(userDid: string): Promise<string> {
+	return CONTENT_ROOT_PREFIX + (await sha256Hex(userDid));
+}
+
+/**
+ * Load the per-DID content root key from localStorage, creating a fresh
+ * random 32-byte key on first use. Returns the raw bytes so they can be
+ * pushed into the Worker via comlink (Uint8Array is structured-cloneable).
+ */
+async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> {
+	const storageKey = await contentRootStorageKey(userDid);
+	const existing = localStorage.getItem(storageKey);
+	if (existing) {
+		try {
+			const bytes = Uint8Array.from(atob(existing), (c) => c.charCodeAt(0));
+			if (bytes.length === 32) return bytes;
+			console.warn(
+				'[catmos] content root key has wrong length, regenerating:',
+				bytes.length
+			);
+		} catch (e) {
+			console.warn('[catmos] content root key base64 decode failed, regenerating:', e);
+		}
+	}
+	const fresh = new Uint8Array(32);
+	crypto.getRandomValues(fresh);
+	const b64 = btoa(String.fromCharCode(...fresh));
+	localStorage.setItem(storageKey, b64);
+	return fresh;
+}
+
+/**
+ * Push the per-DID content root key into the WASM module. Called once per
+ * session after `setAuth` resolves so that subsequent `setup()` and any
+ * message encrypt/decrypt has the key bound.
+ */
+async function installContentRootKey(did: string): Promise<void> {
+	const key = await loadOrCreateContentRootKey(did);
+	const w = getWorker();
+	try {
+		await (
+			w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
+		).setContentRootKey(key);
+	} catch (e) {
+		console.warn(
+			'[catmos] setContentRootKey failed; messages will fall back to legacy plaintext storage:',
+			e
+		);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Nest BFF URL
 // ---------------------------------------------------------------------------
 
@@ -244,6 +323,10 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 	// Push credentials to Worker and run MLS setup
 	const w = getWorker();
 	await w.setAuth(did, sessionId);
+	// Install the per-DID content root key BEFORE setup() so the field-
+	// level encryption layer is ready for the very first message that
+	// setup() may decrypt during initial sync.
+	await installContentRootKey(did);
 	await w.setup();
 
 	// Ensure key packages are available for other clients to send us Welcomes
@@ -262,6 +345,9 @@ export async function setAuth(did: string, token: string): Promise<void> {
 	persistBrowserAuth(did, token);
 	const w = getWorker();
 	await w.setAuth(did, token);
+	// Install the per-DID content root key after auth so the field-level
+	// encryption layer is bound before any subsequent message flow.
+	await installContentRootKey(did);
 }
 
 /**
@@ -271,6 +357,16 @@ export async function clearAuth(): Promise<void> {
 	if (isTauri) return;
 	clearBrowserAuth();
 	const w = getWorker();
+	// Drop the in-memory content root key from the WASM layer first; the
+	// localStorage entry is intentionally preserved so re-login from the
+	// same browser profile resumes the same HMAC chain seed.
+	try {
+		await (
+			w as unknown as { clearContentRootKey: () => Promise<void> }
+		).clearContentRootKey();
+	} catch (e) {
+		console.warn('[catmos] clearContentRootKey failed:', e);
+	}
 	await w.clearAuth();
 }
 
@@ -292,6 +388,10 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		// Push restored credentials to Worker
 		const w = getWorker();
 		await w.setAuth(info.did, sessionId);
+		// Restore the per-DID content root key from localStorage (or
+		// generate one if first restore on this profile) so the field-
+		// level encryption layer can read pre-existing sealed rows.
+		await installContentRootKey(info.did);
 		await w.setup();
 
 		// Replenish key packages (setup skips upload on returning sessions)
@@ -319,6 +419,13 @@ export async function logout(): Promise<void> {
 	// Clear auth in worker, then terminate it
 	try {
 		if (_worker) {
+			try {
+				await (
+					_worker as unknown as { clearContentRootKey: () => Promise<void> }
+				).clearContentRootKey();
+			} catch (e) {
+				console.warn('[catmos] clearContentRootKey failed during logout:', e);
+			}
 			await _worker.clearAuth();
 		}
 	} finally {

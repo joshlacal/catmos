@@ -29,6 +29,18 @@ const api = {
 	clearAuth: () => {
 		wasm.catbird_mls_clear_auth();
 	},
+	// Field-level encryption (Stage 6 / Task 22): install the 32-byte
+	// per-DID content root key. Pushed by the main thread after pulling
+	// the bytes from localStorage. wasm-bindgen exports the function as
+	// `setContentRootKey`/`clearContentRootKey` (see catbird-mls-web/src/lib.rs).
+	setContentRootKey: (key: Uint8Array) => {
+		(wasm as unknown as { setContentRootKey: (k: Uint8Array) => void }).setContentRootKey(
+			key
+		);
+	},
+	clearContentRootKey: () => {
+		(wasm as unknown as { clearContentRootKey: () => void }).clearContentRootKey();
+	},
 	setup: async () => {
 		await wasm.catbird_mls_setup();
 	},
