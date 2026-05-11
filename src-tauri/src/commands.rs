@@ -25,6 +25,41 @@ fn log_file_path() -> std::path::PathBuf {
     base.join("catmos").join("catmos.log")
 }
 
+/// Resolve the per-DID content-root key from disk and install it on the
+/// shared `MLSContext`. Best-effort: any error is logged and the storage
+/// layer keeps writing legacy plaintext columns until the next attempt.
+/// Idempotent — re-running with the same DID is a no-op once the in-memory
+/// key matches the file on disk.
+fn install_content_root_key(state: &AppState, user_did: &str) {
+    match crate::keys::load_or_create_content_root_key(&state.data_dir, user_did) {
+        Ok(root_key) => {
+            if let Err(err) = state
+                .orchestrator
+                .mls_context()
+                .set_content_root_key(root_key)
+            {
+                tracing::warn!(
+                    user_did = %user_did,
+                    error = ?err,
+                    "install_content_root_key: set_content_root_key failed"
+                );
+            } else {
+                tracing::info!(
+                    user_did = %user_did,
+                    "install_content_root_key: field-level encryption key installed"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                user_did = %user_did,
+                error = %err,
+                "install_content_root_key: load_or_create_content_root_key failed; storage will fall back to plaintext columns"
+            );
+        }
+    }
+}
+
 pub(crate) fn append_log_line(line: &str) {
     eprint!("{}", line);
     let path = log_file_path();
@@ -555,6 +590,12 @@ pub async fn complete_login(
         .await
         .map_err(|e| format!("{:?}", e))?;
 
+    // Install the per-DID content-root key so the field-level (envelope)
+    // encryption layer can encrypt subsequent message inserts. Best-effort:
+    // a failure here downgrades to legacy plaintext writes with a warning
+    // rather than blocking login.
+    install_content_root_key(&state, &session.did);
+
     // Set auth on API client (before device registration and opt-in, which need auth)
     state
         .api_client
@@ -630,6 +671,9 @@ pub async fn try_restore_session(
                 .initialize(&session.did)
                 .await
                 .map_err(|e| format!("{:?}", e))?;
+            // Install the per-DID content-root key for the field-level
+            // encryption layer; see `complete_login` for rationale.
+            install_content_root_key(&state, &session.did);
             state.api_client.set_auth(session.did.clone(), sid.clone());
 
             // Ensure device is registered (idempotent — skips if already done)
@@ -674,6 +718,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     if let Some(handle) = state.sync_loop.lock().await.take() {
         handle.abort();
     }
+    // Drop the in-memory content-root key. The file on disk is preserved so
+    // re-login on the same machine resumes the same chain seed; an explicit
+    // wipe path (account removal) would also call `keys::delete_content_root_key`.
+    state.orchestrator.mls_context().clear_content_root_key();
     state.orchestrator.shutdown().await;
     state.api_client.clear_auth();
     clear_saved_session_credentials();

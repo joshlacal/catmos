@@ -4,6 +4,7 @@ pub use catbird_atproto::types;
 mod commands;
 mod credentials;
 mod keychain;
+mod keys;
 mod mls_proxy;
 mod quarantine_observer;
 mod storage;
@@ -81,6 +82,10 @@ pub struct AppState {
     pub ws_handles: Mutex<HashMap<String, WsHandle>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-app data directory (`~/Library/Application Support/catmos` on macOS,
+    /// platform-equivalent elsewhere). Used by the auth flow to resolve the
+    /// per-DID content-root key file (`keys::load_or_create_content_root_key`).
+    pub data_dir: std::path::PathBuf,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -134,6 +139,12 @@ pub fn run() {
     // Share the MLS context with the API client so it can derive confirmation tags.
     api_client.set_mls_context(mls_context.clone());
 
+    // Share the MLS context with storage so the field-level (envelope)
+    // encryption layer can encrypt on write / decrypt on read. The content
+    // root key is installed later in the auth flow once `user_did` is known
+    // (see `commands::complete_login` / `commands::try_restore_session`).
+    storage.set_mls_context(mls_context.clone());
+
     // Create orchestrator (MLSContext::new already returns Arc<MLSContext>)
     let orchestrator = Arc::new(MLSOrchestrator::new(
         mls_context,
@@ -149,6 +160,7 @@ pub fn run() {
         ws_handles: Mutex::new(HashMap::new()),
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
+        data_dir,
     };
 
     tauri::Builder::default()

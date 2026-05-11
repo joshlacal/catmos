@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use rusqlite::Connection;
-use std::sync::Mutex;
+use rusqlite::{Connection, OptionalExtension};
+use std::sync::{Arc, Mutex, RwLock};
 
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::orchestrator::types::*;
+use catbird_mls::MLSContext;
 
 /// Locally cached encrypted-metadata snapshot for a conversation. Mirrors
 /// what `bootstrap_group_metadata` writes after a successful blob fetch +
@@ -18,9 +19,37 @@ pub struct LocalMetadataSnapshot {
     pub metadata_blob_locator: Option<String>,
 }
 
+/// JSON-shaped canonical plaintext that gets sealed by the field-level
+/// encryption layer before persistence. Storing the rich payload (rather
+/// than the bare `text` column) means that encrypted rows retain enough
+/// fidelity to rebuild the in-memory `Message` after a round-trip, while
+/// the `text NOT NULL` constraint is satisfied by writing an empty string
+/// to the legacy column when the encrypted payload is the source of truth.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CanonicalMessageBody<'a> {
+    text: &'a str,
+    payload_json: Option<&'a str>,
+}
+
+#[derive(serde::Deserialize)]
+struct CanonicalMessageBodyOwned {
+    text: String,
+    payload_json: Option<String>,
+}
+
+/// Version tag stamped into `payload_key_version` on every encrypted row.
+const PAYLOAD_KEY_VERSION_V1: i64 = 1;
+
 /// SQLite-backed storage for Catmos desktop.
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
+    /// Shared MLS context used for the field-level (envelope) encryption layer.
+    /// Set via [`SqliteStorage::set_mls_context`] after the context is built
+    /// in `lib.rs`. When unset — or when the per-DID content root key is not
+    /// yet installed — the write/read paths fall back to plaintext columns so
+    /// the orchestrator can keep functioning during the bootstrap window
+    /// (initial sync may run before login completes).
+    mls_context: RwLock<Option<Arc<MLSContext>>>,
 }
 
 impl SqliteStorage {
@@ -41,9 +70,102 @@ impl SqliteStorage {
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
         let storage = Self {
             conn: Mutex::new(conn),
+            mls_context: RwLock::new(None),
         };
         storage.create_tables()?;
         Ok(storage)
+    }
+
+    /// Bind the per-process MLS context for the field-level encryption layer.
+    /// Called once from `lib.rs::run()` right after the context is constructed.
+    /// Idempotent; later calls replace the binding.
+    pub fn set_mls_context(&self, ctx: Arc<MLSContext>) {
+        if let Ok(mut guard) = self.mls_context.write() {
+            *guard = Some(ctx);
+        }
+    }
+
+    fn mls_context_snapshot(&self) -> Option<Arc<MLSContext>> {
+        self.mls_context
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().cloned())
+    }
+
+    /// Read the most recent (highest sequence_number) `entry_hmac` for a
+    /// conversation so the next encrypted row can extend the HMAC chain.
+    /// Returns `None` for the first row in a conversation (chain seed = 32
+    /// zero bytes is supplied by the Rust core when `prev_hmac=None`) or
+    /// when prior rows are legacy-plaintext (no chain).
+    fn last_entry_hmac(&self, conversation_id: &str) -> Option<Vec<u8>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT entry_hmac FROM messages
+             WHERE conversation_id = ?1 AND entry_hmac IS NOT NULL
+             ORDER BY sequence_number DESC LIMIT 1",
+            rusqlite::params![conversation_id],
+            |r| r.get::<_, Option<Vec<u8>>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
+    /// Seal a `Message` for storage via the field-level encryption layer.
+    /// Returns `None` if the MLS context is unbound or its content root key
+    /// has not been installed yet — callers fall back to legacy plaintext
+    /// columns and log a warning so the orchestrator can continue functioning
+    /// during the bootstrap window (initial sync may run before login
+    /// finishes installing the content root key).
+    fn try_encrypt_message_body(&self, message: &Message) -> Option<(Vec<u8>, Vec<u8>)> {
+        let ctx = self.mls_context_snapshot()?;
+        let body = CanonicalMessageBody {
+            text: &message.text,
+            payload_json: message.payload_json.as_deref(),
+        };
+        let plaintext = match serde_json::to_vec(&body) {
+            Ok(v) => v,
+            Err(err) => {
+                tracing::warn!(
+                    message_id = %message.id,
+                    error = %err,
+                    "try_encrypt_message_body: canonical body serialization failed; falling back to plaintext"
+                );
+                return None;
+            }
+        };
+        let encrypted = match ctx
+            .encrypt_message_payload(message.conversation_id.clone(), plaintext)
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!(
+                    message_id = %message.id,
+                    error = ?err,
+                    "try_encrypt_message_body: encrypt_message_payload failed (content root key may be unset); falling back to plaintext"
+                );
+                return None;
+            }
+        };
+        let prev_hmac = self.last_entry_hmac(&message.conversation_id);
+        let entry_hmac = match ctx.compute_message_hmac(
+            message.conversation_id.clone(),
+            prev_hmac,
+            message.id.clone(),
+            encrypted.clone(),
+        ) {
+            Ok(tag) => tag,
+            Err(err) => {
+                tracing::warn!(
+                    message_id = %message.id,
+                    error = ?err,
+                    "try_encrypt_message_body: compute_message_hmac failed; falling back to plaintext"
+                );
+                return None;
+            }
+        };
+        Some((encrypted, entry_hmac))
     }
 
     fn create_tables(&self) -> std::result::Result<(), rusqlite::Error> {
@@ -121,6 +243,81 @@ impl SqliteStorage {
         Self::ensure_conversations_reset_pending_columns(&conn)?;
         Self::ensure_conversations_metadata_columns(&conn)?;
         Self::ensure_conversations_quarantine_columns(&conn)?;
+        Self::ensure_message_field_columns(&conn)?;
+        Self::ensure_message_field_migration_v1(&conn)?;
+        Ok(())
+    }
+
+    /// Add the field-level-encryption columns to the `messages` table on
+    /// pre-cutover installs. New installs already get these columns from the
+    /// `CREATE TABLE` above implicitly via the migration path; this helper
+    /// is the only place that adds them so the column list stays in one place.
+    /// `text` stays `NOT NULL` because making it nullable would require a full
+    /// table rebuild on SQLite; encrypted rows write an empty string into it
+    /// and put the real payload in `payload_encrypted`.
+    fn ensure_message_field_columns(conn: &Connection) -> std::result::Result<(), rusqlite::Error> {
+        let existing: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(messages)")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        if !existing.contains("payload_encrypted") {
+            conn.execute("ALTER TABLE messages ADD COLUMN payload_encrypted BLOB", [])?;
+        }
+        if !existing.contains("entry_hmac") {
+            conn.execute("ALTER TABLE messages ADD COLUMN entry_hmac BLOB", [])?;
+        }
+        if !existing.contains("payload_key_version") {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN payload_key_version INTEGER",
+                [],
+            )?;
+        }
+        // Tombstone parity with iOS/Android: catmos desktop does not currently
+        // expose user-initiated message delete, but the columns are added now
+        // so that when a delete path lands later it can soft-delete without
+        // another schema migration breaking the HMAC chain.
+        if !existing.contains("is_tombstone") {
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN is_tombstone INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !existing.contains("deleted_at") {
+            conn.execute("ALTER TABLE messages ADD COLUMN deleted_at INTEGER", [])?;
+        }
+        Ok(())
+    }
+
+    /// First-run drop of any pre-field-encryption message rows. Matches the
+    /// `MLSPlaintextHeaderMigration` precedent on iOS / Android: existing
+    /// transcripts cannot satisfy the encrypted-row invariants (no HMAC chain
+    /// seed, no per-conversation content key derivation history), so we drop
+    /// them once and record the migration in a `migration_status` table so
+    /// it is never re-run.
+    fn ensure_message_field_migration_v1(
+        conn: &Connection,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS migration_status (
+                name TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        let already: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM migration_status WHERE name = ?1",
+            ["MLSMessageFieldMigrationV1"],
+            |r| r.get(0),
+        )?;
+        if already > 0 {
+            return Ok(());
+        }
+        conn.execute("DELETE FROM messages", [])?;
+        conn.execute(
+            "INSERT INTO migration_status (name, applied_at) VALUES (?1, strftime('%s','now'))",
+            ["MLSMessageFieldMigrationV1"],
+        )?;
         Ok(())
     }
 
@@ -204,10 +401,7 @@ impl SqliteStorage {
             )?;
         }
         if !has_avatar_bytes {
-            conn.execute(
-                "ALTER TABLE conversations ADD COLUMN avatar_bytes BLOB",
-                [],
-            )?;
+            conn.execute("ALTER TABLE conversations ADD COLUMN avatar_bytes BLOB", [])?;
         }
         if !has_avatar_content_type {
             conn.execute(
@@ -327,12 +521,8 @@ impl SqliteStorage {
             },
         )
         .ok()
-        .and_then(
-            |(new_group_id, reset_generation, notified_at_ms)| match (
-                new_group_id,
-                reset_generation,
-                notified_at_ms,
-            ) {
+        .and_then(|(new_group_id, reset_generation, notified_at_ms)| {
+            match (new_group_id, reset_generation, notified_at_ms) {
                 (Some(new_group_id), Some(reset_generation), Some(notified_at_ms)) => {
                     Some(ConversationState::ResetPending {
                         new_group_id,
@@ -341,8 +531,8 @@ impl SqliteStorage {
                     })
                 }
                 _ => None,
-            },
-        )
+            }
+        })
     }
 
     /// Persist the decrypted `GroupMetadataV1` payload (as JSON) along with
@@ -756,30 +946,70 @@ impl MLSStorageBackend for SqliteStorage {
     }
 
     async fn store_message(&self, message: &Message) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
         let delivery_status_json = message
             .delivery_status
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        conn.execute(
-            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                message.id,
-                message.conversation_id,
-                message.sender_did,
-                message.text,
-                message.timestamp.to_rfc3339(),
-                message.epoch,
-                message.sequence_number,
-                message.is_own as i32,
-                delivery_status_json,
-                message.payload_json,
-            ],
-        )
-        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+
+        // Attempt field-level encryption. Falls back to legacy plaintext when
+        // the context isn't bound yet OR when the content root key hasn't
+        // been installed (initial sync may run before login completes).
+        let sealed = self.try_encrypt_message_body(message);
+
+        let conn = self.conn.lock().unwrap();
+        match sealed {
+            Some((encrypted, entry_hmac)) => {
+                conn.execute(
+                    "INSERT OR REPLACE INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted, entry_hmac, payload_key_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                    rusqlite::params![
+                        message.id,
+                        message.conversation_id,
+                        message.sender_did,
+                        // text/payload_json kept blank when the sealed payload
+                        // is the source of truth — `text NOT NULL` schema
+                        // constraint forces an empty string here, not NULL.
+                        "",
+                        message.timestamp.to_rfc3339(),
+                        message.epoch,
+                        message.sequence_number,
+                        message.is_own as i32,
+                        delivery_status_json,
+                        Option::<String>::None,
+                        encrypted,
+                        entry_hmac,
+                        PAYLOAD_KEY_VERSION_V1,
+                    ],
+                )
+                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+            }
+            None => {
+                tracing::warn!(
+                    message_id = %message.id,
+                    conversation_id = %message.conversation_id,
+                    "store_message: field-encryption unavailable; falling back to legacy plaintext columns"
+                );
+                conn.execute(
+                    "INSERT OR REPLACE INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted, entry_hmac, payload_key_version)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL)",
+                    rusqlite::params![
+                        message.id,
+                        message.conversation_id,
+                        message.sender_did,
+                        message.text,
+                        message.timestamp.to_rfc3339(),
+                        message.epoch,
+                        message.sequence_number,
+                        message.is_own as i32,
+                        delivery_status_json,
+                        message.payload_json,
+                    ],
+                )
+                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+            }
+        }
         Ok(())
     }
 
@@ -789,21 +1019,22 @@ impl MLSStorageBackend for SqliteStorage {
         limit: u32,
         before_sequence: Option<u64>,
     ) -> Result<Vec<Message>> {
+        let mls_ctx = self.mls_context_snapshot();
         let conn = self.conn.lock().unwrap();
         let mut result = Vec::new();
 
         if let Some(before) = before_sequence {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json
-                     FROM messages WHERE conversation_id = ?1 AND sequence_number < ?2
+                    "SELECT id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted
+                     FROM messages WHERE conversation_id = ?1 AND sequence_number < ?2 AND COALESCE(is_tombstone, 0) = 0
                      ORDER BY sequence_number DESC LIMIT ?3",
                 )
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
             let rows = stmt
                 .query_map(rusqlite::params![conversation_id, before, limit], |row| {
-                    row_to_message(row)
+                    row_to_message(row, mls_ctx.as_deref())
                 })
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
@@ -813,15 +1044,15 @@ impl MLSStorageBackend for SqliteStorage {
         } else {
             let mut stmt = conn
                 .prepare(
-                    "SELECT id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json
-                     FROM messages WHERE conversation_id = ?1
+                    "SELECT id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted
+                     FROM messages WHERE conversation_id = ?1 AND COALESCE(is_tombstone, 0) = 0
                      ORDER BY sequence_number DESC LIMIT ?2",
                 )
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
             let rows = stmt
                 .query_map(rusqlite::params![conversation_id, limit], |row| {
-                    row_to_message(row)
+                    row_to_message(row, mls_ctx.as_deref())
                 })
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
@@ -933,11 +1164,7 @@ impl MLSStorageBackend for SqliteStorage {
 
     // -- Pending Messages (self-echo dedup across restarts, spec §5) --
 
-    async fn store_pending_message(
-        &self,
-        conversation_id: &str,
-        message_id: &str,
-    ) -> Result<()> {
+    async fn store_pending_message(&self, conversation_id: &str, message_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now().timestamp();
         conn.execute(
@@ -961,17 +1188,18 @@ impl MLSStorageBackend for SqliteStorage {
     }
 }
 
-fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+fn row_to_message(row: &rusqlite::Row, mls_ctx: Option<&MLSContext>) -> rusqlite::Result<Message> {
     let id: String = row.get(0)?;
     let conversation_id: String = row.get(1)?;
     let sender_did: String = row.get(2)?;
-    let text: String = row.get(3)?;
+    let legacy_text: String = row.get(3)?;
     let timestamp_str: String = row.get(4)?;
     let epoch: u64 = row.get(5)?;
     let sequence_number: u64 = row.get(6)?;
     let is_own: i32 = row.get(7)?;
     let delivery_status_json: Option<String> = row.get(8)?;
-    let payload_json: Option<String> = row.get(9)?;
+    let legacy_payload_json: Option<String> = row.get(9)?;
+    let payload_encrypted: Option<Vec<u8>> = row.get(10)?;
 
     let timestamp = timestamp_str
         .parse::<chrono::DateTime<chrono::Utc>>()
@@ -989,6 +1217,52 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
             }
         });
 
+    // Prefer the encrypted column when present and the MLS context is bound;
+    // fall back to the legacy plaintext columns for rows written during a
+    // bootstrap-race window or before the field-encryption migration ran.
+    let (text, payload_json) = match (payload_encrypted, mls_ctx) {
+        (Some(ref wire), Some(ctx)) if !wire.is_empty() => {
+            match ctx.decrypt_message_payload(conversation_id.clone(), wire.clone()) {
+                Ok(plaintext) => {
+                    match serde_json::from_slice::<CanonicalMessageBodyOwned>(&plaintext) {
+                        Ok(body) => (body.text, body.payload_json),
+                        Err(err) => {
+                            tracing::warn!(
+                                message_id = %id,
+                                error = %err,
+                                "row_to_message: canonical body deserialize failed; row will surface empty text"
+                            );
+                            (legacy_text, legacy_payload_json)
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        message_id = %id,
+                        error = ?err,
+                        "row_to_message: decrypt_message_payload failed; falling back to legacy columns"
+                    );
+                    (legacy_text, legacy_payload_json)
+                }
+            }
+        }
+        // Sealed row read without an MLS context: log loudly. In production
+        // the orchestrator owns the context for its lifetime, so this branch
+        // should only fire during the bootstrap window before login installs
+        // the context. The legacy `text` column will be an empty string here
+        // (because the write path put the real payload in `payload_encrypted`),
+        // so the UI will surface a blank body — preferable to a panic.
+        (Some(_), None) => {
+            tracing::error!(
+                message_id = %id,
+                "row_to_message: sealed row read with no MLS context bound; \
+                 payload will surface empty until the context is installed"
+            );
+            (legacy_text, legacy_payload_json)
+        }
+        _ => (legacy_text, legacy_payload_json),
+    };
+
     Ok(Message {
         id,
         conversation_id,
@@ -1001,4 +1275,317 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         delivery_status,
         payload_json,
     })
+}
+
+#[cfg(test)]
+mod field_encryption_tests {
+    use super::*;
+    use catbird_mls::KeychainAccess;
+    use catbird_mls::MLSError;
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// Minimal in-memory `KeychainAccess` impl used in tests so we don't have
+    /// to depend on the OS keychain (which would taint the developer's real
+    /// `keyring` store and break parallel test runs).
+    struct InMemoryKeychain {
+        inner: StdMutex<HashMap<String, Vec<u8>>>,
+    }
+
+    impl InMemoryKeychain {
+        fn new() -> Self {
+            Self {
+                inner: StdMutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KeychainAccess for InMemoryKeychain {
+        async fn read(&self, key: String) -> std::result::Result<Option<Vec<u8>>, MLSError> {
+            Ok(self.inner.lock().unwrap().get(&key).cloned())
+        }
+        async fn write(&self, key: String, value: Vec<u8>) -> std::result::Result<(), MLSError> {
+            self.inner.lock().unwrap().insert(key, value);
+            Ok(())
+        }
+        async fn delete(&self, key: String) -> std::result::Result<(), MLSError> {
+            self.inner.lock().unwrap().remove(&key);
+            Ok(())
+        }
+    }
+
+    /// 32-byte hex key suitable for SQLCipher's `PRAGMA key`.
+    const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
+
+    fn new_temp_storage() -> (tempfile::TempDir, SqliteStorage) {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join("catmos-test.db");
+        let storage =
+            SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("open SqliteStorage");
+        (tmp, storage)
+    }
+
+    /// Smoke-test the schema migration: after `SqliteStorage::new` the new
+    /// columns must exist on `messages` and the `MLSMessageFieldMigrationV1`
+    /// migration row must be present. This is the catmos-desktop equivalent
+    /// of the iOS `MLSPlaintextHeaderMigration` migration-status check.
+    #[test]
+    fn message_field_columns_and_migration_row_exist() {
+        let (_tmp, storage) = new_temp_storage();
+        let conn = storage.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(messages)").unwrap();
+        let cols: std::collections::HashSet<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for required in &[
+            "payload_encrypted",
+            "entry_hmac",
+            "payload_key_version",
+            "is_tombstone",
+            "deleted_at",
+        ] {
+            assert!(
+                cols.contains(*required),
+                "missing required column on messages: {}",
+                required
+            );
+        }
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM migration_status WHERE name = 'MLSMessageFieldMigrationV1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "MLSMessageFieldMigrationV1 row should be present");
+    }
+
+    /// Without an MLS context bound, `store_message` must fall back to legacy
+    /// plaintext columns rather than panicking — this is the bootstrap-race
+    /// path (initial sync may run before login installs the content root key).
+    #[tokio::test]
+    async fn store_message_falls_back_to_plaintext_without_mls_context() {
+        let (_tmp, storage) = new_temp_storage();
+        let now = Utc::now();
+        let msg = Message {
+            id: "msg-1".into(),
+            conversation_id: "conv-1".into(),
+            sender_did: "did:plc:sender".into(),
+            text: "hello bootstrap".into(),
+            timestamp: now,
+            epoch: 0,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        storage.store_message(&msg).await.expect("store");
+
+        let got = storage
+            .get_messages("conv-1", 10, None)
+            .await
+            .expect("read");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "hello bootstrap");
+        // Encrypted column should be NULL on the legacy fallback row.
+        let conn = storage.conn.lock().unwrap();
+        let payload_encrypted: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT payload_encrypted FROM messages WHERE id = 'msg-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            payload_encrypted.is_none(),
+            "fallback row must leave payload_encrypted NULL"
+        );
+    }
+
+    /// Full roundtrip: install a content-root key on an ephemeral
+    /// `MLSContext`, write a message via `store_message` (encrypts + chains
+    /// HMAC), read it back via `get_messages` (decrypts), and verify the
+    /// payload survives. Also verifies that the encrypted column and the
+    /// HMAC tag are persisted (not just the legacy plaintext fallback).
+    #[tokio::test]
+    async fn message_round_trip_with_field_encryption() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let storage_db = tmp.path().join("catmos-test.db");
+        let mls_db = tmp.path().join("mls-test.db");
+
+        let storage = SqliteStorage::new(storage_db.to_str().unwrap(), TEST_DB_KEY)
+            .expect("open SqliteStorage");
+
+        let keychain: Box<dyn KeychainAccess> = Box::new(InMemoryKeychain::new());
+        let mls_ctx = catbird_mls::MLSContext::new(
+            mls_db.to_string_lossy().to_string(),
+            TEST_DB_KEY.to_string(),
+            keychain,
+        )
+        .expect("construct MLSContext");
+        mls_ctx
+            .set_content_root_key(vec![0x42u8; 32])
+            .expect("set content root key");
+        storage.set_mls_context(mls_ctx.clone());
+
+        let now = Utc::now();
+        let msg = Message {
+            id: "msg-rt".into(),
+            conversation_id: "conv-rt".into(),
+            sender_did: "did:plc:sender".into(),
+            text: "round-trip body".into(),
+            timestamp: now,
+            epoch: 0,
+            sequence_number: 1,
+            is_own: true,
+            delivery_status: None,
+            payload_json: Some(
+                r#"{"version":1,"messageType":"text","text":"round-trip body"}"#.into(),
+            ),
+        };
+        storage.store_message(&msg).await.expect("store");
+
+        // The encrypted column and HMAC tag must be persisted; the legacy
+        // text column should hold an empty string (NOT NULL constraint).
+        {
+            let conn = storage.conn.lock().unwrap();
+            let (payload_encrypted, entry_hmac, text, payload_key_version): (
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                String,
+                Option<i64>,
+            ) = conn
+                .query_row(
+                    "SELECT payload_encrypted, entry_hmac, text, payload_key_version FROM messages WHERE id = 'msg-rt'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert!(
+                payload_encrypted
+                    .as_ref()
+                    .map(|b| !b.is_empty())
+                    .unwrap_or(false),
+                "payload_encrypted must be populated"
+            );
+            assert!(
+                entry_hmac.as_ref().map(|b| !b.is_empty()).unwrap_or(false),
+                "entry_hmac must be populated"
+            );
+            assert_eq!(
+                text, "",
+                "legacy text column should be empty for sealed rows"
+            );
+            assert_eq!(payload_key_version, Some(1));
+        }
+
+        // Read back through the public API — should decrypt and restore the
+        // original text + payload_json.
+        let got = storage
+            .get_messages("conv-rt", 10, None)
+            .await
+            .expect("read");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].text, "round-trip body");
+        assert_eq!(
+            got[0].payload_json.as_deref(),
+            Some(r#"{"version":1,"messageType":"text","text":"round-trip body"}"#)
+        );
+    }
+
+    /// HMAC chain: two messages on the same conversation should chain — the
+    /// second row's HMAC must be a function of the first row's HMAC, so
+    /// rewriting the second row's prev-hmac input (via tampering or replay)
+    /// is detectable. We just assert the tags are different and non-empty
+    /// here; full chain verification is the Rust core's responsibility.
+    #[tokio::test]
+    async fn hmac_chain_advances_per_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage_db = tmp.path().join("catmos-test.db");
+        let mls_db = tmp.path().join("mls-test.db");
+        let storage = SqliteStorage::new(storage_db.to_str().unwrap(), TEST_DB_KEY).unwrap();
+        let keychain: Box<dyn KeychainAccess> = Box::new(InMemoryKeychain::new());
+        let mls_ctx = catbird_mls::MLSContext::new(
+            mls_db.to_string_lossy().to_string(),
+            TEST_DB_KEY.to_string(),
+            keychain,
+        )
+        .unwrap();
+        mls_ctx.set_content_root_key(vec![0x11u8; 32]).unwrap();
+        storage.set_mls_context(mls_ctx);
+
+        let now = Utc::now();
+        for (id, seq) in [("m1", 1u64), ("m2", 2u64)] {
+            let msg = Message {
+                id: id.into(),
+                conversation_id: "conv-chain".into(),
+                sender_did: "did:plc:s".into(),
+                text: format!("body-{}", id),
+                timestamp: now,
+                epoch: 0,
+                sequence_number: seq,
+                is_own: false,
+                delivery_status: None,
+                payload_json: None,
+            };
+            storage.store_message(&msg).await.unwrap();
+        }
+        let conn = storage.conn.lock().unwrap();
+        let h1: Vec<u8> = conn
+            .query_row("SELECT entry_hmac FROM messages WHERE id = 'm1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let h2: Vec<u8> = conn
+            .query_row("SELECT entry_hmac FROM messages WHERE id = 'm2'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(h1.len(), 32);
+        assert_eq!(h2.len(), 32);
+        assert_ne!(h1, h2, "chained HMACs should differ");
+    }
+
+    /// Tombstone visibility filter: rows flagged `is_tombstone = 1` must be
+    /// excluded from `get_messages`. catmos desktop doesn't currently expose
+    /// user-initiated delete, but the schema parity contract requires the
+    /// read path to honor the flag for when iOS/Android replicate a delete.
+    #[tokio::test]
+    async fn tombstoned_rows_are_excluded_from_get_messages() {
+        let (_tmp, storage) = new_temp_storage();
+        let now = Utc::now();
+        for (id, seq) in [("msg-a", 1u64), ("msg-b", 2u64), ("msg-c", 3u64)] {
+            let msg = Message {
+                id: id.into(),
+                conversation_id: "conv-x".into(),
+                sender_did: "did:plc:sender".into(),
+                text: format!("body-{}", id),
+                timestamp: now,
+                epoch: 0,
+                sequence_number: seq,
+                is_own: false,
+                delivery_status: None,
+                payload_json: None,
+            };
+            storage.store_message(&msg).await.unwrap();
+        }
+        // Tombstone msg-b out of band.
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE messages SET is_tombstone = 1, deleted_at = strftime('%s','now') WHERE id = 'msg-b'",
+                [],
+            )
+            .unwrap();
+        }
+        let got = storage.get_messages("conv-x", 10, None).await.unwrap();
+        let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["msg-a", "msg-c"]);
+    }
 }
