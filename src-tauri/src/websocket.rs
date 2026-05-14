@@ -501,9 +501,13 @@ async fn handle_binary_frame(
             // the cost is one cheap SQLite read for unrelated commits.
             if commit_did_merge {
                 let stable_convo_id = msg_convo_id_owned.as_str();
-                if let Err(e) =
-                    commands::bootstrap_group_metadata_for_ws(orchestrator, api_client, convo_id, stable_convo_id)
-                        .await
+                if let Err(e) = commands::bootstrap_group_metadata_for_ws(
+                    orchestrator,
+                    api_client,
+                    convo_id,
+                    stable_convo_id,
+                )
+                .await
                 {
                     log_ws!(
                         "bootstrap_group_metadata after merge failed for convo={} (gid={}): {}",
@@ -673,11 +677,7 @@ async fn handle_binary_frame(
             // Spec §8.5: groupReset is a RESET_PENDING trigger — reset the
             // recovery tracker's attempt counter to 0 so the deferred recovery
             // treats this as a fresh attempt (no accumulated backoff/cooldown).
-            orchestrator
-                .recovery_tracker()
-                .lock()
-                .await
-                .clear(convo_id);
+            orchestrator.recovery_tracker().lock().await.clear(convo_id);
             log_ws!(
                 "Reset recovery tracker for {} (groupReset → fresh attempt)",
                 convo_id
@@ -690,11 +690,7 @@ async fn handle_binary_frame(
             // (spec §8.5) so the new group id + reset generation survive a
             // restart even if the orchestrator's in-memory
             // `conversation_states` map is empty on next boot.
-            if let Err(e) = orchestrator
-                .storage()
-                .mark_needs_rejoin(convo_id)
-                .await
-            {
+            if let Err(e) = orchestrator.storage().mark_needs_rejoin(convo_id).await {
                 log_ws!("Failed to mark_needs_rejoin for {}: {:?}", convo_id, e);
             }
 
@@ -712,20 +708,11 @@ async fn handle_binary_frame(
                     )
                     .await
                 {
-                    log_ws!(
-                        "Failed to set ResetPending state for {}: {:?}",
-                        convo_id,
-                        e
-                    );
+                    log_ws!("Failed to set ResetPending state for {}: {:?}", convo_id, e);
                 }
                 if let Err(e) = orchestrator
                     .storage()
-                    .mark_reset_pending(
-                        convo_id,
-                        &new_group_id,
-                        reset_generation,
-                        notified_at_ms,
-                    )
+                    .mark_reset_pending(convo_id, &new_group_id, reset_generation, notified_at_ms)
                     .await
                 {
                     log_ws!(
@@ -806,11 +793,7 @@ async fn handle_binary_frame(
                 conversation_id: convo_id.to_string(),
                 sender_did: String::new(),
                 sender_handle: String::new(),
-                content: format!(
-                    "Group was reset by {}{}",
-                    short_id(&reset_by),
-                    reason_text
-                ),
+                content: format!("Group was reset by {}{}", short_id(&reset_by), reason_text),
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),

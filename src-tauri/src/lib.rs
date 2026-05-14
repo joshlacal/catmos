@@ -26,8 +26,8 @@ use tokio::sync::Mutex;
 /// `label` distinguishes between multiple databases (e.g. "conversation-db", "mls-db").
 fn get_or_create_db_key(label: &str) -> String {
     let service = "blue.catbird.catmos";
-    let entry = keyring::Entry::new(service, label)
-        .expect("Failed to create keyring entry for DB key");
+    let entry =
+        keyring::Entry::new(service, label).expect("Failed to create keyring entry for DB key");
 
     // Try to load an existing key
     match entry.get_password() {
@@ -133,7 +133,10 @@ pub fn run() {
     // Clear leftover WAL from previous session — ensures all committed data is
     // checkpointed into the main database file before we start reading.
     if let Err(e) = mls_context.launch_checkpoint() {
-        eprintln!("[catmos] Warning: launch checkpoint failed (non-fatal): {:?}", e);
+        eprintln!(
+            "[catmos] Warning: launch checkpoint failed (non-fatal): {:?}",
+            e
+        );
     }
 
     // Share the MLS context with the API client so it can derive confirmation tags.
@@ -216,8 +219,9 @@ pub fn run() {
             let app_handle = app.handle().clone();
             let state = app.state::<AppState>();
             let orchestrator = state.orchestrator.clone();
-            let observer: Arc<dyn catbird_mls::orchestrator::event_observer::OrchestratorEventObserver> =
-                Arc::new(QuarantineObserver::new(app_handle));
+            let observer: Arc<
+                dyn catbird_mls::orchestrator::event_observer::OrchestratorEventObserver,
+            > = Arc::new(QuarantineObserver::new(app_handle));
             tauri::async_runtime::block_on(async move {
                 orchestrator.set_event_observer(Some(observer)).await;
             });

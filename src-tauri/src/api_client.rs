@@ -702,14 +702,7 @@ fn convo_view_to_conversation(c: &lexicon::defs::ConvoViewData) -> ConversationV
                 },
             })
             .collect(),
-        metadata: c.metadata.as_ref().map(|m| ConversationMetadata {
-            name: m.name.as_ref().map(|name| name.to_string()),
-            description: m
-                .description
-                .as_ref()
-                .map(|description| description.to_string()),
-            avatar_url: None,
-        }),
+        metadata: None,
         created_at: c.created_at.as_ref().to_string().parse().ok(),
         updated_at: None,
     }
@@ -796,7 +789,6 @@ impl MLSAPIClient for ReqwestApiClient {
             group_id: group_id.to_string().into(),
             cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
             initial_members: initial_members.map(|m| m.iter().map(|d| parse_did(d)).collect()),
-            metadata: None,
             welcome_message: welcome_data.map(bytes::Bytes::copy_from_slice),
             current_epoch: Some(if welcome_data.is_some() { 1 } else { 0 }),
             key_package_hashes: None,
