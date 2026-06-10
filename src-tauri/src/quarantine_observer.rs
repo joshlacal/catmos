@@ -41,6 +41,15 @@ pub struct QuarantineClearedPayload {
     pub via_tag: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStorageWriteFailedPayload {
+    pub convo_id: String,
+    /// Storage-trait method name that failed (e.g. `mark_needs_rejoin`).
+    pub operation: String,
+    pub error: String,
+}
+
 /// Tauri-side observer. Cheap to clone (just an `AppHandle`), and
 /// `tauri::AppHandle` is `Send + Sync`, satisfying the orchestrator's
 /// non-WASM observer trait bound.
@@ -85,6 +94,32 @@ impl OrchestratorEventObserver for QuarantineObserver {
                 convo_id,
                 error = %e,
                 "Failed to emit mls://quarantine-cleared to renderer"
+            );
+        }
+    }
+
+    fn on_recovery_storage_write_failed(&self, convo_id: &str, operation: &str, error: &str) {
+        // WS-5.2: a failed recovery-critical storage write silently cancels
+        // deferred recovery across restart — never let it vanish.
+        tracing::error!(
+            convo_id,
+            operation,
+            error,
+            "Recovery-critical storage write failed in orchestrator"
+        );
+        let payload = RecoveryStorageWriteFailedPayload {
+            convo_id: convo_id.to_string(),
+            operation: operation.to_string(),
+            error: error.to_string(),
+        };
+        if let Err(e) = self
+            .app
+            .emit("mls://recovery-storage-write-failed", &payload)
+        {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "Failed to emit mls://recovery-storage-write-failed to renderer"
             );
         }
     }
