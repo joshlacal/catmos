@@ -11,11 +11,25 @@ pub struct KeyringCredentialStore;
 
 impl KeyringCredentialStore {
     pub fn new() -> Self {
+        match Self::try_new() {
+            Ok(store) => store,
+            Err(err) => panic!("{err}"),
+        }
+    }
+
+    pub fn try_new() -> Result<Self> {
         #[cfg(target_os = "android")]
-        tracing::warn!(
-            "Android is currently using keyring's mock credential backend; secure OS keystore integration is not implemented yet"
-        );
-        Self
+        {
+            Err(OrchestratorError::Credential(
+                "Android secure credential storage is not implemented; refusing to initialize MLS with keyring's mock store"
+                    .to_string(),
+            ))
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            Ok(Self)
+        }
     }
 
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
@@ -126,5 +140,31 @@ impl CredentialStore for KeyringCredentialStore {
             let _ = entry.delete_credential();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(target_os = "android")]
+    #[test]
+    fn android_credential_store_constructor_fails_closed() {
+        let err = match KeyringCredentialStore::try_new() {
+            Ok(_) => panic!("Android must not use keyring's mock credential store"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("Android secure credential storage is not implemented"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn non_android_credential_store_constructor_succeeds() {
+        let _ =
+            KeyringCredentialStore::try_new().expect("desktop credential constructor should work");
     }
 }

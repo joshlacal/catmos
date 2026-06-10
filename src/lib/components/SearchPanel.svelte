@@ -22,6 +22,11 @@
   let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let inputEl: HTMLInputElement | undefined = $state();
 
+  type HighlightSegment = {
+    text: string;
+    match: boolean;
+  };
+
   $effect(() => {
     if (open && inputEl) {
       inputEl.focus();
@@ -81,20 +86,28 @@
     onClose();
   }
 
-  function highlightMatch(text: string, q: string): string {
-    if (!q.trim()) return escapeHtml(text);
-    const escaped = escapeHtml(text);
-    const escapedQuery = escapeHtml(q.trim());
-    const regex = new RegExp(`(${escapeRegex(escapedQuery)})`, 'gi');
-    return escaped.replace(regex, '<mark>$1</mark>');
-  }
+  function highlightSegments(text: string, q: string): HighlightSegment[] {
+    const term = q.trim();
+    if (!term) return [{ text, match: false }];
 
-  function escapeHtml(str: string): string {
-    return str
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+    const regex = new RegExp(escapeRegex(term), 'gi');
+    const segments: HighlightSegment[] = [];
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        segments.push({ text: text.slice(lastIndex, match.index), match: false });
+      }
+      segments.push({ text: match[0], match: true });
+      lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      segments.push({ text: text.slice(lastIndex), match: false });
+    }
+
+    return segments.length > 0 ? segments : [{ text, match: false }];
   }
 
   function escapeRegex(str: string): string {
@@ -172,7 +185,13 @@
               </div>
               <div class="result-sender">{hit.senderDid}</div>
               <div class="result-content">
-                {@html highlightMatch(hit.content, query)}
+                {#each highlightSegments(hit.content, query) as segment}
+                  {#if segment.match}
+                    <mark>{segment.text}</mark>
+                  {:else}
+                    {segment.text}
+                  {/if}
+                {/each}
               </div>
             </button>
           {/each}
@@ -380,7 +399,7 @@
     white-space: nowrap;
   }
 
-  .result-content :global(mark) {
+  .result-content mark {
     background: var(--accent);
     color: var(--text-on-accent);
     border-radius: 2px;
