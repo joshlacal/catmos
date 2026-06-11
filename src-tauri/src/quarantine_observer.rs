@@ -50,6 +50,30 @@ pub struct RecoveryStorageWriteFailedPayload {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialBindingWarningPayload {
+    /// `"<none>"` when no conversation is in scope yet (e.g. key-package
+    /// fetch during group creation).
+    pub convo_id: String,
+    /// ADR-009 D5 operation tag (`fetch`, `message`, ...).
+    pub operation: String,
+    pub expected_did: String,
+    pub claimed_identity: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SequencerEquivocationPayload {
+    pub convo_id: String,
+    pub epoch: i32,
+    /// Hex-encoded commit hashes from the two conflicting receipts.
+    pub stored_commit_hash_hex: String,
+    pub new_commit_hash_hex: String,
+    pub sequencer_did: String,
+}
+
 /// Tauri-side observer. Cheap to clone (just an `AppHandle`), and
 /// `tauri::AppHandle` is `Send + Sync`, satisfying the orchestrator's
 /// non-WASM observer trait bound.
@@ -120,6 +144,75 @@ impl OrchestratorEventObserver for QuarantineObserver {
                 convo_id,
                 error = %e,
                 "Failed to emit mls://recovery-storage-write-failed to renderer"
+            );
+        }
+    }
+
+    fn on_credential_binding_warning(
+        &self,
+        convo_id: &str,
+        operation: &str,
+        expected_did: &str,
+        claimed_identity: &str,
+        reason: &str,
+    ) {
+        // WS-3 stage 1 (ADR-009 D5): warn-and-allow — the operation
+        // continued, but field data on these warnings gates the enforce
+        // flip. Never let one vanish.
+        tracing::error!(
+            convo_id,
+            operation,
+            expected_did,
+            claimed_identity,
+            reason,
+            "Credential-binding check failed in warn-and-allow mode"
+        );
+        let payload = CredentialBindingWarningPayload {
+            convo_id: convo_id.to_string(),
+            operation: operation.to_string(),
+            expected_did: expected_did.to_string(),
+            claimed_identity: claimed_identity.to_string(),
+            reason: reason.to_string(),
+        };
+        if let Err(e) = self.app.emit("mls://credential-binding-warning", &payload) {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "Failed to emit mls://credential-binding-warning to renderer"
+            );
+        }
+    }
+
+    fn on_sequencer_equivocation(
+        &self,
+        convo_id: &str,
+        epoch: i32,
+        stored_commit_hash_hex: &str,
+        new_commit_hash_hex: &str,
+        sequencer_did: &str,
+    ) {
+        // WS-3 stage 1 (ADR-009 D8 / E3): detection-only — two receipts for
+        // the same (conversation, epoch) carried different commit hashes.
+        tracing::error!(
+            convo_id,
+            epoch,
+            stored_commit_hash_hex,
+            new_commit_hash_hex,
+            sequencer_did,
+            "Sequencer equivocation detected"
+        );
+        let payload = SequencerEquivocationPayload {
+            convo_id: convo_id.to_string(),
+            epoch,
+            stored_commit_hash_hex: stored_commit_hash_hex.to_string(),
+            new_commit_hash_hex: new_commit_hash_hex.to_string(),
+            sequencer_did: sequencer_did.to_string(),
+        };
+        if let Err(e) = self.app.emit("mls://sequencer-equivocation", &payload) {
+            tracing::warn!(
+                convo_id,
+                error = %e,
+                "Failed to emit mls://sequencer-equivocation to renderer"
             );
         }
     }
