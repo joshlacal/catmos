@@ -705,6 +705,11 @@ fn convo_view_to_conversation(c: &lexicon::defs::ConvoViewData) -> ConversationV
         metadata: None,
         created_at: c.created_at.as_ref().to_string().parse().ok(),
         updated_at: None,
+        // WS-4 rung 2: the vendored crate::catbird lexicon types predate
+        // convoView.sequencerDid; map None until they are regenerated
+        // (2026-06-11 WS-4 plan §3.4). The orchestrator treats absence as
+        // "sequencer unknown" and keeps default routing.
+        sequencer_did: None,
     }
 }
 

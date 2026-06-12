@@ -726,6 +726,9 @@ impl MLSStorageBackend for SqliteStorage {
                     metadata,
                     created_at: created,
                     updated_at: updated,
+                    // WS-4 rung 2: not yet persisted in this platform's storage
+                    // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
+                    sequencer_did: None,
                 })
             })
             .ok();
@@ -766,6 +769,9 @@ impl MLSStorageBackend for SqliteStorage {
                     metadata,
                     created_at: created,
                     updated_at: updated,
+                    // WS-4 rung 2: not yet persisted in this platform's storage
+                    // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
+                    sequencer_did: None,
                 })
             })
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
