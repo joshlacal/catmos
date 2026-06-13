@@ -190,6 +190,7 @@ impl SqliteStorage {
                 avatar_content_type TEXT,
                 created_at TEXT,
                 updated_at TEXT,
+                sequencer_did TEXT,
                 reset_new_group_id TEXT,
                 reset_generation INTEGER,
                 reset_notified_at_ms INTEGER,
@@ -242,6 +243,7 @@ impl SqliteStorage {
         Self::ensure_messages_delivery_status_column(&conn)?;
         Self::ensure_conversations_reset_pending_columns(&conn)?;
         Self::ensure_conversations_metadata_columns(&conn)?;
+        Self::ensure_conversations_sequencer_column(&conn)?;
         Self::ensure_conversations_quarantine_columns(&conn)?;
         Self::ensure_message_field_columns(&conn)?;
         Self::ensure_message_field_migration_v1(&conn)?;
@@ -406,6 +408,28 @@ impl SqliteStorage {
         if !has_avatar_content_type {
             conn.execute(
                 "ALTER TABLE conversations ADD COLUMN avatar_content_type TEXT",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_conversations_sequencer_column(
+        conn: &Connection,
+    ) -> std::result::Result<(), rusqlite::Error> {
+        let mut stmt = conn.prepare("PRAGMA table_info(conversations)")?;
+        let mut has_sequencer_did = false;
+        let column_names = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+        for column_name in column_names {
+            if column_name? == "sequencer_did" {
+                has_sequencer_did = true;
+            }
+        }
+
+        if !has_sequencer_did {
+            conn.execute(
+                "ALTER TABLE conversations ADD COLUMN sequencer_did TEXT",
                 [],
             )?;
         }
@@ -696,7 +720,7 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at
+                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at, sequencer_did
                  FROM conversations WHERE conversation_id = ?1 AND user_did = ?2",
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -710,6 +734,7 @@ impl MLSStorageBackend for SqliteStorage {
                 let metadata_json: Option<String> = row.get(4)?;
                 let created_at: Option<String> = row.get(5)?;
                 let updated_at: Option<String> = row.get(6)?;
+                let sequencer_did: Option<String> = row.get(7)?;
 
                 let members: Vec<MemberView> =
                     serde_json::from_str(&members_json).unwrap_or_default();
@@ -726,9 +751,7 @@ impl MLSStorageBackend for SqliteStorage {
                     metadata,
                     created_at: created,
                     updated_at: updated,
-                    // WS-4 rung 2: not yet persisted in this platform's storage
-                    // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-                    sequencer_did: None,
+                    sequencer_did,
                 })
             })
             .ok();
@@ -740,7 +763,7 @@ impl MLSStorageBackend for SqliteStorage {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at
+                "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at, sequencer_did
                  FROM conversations WHERE user_did = ?1",
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -754,6 +777,7 @@ impl MLSStorageBackend for SqliteStorage {
                 let metadata_json: Option<String> = row.get(4)?;
                 let created_at: Option<String> = row.get(5)?;
                 let updated_at: Option<String> = row.get(6)?;
+                let sequencer_did: Option<String> = row.get(7)?;
 
                 let members: Vec<MemberView> =
                     serde_json::from_str(&members_json).unwrap_or_default();
@@ -769,9 +793,7 @@ impl MLSStorageBackend for SqliteStorage {
                     metadata,
                     created_at: created,
                     updated_at: updated,
-                    // WS-4 rung 2: not yet persisted in this platform's storage
-                    // (2026-06-11 WS-4 plan §3.4); absence = sequencer unknown.
-                    sequencer_did: None,
+                    sequencer_did,
                 })
             })
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -908,6 +930,20 @@ impl MLSStorageBackend for SqliteStorage {
                  reset_notified_at_ms = NULL
              WHERE conversation_id = ?1",
             rusqlite::params![conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn set_conversation_sequencer(
+        &self,
+        conversation_id: &str,
+        sequencer_did: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations SET sequencer_did = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![sequencer_did, conversation_id],
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
@@ -1192,6 +1228,19 @@ impl MLSStorageBackend for SqliteStorage {
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(rows > 0)
     }
+
+    fn implemented_optional_methods(&self) -> &'static [&'static str] {
+        &[
+            "get_conversation_state",
+            "mark_reset_pending",
+            "clear_reset_pending",
+            "set_conversation_sequencer",
+            "mark_quarantined",
+            "clear_quarantine",
+            "store_pending_message",
+            "remove_pending_message",
+        ]
+    }
 }
 
 fn row_to_message(row: &rusqlite::Row, mls_ctx: Option<&MLSContext>) -> rusqlite::Result<Message> {
@@ -1412,6 +1461,47 @@ mod field_encryption_tests {
             payload_encrypted.is_none(),
             "fallback row must leave payload_encrypted NULL"
         );
+    }
+
+    #[tokio::test]
+    async fn conversation_sequencer_did_round_trips() {
+        let (_tmp, storage) = new_temp_storage();
+        let user_did = "did:plc:alice";
+        let conversation_id = "conv-sequencer";
+        let group_id = "group-sequencer";
+        let sequencer_did = "did:web:ds-b.example";
+
+        storage
+            .ensure_conversation_exists(user_did, conversation_id, group_id)
+            .await
+            .expect("create conversation");
+        storage
+            .set_conversation_sequencer(conversation_id, sequencer_did)
+            .await
+            .expect("persist sequencer");
+        assert!(
+            storage
+                .implemented_optional_methods()
+                .contains(&"set_conversation_sequencer"),
+            "storage capabilities should report sequencer persistence"
+        );
+
+        let got = storage
+            .get_conversation(user_did, conversation_id)
+            .await
+            .expect("load conversation")
+            .expect("conversation exists");
+        assert_eq!(got.sequencer_did.as_deref(), Some(sequencer_did));
+
+        let listed = storage
+            .list_conversations(user_did)
+            .await
+            .expect("list conversations");
+        let listed = listed
+            .into_iter()
+            .find(|c| c.conversation_id == conversation_id)
+            .expect("listed conversation");
+        assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
     }
 
     /// Full roundtrip: install a content-root key on an ephemeral
