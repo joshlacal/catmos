@@ -5,6 +5,7 @@ use reqwest::Client;
 use std::sync::RwLock;
 
 use catbird_mls::orchestrator::api_client::MLSAPIClient;
+use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::types::*;
 
@@ -226,6 +227,8 @@ pub struct ReqwestApiClient {
     auth_token: RwLock<Option<String>>,
     current_did: RwLock<Option<String>>,
     mls_context: RwLock<Option<std::sync::Arc<catbird_mls::MLSContext>>>,
+    #[cfg(test)]
+    publish_device_id_override: RwLock<Option<String>>,
 }
 
 impl ReqwestApiClient {
@@ -242,6 +245,8 @@ impl ReqwestApiClient {
             auth_token: RwLock::new(None),
             current_did: RwLock::new(None),
             mls_context: RwLock::new(None),
+            #[cfg(test)]
+            publish_device_id_override: RwLock::new(None),
         }
     }
 
@@ -287,6 +292,39 @@ impl ReqwestApiClient {
 
     pub fn get_auth_token(&self) -> Option<String> {
         self.auth_token.read().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn set_publish_device_id_for_tests(&self, device_id: impl Into<String>) {
+        *self.publish_device_id_override.write().unwrap() = Some(device_id.into());
+    }
+
+    async fn current_publish_device_id(&self) -> Result<String> {
+        #[cfg(test)]
+        if let Some(device_id) = self.publish_device_id_override.read().unwrap().clone() {
+            let device_id = device_id.trim().to_string();
+            if !device_id.is_empty() {
+                return Ok(device_id);
+            }
+        }
+
+        let user_did = self
+            .current_did
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let store = crate::credentials::KeyringCredentialStore::try_new()?;
+        store
+            .get_device_uuid(&user_did)
+            .await?
+            .map(|device_id| device_id.trim().to_string())
+            .filter(|device_id| !device_id.is_empty())
+            .ok_or_else(|| {
+                OrchestratorError::Api(
+                    "Cannot publish key package before MLS device registration".to_string(),
+                )
+            })
     }
 
     /// Check if the current user is opted into MLS chat.
@@ -705,11 +743,7 @@ fn convo_view_to_conversation(c: &lexicon::defs::ConvoViewData) -> ConversationV
         metadata: None,
         created_at: c.created_at.as_ref().to_string().parse().ok(),
         updated_at: None,
-        // WS-4 rung 2: the vendored crate::catbird lexicon types predate
-        // convoView.sequencerDid; map None until they are regenerated
-        // (2026-06-11 WS-4 plan §3.4). The orchestrator treats absence as
-        // "sequencer unknown" and keeps default routing.
-        sequencer_did: None,
+        sequencer_did: c.sequencer_did.as_ref().map(|d| d.as_str().to_string()),
     }
 }
 
@@ -1106,6 +1140,7 @@ impl MLSAPIClient for ReqwestApiClient {
         expires_at: &str,
     ) -> Result<()> {
         let token = self.auth_header()?;
+        let device_id = self.current_publish_device_id().await?;
         let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
             .map(crate::types::string::Datetime::new)
             .map_err(|e| OrchestratorError::Api(format!("Invalid expires timestamp: {e}")))?;
@@ -1113,7 +1148,7 @@ impl MLSAPIClient for ReqwestApiClient {
             lexicon::publish_key_packages::InputData {
                 action: "publish".to_string(),
                 convo_id: None,
-                device_id: None,
+                device_id: Some(device_id),
                 key_packages: Some(vec![lexicon::publish_key_packages::KeyPackageItemData {
                     cipher_suite: cipher_suite.to_string(),
                     expires,
@@ -1646,6 +1681,37 @@ mod tests {
         assert_ne!(encoded, DOUBLE_ENCODED);
     }
 
+    #[test]
+    fn convo_view_mapper_preserves_sequencer_did() {
+        let raw = r#"{
+            "conversationId": "conv-sequencer",
+            "groupId": "group-sequencer",
+            "creator": "did:plc:creator",
+            "members": [
+                {
+                    "did": "did:plc:alice",
+                    "userDid": "did:plc:alice",
+                    "joinedAt": "2026-06-13T00:00:00Z",
+                    "isAdmin": true
+                }
+            ],
+            "epoch": 7,
+            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+            "createdAt": "2026-06-13T00:00:00Z",
+            "sequencerDid": "did:web:ds-b.example"
+        }"#;
+        let parsed: blue_catbird::mlsChat::ConvoView<'_> =
+            serde_json::from_str(raw).expect("deserialize ConvoView");
+        let generated: lexicon::defs::ConvoViewData = parsed.into_static();
+
+        let mapped = convo_view_to_conversation(&generated);
+
+        assert_eq!(
+            mapped.sequencer_did.as_deref(),
+            Some("did:web:ds-b.example")
+        );
+    }
+
     /// Demonstrates the bug the new path fixes: construct through the
     /// `InputData` adapter with a `B64.encode` string and observe the
     /// double-encoded wire output. If this ever starts producing
@@ -1762,6 +1828,41 @@ mod tests {
             });
         });
         (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    #[tokio::test]
+    async fn publish_key_package_posts_registered_device_id() {
+        let (base_url, rx) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+        client.set_publish_device_id_for_tests("device-uuid-123");
+
+        client
+            .publish_key_package(
+                b"test-key-package",
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
+                "2099-01-01T00:00:00Z",
+            )
+            .await
+            .expect("publish_key_package should succeed against 200 OK");
+
+        let captured = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server received request");
+
+        assert_eq!(captured.method, "POST");
+        assert_eq!(
+            captured.path, "/xrpc/blue.catbird.mlsChat.publishKeyPackages",
+            "must POST to the publishKeyPackages XRPC NSID"
+        );
+
+        let body: serde_json::Value = serde_json::from_slice(&captured.body).expect("body is JSON");
+        assert_eq!(body["action"], "publish");
+        assert_eq!(body["deviceId"], "device-uuid-123");
+        assert_eq!(
+            body["keyPackages"][0]["cipherSuite"],
+            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
+        );
     }
 
     #[tokio::test]
