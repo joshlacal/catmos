@@ -1126,6 +1126,7 @@ impl MLSAPIClient for ReqwestApiClient {
                     .parse()
                     .unwrap_or_else(|_| chrono::Utc::now()),
                 server_message_id: Some(m.id.to_string()),
+                server_epoch: Some(m.epoch as u64),
             })
             .collect();
 

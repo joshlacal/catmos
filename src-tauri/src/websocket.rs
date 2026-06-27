@@ -456,6 +456,7 @@ async fn handle_binary_frame(
                 ciphertext,
                 timestamp,
                 server_message_id: Some(id.clone()),
+                server_epoch: None,
             };
 
             // Decrypt via orchestrator. `decrypt_message` (task #33) no longer
