@@ -3,6 +3,7 @@ import * as api from '$lib/wasm';
 import { listenForEvent, isTauri } from '$lib/wasm';
 import type { AuthState } from '$lib/tauri';
 import { profiles } from './profiles';
+import { OAuthFlowGeneration } from '$lib/oauth-exchange';
 
 interface AuthStore {
 	user: AuthState | null;
@@ -32,57 +33,84 @@ async function fetchOwnProfile(user: AuthState) {
 function createAuthStore() {
 	const { subscribe, set, update } = writable<AuthStore>(initialState);
 
-	let unlistenOAuth: (() => void) | null = null;
-	let unlistenOAuthError: (() => void) | null = null;
-	let activeNativeOriginPromise: Promise<string | null> | null = null;
+	const oauthFlows = new OAuthFlowGeneration();
+	let activeCleanup: (() => void) | null = null;
 
-	function clearOAuthListeners() {
-		if (unlistenOAuth) unlistenOAuth();
-		if (unlistenOAuthError) unlistenOAuthError();
-		unlistenOAuth = null;
-		unlistenOAuthError = null;
-		activeNativeOriginPromise = null;
+	function invalidateOAuthFlow() {
+		oauthFlows.cancel();
+		activeCleanup?.();
+		activeCleanup = null;
 	}
 
 	return {
 		subscribe,
 		async startLogin(identifier: string) {
+			const generation = oauthFlows.begin();
+			activeCleanup?.();
+			activeCleanup = null;
 			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
 			try {
 				if (isTauri) {
-					clearOAuthListeners();
 					await api.cancelLogin();
+					if (!oauthFlows.isActive(generation)) return;
+					let unlistenCallback: (() => void) | null = null;
+					let unlistenError: (() => void) | null = null;
+					let originPromise: Promise<string | null> | null = null;
+					const cleanup = () => {
+						unlistenCallback?.();
+						unlistenError?.();
+						unlistenCallback = null;
+						unlistenError = null;
+					};
+					activeCleanup = cleanup;
 					// Tauri: listen for oauth-callback IPC event, then completeLogin
-					unlistenOAuth = await listenForEvent<{ code: string; redirectOrigin: string }>('oauth-callback', async (callback) => {
-						const expectedOrigin = await activeNativeOriginPromise;
-						if (callback.redirectOrigin !== expectedOrigin) return;
+					unlistenCallback = await listenForEvent<{ code: string; redirectOrigin: string }>('oauth-callback', async (callback) => {
+						const expectedOrigin = await originPromise;
+						if (!oauthFlows.isActive(generation) || callback.redirectOrigin !== expectedOrigin || !oauthFlows.claim(generation)) return;
+						cleanup();
 						try {
 							const user = await api.completeLogin(callback.code, callback.redirectOrigin);
+							if (!oauthFlows.isActive(generation)) return;
 							await fetchOwnProfile(user);
+							if (!oauthFlows.isActive(generation)) return;
 							set({ user, loading: false, error: null, waitingForOAuth: false });
 						} catch (e) {
+							if (!oauthFlows.isActive(generation)) return;
 							set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 						}
-						clearOAuthListeners();
 					});
-					unlistenOAuthError = await listenForEvent<{ message: string; redirectOrigin: string }>('oauth-error', async (event) => {
-						const expectedOrigin = await activeNativeOriginPromise;
-						if (event.redirectOrigin !== expectedOrigin) return;
+					if (!oauthFlows.isActive(generation)) {
+						cleanup();
+						return;
+					}
+					unlistenError = await listenForEvent<{ message: string; redirectOrigin: string }>('oauth-error', async (event) => {
+						const expectedOrigin = await originPromise;
+						if (!oauthFlows.isActive(generation) || event.redirectOrigin !== expectedOrigin || !oauthFlows.claim(generation)) return;
+						cleanup();
 						set({ user: null, loading: false, error: event.message, waitingForOAuth: false });
-						clearOAuthListeners();
 					});
-					activeNativeOriginPromise = api.startLogin(identifier);
-					await activeNativeOriginPromise;
+					if (!oauthFlows.isActive(generation)) {
+						cleanup();
+						return;
+					}
+					originPromise = api.startLogin(identifier);
+					await originPromise;
+					if (!oauthFlows.isActive(generation)) cleanup();
 				} else {
 					// Browser: startLogin redirects to nest OAuth — page navigates away.
 					await api.startLogin(identifier);
+					if (!oauthFlows.isActive(generation)) return;
 				}
 			} catch (e) {
+				if (!oauthFlows.isActive(generation)) return;
+				oauthFlows.claim(generation);
+				activeCleanup?.();
+				activeCleanup = null;
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
 		cancelLogin() {
-			clearOAuthListeners();
+			invalidateOAuthFlow();
 			void api.cancelLogin();
 			set(initialState);
 		},

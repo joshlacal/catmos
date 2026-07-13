@@ -227,7 +227,7 @@ async fn take_pending_oauth_for_origin(
     origin: &str,
 ) -> Result<PendingOAuth, String> {
     let mut pending = slot.lock().await;
-    if !pending.as_ref().is_some_and(|flow| flow.origin == origin) {
+    if pending.as_ref().is_none_or(|flow| flow.origin != origin) {
         return Err("OAuth login state is missing, mismatched, or already used".to_string());
     }
     pending
@@ -264,23 +264,77 @@ async fn redeem_oauth_code(
     code: &str,
     pending: &PendingOAuth,
 ) -> Result<String, String> {
-    let client = reqwest::Client::new();
+    redeem_oauth_code_with_limits(
+        nest_url,
+        code,
+        pending,
+        std::time::Duration::from_secs(10),
+        4096,
+    )
+    .await
+}
+
+async fn redeem_oauth_code_with_limits(
+    nest_url: &str,
+    code: &str,
+    pending: &PendingOAuth,
+    timeout: std::time::Duration,
+    max_response_bytes: usize,
+) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "OAuth exchange request could not be built".to_string())?;
     let request = build_oauth_exchange_request(&client, nest_url, code, pending)?;
-    let response = client
+    let mut response = client
         .execute(request)
         .await
-        .map_err(|_| "OAuth exchange request failed".to_string())?;
+        .map_err(map_oauth_exchange_transport_error)?;
     if !response.status().is_success() {
         return Err("OAuth exchange failed".to_string());
     }
-    let exchange: OAuthExchangeResponse = response
-        .json()
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase);
+    if content_type.as_deref() != Some("application/json") {
+        return Err("OAuth exchange returned an invalid content type".to_string());
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_response_bytes as u64)
+    {
+        return Err("OAuth exchange response is too large".to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(map_oauth_exchange_transport_error)?
+    {
+        if body.len().saturating_add(chunk.len()) > max_response_bytes {
+            return Err("OAuth exchange response is too large".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let exchange: OAuthExchangeResponse = serde_json::from_slice(&body)
         .map_err(|_| "OAuth exchange returned an invalid response".to_string())?;
     if exchange.session_id.is_empty() {
         return Err("OAuth exchange returned an invalid response".to_string());
     }
     Ok(exchange.session_id)
+}
+
+fn map_oauth_exchange_transport_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "OAuth exchange timed out".to_string()
+    } else {
+        "OAuth exchange request failed".to_string()
+    }
 }
 
 fn build_oauth_exchange_request(
@@ -760,6 +814,25 @@ fn parse_callback_code(path: &str) -> Result<String, String> {
 mod oauth_exchange_tests {
     use super::*;
 
+    async fn spawn_exchange_server(response_parts: Vec<Vec<u8>>, delay_ms: u64) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let _ = stream.read(&mut request).await;
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            for part in response_parts {
+                if stream.write_all(&part).await.is_err() {
+                    break;
+                }
+            }
+        });
+        format!("http://{}", address)
+    }
+
     #[test]
     fn callback_accepts_only_exchange_code() {
         assert_eq!(
@@ -826,6 +899,66 @@ mod oauth_exchange_tests {
             "http://127.0.0.1:43210"
         );
         assert!(!request.url().as_str().contains("session_id"));
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_delayed_response() {
+        let server = spawn_exchange_server(
+            vec![b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"session_id\":\"credential\"}".to_vec()],
+            100,
+        )
+        .await;
+        let pending =
+            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:43210".into());
+        let result = redeem_oauth_code_with_limits(
+            &server,
+            &"A".repeat(43),
+            &pending,
+            std::time::Duration::from_millis(10),
+            4096,
+        )
+        .await;
+        assert_eq!(result.unwrap_err(), "OAuth exchange timed out");
+    }
+
+    #[tokio::test]
+    async fn exchange_rejects_oversized_content_length_and_chunked_body() {
+        let pending =
+            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:43210".into());
+        let content_length_server = spawn_exchange_server(
+            vec![b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4097\r\n\r\n".to_vec()],
+            0,
+        )
+        .await;
+        let length_error = redeem_oauth_code_with_limits(
+            &content_length_server,
+            &"A".repeat(43),
+            &pending,
+            std::time::Duration::from_secs(1),
+            4096,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(length_error, "OAuth exchange response is too large");
+
+        let chunk = vec![b'x'; 3000];
+        let mut first = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", chunk.len()).into_bytes();
+        first.extend_from_slice(&chunk);
+        first.extend_from_slice(b"\r\n");
+        let mut second = format!("{:x}\r\n", chunk.len()).into_bytes();
+        second.extend_from_slice(&chunk);
+        second.extend_from_slice(b"\r\n0\r\n\r\n");
+        let chunked_server = spawn_exchange_server(vec![first, second], 0).await;
+        let chunked_error = redeem_oauth_code_with_limits(
+            &chunked_server,
+            &"A".repeat(43),
+            &pending,
+            std::time::Duration::from_secs(1),
+            4096,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(chunked_error, "OAuth exchange response is too large");
     }
 }
 
