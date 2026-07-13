@@ -51,6 +51,15 @@ describe('OAuth callback exchange', () => {
 		expect(fetcher).toHaveBeenCalledTimes(2);
 	});
 
+	it('refuses redirects so code and nonce cannot be forwarded to another origin', async () => {
+		const fetcher = vi.fn().mockImplementation((_input: string, init: RequestInit) => {
+			expect(init.redirect).toBe('error');
+			return Promise.resolve(new Response(JSON.stringify({ session_id: 'credential' }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+		});
+		await expect(redeemOAuthCode('https://api.catbird.blue', 'A'.repeat(43), 'nonce-value-123456', fetcher)).resolves.toBe('credential');
+		expect(fetcher).toHaveBeenCalledOnce();
+	});
+
 	it('times out a delayed exchange response', async () => {
 		const fetcher = vi.fn((_input: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {
 			init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));

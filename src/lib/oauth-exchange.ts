@@ -102,6 +102,7 @@ export async function redeemOAuthCode(
 	try {
 		response = await fetcher(new URL('/auth/exchange', nestUrl).toString(), {
 			method: 'POST',
+			redirect: 'error',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({ code, browser_nonce: browserNonce }),
 			signal: controller.signal
