@@ -1,4 +1,4 @@
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
 use base64::Engine;
 use catbird_atproto::blue_catbird;
 use catbird_atproto::jacquard_common::IntoStatic;
@@ -8,7 +8,7 @@ use catbird_mls::orchestrator::MLSAPIClient;
 use catbird_mls::orchestrator::MLSStorageBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -190,10 +190,114 @@ pub struct AuthResponse {
     pub avatar: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OAuthCallbackEvent {
+    code: String,
+    redirect_origin: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OAuthErrorEvent {
+    message: String,
+    redirect_origin: String,
+}
+
 #[derive(Debug, Clone)]
 struct SessionInfo {
     did: String,
     handle: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOAuth {
+    nonce: String,
+    origin: String,
+}
+
+impl PendingOAuth {
+    fn new(nonce: String, origin: String) -> Self {
+        Self { nonce, origin }
+    }
+}
+
+async fn take_pending_oauth_for_origin(
+    slot: &tokio::sync::Mutex<Option<PendingOAuth>>,
+    origin: &str,
+) -> Result<PendingOAuth, String> {
+    let mut pending = slot.lock().await;
+    if !pending.as_ref().is_some_and(|flow| flow.origin == origin) {
+        return Err("OAuth login state is missing, mismatched, or already used".to_string());
+    }
+    pending
+        .take()
+        .ok_or_else(|| "OAuth login state is missing, mismatched, or already used".to_string())
+}
+
+async fn clear_pending_oauth_if_origin(
+    slot: &tokio::sync::Mutex<Option<PendingOAuth>>,
+    origin: &str,
+) -> bool {
+    let mut pending = slot.lock().await;
+    if pending.as_ref().is_some_and(|flow| flow.origin == origin) {
+        pending.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[derive(Serialize)]
+struct OAuthExchangeRequest<'a> {
+    code: &'a str,
+    browser_nonce: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OAuthExchangeResponse {
+    session_id: String,
+}
+
+async fn redeem_oauth_code(
+    nest_url: &str,
+    code: &str,
+    pending: &PendingOAuth,
+) -> Result<String, String> {
+    let client = reqwest::Client::new();
+    let request = build_oauth_exchange_request(&client, nest_url, code, pending)?;
+    let response = client
+        .execute(request)
+        .await
+        .map_err(|_| "OAuth exchange request failed".to_string())?;
+    if !response.status().is_success() {
+        return Err("OAuth exchange failed".to_string());
+    }
+    let exchange: OAuthExchangeResponse = response
+        .json()
+        .await
+        .map_err(|_| "OAuth exchange returned an invalid response".to_string())?;
+    if exchange.session_id.is_empty() {
+        return Err("OAuth exchange returned an invalid response".to_string());
+    }
+    Ok(exchange.session_id)
+}
+
+fn build_oauth_exchange_request(
+    client: &reqwest::Client,
+    nest_url: &str,
+    code: &str,
+    pending: &PendingOAuth,
+) -> Result<reqwest::Request, String> {
+    client
+        .post(format!("{}/auth/exchange", nest_url.trim_end_matches('/')))
+        .header(reqwest::header::ORIGIN, &pending.origin)
+        .json(&OAuthExchangeRequest {
+            code,
+            browser_nonce: &pending.nonce,
+        })
+        .build()
+        .map_err(|_| "OAuth exchange request could not be built".to_string())
 }
 
 fn clear_saved_session_credentials() {
@@ -453,7 +557,11 @@ pub struct GroupMember {
 }
 
 #[tauri::command]
-pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
+pub async fn start_login(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    identifier: String,
+) -> Result<String, String> {
     let nest_url =
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
@@ -466,24 +574,37 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
         .map_err(|e| format!("Failed to get port: {}", e))?
         .port();
 
-    let redirect_to = format!("http://127.0.0.1:{}/callback", port);
+    let origin = format!("http://127.0.0.1:{}", port);
+    let redirect_to = format!("{}/callback", origin);
+    let mut nonce_bytes = [0u8; 32];
+    getrandom::getrandom(&mut nonce_bytes)
+        .map_err(|_| "Failed to generate OAuth nonce".to_string())?;
+    let browser_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
+    *state.pending_oauth.lock().await = Some(PendingOAuth::new(browser_nonce.clone(), origin));
     let login_url = format!(
-        "{}/auth/login?identifier={}&client=catmos&redirect_to={}",
+        "{}/auth/login?identifier={}&client=catmos&redirect_to={}&browser_nonce={}",
         nest_url,
         urlencoding::encode(&identifier),
-        urlencoding::encode(&redirect_to)
+        urlencoding::encode(&redirect_to),
+        urlencoding::encode(&browser_nonce)
     );
 
     // Open system browser
     #[allow(deprecated)]
     {
-        app.shell()
-            .open(&login_url, None)
-            .map_err(|e| e.to_string())?;
+        if let Err(error) = app.shell().open(&login_url, None) {
+            state.pending_oauth.lock().await.take();
+            return Err(error.to_string());
+        }
     }
 
     // Spawn async task to wait for the OAuth callback
     let app_handle = app.clone();
+    let callback_origin = redirect_to
+        .strip_suffix("/callback")
+        .expect("callback suffix is constant")
+        .to_string();
+    let returned_origin = callback_origin.clone();
     tokio::spawn(async move {
         match tokio::time::timeout(
             std::time::Duration::from_secs(300),
@@ -491,20 +612,67 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
         )
         .await
         {
-            Ok(Ok(session_id)) => {
-                let _ = app_handle.emit("oauth-callback", &session_id);
+            Ok(Ok(code)) => {
+                let state = app_handle.state::<AppState>();
+                if state
+                    .pending_oauth
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|flow| flow.origin == callback_origin)
+                {
+                    let _ = app_handle.emit(
+                        "oauth-callback",
+                        OAuthCallbackEvent {
+                            code,
+                            redirect_origin: callback_origin,
+                        },
+                    );
+                }
             }
             Ok(Err(e)) => {
-                log_catmos!("OAuth callback error: {}", e);
-                let _ = app_handle.emit("oauth-error", &e);
+                if clear_pending_oauth_if_origin(
+                    &app_handle.state::<AppState>().pending_oauth,
+                    &callback_origin,
+                )
+                .await
+                {
+                    log_catmos!("OAuth callback error: {}", e);
+                    let _ = app_handle.emit(
+                        "oauth-error",
+                        OAuthErrorEvent {
+                            message: e,
+                            redirect_origin: callback_origin,
+                        },
+                    );
+                }
             }
             Err(_) => {
-                log_catmos!("OAuth callback timed out");
-                let _ = app_handle.emit("oauth-error", "Login timed out");
+                if clear_pending_oauth_if_origin(
+                    &app_handle.state::<AppState>().pending_oauth,
+                    &callback_origin,
+                )
+                .await
+                {
+                    log_catmos!("OAuth callback timed out");
+                    let _ = app_handle.emit(
+                        "oauth-error",
+                        OAuthErrorEvent {
+                            message: "Login timed out".to_string(),
+                            redirect_origin: callback_origin,
+                        },
+                    );
+                }
             }
         }
     });
 
+    Ok(returned_origin)
+}
+
+#[tauri::command]
+pub async fn cancel_login(state: State<'_, AppState>) -> Result<(), String> {
+    state.pending_oauth.lock().await.take();
     Ok(())
 }
 
@@ -545,23 +713,7 @@ async fn wait_for_callback(listener: TcpListener) -> Result<String, String> {
 
     let path = req.path.ok_or("No path in HTTP request")?;
 
-    // Extract query string from the path
-    let query = path
-        .split_once('?')
-        .map(|(_, q)| q)
-        .ok_or("No query string in callback URL")?;
-
-    // Find session_id parameter and URL-decode its value
-    let session_id = query
-        .split('&')
-        .find_map(|param| {
-            param.strip_prefix("session_id=").map(|v| {
-                urlencoding::decode(v)
-                    .unwrap_or_else(|_| v.into())
-                    .into_owned()
-            })
-        })
-        .ok_or_else(|| "No session_id in callback".to_string())?;
+    let code = parse_callback_code(path)?;
 
     // Send HTML response telling user to close the tab
     let html = r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>✅ Signed in!</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#;
@@ -573,14 +725,120 @@ async fn wait_for_callback(listener: TcpListener) -> Result<String, String> {
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
 
-    Ok(session_id)
+    Ok(code)
+}
+
+fn parse_callback_code(path: &str) -> Result<String, String> {
+    let (callback_path, query) = path
+        .split_once('?')
+        .ok_or_else(|| "Invalid OAuth callback".to_string())?;
+    if callback_path != "/callback" {
+        return Err("Invalid OAuth callback".to_string());
+    }
+    let mut params = query.split('&');
+    let parameter = params
+        .next()
+        .filter(|_| params.next().is_none())
+        .ok_or_else(|| "Invalid OAuth callback".to_string())?;
+    let encoded = parameter
+        .strip_prefix("code=")
+        .ok_or_else(|| "Invalid OAuth callback".to_string())?;
+    let code = urlencoding::decode(encoded)
+        .map_err(|_| "Invalid OAuth callback".to_string())?
+        .into_owned();
+    if code.len() != 43
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("Invalid OAuth callback".to_string());
+    }
+    Ok(code)
+}
+
+#[cfg(test)]
+mod oauth_exchange_tests {
+    use super::*;
+
+    #[test]
+    fn callback_accepts_only_exchange_code() {
+        assert_eq!(
+            parse_callback_code(&format!("/callback?code={}", "A".repeat(43))).unwrap(),
+            "A".repeat(43)
+        );
+        assert!(parse_callback_code("/callback?session_id=credential").is_err());
+        assert!(parse_callback_code("/callback?code=bad!").is_err());
+    }
+
+    #[tokio::test]
+    async fn pending_oauth_flow_is_origin_bound_and_single_use() {
+        let pending =
+            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:1234".into());
+        let slot = tokio::sync::Mutex::new(Some(pending));
+        assert!(
+            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:9999")
+                .await
+                .is_err()
+        );
+        assert!(
+            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:1234")
+                .await
+                .is_ok()
+        );
+        assert!(
+            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:1234")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_callback_cannot_clear_a_newer_login() {
+        let slot = tokio::sync::Mutex::new(Some(PendingOAuth::new(
+            "new-nonce-value-123456".into(),
+            "http://127.0.0.1:2222".into(),
+        )));
+        assert!(!clear_pending_oauth_if_origin(&slot, "http://127.0.0.1:1111").await);
+        assert!(
+            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:2222")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn exchange_request_binds_exact_origin_and_contains_no_credential_in_url() {
+        let pending =
+            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:43210".into());
+        let request = build_oauth_exchange_request(
+            &reqwest::Client::new(),
+            "https://api.catbird.blue",
+            &"A".repeat(43),
+            &pending,
+        )
+        .unwrap();
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.catbird.blue/auth/exchange"
+        );
+        assert_eq!(
+            request.headers()[reqwest::header::ORIGIN],
+            "http://127.0.0.1:43210"
+        );
+        assert!(!request.url().as_str().contains("session_id"));
+    }
 }
 
 #[tauri::command]
 pub async fn complete_login(
     state: State<'_, AppState>,
-    session_id: String,
+    code: String,
+    redirect_origin: String,
 ) -> Result<AuthResponse, String> {
+    let pending = take_pending_oauth_for_origin(&state.pending_oauth, &redirect_origin).await?;
+    let nest_url =
+        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+    let session_id = redeem_oauth_code(&nest_url, &code, &pending).await?;
     let session = fetch_session_info(&session_id).await?;
 
     // Initialize orchestrator for this user
@@ -2191,6 +2449,7 @@ pub async fn update_group_metadata(
             description.as_deref(),
             avatar_blob_locator.as_deref(),
             avatar_content_type.as_deref(),
+            None,
         )
         .await
         .map_err(|e| format!("{:?}", e))?;

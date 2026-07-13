@@ -33,6 +33,16 @@ function createAuthStore() {
 	const { subscribe, set, update } = writable<AuthStore>(initialState);
 
 	let unlistenOAuth: (() => void) | null = null;
+	let unlistenOAuthError: (() => void) | null = null;
+	let activeNativeOriginPromise: Promise<string | null> | null = null;
+
+	function clearOAuthListeners() {
+		if (unlistenOAuth) unlistenOAuth();
+		if (unlistenOAuthError) unlistenOAuthError();
+		unlistenOAuth = null;
+		unlistenOAuthError = null;
+		activeNativeOriginPromise = null;
+	}
 
 	return {
 		subscribe,
@@ -40,26 +50,40 @@ function createAuthStore() {
 			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
 			try {
 				if (isTauri) {
+					clearOAuthListeners();
+					await api.cancelLogin();
 					// Tauri: listen for oauth-callback IPC event, then completeLogin
-					unlistenOAuth = await listenForEvent<string>('oauth-callback', async (sessionId) => {
+					unlistenOAuth = await listenForEvent<{ code: string; redirectOrigin: string }>('oauth-callback', async (callback) => {
+						const expectedOrigin = await activeNativeOriginPromise;
+						if (callback.redirectOrigin !== expectedOrigin) return;
 						try {
-							const user = await api.completeLogin(sessionId);
+							const user = await api.completeLogin(callback.code, callback.redirectOrigin);
 							await fetchOwnProfile(user);
 							set({ user, loading: false, error: null, waitingForOAuth: false });
 						} catch (e) {
 							set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 						}
-						if (unlistenOAuth) unlistenOAuth();
+						clearOAuthListeners();
 					});
+					unlistenOAuthError = await listenForEvent<{ message: string; redirectOrigin: string }>('oauth-error', async (event) => {
+						const expectedOrigin = await activeNativeOriginPromise;
+						if (event.redirectOrigin !== expectedOrigin) return;
+						set({ user: null, loading: false, error: event.message, waitingForOAuth: false });
+						clearOAuthListeners();
+					});
+					activeNativeOriginPromise = api.startLogin(identifier);
+					await activeNativeOriginPromise;
+				} else {
+					// Browser: startLogin redirects to nest OAuth — page navigates away.
+					await api.startLogin(identifier);
 				}
-				// Browser: startLogin redirects to nest OAuth — page navigates away.
-				await api.startLogin(identifier);
 			} catch (e) {
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
 		cancelLogin() {
-			if (unlistenOAuth) unlistenOAuth();
+			clearOAuthListeners();
+			void api.cancelLogin();
 			set(initialState);
 		},
 		async logout() {
@@ -81,14 +105,15 @@ function createAuthStore() {
 			}
 		},
 		/** Called from /auth/callback route after browser OAuth completes. */
-		async completeOAuthCallback(sessionId: string) {
+		async completeOAuthCallback(code: string) {
 			update((s) => ({ ...s, loading: true, error: null }));
 			try {
-				const user = await api.completeLogin(sessionId);
+				const user = await api.completeLogin(code);
 				await fetchOwnProfile(user);
 				set({ user, loading: false, error: null, waitingForOAuth: false });
 			} catch (e) {
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
+				throw e;
 			}
 		},
 		setUser(user: AuthState) {

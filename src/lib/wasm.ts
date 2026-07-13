@@ -54,6 +54,12 @@ import type {
 
 import { wrap, proxy, type Remote } from 'comlink';
 import type { WorkerApi } from './mls-worker';
+import {
+	beginOAuthExchange,
+	cancelOAuthExchange,
+	consumeOAuthNonce,
+	redeemOAuthCode
+} from './oauth-exchange';
 
 // ---------------------------------------------------------------------------
 // Environment detection
@@ -285,30 +291,35 @@ function clearBrowserAuth(): void {
 	sessionStorage.removeItem(SS_ACTIVE_DID);
 }
 
-export async function startLogin(identifier: string): Promise<void> {
+export async function startLogin(identifier: string): Promise<string | null> {
 	if (isTauri) {
-		return tauriInvoke('start_login', { identifier });
+		return tauriInvoke<string>('start_login', { identifier });
 	}
-	const { hostname, port } = window.location;
-	let callbackBase: string;
-	if (hostname === 'localhost' || hostname === '127.0.0.1') {
-		callbackBase = `http://127.0.0.1:${port || '80'}`;
-	} else {
-		callbackBase = window.location.origin;
-	}
-	const redirectTo = `${callbackBase}/auth/callback`;
-	const loginUrl =
-		`${NEST_URL}/auth/login` +
-		`?identifier=${encodeURIComponent(identifier)}` +
-		`&client=catmos` +
-		`&redirect_to=${encodeURIComponent(redirectTo)}`;
-	window.location.href = loginUrl;
+	// Keep the exact initiating origin, including loopback hostname and port,
+	// because sessionStorage (and therefore the nonce) is origin-scoped.
+	const redirectTo = `${window.location.origin}/auth/callback`;
+	window.location.href = beginOAuthExchange(
+		NEST_URL,
+		identifier,
+		redirectTo,
+		sessionStorage
+	).toString();
+	return null;
 }
 
-export async function completeLogin(sessionId: string): Promise<AuthState> {
+export async function cancelLogin(): Promise<void> {
+	if (isTauri) return tauriInvoke('cancel_login');
+	cancelOAuthExchange(sessionStorage);
+}
+
+export async function completeLogin(code: string, redirectOrigin?: string): Promise<AuthState> {
 	if (isTauri) {
-		return tauriInvoke('complete_login', { sessionId });
+		if (!redirectOrigin) throw new Error('OAuth callback origin is missing');
+		return tauriInvoke('complete_login', { code, redirectOrigin });
 	}
+	const nonce = consumeOAuthNonce(sessionStorage);
+	if (!nonce) throw new Error('OAuth login state is missing or already used');
+	const sessionId = await redeemOAuthCode(NEST_URL, code, nonce);
 	const resp = await fetch(`${NEST_URL}/auth/session`, {
 		headers: { Authorization: `Bearer ${sessionId}` }
 	});

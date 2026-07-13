@@ -82,6 +82,7 @@ pub struct AppState {
     pub ws_handles: Mutex<HashMap<String, WsHandle>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    pub pending_oauth: Mutex<Option<commands::PendingOAuth>>,
     /// Per-app data directory (`~/Library/Application Support/catmos` on macOS,
     /// platform-equivalent elsewhere). Used by the auth flow to resolve the
     /// per-DID content-root key file (`keys::load_or_create_content_root_key`).
@@ -163,6 +164,7 @@ pub fn run() {
         ws_handles: Mutex::new(HashMap::new()),
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
+        pending_oauth: Mutex::new(None),
         data_dir,
     };
 
@@ -171,6 +173,7 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::start_login,
+            commands::cancel_login,
             commands::complete_login,
             commands::try_restore_session,
             commands::logout,

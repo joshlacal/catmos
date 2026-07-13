@@ -3,20 +3,17 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { auth } from '$lib/stores/auth';
+	import { parseOAuthCallback } from '$lib/oauth-exchange';
 
 	let status = $state('Completing sign in…');
 
 	onMount(async () => {
-		const sessionId = $page.url.searchParams.get('session_id');
-		if (!sessionId) {
-			status = 'Error: missing session_id in callback URL.';
-			return;
-		}
 		try {
-			await auth.completeOAuthCallback(sessionId);
+			const code = parseOAuthCallback($page.url);
+			await auth.completeOAuthCallback(code);
 			goto('/');
-		} catch (e) {
-			status = `Sign-in failed: ${e}`;
+		} catch {
+			status = 'Sign-in failed. Please restart the login flow.';
 		}
 	});
 </script>

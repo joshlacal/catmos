@@ -1139,9 +1139,13 @@ impl MLSAPIClient for ReqwestApiClient {
         key_package: &[u8],
         cipher_suite: &str,
         expires_at: &str,
+        device_id: Option<&str>,
     ) -> Result<()> {
         let token = self.auth_header()?;
-        let device_id = self.current_publish_device_id().await?;
+        let device_id = match device_id {
+            Some(device_id) => device_id.to_string(),
+            None => self.current_publish_device_id().await?,
+        };
         let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
             .map(crate::types::string::Datetime::new)
             .map_err(|e| OrchestratorError::Api(format!("Invalid expires timestamp: {e}")))?;
@@ -1843,6 +1847,7 @@ mod tests {
                 b"test-key-package",
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
                 "2099-01-01T00:00:00Z",
+                None,
             )
             .await
             .expect("publish_key_package should succeed against 200 OK");

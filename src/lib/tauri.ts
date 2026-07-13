@@ -113,12 +113,16 @@ export interface ProfileView {
 	avatar?: string;
 }
 
-export async function startLogin(identifier: string): Promise<void> {
+export async function startLogin(identifier: string): Promise<string> {
 	return invoke('start_login', { identifier });
 }
 
-export async function completeLogin(sessionId: string): Promise<AuthState> {
-	return invoke('complete_login', { sessionId });
+export async function cancelLogin(): Promise<void> {
+	return invoke('cancel_login');
+}
+
+export async function completeLogin(code: string, redirectOrigin: string): Promise<AuthState> {
+	return invoke('complete_login', { code, redirectOrigin });
 }
 
 export async function tryRestoreSession(): Promise<AuthState | null> {
