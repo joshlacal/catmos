@@ -9,7 +9,6 @@ use tauri::{AppHandle, Emitter};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use catbird_mls::orchestrator::types::IncomingEnvelope;
-use catbird_mls::orchestrator::MLSStorageBackend;
 
 use crate::api_client::ReqwestApiClient;
 use crate::{commands, CatmosOrchestrator};
@@ -43,10 +42,27 @@ fn cbor_int(map: &[(CborValue, CborValue)], key: &str) -> Option<i64> {
     map.iter().find_map(|(k, v)| match (k, v) {
         (CborValue::Text(k), CborValue::Integer(v)) if k == key => {
             let n: i128 = (*v).into();
-            Some(n as i64)
+            i64::try_from(n).ok()
         }
         _ => None,
     })
+}
+
+fn group_reset_authority_fields(map: &[(CborValue, CborValue)]) -> Result<(String, i32), String> {
+    let new_group_id = cbor_str(map, "newGroupId")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "groupReset event is missing a non-empty newGroupId".to_string())?;
+    let generation = cbor_int(map, "resetGeneration")
+        .ok_or_else(|| "groupReset event is missing a valid resetGeneration".to_string())?;
+    let generation = i32::try_from(generation).map_err(|_| {
+        format!("groupReset resetGeneration is outside the i32 domain: {generation}")
+    })?;
+    if generation < 0 {
+        return Err(format!(
+            "groupReset resetGeneration must be non-negative: {generation}"
+        ));
+    }
+    Ok((new_group_id, generation))
 }
 
 /// Extract a boolean from a CBOR map
@@ -662,8 +678,10 @@ async fn handle_binary_frame(
             };
 
             let cursor = cbor_str(top, "cursor");
-            let new_group_id = cbor_str(top, "newGroupId").unwrap_or_default();
-            let reset_generation = cbor_int(top, "resetGeneration").unwrap_or(0) as i32;
+            // Parse authority fields before performing side effects. A
+            // malformed event returns an error, so its cursor is not durably
+            // advanced and the server can replay it after remediation.
+            let (new_group_id, reset_generation) = group_reset_authority_fields(top)?;
             let reset_by = cbor_str(top, "resetBy").unwrap_or_default();
             let reason = cbor_str(top, "reason");
 
@@ -675,103 +693,26 @@ async fn handle_binary_frame(
                 short_id(&reset_by)
             );
 
-            // Spec §8.5: groupReset is a RESET_PENDING trigger — reset the
-            // recovery tracker's attempt counter to 0 so the deferred recovery
-            // treats this as a fresh attempt (no accumulated backoff/cooldown).
-            orchestrator.recovery_tracker().lock().await.clear(convo_id);
+            // The orchestrator owns the entire reset transition. It
+            // atomically publishes durable authority, preserves the old
+            // conversation→group mapping until predecessor deletion, and
+            // arms deferred recovery. Advancing the websocket cursor is
+            // unsafe unless that transition succeeds.
+            let new_group_id_bytes = hex::decode(&new_group_id).map_err(|e| {
+                format!("groupReset newGroupId was not valid hex for {convo_id}: {e}")
+            })?;
+            orchestrator
+                .record_group_reset(convo_id, new_group_id_bytes, reset_generation)
+                .await
+                .map_err(|e| {
+                    format!("Failed to record GroupReset authority for {convo_id}: {e}")
+                })?;
             log_ws!(
-                "Reset recovery tracker for {} (groupReset → fresh attempt)",
-                convo_id
+                "Recorded {} for deferred rejoin after group reset (newGroupId={}, gen={})",
+                convo_id,
+                new_group_id,
+                reset_generation
             );
-
-            // Flag for deferred recovery — External Commits only in deferred
-            // recovery, never inline in event handlers. Recovery dispatch
-            // reads the `needs_rejoin` boolean (recovery.rs), so we keep
-            // marking it; in addition we persist the RESET_PENDING payload
-            // (spec §8.5) so the new group id + reset generation survive a
-            // restart even if the orchestrator's in-memory
-            // `conversation_states` map is empty on next boot.
-            if let Err(e) = orchestrator.storage().mark_needs_rejoin(convo_id).await {
-                log_ws!("Failed to mark_needs_rejoin for {}: {:?}", convo_id, e);
-            }
-
-            let notified_at_ms = chrono::Utc::now().timestamp_millis();
-            if !new_group_id.is_empty() {
-                if let Err(e) = orchestrator
-                    .storage()
-                    .set_conversation_state(
-                        convo_id,
-                        catbird_mls::orchestrator::types::ConversationState::ResetPending {
-                            new_group_id: new_group_id.clone(),
-                            reset_generation,
-                            notified_at_ms,
-                        },
-                    )
-                    .await
-                {
-                    log_ws!("Failed to set ResetPending state for {}: {:?}", convo_id, e);
-                }
-                if let Err(e) = orchestrator
-                    .storage()
-                    .mark_reset_pending(convo_id, &new_group_id, reset_generation, notified_at_ms)
-                    .await
-                {
-                    log_ws!(
-                        "Failed to persist ResetPending payload for {}: {:?}",
-                        convo_id,
-                        e
-                    );
-                } else {
-                    log_ws!(
-                        "Flagged {} for deferred rejoin after group reset (newGroupId={}, gen={})",
-                        convo_id,
-                        new_group_id,
-                        reset_generation
-                    );
-                }
-            } else {
-                // Server didn't send a new group id; fall back to NeedsRejoin
-                // state so the recovery loop still picks this up via the
-                // pre-reset lookup-by-conversation-id heuristic.
-                if let Err(e) = orchestrator
-                    .storage()
-                    .set_conversation_state(
-                        convo_id,
-                        catbird_mls::orchestrator::types::ConversationState::NeedsRejoin,
-                    )
-                    .await
-                {
-                    log_ws!("Failed to set NeedsRejoin state for {}: {:?}", convo_id, e);
-                } else {
-                    log_ws!(
-                        "Flagged {} for deferred rejoin after group reset (no newGroupId in payload)",
-                        convo_id
-                    );
-                }
-            }
-
-            // Adopt the new group id locally so the deferred rejoin targets
-            // the post-reset MLS group. Empty = server didn't send one; fall
-            // back to the pre-reset lookup-by-conversation-id heuristic.
-            if !new_group_id.is_empty() {
-                if let Err(e) = orchestrator
-                    .storage()
-                    .update_conversation_group_id(convo_id, &new_group_id)
-                {
-                    log_ws!(
-                        "Failed to update group_id for {} to {}: {:?}",
-                        convo_id,
-                        new_group_id,
-                        e
-                    );
-                } else {
-                    log_ws!(
-                        "Adopted new group_id {} for convo {}",
-                        new_group_id,
-                        convo_id
-                    );
-                }
-            }
 
             // Emit event to frontend
             let _ = app.emit(
@@ -917,5 +858,52 @@ fn cbor_str_from_cbor(val: &CborValue, key: &str) -> Option<String> {
     match val {
         CborValue::Map(ref entries) => cbor_str(entries, key),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reset_map(
+        new_group_id: Option<&str>,
+        generation: Option<i64>,
+    ) -> Vec<(CborValue, CborValue)> {
+        let mut map = Vec::new();
+        if let Some(new_group_id) = new_group_id {
+            map.push((
+                CborValue::Text("newGroupId".to_string()),
+                CborValue::Text(new_group_id.to_string()),
+            ));
+        }
+        if let Some(generation) = generation {
+            map.push((
+                CborValue::Text("resetGeneration".to_string()),
+                CborValue::Integer(generation.into()),
+            ));
+        }
+        map
+    }
+
+    #[test]
+    fn group_reset_authority_requires_target_before_cursor_ack() {
+        assert!(group_reset_authority_fields(&reset_map(None, Some(1))).is_err());
+        assert!(group_reset_authority_fields(&reset_map(Some(""), Some(1))).is_err());
+    }
+
+    #[test]
+    fn group_reset_authority_requires_nonnegative_i32_generation_before_cursor_ack() {
+        assert!(group_reset_authority_fields(&reset_map(Some("00"), None)).is_err());
+        assert!(group_reset_authority_fields(&reset_map(Some("00"), Some(-1))).is_err());
+        assert!(group_reset_authority_fields(&reset_map(
+            Some("00"),
+            Some(i64::from(i32::MAX) + 1),
+        ))
+        .is_err());
+        assert_eq!(
+            group_reset_authority_fields(&reset_map(Some("00"), Some(i64::from(i32::MAX))))
+                .expect("maximum valid generation"),
+            ("00".to_string(), i32::MAX)
+        );
     }
 }
