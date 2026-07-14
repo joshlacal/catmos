@@ -110,6 +110,14 @@ fn parse_sequencer_receipt_data(
         .and_then(|value| value.as_integer())
         .ok_or_else(|| "missing epoch".to_string())
         .and_then(|value| i32::try_from(value).map_err(|_| "epoch out of i32 range".to_string()))?;
+    let sequencer_term = object
+        .get("sequencer_term")
+        .or_else(|| object.get("sequencerTerm"))
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "missing sequencer_term/sequencerTerm".to_string())
+        .and_then(|value| {
+            u64::try_from(value).map_err(|_| "sequencer term out of u64 range".to_string())
+        })?;
     let commit_hash = parse_receipt_bytes_data(
         "commit_hash",
         object
@@ -138,6 +146,7 @@ fn parse_sequencer_receipt_data(
     Ok(SequencerReceipt {
         convo_id,
         epoch,
+        sequencer_term,
         commit_hash,
         sequencer_did,
         issued_at,
@@ -145,10 +154,48 @@ fn parse_sequencer_receipt_data(
     })
 }
 
+fn find_receipt_value(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    let object = value.as_object()?;
+    object.get("receipt").or_else(|| {
+        object
+            .values()
+            .find_map(|value| value.as_object().and_then(|nested| nested.get("receipt")))
+    })
+}
+
+/// Parse a commit response without allowing Jacquard's open-value integer
+/// representation to truncate an out-of-domain unsigned JSON number.
+fn parse_commit_group_change_output(
+    body: &[u8],
+    op: &str,
+) -> Result<lexicon::commit_group_change::Output> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+    if let Some(receipt) = find_receipt_value(&raw) {
+        let receipt = receipt.as_object().ok_or_else(|| {
+            OrchestratorError::Api(format!("invalid {op} sequencer receipt: expected object"))
+        })?;
+        let term = receipt
+            .get("sequencer_term")
+            .or_else(|| receipt.get("sequencerTerm"))
+            .and_then(serde_json::Value::as_u64)
+            .filter(|term| *term <= i64::MAX as u64)
+            .ok_or_else(|| {
+                OrchestratorError::Api(format!(
+                    "invalid {op} sequencer receipt: sequencer term must be an ATProto i64 integer"
+                ))
+            })?;
+        debug_assert!(i64::try_from(term).is_ok());
+    }
+    parse_lexicon_json::<blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>>(
+        body,
+    )
+}
+
 fn parse_commit_group_change_receipt(
     output: &lexicon::commit_group_change::Output,
     op: &str,
-) -> Option<SequencerReceipt> {
+) -> Result<Option<SequencerReceipt>> {
     let receipt = output.extra_data.as_ref().and_then(|extra| {
         extra.get("receipt").or_else(|| {
             extra
@@ -157,22 +204,13 @@ fn parse_commit_group_change_receipt(
         })
     });
 
-    let receipt = match receipt {
-        Some(value) => value,
-        None => return None,
+    let Some(receipt) = receipt else {
+        return Ok(None);
     };
 
-    match parse_sequencer_receipt_data(receipt) {
-        Ok(receipt) => Some(receipt),
-        Err(error) => {
-            tracing::warn!(
-                operation = op,
-                error = %error,
-                "Failed to parse sequencer receipt; continuing without receipt"
-            );
-            None
-        }
-    }
+    parse_sequencer_receipt_data(receipt)
+        .map(Some)
+        .map_err(|error| OrchestratorError::Api(format!("invalid {op} sequencer receipt: {error}")))
 }
 
 /// Build a `CommitGroupChange<'static>` for the wire **without** going through
@@ -991,9 +1029,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_commit_group_change_output(body.as_ref(), "add_members")?;
 
         Ok(AddMembersServerResult {
             success: output.success,
@@ -1001,7 +1037,7 @@ impl MLSAPIClient for ReqwestApiClient {
                 .new_epoch
                 .and_then(|epoch| u64::try_from(epoch).ok())
                 .unwrap_or(0),
-            receipt: parse_commit_group_change_receipt(&output, "add_members"),
+            receipt: parse_commit_group_change_receipt(&output, "add_members")?,
         })
     }
 
@@ -1533,9 +1569,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_commit_group_change_output(body.as_ref(), "process_external_commit")?;
         let epoch = output
             .new_epoch
             .and_then(|value| u64::try_from(value).ok())
@@ -1549,7 +1583,7 @@ impl MLSAPIClient for ReqwestApiClient {
         Ok(ProcessExternalCommitResult {
             epoch,
             rejoined_at,
-            receipt: parse_commit_group_change_receipt(&output, "process_external_commit"),
+            receipt: parse_commit_group_change_receipt(&output, "process_external_commit")?,
         })
     }
 
@@ -1631,6 +1665,92 @@ mod tests {
     /// Standard base64 of the ASCII bytes of SINGLE_ENCODED — the bogus
     /// output the old `InputData` path would produce (regression tripwire).
     const DOUBLE_ENCODED: &str = "QUFFQ0F3VGVyYjd2";
+
+    #[test]
+    fn sequencer_receipt_parser_preserves_sequencer_term() {
+        let raw = r#"{
+            "convoId": "conv-receipt",
+            "epoch": 7,
+            "sequencerTerm": 42,
+            "commitHash": [1, 2, 3],
+            "sequencerDid": "did:web:sequencer.example",
+            "issuedAt": 1717000000,
+            "signature": [4, 5, 6]
+        }"#;
+        let value: catbird_atproto::jacquard_common::types::value::Data<'_> =
+            serde_json::from_str(raw).expect("deserialize receipt data");
+
+        let receipt = parse_sequencer_receipt_data(&value).expect("parse receipt");
+
+        assert_eq!(receipt.sequencer_term, 42);
+    }
+
+    fn commit_output_with_receipt(
+        receipt: serde_json::Value,
+    ) -> Result<lexicon::commit_group_change::Output> {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "success": true,
+            "receipt": receipt,
+        }))
+        .expect("serialize commit output");
+        parse_commit_group_change_output(&body, "test")
+    }
+
+    #[test]
+    fn present_receipt_missing_sequencer_term_fails_the_operation() {
+        let error = commit_output_with_receipt(serde_json::json!({
+            "convoId": "conv-receipt",
+            "epoch": 7,
+            "commitHash": [1, 2, 3],
+            "sequencerDid": "did:web:sequencer.example",
+            "issuedAt": 1717000000,
+            "signature": [4, 5, 6]
+        }))
+        .expect_err("a malformed present receipt must fail closed");
+        assert!(error.to_string().contains("sequencer term"));
+    }
+
+    #[test]
+    fn present_receipt_with_negative_sequencer_term_fails_the_operation() {
+        let error = commit_output_with_receipt(serde_json::json!({
+            "convoId": "conv-receipt",
+            "epoch": 7,
+            "sequencerTerm": -1,
+            "commitHash": [1, 2, 3],
+            "sequencerDid": "did:web:sequencer.example",
+            "issuedAt": 1717000000,
+            "signature": [4, 5, 6]
+        }))
+        .expect_err("a negative sequencer term must fail closed");
+        assert!(error.to_string().contains("sequencer term"));
+    }
+
+    #[test]
+    fn present_receipt_with_overflowing_sequencer_term_fails_the_operation() {
+        let error = commit_output_with_receipt(serde_json::json!({
+            "convoId": "conv-receipt",
+            "epoch": 7,
+            "sequencerTerm": 18446744073709551615_u64,
+            "commitHash": [1, 2, 3],
+            "sequencerDid": "did:web:sequencer.example",
+            "issuedAt": 1717000000,
+            "signature": [4, 5, 6]
+        }))
+        .expect_err("an unrepresentable sequencer term must fail closed");
+        assert!(error.to_string().contains("sequencer term"));
+    }
+
+    #[test]
+    fn absent_receipt_remains_an_explicit_none() {
+        let body = serde_json::to_vec(&serde_json::json!({ "success": true }))
+            .expect("serialize commit output");
+        let output = parse_commit_group_change_output(&body, "test")
+            .expect("a truly absent receipt is permitted");
+
+        assert!(parse_commit_group_change_receipt(&output, "test")
+            .expect("absence is not a malformed receipt")
+            .is_none());
+    }
 
     #[test]
     fn build_commit_group_change_produces_single_base64_on_wire() {
