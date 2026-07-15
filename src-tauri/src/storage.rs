@@ -1124,7 +1124,11 @@ impl MLSStorageBackend for SqliteStorage {
         conversation_id: &str,
         expected_generation: i32,
         expected_new_group_id_hex: &str,
+        landed_epoch: u64,
     ) -> Result<bool> {
+        let landed_epoch = i64::try_from(landed_epoch).map_err(|_| {
+            OrchestratorError::Storage("landed reset epoch exceeds SQLite range".into())
+        })?;
         let conn = self.conn.lock().unwrap();
         let active_state = serde_json::to_string(&ConversationState::Active)
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -1133,6 +1137,8 @@ impl MLSStorageBackend for SqliteStorage {
                 "UPDATE conversations
                  SET state = ?1,
                      group_id = ?2,
+                     epoch = ?7,
+                     join_epoch = ?7,
                      reset_new_group_id = NULL,
                      reset_generation = NULL,
                      reset_notified_at_ms = NULL,
@@ -1153,6 +1159,7 @@ impl MLSStorageBackend for SqliteStorage {
                     RESET_PENDING_STATE_TAG,
                     "{\"ResetPending\":%",
                     expected_generation as i64,
+                    landed_epoch,
                 ],
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -1968,7 +1975,7 @@ mod field_encryption_tests {
             .await
             .expect("commit replacement reset");
         let cleared = storage
-            .complete_reset_pending(conversation_id, 4, "replacement-group")
+            .complete_reset_pending(conversation_id, 4, "replacement-group", 4)
             .await
             .expect("clear committed reset");
         assert!(cleared, "exact generation must report a committed clear");
@@ -1996,17 +2003,17 @@ mod field_encryption_tests {
             .expect("commit reset authority");
 
         let stale_cleared = storage
-            .complete_reset_pending(conversation_id, 21, "new-group")
+            .complete_reset_pending(conversation_id, 21, "new-group", 21)
             .await
             .expect("a stale clear is a successful no-op");
         assert!(!stale_cleared, "stale generation must report no commit");
         let newer_cleared = storage
-            .complete_reset_pending(conversation_id, 23, "new-group")
+            .complete_reset_pending(conversation_id, 23, "new-group", 23)
             .await
             .expect("a newer clear is also a successful no-op");
         assert!(!newer_cleared, "newer generation must report no commit");
         let wrong_target_cleared = storage
-            .complete_reset_pending(conversation_id, 22, "attacker-group")
+            .complete_reset_pending(conversation_id, 22, "attacker-group", 22)
             .await
             .expect("a target mismatch is a successful no-op");
         assert!(
@@ -2026,7 +2033,7 @@ mod field_encryption_tests {
         );
 
         let exact_cleared = storage
-            .complete_reset_pending(conversation_id, 22, "new-group")
+            .complete_reset_pending(conversation_id, 22, "new-group", 22)
             .await
             .expect("matching generation clears the committed reset");
         assert!(exact_cleared, "exact generation must report a commit");
@@ -2049,6 +2056,94 @@ mod field_encryption_tests {
             )
             .unwrap();
         assert_eq!(group_id, "new-group");
+    }
+
+    #[tokio::test]
+    async fn completion_atomically_projects_landed_epoch_and_preserves_mismatch() {
+        let (_tmp, storage) = new_temp_storage();
+        let conversation_id = "conv-landed-epoch";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE conversations SET epoch = 741, join_epoch = 742
+                 WHERE conversation_id = ?1",
+                [conversation_id],
+            )
+            .expect("seed distinct current and join epochs");
+        storage
+            .mark_reset_pending(conversation_id, "new-group", 23, 1_717_000_000_023)
+            .await
+            .expect("publish reset authority");
+
+        type CompletionSnapshot = (
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i64,
+        );
+        let snapshot = || -> CompletionSnapshot {
+            storage
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT state, group_id, epoch, join_epoch, reset_new_group_id,
+                        reset_generation, reset_notified_at_ms, needs_rejoin,
+                        last_reset_generation
+                 FROM conversations WHERE conversation_id = ?1",
+                    [conversation_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ))
+                    },
+                )
+                .expect("read completion snapshot")
+        };
+        let pending = snapshot();
+        assert!(!storage
+            .complete_reset_pending(conversation_id, 22, "new-group", 3)
+            .await
+            .expect("stale completion is a clean CAS miss"));
+        assert_eq!(snapshot(), pending, "mismatch preserves every field");
+
+        assert!(storage
+            .complete_reset_pending(conversation_id, 23, "new-group", 3)
+            .await
+            .expect("exact completion commits"));
+        assert_eq!(
+            snapshot(),
+            (
+                serde_json::to_string(&ConversationState::Active).unwrap(),
+                "new-group".into(),
+                3,
+                Some(3),
+                None,
+                None,
+                None,
+                0,
+                23,
+            )
+        );
     }
 
     #[tokio::test]
@@ -2143,12 +2238,12 @@ mod field_encryption_tests {
             .expect("commit reset authority");
 
         let exact_cleared = storage
-            .complete_reset_pending(conversation_id, 52, "new-group")
+            .complete_reset_pending(conversation_id, 52, "new-group", 52)
             .await
             .expect("matching completion clears the committed authority");
         assert!(exact_cleared);
         let replay_cleared = storage
-            .complete_reset_pending(conversation_id, 52, "new-group")
+            .complete_reset_pending(conversation_id, 52, "new-group", 52)
             .await
             .expect("completion replay is a successful no-op");
         assert!(!replay_cleared, "affected-row result is true exactly once");
@@ -2182,7 +2277,7 @@ mod field_encryption_tests {
         // A delayed generation-one completion reaches the adapter after the
         // newer authority is already committed.
         let stale_cleared = storage
-            .complete_reset_pending(conversation_id, 1, "generation-one-group")
+            .complete_reset_pending(conversation_id, 1, "generation-one-group", 1)
             .await
             .expect("stale clear is a successful no-op");
         assert!(!stale_cleared, "stale generation must report no commit");
@@ -2214,7 +2309,7 @@ mod field_encryption_tests {
             .await
             .expect("commit generation one");
         assert!(storage
-            .complete_reset_pending(conversation_id, 1, "group-b")
+            .complete_reset_pending(conversation_id, 1, "group-b", 1)
             .await
             .expect("complete generation one"));
         storage
@@ -2222,7 +2317,7 @@ mod field_encryption_tests {
             .await
             .expect("commit generation two");
         assert!(storage
-            .complete_reset_pending(conversation_id, 2, "group-c")
+            .complete_reset_pending(conversation_id, 2, "group-c", 2)
             .await
             .expect("complete generation two"));
 
