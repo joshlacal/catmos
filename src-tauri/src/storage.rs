@@ -642,6 +642,46 @@ impl SqliteStorage {
         }
     }
 
+    /// Atomically retarget a complete ResetPending tuple after the server and
+    /// MLS processing have independently verified the winning reset group.
+    /// Kept as a synchronous SQL helper so the trait forwarding method and
+    /// focused storage tests exercise the same atomic statement.
+    fn adopt_reset_pending_target_cas(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        if authoritative_new_target.is_empty() {
+            return Ok(false);
+        }
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE conversations
+                 SET reset_new_group_id = ?1,
+                     needs_rejoin = 1
+                 WHERE conversation_id = ?2
+                   AND ?1 <> ''
+                   AND (state = ?3 OR state LIKE ?4)
+                   AND reset_new_group_id = ?5
+                   AND reset_new_group_id <> ''
+                   AND reset_generation = ?6
+                   AND reset_notified_at_ms IS NOT NULL",
+                rusqlite::params![
+                    authoritative_new_target,
+                    conversation_id,
+                    RESET_PENDING_STATE_TAG,
+                    "{\"ResetPending\":%",
+                    expected_old_target,
+                    expected_generation as i64,
+                ],
+            )
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(updated == 1)
+    }
+
     /// Persist the decrypted `GroupMetadataV1` payload (as JSON) along with
     /// the version and blob locator that produced it. Avatars are persisted
     /// separately via [`update_avatar_bytes`] so a metadata-only update does
@@ -1064,6 +1104,21 @@ impl MLSStorageBackend for SqliteStorage {
         Ok(())
     }
 
+    async fn adopt_reset_pending_target(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+        expected_old_target: &str,
+        authoritative_new_target: &str,
+    ) -> Result<bool> {
+        self.adopt_reset_pending_target_cas(
+            conversation_id,
+            expected_generation,
+            expected_old_target,
+            authoritative_new_target,
+        )
+    }
+
     async fn complete_reset_pending(
         &self,
         conversation_id: &str,
@@ -1439,6 +1494,7 @@ impl MLSStorageBackend for SqliteStorage {
         &[
             "get_conversation_state",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
             "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
@@ -1696,6 +1752,105 @@ mod field_encryption_tests {
             })
         );
         assert!(reopened.needs_rejoin(conversation_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn adopt_reset_pending_target_cas_preserves_reset_authority_and_mapping() {
+        let (_tmp, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-winner-adoption";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "losing-group", 23, 1_717_000_000_023)
+            .await
+            .expect("publish losing reset candidate");
+
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "losing-group", "winner-group",)
+            .expect("adopt authoritative winner"));
+
+        let snapshot: (String, String, String, i64, i64, i64, i64) = storage
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT state, group_id, reset_new_group_id, reset_generation,
+                        reset_notified_at_ms, needs_rejoin, last_reset_generation
+                 FROM conversations WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .expect("read adopted reset snapshot");
+        assert_eq!(
+            snapshot,
+            (
+                RESET_PENDING_STATE_TAG.to_string(),
+                "old-group".to_string(),
+                "winner-group".to_string(),
+                23,
+                1_717_000_000_023,
+                1,
+                -1,
+            ),
+            "adoption changes only the pending target and keeps reset recovery durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_reset_pending_target_cas_rejects_stale_or_competing_authority() {
+        let (_tmp, storage) = new_temp_storage();
+        let conversation_id = "conv-reset-competing-winners";
+        storage
+            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
+            .await
+            .expect("create conversation");
+        storage
+            .mark_reset_pending(conversation_id, "losing-group", 24, 1_717_000_000_024)
+            .await
+            .expect("publish reset candidate");
+
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "losing-group", "")
+            .expect("empty winner is rejected fail closed"));
+
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 23, "losing-group", "winner-a")
+            .expect("stale generation is a clean CAS miss"));
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "other-loser", "winner-a")
+            .expect("wrong old target is a clean CAS miss"));
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "losing-group", "winner-a")
+            .expect("first verified winner adopts"));
+        assert!(storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "winner-a", "winner-a")
+            .expect("exact winner replay is idempotent"));
+        assert!(!storage
+            .adopt_reset_pending_target_cas(conversation_id, 24, "losing-group", "winner-b")
+            .expect("competing stale winner loses CAS"));
+
+        assert_eq!(
+            storage
+                .get_reset_pending(conversation_id)
+                .expect("read winning authority"),
+            Some(ConversationState::ResetPending {
+                new_group_id: "winner-a".into(),
+                reset_generation: 24,
+                notified_at_ms: 1_717_000_000_024,
+            })
+        );
     }
 
     #[tokio::test]
