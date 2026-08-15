@@ -16,7 +16,7 @@ use crate::types::string::Did;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
-fn parse_did(s: &str) -> Did<'static> {
+fn parse_did(s: &str) -> Did {
     Did::new_owned(s.to_string()).unwrap_or_else(|_| panic!("invalid DID: {}", s))
 }
 
@@ -47,7 +47,7 @@ fn decode_hex_bytes(input: &str) -> std::result::Result<Vec<u8>, String> {
 
 fn parse_receipt_bytes_data(
     field: &str,
-    value: &catbird_atproto::jacquard_common::types::value::Data<'_>,
+    value: &catbird_atproto::jacquard_common::types::value::Data,
 ) -> std::result::Result<Vec<u8>, String> {
     use catbird_atproto::jacquard_common::types::value::Data;
 
@@ -93,7 +93,7 @@ fn parse_receipt_bytes_data(
 }
 
 fn parse_sequencer_receipt_data(
-    value: &catbird_atproto::jacquard_common::types::value::Data<'_>,
+    value: &catbird_atproto::jacquard_common::types::value::Data,
 ) -> std::result::Result<SequencerReceipt, String> {
     let object = value
         .as_object()
@@ -128,6 +128,14 @@ fn parse_sequencer_receipt_data(
         .or_else(|| object.get("issuedAt"))
         .and_then(|value| value.as_integer())
         .ok_or_else(|| "missing issued_at/issuedAt".to_string())?;
+    let sequencer_term = object
+        .get("sequencer_term")
+        .or_else(|| object.get("sequencerTerm"))
+        .and_then(|value| value.as_integer())
+        .ok_or_else(|| "missing sequencer_term/sequencerTerm".to_string())
+        .and_then(|value| {
+            u64::try_from(value).map_err(|_| "sequencer_term out of u64 range".to_string())
+        })?;
     let signature = parse_receipt_bytes_data(
         "signature",
         object
@@ -138,6 +146,7 @@ fn parse_sequencer_receipt_data(
     Ok(SequencerReceipt {
         convo_id,
         epoch,
+        sequencer_term,
         commit_hash,
         sequencer_did,
         issued_at,
@@ -175,7 +184,7 @@ fn parse_commit_group_change_receipt(
     }
 }
 
-/// Build a `CommitGroupChange<'static>` for the wire **without** going through
+/// Build a `CommitGroupChange` for the wire **without** going through
 /// the buggy `InputData → Input` adapter in `catbird-atproto`.
 ///
 /// Why not use `crate::catbird::mls_chat::commit_group_change::InputData`?
@@ -200,11 +209,13 @@ fn build_commit_group_change(
     welcome: Option<Vec<u8>>,
     group_info: Option<Vec<u8>>,
     confirmation_tag: Option<Vec<u8>>,
-    member_dids: Option<Vec<Did<'static>>>,
+    member_dids: Option<Vec<Did>>,
     idempotency_key: Option<String>,
-) -> blue_catbird::mlsChat::commit_group_change::CommitGroupChange<'static> {
+) -> blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
     blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
-        action: action.to_string().into(),
+        action: blue_catbird::mlsChat::commit_group_change::CommitGroupChangeAction::from_value(
+            action.to_string().into(),
+        ),
         commit: commit.map(bytes::Bytes::from),
         confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
         convo_id: convo_id.to_string().into(),
@@ -268,7 +279,7 @@ impl ReqwestApiClient {
     /// Get the raw (un-encoded) confirmation tag bytes for a conversation.
     ///
     /// Use this on `commitGroupChange` call sites that construct
-    /// `CommitGroupChange<'static>` directly (where `confirmation_tag` is
+    /// `CommitGroupChange` directly (where `confirmation_tag` is
     /// `Option<bytes::Bytes>` and the lexicon serializer base64-encodes
     /// once). Do NOT use with the `InputData` adapter — that adapter expects
     /// a pre-base64 string and re-encodes as UTF-8 bytes, producing
@@ -354,7 +365,7 @@ impl ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output =
-            parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<'_>>(body.as_ref())?;
+            parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput>(body.as_ref())?;
 
         let statuses = output.statuses.unwrap_or_default();
 
@@ -419,7 +430,7 @@ impl ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::put_group_metadata_blob::PutGroupMetadataBlobOutput<'_>,
+            blue_catbird::mlsChat::put_group_metadata_blob::PutGroupMetadataBlobOutput,
         >(body.as_ref())?;
         let size = usize::try_from(output.size)
             .map_err(|_| OrchestratorError::Api("metadata blob size out of range".into()))?;
@@ -509,7 +520,7 @@ impl ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::upload_blob::UploadBlobOutput<'_>>(
+        let output = parse_lexicon_json::<blue_catbird::mlsChat::upload_blob::UploadBlobOutput>(
             body.as_ref(),
         )?;
         let size = usize::try_from(output.size)
@@ -788,7 +799,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::get_convos::GetConvosOutput<'_>>(
+        let output = parse_lexicon_json::<blue_catbird::mlsChat::get_convos::GetConvosOutput>(
             body.as_ref(),
         )?;
 
@@ -826,7 +837,11 @@ impl MLSAPIClient for ReqwestApiClient {
         // Welcome in the same way the old commitGroupChange adapter did.
         let input = blue_catbird::mlsChat::create_convo::CreateConvo {
             group_id: group_id.to_string().into(),
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
+            cipher_suite: blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::from_value(
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
+                    .to_string()
+                    .into(),
+            ),
             initial_members: initial_members.map(|m| m.iter().map(|d| parse_did(d)).collect()),
             welcome_message: welcome_data.map(bytes::Bytes::copy_from_slice),
             current_epoch: Some(if welcome_data.is_some() { 1 } else { 0 }),
@@ -851,9 +866,9 @@ impl MLSAPIClient for ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::create_convo::CreateConvoOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::mlsChat::create_convo::CreateConvoOutput>(
+            body.as_ref(),
+        )?;
 
         Ok(CreateConversationResult {
             conversation: convo_view_to_conversation(&output.convo),
@@ -914,7 +929,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupOutput<'_>,
+            blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupOutput,
         >(body_bytes.as_ref())?;
 
         Ok(CreateConversationResult {
@@ -992,7 +1007,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
+            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput,
         >(body.as_ref())?;
 
         Ok(AddMembersServerResult {
@@ -1108,9 +1123,9 @@ impl MLSAPIClient for ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_messages::GetMessagesOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::mlsChat::get_messages::GetMessagesOutput>(
+            body.as_ref(),
+        )?;
 
         let envelopes = output
             .messages
@@ -1207,7 +1222,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_key_packages::GetKeyPackagesOutput<'_>,
+            blue_catbird::mlsChat::get_key_packages::GetKeyPackagesOutput,
         >(body.as_ref())?;
 
         Ok(output
@@ -1242,7 +1257,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_key_package_status::GetKeyPackageStatusOutput<'_>,
+            blue_catbird::mlsChat::get_key_package_status::GetKeyPackageStatusOutput,
         >(body.as_ref())?;
         let stats = output.stats.ok_or_else(|| {
             OrchestratorError::Api("missing stats in key package response".into())
@@ -1314,7 +1329,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::register_device::RegisterDeviceOutput<'_>,
+            blue_catbird::mlsChat::register_device::RegisterDeviceOutput,
         >(body.as_ref())?;
 
         Ok(DeviceInfo {
@@ -1343,9 +1358,9 @@ impl MLSAPIClient for ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::list_devices::ListDevicesOutput<'_>,
-        >(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::mlsChat::list_devices::ListDevicesOutput>(
+            body.as_ref(),
+        )?;
 
         Ok(output
             .devices
@@ -1423,7 +1438,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput<'_>,
+            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput,
         >(body.as_ref())?;
         output
             .group_info
@@ -1452,7 +1467,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput<'_>,
+            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput,
         >(body.as_ref())?;
 
         match output.welcome {
@@ -1534,7 +1549,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<'_>,
+            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput,
         >(body.as_ref())?;
         let epoch = output
             .new_epoch
@@ -1604,7 +1619,7 @@ mod tests {
     //! History: catmos Tauri was constructing `commitGroupChange` inputs via
     //! the `catbird_atproto::catbird::mls_chat::commit_group_change::InputData`
     //! adapter. That adapter types byte fields as `Option<String>` and maps
-    //! them to the generated `CommitGroupChange<'static>` struct via
+    //! them to the generated `CommitGroupChange` struct via
     //! `bytes::Bytes::from(String)`, which copies the UTF-8 bytes of the
     //! string verbatim. Callers that pre-base64-encoded their commit bytes
     //! (the `Some(B64.encode(data))` pattern) therefore ended up with
@@ -1613,7 +1628,7 @@ mod tests {
     //! instead of `{"$bytes": "<BASE64(RAW)>"}`.
     //!
     //! The fix is `build_commit_group_change`, which constructs
-    //! `CommitGroupChange<'static>` directly with
+    //! `CommitGroupChange` directly with
     //! `bytes::Bytes::from(Vec<u8>)`. These tests assert the wire output
     //! is singly-encoded (good) and explicitly check the old double-encoded
     //! output the buggy adapter would have produced (regression protection).
@@ -1671,13 +1686,19 @@ mod tests {
 
     #[test]
     fn create_convo_welcome_message_uses_raw_bytes() {
-        let input = blue_catbird::mlsChat::create_convo::CreateConvo {
-            group_id: "deadbeef".into(),
-            cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".into(),
-            welcome_message: Some(bytes::Bytes::copy_from_slice(KNOWN_BYTES)),
-            current_epoch: Some(1),
-            ..Default::default()
-        };
+        let input: blue_catbird::mlsChat::create_convo::CreateConvo =
+            blue_catbird::mlsChat::create_convo::CreateConvo {
+                group_id: "deadbeef".into(),
+                cipher_suite:
+                    blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::from_value(
+                        "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
+                            .to_string()
+                            .into(),
+                    ),
+                welcome_message: Some(bytes::Bytes::copy_from_slice(KNOWN_BYTES)),
+                current_epoch: Some(1),
+                ..Default::default()
+            };
         let json = serde_json::to_value(&input).expect("serialize CreateConvo");
         let encoded = json["welcomeMessage"]["$bytes"]
             .as_str()
@@ -1705,7 +1726,7 @@ mod tests {
             "createdAt": "2026-06-13T00:00:00Z",
             "sequencerDid": "did:web:ds-b.example"
         }"#;
-        let parsed: blue_catbird::mlsChat::ConvoView<'_> =
+        let parsed: blue_catbird::mlsChat::ConvoView =
             serde_json::from_str(raw).expect("deserialize ConvoView");
         let generated: lexicon::defs::ConvoViewData = parsed.into_static();
 
@@ -1736,6 +1757,8 @@ mod tests {
             key_package_hashes: None,
             member_dids: None,
             pending_addition_id: None,
+            transition_challenge_id: None,
+            transition_signature: None,
             welcome: None,
         }
         .into();

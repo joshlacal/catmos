@@ -769,6 +769,40 @@ impl SqliteStorage {
     }
 }
 
+impl SqliteStorage {
+    /// Clear a RESET_PENDING intent without generation fencing (catmos-internal
+    /// helper). Retained as an inherent method: the `MLSStorageBackend` trait no
+    /// longer declares a bare `clear_reset_pending` (it now exposes the
+    /// generation-fenced `clear_reset_pending_for_delete`); adopting that path is
+    /// deferred forward-migration work, so this preserves existing behavior.
+    #[allow(dead_code)]
+    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let failed_state = serde_json::to_string(&ConversationState::Failed)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        conn.execute(
+            "UPDATE conversations
+             SET state = CASE
+                     WHEN state = ?1 OR state LIKE ?2 OR state LIKE ?3 THEN ?4
+                     ELSE state
+                 END,
+                 reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL
+             WHERE conversation_id = ?5",
+            rusqlite::params![
+                RESET_PENDING_STATE_TAG,
+                "reset_pending:%",
+                "{\"ResetPending\":%",
+                failed_state,
+                conversation_id
+            ],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl MLSStorageBackend for SqliteStorage {
     async fn ensure_conversation_exists(
@@ -1037,32 +1071,6 @@ impl MLSStorageBackend for SqliteStorage {
                 "reset_pending intent mismatch while committing: {conversation_id}"
             )));
         }
-        Ok(())
-    }
-
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let failed_state = serde_json::to_string(&ConversationState::Failed)
-            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        conn.execute(
-            "UPDATE conversations
-             SET state = CASE
-                     WHEN state = ?1 OR state LIKE ?2 OR state LIKE ?3 THEN ?4
-                     ELSE state
-                 END,
-                 reset_new_group_id = NULL,
-                 reset_generation = NULL,
-                 reset_notified_at_ms = NULL
-             WHERE conversation_id = ?5",
-            rusqlite::params![
-                RESET_PENDING_STATE_TAG,
-                "reset_pending:%",
-                "{\"ResetPending\":%",
-                failed_state,
-                conversation_id
-            ],
-        )
-        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
     }
 

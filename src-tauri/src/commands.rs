@@ -1812,7 +1812,7 @@ pub async fn update_cursor(
     Ok(())
 }
 
-fn parse_did(s: &str) -> Did<'static> {
+fn parse_did(s: &str) -> Did {
     Did::new_owned(s.to_string()).unwrap_or_else(|_| panic!("invalid DID: {}", s))
 }
 
@@ -1927,8 +1927,7 @@ pub async fn check_opt_in_status(
     }
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let output =
-        parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<'_>>(body.as_ref())?;
+    let output = parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput>(body.as_ref())?;
 
     Ok(output
         .statuses
