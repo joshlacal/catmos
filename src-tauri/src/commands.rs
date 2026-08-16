@@ -1370,7 +1370,7 @@ pub async fn update_cursor(
         .map_err(|e| format!("Update cursor failed: {e:?}"))
 }
 
-fn parse_did(s: &str) -> Did<'static> {
+fn parse_did(s: &str) -> Did {
     Did::new_owned(s.to_string()).unwrap_or_else(|_| panic!("invalid DID: {}", s))
 }
 
@@ -1486,7 +1486,7 @@ pub async fn check_opt_in_status(
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
     let output =
-        parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<'_>>(body.as_ref())?;
+        parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<String>>(body.as_ref())?;
 
     Ok(output
         .statuses
@@ -2140,6 +2140,7 @@ pub async fn update_group_metadata(
             description.as_deref(),
             avatar_blob_locator.as_deref(),
             avatar_content_type.as_deref(),
+            None,
         )
         .await
         .map_err(|e| format!("{:?}", e))?;
