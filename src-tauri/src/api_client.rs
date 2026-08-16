@@ -228,6 +228,8 @@ pub(crate) enum ChatAuthError {
     MissingSession,
     MissingDevice,
     MissingDpopJkt,
+    #[allow(dead_code)]
+    MissingDpopProof,
     MissingSigner,
 }
 
@@ -237,10 +239,19 @@ impl std::fmt::Display for ChatAuthError {
             Self::MissingSession => "chat auth session is missing",
             Self::MissingDevice => "registered chat device is missing",
             Self::MissingDpopJkt => "observed chat DPoP JKT is missing",
+            Self::MissingDpopProof => "real chat DPoP proof is unavailable",
             Self::MissingSigner => "clean-chat application signer is unavailable",
         };
         f.write_str(message)
     }
+}
+
+/// Headers needed by canonical reads. Nest authenticates these reads with
+/// Authorization plus the registered device ID and echoes the DPoP JKT in the
+/// response; no client-side proof is available to send.
+pub(crate) struct CanonicalReadContext {
+    pub(crate) authorization: String,
+    pub(crate) device_id: String,
 }
 
 /// Runtime-owned clean-chat capabilities.
@@ -294,12 +305,11 @@ impl ChatAuthProvider {
         *self.dpop_jkt.write().unwrap() = None;
     }
 
-    /// Build the Rust canonical transport context without exposing the
-    /// underlying token to command/UI code. Nest owns DPoP minting; the
-    /// platform adapter therefore sends only authorization + device ID.
-    pub(crate) fn canonical_context(
+    /// Build the first-read headers. Nest authenticates canonical reads with
+    /// the session and registered device, then echoes the JKT on the response.
+    pub(crate) fn canonical_read_context(
         &self,
-    ) -> std::result::Result<catbird_mls::orchestrator::CleanChatAuthContext, ChatAuthError> {
+    ) -> std::result::Result<CanonicalReadContext, ChatAuthError> {
         let (_, session_token) = self
             .session
             .read()
@@ -313,6 +323,18 @@ impl ChatAuthProvider {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .ok_or(ChatAuthError::MissingDevice)?;
+        Ok(CanonicalReadContext {
+            authorization: format!("Bearer {session_token}"),
+            device_id,
+        })
+    }
+
+    /// Build a proof-required Rust context only when all material is real.
+    #[allow(dead_code)]
+    pub(crate) fn canonical_context(
+        &self,
+    ) -> std::result::Result<catbird_mls::orchestrator::CleanChatAuthContext, ChatAuthError> {
+        let _ = self.canonical_read_context()?;
         let dpop_jkt = self
             .dpop_jkt
             .read()
@@ -320,13 +342,8 @@ impl ChatAuthProvider {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .ok_or(ChatAuthError::MissingDpopJkt)?;
-
-        Ok(catbird_mls::orchestrator::CleanChatAuthContext::new(
-            format!("Bearer {session_token}"),
-            "nest-managed-dpop".to_string(),
-            dpop_jkt,
-            device_id,
-        ))
+        let _ = dpop_jkt;
+        Err(ChatAuthError::MissingDpopProof)
     }
 
     pub(crate) fn signing_capability(
@@ -927,16 +944,21 @@ impl ReqwestApiClient {
     ) -> Result<ConversationListPage> {
         let auth = self
             .chat_auth
-            .canonical_context()
+            .canonical_read_context()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        let prepared =
-            catbird_mls::orchestrator::prepare_get_conversations(&auth, i64::from(limit), cursor)
-                .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let route = catbird_mls::orchestrator::canonical_route(
+            catbird_mls::orchestrator::CanonicalOperation::GetConversations,
+        );
+        let mut path = format!("{}?limit={limit}", route.path);
+        if let Some(cursor) = cursor {
+            path.push_str("&pageCursor=");
+            path.push_str(&urlencoding::encode(cursor));
+        }
 
         let response = self
             .client
-            .get(self.canonical_url(&prepared.path))
-            .header(reqwest::header::AUTHORIZATION, &prepared.authorization)
+            .get(self.canonical_url(&path))
+            .header(reqwest::header::AUTHORIZATION, &auth.authorization)
             .header("x-catbird-chat-device-id", &auth.device_id)
             .send()
             .await
@@ -996,25 +1018,27 @@ impl ReqwestApiClient {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
+        message_type: Option<&str>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
         let auth = self
             .chat_auth
-            .canonical_context()
+            .canonical_read_context()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
         let after_seq = cursor
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        let prepared = catbird_mls::orchestrator::prepare_get_entries(
-            &auth,
-            convo_id,
-            after_seq,
-            i64::from(limit),
-        )
-        .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let route = catbird_mls::orchestrator::canonical_route(
+            catbird_mls::orchestrator::CanonicalOperation::GetEntries,
+        );
+        let path = format!(
+            "{}?afterSeq={after_seq}&conversationId={}&limit={limit}",
+            route.path,
+            urlencoding::encode(convo_id)
+        );
         let response = self
             .client
-            .get(self.canonical_url(&prepared.path))
-            .header(reqwest::header::AUTHORIZATION, &prepared.authorization)
+            .get(self.canonical_url(&path))
+            .header(reqwest::header::AUTHORIZATION, &auth.authorization)
             .header("x-catbird-chat-device-id", &auth.device_id)
             .send()
             .await
@@ -1033,22 +1057,8 @@ impl ReqwestApiClient {
         let entries = output
             .entries
             .into_iter()
-            .filter_map(|entry| match entry {
-                catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(
-                    application,
-                ) => {
-                    let body = application.signed_request.body;
-                    Some(IncomingEnvelope {
-                        conversation_id: application.conversation_id.to_string(),
-                        sender_did: body.actor_did.to_string(),
-                        ciphertext: body.application_message.bytes.to_vec(),
-                        timestamp: application.received_at.as_ref().to_string().parse().ok()?,
-                        server_message_id: Some(application.entry_id.to_string()),
-                        server_epoch: Some(body.prior.epoch.max(0) as u64),
-                    })
-                }
-                _ => None,
-            })
+            .filter(|entry| canonical_entry_matches_type(entry, message_type))
+            .filter_map(map_canonical_entry)
             .collect();
         let next = if output.has_more {
             Some(output.next_after_seq.to_string())
@@ -1065,6 +1075,70 @@ impl ReqwestApiClient {
     }
 }
 
+fn canonical_entry_matches_type(
+    entry: &catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
+    message_type: Option<&str>,
+) -> bool {
+    match message_type {
+        Some("commit") => matches!(
+            entry,
+            catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(_)
+        ),
+        Some("app") => matches!(
+            entry,
+            catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(_)
+        ),
+        _ => true,
+    }
+}
+
+fn map_commit_entry(
+    conversation_id: String,
+    entry_id: String,
+    sender_did: String,
+    received_at: String,
+    ciphertext: Vec<u8>,
+    epoch: i64,
+) -> Option<IncomingEnvelope> {
+    Some(IncomingEnvelope {
+        conversation_id,
+        sender_did,
+        ciphertext,
+        timestamp: received_at.parse().ok()?,
+        server_message_id: Some(entry_id),
+        server_epoch: Some(epoch.max(0) as u64),
+    })
+}
+
+fn map_canonical_entry(
+    entry: catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
+) -> Option<IncomingEnvelope> {
+    match entry {
+        catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(application) => {
+            let body = application.signed_request.body;
+            Some(IncomingEnvelope {
+                conversation_id: application.conversation_id.to_string(),
+                sender_did: body.actor_did.to_string(),
+                ciphertext: body.application_message.bytes.to_vec(),
+                timestamp: application.received_at.as_ref().to_string().parse().ok()?,
+                server_message_id: Some(application.entry_id.to_string()),
+                server_epoch: Some(body.prior.epoch.max(0) as u64),
+            })
+        }
+        catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(commit) => {
+            let body = commit.signed_request.body;
+            map_commit_entry(
+                commit.conversation_id.to_string(),
+                commit.entry_id.to_string(),
+                body.actor_did.to_string(),
+                commit.received_at.as_ref().to_string(),
+                body.commit.bytes.to_vec(),
+                body.next.epoch,
+            )
+        }
+        _ => None,
+    }
+}
 /// Convert a generated ConvoView to orchestrator ConversationView.
 fn convo_view_to_conversation<S: catbird_atproto::jacquard_common::BosStr + ToString>(
     c: &blue_catbird::mlsChat::ConvoView<S>,
@@ -1073,6 +1147,7 @@ fn convo_view_to_conversation<S: catbird_atproto::jacquard_common::BosStr + ToSt
         group_id: c.group_id.to_string(),
         conversation_id: c.group_id.to_string(),
         epoch: c.epoch as u64,
+
         members: c
             .members
             .iter()
@@ -1378,12 +1453,13 @@ impl MLSAPIClient for ReqwestApiClient {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
-        _message_type: Option<&str>,
+        message_type: Option<&str>,
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        let (mut entries, next_cursor) =
-            self.canonical_get_entries(convo_id, cursor, limit).await?;
+        let (mut entries, next_cursor) = self
+            .canonical_get_entries(convo_id, cursor, limit, message_type)
+            .await?;
         entries.retain(|entry| {
             let epoch = entry.server_epoch.unwrap_or_default();
             from_epoch
@@ -2100,6 +2176,49 @@ mod tests {
         });
         (format!("http://127.0.0.1:{port}"), rx)
     }
+    fn spawn_jkt_entries_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local_addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let body = r#"{"entries":[],"hasMore":false,"nextAfterSeq":0}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nx-catbird-chat-dpop-jkt: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn first_canonical_read_observes_jkt_from_response() {
+        let client = ReqwestApiClient::new(spawn_jkt_entries_server());
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+        client
+            .chat_auth
+            .set_device_id("00000000-0000-4000-8000-000000000001".to_string());
+
+        <ReqwestApiClient as MLSAPIClient>::get_messages(
+            &client,
+            "conversation-id",
+            None,
+            10,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("first canonical read should reach HTTP before JKT echo");
+
+        assert_eq!(
+            client.chat_auth.dpop_jkt.read().unwrap().as_deref(),
+            Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        );
+    }
 
     #[tokio::test]
     async fn publish_key_package_posts_registered_device_id() {
@@ -2241,6 +2360,44 @@ fn canonical_read_requires_observed_jkt_before_http() {
         .canonical_context()
         .expect_err("missing JKT must fail closed");
     assert_eq!(error, ChatAuthError::MissingDpopJkt);
+}
+#[test]
+fn canonical_read_allows_first_request_before_jkt_echo() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
+    provider.set_device_for_tests("00000000-0000-4000-8000-000000000001");
+    let context = provider
+        .canonical_read_context()
+        .expect("session and registered device authorize the first read");
+    assert_eq!(context.authorization, "Bearer opaque-session");
+    assert_eq!(context.device_id, "00000000-0000-4000-8000-000000000001");
+}
+
+#[test]
+fn canonical_context_rejects_requests_without_real_dpop_proof() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
+    provider.set_device_for_tests("00000000-0000-4000-8000-000000000001");
+    provider.set_jkt_for_tests("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let error = provider
+        .canonical_context()
+        .expect_err("canonical proof-required context must fail closed");
+    assert_eq!(error, ChatAuthError::MissingDpopProof);
+}
+
+#[test]
+fn canonical_entries_preserve_commit_epochs() {
+    let envelope = map_commit_entry(
+        "00000000-0000-4000-8000-000000000001".to_owned(),
+        "00000000-0000-4000-8000-000000000002".to_owned(),
+        "did:plc:sender".to_owned(),
+        "2026-08-16T12:00:00.000Z".to_owned(),
+        vec![1, 2],
+        5,
+    )
+    .expect("commit entry should map");
+    assert_eq!(envelope.server_epoch, Some(5));
+    assert_eq!(envelope.ciphertext, vec![1, 2]);
 }
 
 #[test]
