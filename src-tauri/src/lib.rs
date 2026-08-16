@@ -1,5 +1,4 @@
 mod api_client;
-mod chat_routes;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
 mod commands;

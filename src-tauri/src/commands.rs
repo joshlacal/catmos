@@ -655,11 +655,6 @@ pub async fn try_restore_session(
                         state.api_client.clear_auth();
                         return Ok(None);
                     }
-
-                    // Keep the saved credentials for retryable transport and
-                    // upstream failures. A restart or explicit retry can
-                    // resume the same DID and content-root key instead of
-                    // forcing a new OAuth login and splitting persistence.
                     log_catmos!(
                         "Stored session could not be restored yet; keeping saved login: {}",
                         e
@@ -1369,9 +1364,8 @@ pub async fn send_typing(
         "ciphertext": { "$bytes": no_op_ciphertext },
     });
     let resp = client.post(format!(
-        "{}/xrpc/{}",
-        nest_url,
-        crate::chat_routes::SEND_MESSAGE
+        "{}/xrpc/blue.catbird.mlsChat.sendMessage",
+        nest_url
     ));
     let resp = crate::mls_proxy::with_mls_proxy_header(resp)
         .bearer_auth(&token)
@@ -1416,9 +1410,8 @@ pub async fn update_cursor(
 
     let client = reqwest::Client::new();
     let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/{}",
-        nest_url,
-        crate::chat_routes::GET_ENTRIES
+        "{}/xrpc/blue.catbird.mlsChat.updateCursor",
+        nest_url
     )))
     .bearer_auth(&token)
     .json(&input)
@@ -2398,11 +2391,9 @@ pub async fn reset_group(
     });
 
     let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/{}",
-        nest_url,
-        crate::chat_routes::RESET_GROUP
-    )))
+    let resp = crate::mls_proxy::with_mls_proxy_header(
+        client.post(format!("{}/xrpc/blue.catbird.mlsChat.resetGroup", nest_url)),
+    )
     .bearer_auth(&token)
     .json(&body)
     .send()
