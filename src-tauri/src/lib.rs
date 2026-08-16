@@ -80,6 +80,9 @@ pub struct WsHandle {
 pub struct AppState {
     pub orchestrator: Arc<CatmosOrchestrator>,
     pub api_client: Arc<ReqwestApiClient>,
+    /// Runtime-owned clean-chat auth capabilities. The provider contains
+    /// opaque session/device/JKT state; commands never persist or log secrets.
+    pub(crate) chat_auth: Arc<api_client::ChatAuthProvider>,
     pub ws_handles: Mutex<HashMap<String, WsHandle>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -157,9 +160,10 @@ pub fn run() {
         cred_store,
         catbird_mls::orchestrator::OrchestratorConfig::default(),
     ));
-
+    let chat_auth = api_client.chat_auth_provider();
     let app_state = AppState {
         orchestrator,
+        chat_auth,
         api_client,
         ws_handles: Mutex::new(HashMap::new()),
         kp_monitor: Mutex::new(None),

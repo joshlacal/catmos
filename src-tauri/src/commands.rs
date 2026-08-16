@@ -16,7 +16,9 @@ use tokio::net::TcpListener;
 use crate::catbird::mls_chat as lexicon;
 use crate::types::string::Did;
 
+use crate::credentials::KeyringCredentialStore;
 use crate::{AppState, CatmosOrchestrator, WsHandle};
+use catbird_mls::orchestrator::credentials::CredentialStore;
 
 fn log_file_path() -> std::path::PathBuf {
     let base = dirs::cache_dir()
@@ -197,11 +199,30 @@ struct SessionInfo {
 }
 
 fn clear_saved_session_credentials() {
-    if let Ok(entry) = keyring::Entry::new("catmos", "session_id") {
-        let _ = entry.delete_credential();
+    for key in ["session_id", "user_did", "chat_dpop_jkt"] {
+        if let Ok(entry) = keyring::Entry::new("catmos", key) {
+            let _ = entry.delete_credential();
+        }
     }
-    if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
-        let _ = entry.delete_credential();
+}
+
+/// Install only opaque runtime capabilities after login/device enrollment.
+/// Persisted session, device, and DPoP material never enters command logs.
+async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
+    state
+        .api_client
+        .set_auth(did.to_string(), session_id.to_string());
+
+    if let Ok(store) = KeyringCredentialStore::try_new() {
+        if let Ok(Some(device_id)) = store.get_device_uuid(did).await {
+            state.chat_auth.set_device_id(device_id);
+        }
+    }
+
+    if let Ok(entry) = keyring::Entry::new("catmos", "chat_dpop_jkt") {
+        if let Ok(jkt) = entry.get_password() {
+            let _ = state.chat_auth.observe_dpop_jkt(jkt);
+        }
     }
 }
 
@@ -607,6 +628,7 @@ pub async fn complete_login(
         .ensure_device_registered()
         .await
         .map_err(|e| format!("{:?}", e))?;
+    configure_chat_auth(&state, &session.did, &session_id).await;
 
     // Auto opt-in to MLS (non-blocking — failures are logged only)
     ensure_opted_in(&state).await;
@@ -689,6 +711,7 @@ pub async fn try_restore_session(
                 .ensure_device_registered()
                 .await
                 .map_err(|e| format!("{:?}", e))?;
+            configure_chat_auth(&state, &session.did, &sid).await;
 
             // Auto opt-in to MLS (non-blocking — failures are logged only)
             ensure_opted_in(&state).await;
@@ -933,6 +956,10 @@ pub async fn send_message(
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
+    state
+        .api_client
+        .require_signing_capability()
+        .map_err(|error| format!("Signed clean-chat send unavailable: {error}"))?;
     log_catmos!(" send_message: convo={}", conversation_id);
 
     let msg = state
@@ -958,6 +985,10 @@ pub async fn send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<Message, String> {
+    state
+        .api_client
+        .require_signing_capability()
+        .map_err(|error| format!("Signed clean-chat send unavailable: {error}"))?;
     log_catmos!(
         " send_image: convo={} bytes={} type={} dims={}x{}",
         conversation_id,
@@ -1332,7 +1363,7 @@ pub async fn send_reaction(
 
 #[tauri::command]
 pub async fn send_typing(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     conversation_id: String,
     is_typing: bool,
 ) -> Result<(), String> {

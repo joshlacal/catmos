@@ -222,6 +222,135 @@ fn build_commit_group_change(
     }
 }
 
+/// Errors returned when a canonical clean-chat request cannot be authorized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ChatAuthError {
+    MissingSession,
+    MissingDevice,
+    MissingDpopJkt,
+    MissingSigner,
+}
+
+impl std::fmt::Display for ChatAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::MissingSession => "chat auth session is missing",
+            Self::MissingDevice => "registered chat device is missing",
+            Self::MissingDpopJkt => "observed chat DPoP JKT is missing",
+            Self::MissingSigner => "clean-chat application signer is unavailable",
+        };
+        f.write_str(message)
+    }
+}
+
+/// Runtime-owned clean-chat capabilities.
+///
+/// Session tokens and the DPoP binding are intentionally kept behind this
+/// provider. Callers receive only a transport context or an opaque signer
+/// capability; neither capability exposes persisted secret material through
+/// `Debug` or log formatting.
+pub(crate) struct ChatAuthProvider {
+    session: std::sync::RwLock<Option<(String, String)>>,
+    device_id: std::sync::RwLock<Option<String>>,
+    dpop_jkt: std::sync::RwLock<Option<String>>,
+}
+
+impl Default for ChatAuthProvider {
+    fn default() -> Self {
+        Self {
+            session: std::sync::RwLock::new(None),
+            device_id: std::sync::RwLock::new(None),
+            dpop_jkt: std::sync::RwLock::new(None),
+        }
+    }
+}
+/// Opaque marker for the application signer. The current catbird-mls FFI does
+/// not expose clean-chat application signing, so no instance can be issued.
+#[derive(Debug)]
+pub(crate) struct ChatSigningCapability {
+    _private: (),
+}
+
+impl ChatAuthProvider {
+    pub(crate) fn set_session(&self, did: String, session_token: String) {
+        *self.session.write().unwrap() = Some((did, session_token));
+    }
+
+    pub(crate) fn set_device_id(&self, device_id: String) {
+        *self.device_id.write().unwrap() = Some(device_id);
+    }
+
+    pub(crate) fn observe_dpop_jkt(&self, jkt: String) -> std::result::Result<(), ChatAuthError> {
+        if jkt.trim().is_empty() {
+            return Err(ChatAuthError::MissingDpopJkt);
+        }
+        *self.dpop_jkt.write().unwrap() = Some(jkt);
+        Ok(())
+    }
+
+    pub(crate) fn clear(&self) {
+        *self.session.write().unwrap() = None;
+        *self.device_id.write().unwrap() = None;
+        *self.dpop_jkt.write().unwrap() = None;
+    }
+
+    /// Build the Rust canonical transport context without exposing the
+    /// underlying token to command/UI code. Nest owns DPoP minting; the
+    /// platform adapter therefore sends only authorization + device ID.
+    pub(crate) fn canonical_context(
+        &self,
+    ) -> std::result::Result<catbird_mls::orchestrator::CleanChatAuthContext, ChatAuthError> {
+        let (_, session_token) = self
+            .session
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or(ChatAuthError::MissingSession)?;
+        let device_id = self
+            .device_id
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ChatAuthError::MissingDevice)?;
+        let dpop_jkt = self
+            .dpop_jkt
+            .read()
+            .unwrap()
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ChatAuthError::MissingDpopJkt)?;
+
+        Ok(catbird_mls::orchestrator::CleanChatAuthContext::new(
+            format!("Bearer {session_token}"),
+            "nest-managed-dpop".to_string(),
+            dpop_jkt,
+            device_id,
+        ))
+    }
+
+    pub(crate) fn signing_capability(
+        &self,
+    ) -> std::result::Result<ChatSigningCapability, ChatAuthError> {
+        Err(ChatAuthError::MissingSigner)
+    }
+
+    #[cfg(test)]
+    fn set_session_for_tests(&self, did: &str, session_token: &str) {
+        self.set_session(did.to_string(), session_token.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_device_for_tests(&self, device_id: &str) {
+        self.set_device_id(device_id.to_string());
+    }
+
+    #[cfg(test)]
+    fn set_jkt_for_tests(&self, jkt: &str) {
+        let _ = self.observe_dpop_jkt(jkt.to_string());
+    }
+}
+
 /// HTTP API client for the mls-ds delivery service using reqwest.
 pub struct ReqwestApiClient {
     client: Client,
@@ -229,6 +358,7 @@ pub struct ReqwestApiClient {
     auth_token: RwLock<Option<String>>,
     current_did: RwLock<Option<String>>,
     mls_context: RwLock<Option<std::sync::Arc<catbird_mls::MLSContext>>>,
+    chat_auth: std::sync::Arc<ChatAuthProvider>,
     #[cfg(test)]
     publish_device_id_override: RwLock<Option<String>>,
 }
@@ -247,6 +377,7 @@ impl ReqwestApiClient {
             auth_token: RwLock::new(None),
             current_did: RwLock::new(None),
             mls_context: RwLock::new(None),
+            chat_auth: std::sync::Arc::new(ChatAuthProvider::default()),
             #[cfg(test)]
             publish_device_id_override: RwLock::new(None),
         }
@@ -283,13 +414,32 @@ impl ReqwestApiClient {
     }
 
     pub fn set_auth(&self, did: String, token: String) {
+        self.chat_auth.set_session(did.clone(), token.clone());
         *self.auth_token.write().unwrap() = Some(token);
         *self.current_did.write().unwrap() = Some(did);
+    }
+
+    pub(crate) fn observe_chat_dpop_jkt(
+        &self,
+        jkt: String,
+    ) -> std::result::Result<(), ChatAuthError> {
+        self.chat_auth.observe_dpop_jkt(jkt)
+    }
+
+    pub(crate) fn require_signing_capability(
+        &self,
+    ) -> std::result::Result<ChatSigningCapability, ChatAuthError> {
+        self.chat_auth.signing_capability()
+    }
+
+    pub(crate) fn chat_auth_provider(&self) -> std::sync::Arc<ChatAuthProvider> {
+        self.chat_auth.clone()
     }
 
     pub fn clear_auth(&self) {
         *self.auth_token.write().unwrap() = None;
         *self.current_did.write().unwrap() = None;
+        self.chat_auth.clear();
     }
 
     pub fn get_auth_token(&self) -> Option<String> {
@@ -355,8 +505,9 @@ impl ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output =
-            parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<String>>(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<String>>(
+            body.as_ref(),
+        )?;
 
         let statuses = output.statuses.unwrap_or_default();
 
@@ -511,9 +662,9 @@ impl ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::upload_blob::UploadBlobOutput<String>>(
-            body.as_ref(),
-        )?;
+        let output = parse_lexicon_json::<
+            blue_catbird::mlsChat::upload_blob::UploadBlobOutput<String>,
+        >(body.as_ref())?;
         let size = usize::try_from(output.size)
             .map_err(|_| OrchestratorError::Api("blob size out of range".into()))?;
 
@@ -754,6 +905,159 @@ impl ReqwestApiClient {
         Ok(())
     }
 
+    fn canonical_url(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+
+    fn observe_chat_binding(&self, response: &reqwest::Response) {
+        if let Some(value) = response.headers().get("x-catbird-chat-dpop-jkt") {
+            if let Ok(jkt) = value.to_str() {
+                if self.observe_chat_dpop_jkt(jkt.to_string()).is_ok() {
+                    if let Ok(entry) = keyring::Entry::new("catmos", "chat_dpop_jkt") {
+                        let _ = entry.set_password(jkt);
+                    }
+                }
+            }
+        }
+    }
+    async fn canonical_get_conversations(
+        &self,
+        limit: u32,
+        cursor: Option<&str>,
+    ) -> Result<ConversationListPage> {
+        let auth = self
+            .chat_auth
+            .canonical_context()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let prepared =
+            catbird_mls::orchestrator::prepare_get_conversations(&auth, i64::from(limit), cursor)
+                .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+
+        let response = self
+            .client
+            .get(self.canonical_url(&prepared.path))
+            .header(reqwest::header::AUTHORIZATION, &prepared.authorization)
+            .header("x-catbird-chat-device-id", &auth.device_id)
+            .send()
+            .await
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.observe_chat_binding(&response);
+        if !response.status().is_success() {
+            return Err(self.handle_error(response).await);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let output = parse_lexicon_json::<
+            catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
+        >(body.as_ref())?;
+
+        let conversations = output
+            .items
+            .into_iter()
+            .filter_map(|item| match item {
+                catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(state) => {
+                    let state = state.state;
+                    Some(ConversationView {
+                        group_id: hex::encode(&state.coordinates.group_id),
+                        conversation_id: state.coordinates.conversation_id.to_string(),
+                        epoch: state.coordinates.epoch.max(0) as u64,
+                        members: state
+                            .participants
+                            .into_iter()
+                            .map(|member| MemberView {
+                                did: member.user_did.to_string(),
+                                role: if member.role.to_string() == "admin" {
+                                    MemberRole::Admin
+                                } else {
+                                    MemberRole::Member
+                                },
+                            })
+                            .collect(),
+                        metadata: None,
+                        created_at: None,
+                        updated_at: None,
+                        sequencer_did: None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+
+        Ok(ConversationListPage {
+            conversations,
+            cursor: output.next_page_cursor.map(|value| value.to_string()),
+        })
+    }
+
+    async fn canonical_get_entries(
+        &self,
+        convo_id: &str,
+        cursor: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
+        let auth = self
+            .chat_auth
+            .canonical_context()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let after_seq = cursor
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let prepared = catbird_mls::orchestrator::prepare_get_entries(
+            &auth,
+            convo_id,
+            after_seq,
+            i64::from(limit),
+        )
+        .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let response = self
+            .client
+            .get(self.canonical_url(&prepared.path))
+            .header(reqwest::header::AUTHORIZATION, &prepared.authorization)
+            .header("x-catbird-chat-device-id", &auth.device_id)
+            .send()
+            .await
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.observe_chat_binding(&response);
+        if !response.status().is_success() {
+            return Err(self.handle_error(response).await);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let output = parse_lexicon_json::<
+            catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
+        >(body.as_ref())?;
+        let entries = output
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(
+                    application,
+                ) => {
+                    let body = application.signed_request.body;
+                    Some(IncomingEnvelope {
+                        conversation_id: application.conversation_id.to_string(),
+                        sender_did: body.actor_did.to_string(),
+                        ciphertext: body.application_message.bytes.to_vec(),
+                        timestamp: application.received_at.as_ref().to_string().parse().ok()?,
+                        server_message_id: Some(application.entry_id.to_string()),
+                        server_epoch: Some(body.prior.epoch.max(0) as u64),
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        let next = if output.has_more {
+            Some(output.next_after_seq.to_string())
+        } else {
+            None
+        };
+        Ok((entries, next))
+    }
+
     async fn handle_error(&self, resp: reqwest::Response) -> OrchestratorError {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
@@ -803,46 +1107,7 @@ impl MLSAPIClient for ReqwestApiClient {
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
-        let token = self.auth_header()?;
-        let mut url = format!(
-            "{}?limit={}",
-            self.xrpc_url(lexicon::get_convos::NSID),
-            limit
-        );
-        if let Some(c) = cursor {
-            url.push_str(&format!("&cursor={}", c));
-        }
-
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::get_convos::GetConvosOutput<String>>(
-            body.as_ref(),
-        )?;
-
-        let conversations = output
-            .conversations
-            .iter()
-            .map(|c| convo_view_to_conversation(c))
-            .collect();
-
-        Ok(ConversationListPage {
-            conversations,
-            cursor: output.cursor.as_ref().map(|cursor| cursor.to_string()),
-        })
+        self.canonical_get_conversations(limit, cursor).await
     }
 
     async fn create_conversation(
@@ -868,7 +1133,9 @@ impl MLSAPIClient for ReqwestApiClient {
         let input = blue_catbird::mlsChat::create_convo::CreateConvo {
             group_id: group_id.to_string().into(),
             cipher_suite: blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::from_value(
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string().into(),
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
+                    .to_string()
+                    .into(),
             ),
             initial_members: initial_members.map(|m| m.iter().map(|d| parse_did(d)).collect()),
             welcome_message: welcome_data.map(bytes::Bytes::copy_from_slice),
@@ -1111,70 +1378,20 @@ impl MLSAPIClient for ReqwestApiClient {
         convo_id: &str,
         cursor: Option<&str>,
         limit: u32,
-        message_type: Option<&str>,
+        _message_type: Option<&str>,
         from_epoch: Option<u32>,
         to_epoch: Option<u32>,
     ) -> Result<(Vec<IncomingEnvelope>, Option<String>)> {
-        let token = self.auth_header()?;
-        let mut url = format!(
-            "{}?convoId={}&limit={}",
-            self.xrpc_url(lexicon::get_messages::NSID),
-            convo_id,
-            limit
-        );
-        if let Some(c) = cursor {
-            url.push_str(&format!("&sinceSeq={}", c));
-        }
-        if let Some(t) = message_type {
-            url.push_str(&format!("&type={}", t));
-        }
-        if let Some(from) = from_epoch {
-            url.push_str(&format!("&fromEpoch={}", from));
-        }
-        if let Some(to) = to_epoch {
-            url.push_str(&format!("&toEpoch={}", to));
-        }
-
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_messages::GetMessagesOutput<String>,
-        >(body.as_ref())?;
-
-        let envelopes = output
-            .messages
-            .iter()
-            .map(|m| IncomingEnvelope {
-                conversation_id: m.convo_id.to_string(),
-                sender_did: String::new(), // Dumb DS - sender unknown
-                ciphertext: m.ciphertext.to_vec(),
-                timestamp: m
-                    .created_at
-                    .as_ref()
-                    .to_string()
-                    .parse()
-                    .unwrap_or_else(|_| chrono::Utc::now()),
-                server_message_id: Some(m.id.to_string()),
-                server_epoch: Some(m.epoch as u64),
-            })
-            .collect();
-
-        let next_cursor = output.last_seq.map(|s| s.to_string());
-        Ok((envelopes, next_cursor))
+        let (mut entries, next_cursor) =
+            self.canonical_get_entries(convo_id, cursor, limit).await?;
+        entries.retain(|entry| {
+            let epoch = entry.server_epoch.unwrap_or_default();
+            from_epoch
+                .map(|from| epoch >= u64::from(from))
+                .unwrap_or(true)
+                && to_epoch.map(|to| epoch <= u64::from(to)).unwrap_or(true)
+        });
+        Ok((entries, next_cursor))
     }
 
     async fn publish_key_package(
@@ -1717,7 +1934,9 @@ mod tests {
         let input = blue_catbird::mlsChat::create_convo::CreateConvo::<String> {
             group_id: "deadbeef".to_string().into(),
             cipher_suite: blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::from_value(
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string().into(),
+                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
+                    .to_string()
+                    .into(),
             ),
             welcome_message: Some(bytes::Bytes::copy_from_slice(KNOWN_BYTES)),
             current_epoch: Some(1),
@@ -1992,4 +2211,46 @@ mod tests {
             "failureMode must be omitted when caller passes None"
         );
     }
+}
+
+#[test]
+fn canonical_read_requires_session_before_http() {
+    let provider = ChatAuthProvider::default();
+    let error = provider
+        .canonical_context()
+        .expect_err("missing session must fail closed");
+    assert_eq!(error, ChatAuthError::MissingSession);
+}
+
+#[test]
+fn canonical_read_requires_registered_device_before_http() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
+    let error = provider
+        .canonical_context()
+        .expect_err("missing device must fail closed");
+    assert_eq!(error, ChatAuthError::MissingDevice);
+}
+
+#[test]
+fn canonical_read_requires_observed_jkt_before_http() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
+    provider.set_device_for_tests("00000000-0000-4000-8000-000000000001");
+    let error = provider
+        .canonical_context()
+        .expect_err("missing JKT must fail closed");
+    assert_eq!(error, ChatAuthError::MissingDpopJkt);
+}
+
+#[test]
+fn signed_mutation_requires_runtime_signer_before_http() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
+    provider.set_device_for_tests("00000000-0000-4000-8000-000000000001");
+    provider.set_jkt_for_tests("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    let error = provider
+        .signing_capability()
+        .expect_err("missing signer must fail closed");
+    assert_eq!(error, ChatAuthError::MissingSigner);
 }
