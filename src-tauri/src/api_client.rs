@@ -11,6 +11,7 @@ use catbird_mls::orchestrator::types::*;
 
 // Generated lexicon types
 use crate::catbird::mls_chat as lexicon;
+use crate::chat_routes;
 use crate::types::string::Did;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -338,7 +339,7 @@ impl ReqwestApiClient {
         .into();
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::get_opt_in_status::NSID))
+            .post(self.xrpc_url(chat_routes::GET_OPT_IN_STATUS))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -378,7 +379,7 @@ impl ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::opt_in::NSID))
+            .post(self.xrpc_url(chat_routes::OPT_IN))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -401,7 +402,7 @@ impl ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
+            .post(self.xrpc_url(chat_routes::PUT_GROUP_METADATA_BLOB))
             .bearer_auth(&token)
             .query(&[("blobLocator", blob_locator), ("groupId", group_id)])
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -442,7 +443,7 @@ impl ReqwestApiClient {
         let token = self.auth_header()?;
         let mut req = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
+            .get(self.xrpc_url(chat_routes::GET_GROUP_METADATA_BLOB))
             .bearer_auth(&token)
             .query(&[("blobLocator", blob_locator), ("groupId", group_id)]);
         if let Some(k) = kind {
@@ -469,7 +470,7 @@ impl ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
+            .get(self.xrpc_url(chat_routes::GET_GROUP_METADATA_BLOB))
             .bearer_auth(&token)
             .query(&[("groupId", group_id)])
             .send()
@@ -492,7 +493,7 @@ impl ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::upload_blob::NSID))
+            .post(self.xrpc_url(chat_routes::UPLOAD_BLOB))
             .bearer_auth(&token)
             .query(&[("convoId", convo_id)])
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -523,7 +524,7 @@ impl ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_blob::NSID))
+            .get(self.xrpc_url(chat_routes::GET_BLOB))
             .bearer_auth(&token)
             .query(&[("blobId", blob_id)])
             .send()
@@ -578,7 +579,7 @@ impl ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::send_message::NSID))
+            .post(self.xrpc_url(chat_routes::SEND_MESSAGE))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -642,7 +643,7 @@ impl ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.reportRecoveryFailure"))
+            .post(self.xrpc_url(chat_routes::REPORT_RECOVERY_FAILURE))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -702,7 +703,7 @@ impl ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.reportSpam"))
+            .post(self.xrpc_url(chat_routes::REPORT_SPAM))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -765,7 +766,7 @@ impl MLSAPIClient for ReqwestApiClient {
         let token = self.auth_header()?;
         let mut url = format!(
             "{}?limit={}",
-            self.xrpc_url(lexicon::get_convos::NSID),
+            self.xrpc_url(chat_routes::GET_CONVERSATIONS),
             limit
         );
         if let Some(c) = cursor {
@@ -836,7 +837,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::create_convo::NSID))
+            .post(self.xrpc_url(chat_routes::CREATE_CONVERSATION))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -898,7 +899,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.bootstrapResetGroup"))
+            .post(self.xrpc_url(chat_routes::RESET_GROUP))
             .bearer_auth(&token)
             .json(&body)
             .send()
@@ -935,7 +936,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::leave_convo::NSID))
+            .post(self.xrpc_url(chat_routes::LEAVE_CONVERSATION))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -976,7 +977,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url(chat_routes::SUBMIT_TRANSITION))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1028,7 +1029,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url(chat_routes::SUBMIT_TRANSITION))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1075,7 +1076,7 @@ impl MLSAPIClient for ReqwestApiClient {
         let token = self.auth_header()?;
         let mut url = format!(
             "{}?convoId={}&limit={}",
-            self.xrpc_url(lexicon::get_messages::NSID),
+            self.xrpc_url(chat_routes::GET_ENTRIES),
             convo_id,
             limit
         );
@@ -1164,7 +1165,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::publish_key_packages::NSID))
+            .post(self.xrpc_url(chat_routes::REPLENISH_KEY_PACKAGES))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1182,7 +1183,7 @@ impl MLSAPIClient for ReqwestApiClient {
         let dids_param = dids.join(",");
         let url = format!(
             "{}?dids={}",
-            self.xrpc_url(lexicon::get_key_packages::NSID),
+            self.xrpc_url(chat_routes::GET_PENDING_WELCOMES),
             dids_param
         );
 
@@ -1222,7 +1223,7 @@ impl MLSAPIClient for ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_key_package_status::NSID))
+            .get(self.xrpc_url(chat_routes::GET_OWN_DEVICES))
             .bearer_auth(&token)
             .query(&[("include", "stats")])
             .send()
@@ -1294,7 +1295,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::register_device::NSID))
+            .post(self.xrpc_url(chat_routes::ENROLL_DEVICE))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1325,7 +1326,7 @@ impl MLSAPIClient for ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::list_devices::NSID))
+            .get(self.xrpc_url(chat_routes::GET_DEVICES))
             .bearer_auth(&token)
             .send()
             .await
@@ -1385,7 +1386,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url(chat_routes::SUBMIT_TRANSITION))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1403,7 +1404,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_state::NSID))
+            .get(self.xrpc_url(chat_routes::GET_CONVERSATION_STATE))
             .bearer_auth(&token)
             .query(&[("convoId", convo_id), ("include", "groupInfo,epoch")])
             .send()
@@ -1432,7 +1433,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_state::NSID))
+            .get(self.xrpc_url(chat_routes::GET_CONVERSATION_STATE))
             .bearer_auth(&token)
             .query(&[("convoId", convo_id), ("include", "welcome")])
             .send()
@@ -1514,7 +1515,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
+            .post(self.xrpc_url(chat_routes::SUBMIT_TRANSITION))
             .bearer_auth(&token)
             .json(&input)
             .send()
@@ -1565,7 +1566,7 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let mut req = self
             .client
-            .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
+            .post(self.xrpc_url(chat_routes::PUT_GROUP_METADATA_BLOB))
             .bearer_auth(&token)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
         let mut params: Vec<(&str, &str)> = vec![
@@ -1853,7 +1854,7 @@ mod tests {
 
         assert_eq!(captured.method, "POST");
         assert_eq!(
-            captured.path, "/xrpc/blue.catbird.mlsChat.publishKeyPackages",
+            captured.path, "/xrpc/blue.catbird.chat.replenishKeyPackages",
             "must POST to the publishKeyPackages XRPC NSID"
         );
 
@@ -1888,7 +1889,7 @@ mod tests {
 
         assert_eq!(captured.method, "POST");
         assert_eq!(
-            captured.path, "/xrpc/blue.catbird.mlsChat.reportRecoveryFailure",
+            captured.path, "/xrpc/blue.catbird.chat.reportRecoveryFailure",
             "must POST to the reportRecoveryFailure XRPC NSID"
         );
 

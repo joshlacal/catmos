@@ -70,14 +70,20 @@ function createAuthStore() {
 			}
 		},
 		async tryRestore() {
+			update((s) => ({ ...s, loading: true, error: null }));
 			try {
 				const user = await api.tryRestoreSession();
 				if (user) {
 					await fetchOwnProfile(user);
 					set({ user, loading: false, error: null, waitingForOAuth: false });
+				} else {
+					set({ ...initialState, loading: false });
 				}
-			} catch {
-				// No saved session, that's fine
+			} catch (e) {
+				// A transient restore failure must be visible and retryable. The
+				// desktop backend intentionally keeps the keychained session so a
+				// retry can resume the existing encrypted transcript.
+				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
 		/** Called from /auth/callback route after browser OAuth completes. */

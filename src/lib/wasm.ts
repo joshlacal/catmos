@@ -142,6 +142,14 @@ function getOrCreateMlsDbKey(): string {
 
 const CONTENT_ROOT_PREFIX = 'mls.content.root.';
 
+// Keep browser-side direct XRPC calls on the same clean-chat route contract
+// as the Tauri boundary. The shared Nest/mls-ds adapter accepts the existing
+// payloads while generated clean-chat bindings are propagated upstream.
+const CHAT_ROUTE = {
+	resetGroup: 'blue.catbird.chat.resetGroup',
+	reportSpam: 'blue.catbird.chat.reportSpam'
+} as const;
+
 async function sha256Hex(input: string): Promise<string> {
 	const bytes = new TextEncoder().encode(input);
 	const digest = await crypto.subtle.digest('SHA-256', bytes);
@@ -382,7 +390,18 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		const resp = await fetch(`${NEST_URL}/auth/session`, {
 			headers: { Authorization: `Bearer ${sessionId}` }
 		});
-		if (!resp.ok) return null;
+		if (!resp.ok) {
+			// Only discard credentials when Nest definitively rejects them. A
+			// transport/5xx failure is retryable and must not strand the
+			// persisted DID/content-root key behind a fresh login.
+			if (resp.status === 401 || resp.status === 403) {
+				clearBrowserAuth();
+				return null;
+			}
+			else {
+				throw new Error(`Failed to restore session: ${resp.status}`);
+			}
+		}
 		const info = await resp.json();
 
 		// Push restored credentials to Worker
@@ -399,8 +418,8 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		startKeyPackageReplenishment();
 
 		return { did: info.did, handle: info.handle ?? info.did };
-	} catch {
-		return null;
+	} catch (error) {
+		throw error;
 	}
 }
 
@@ -894,7 +913,7 @@ export async function resetGroup(
 		cipherSuite: 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519'
 	};
 	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.mlsChat.resetGroup`, {
+	const resp = await fetch(`${NEST_URL}/xrpc/${CHAT_ROUTE.resetGroup}`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
@@ -926,7 +945,7 @@ export async function reportSpam(
 	if (!saved) throw new Error('Not authenticated');
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
 	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.mlsChat.reportSpam`, {
+	const resp = await fetch(`${NEST_URL}/xrpc/${CHAT_ROUTE.reportSpam}`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',

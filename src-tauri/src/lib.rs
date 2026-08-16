@@ -1,4 +1,5 @@
 mod api_client;
+mod chat_routes;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
 mod commands;
@@ -7,6 +8,7 @@ mod keychain;
 mod keys;
 mod mls_proxy;
 mod quarantine_observer;
+mod session_restore;
 mod storage;
 mod websocket;
 

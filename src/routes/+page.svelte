@@ -360,7 +360,10 @@
 					class="login-input"
 				/>
 				{#if $auth.error}
-					<p class="login-error">{$auth.error}</p>
+					<p class="login-error" role="alert">{$auth.error}</p>
+					<button type="button" class="btn btn-secondary restore-btn" onclick={() => auth.tryRestore()}>
+						Try restoring session
+					</button>
 				{/if}
 				<button type="submit" class="btn btn-primary login-btn" disabled={$auth.loading || !loginIdentifier}>
 					Sign in with Bluesky
@@ -584,6 +587,11 @@
 
 	.login-btn {
 		width: 100%;
+	}
+
+	.restore-btn {
+		width: 100%;
+		margin-bottom: 12px;
 	}
 
 	.oauth-waiting {

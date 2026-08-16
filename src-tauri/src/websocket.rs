@@ -274,8 +274,9 @@ async fn do_subscribe(
         None => serde_json::json!({}),
     };
     let ticket_resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.getSubscriptionTicket",
-        api_base_url
+        "{}/xrpc/{}",
+        api_base_url,
+        crate::chat_routes::GET_SUBSCRIPTION_TICKET
     )))
     .bearer_auth(auth_token)
     .json(&ticket_body)
