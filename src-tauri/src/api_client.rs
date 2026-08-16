@@ -715,6 +715,43 @@ impl ReqwestApiClient {
         Ok(())
     }
 
+    /// Persist the read cursor using the generated lexicon DTO.
+    ///
+    /// This endpoint is intentionally kept separate from `MLSAPIClient`: read
+    /// receipts do not affect MLS state and the orchestrator has no cursor
+    /// abstraction yet. Keeping the request here still gives the desktop
+    /// command the same authenticated, typed transport boundary as the other
+    /// API calls.
+    pub async fn update_cursor(&self, convo_id: &str, cursor: &str) -> Result<()> {
+        let token = self.auth_header()?;
+        let input = blue_catbird::mlsChat::update_cursor::UpdateCursor {
+            convo_id: convo_id.to_string().into(),
+            cursor: cursor.to_string().into(),
+            extra_data: None,
+        };
+
+        let resp = self
+            .client
+            .post(self.xrpc_url("blue.catbird.mlsChat.updateCursor"))
+            .bearer_auth(&token)
+            .json(&input)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(self.handle_error(resp).await);
+        }
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let _output = parse_lexicon_json::<blue_catbird::mlsChat::update_cursor::UpdateCursorOutput>(
+            body.as_ref(),
+        )?;
+        Ok(())
+    }
+
     async fn handle_error(&self, resp: reqwest::Response) -> OrchestratorError {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();

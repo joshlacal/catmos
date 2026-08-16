@@ -1342,45 +1342,13 @@ pub async fn send_typing(
         is_typing
     );
 
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let client = reqwest::Client::new();
-    let action_name = if is_typing { "typing" } else { "typingStop" };
-    let no_op_ciphertext = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 512]);
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "delivery": "ephemeral",
-        "action": action_name,
-        // These are required by sendMessage schema for ephemeral sub-actions.
-        "msgId": uuid::Uuid::new_v4().to_string(),
-        "epoch": 0,
-        "paddedSize": 512,
-        "ciphertext": { "$bytes": no_op_ciphertext },
-    });
-    let resp = client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.sendMessage",
-        nest_url
-    ));
-    let resp = crate::mls_proxy::with_mls_proxy_header(resp)
-        .bearer_auth(&token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| format!("Typing update failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Typing update failed ({}): {}", status, body));
-    }
-
-    Ok(())
+    // The canonical blue.catbird.chat.publishTyping endpoint requires a
+    // signed request (device identity, DPoP binding, and typing body). The
+    // old mlsChat.sendMessage/ephemeral shim fabricated ciphertext and is not
+    // a valid substitute. Do not emit a misleading network request until the
+    // catmos signing adapter is available.
+    let _ = (conversation_id, is_typing);
+    Err("Typing is temporarily unavailable: canonical signed typing transport is not wired".into())
 }
 
 #[tauri::command]
@@ -1395,37 +1363,11 @@ pub async fn update_cursor(
         cursor
     );
 
-    let token = state
+    state
         .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "cursor": cursor,
-    });
-
-    let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.updateCursor",
-        nest_url
-    )))
-    .bearer_auth(&token)
-    .json(&input)
-    .send()
-    .await
-    .map_err(|e| format!("Update cursor failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Update cursor failed ({}): {}", status, body));
-    }
-
-    Ok(())
+        .update_cursor(&conversation_id, &cursor)
+        .await
+        .map_err(|e| format!("Update cursor failed: {e:?}"))
 }
 
 fn parse_did(s: &str) -> Did<'static> {
