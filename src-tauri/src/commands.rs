@@ -950,6 +950,31 @@ pub async fn create_group(
     })
 }
 
+/// Resolve the hex MLS group id for a canonical conversation id (UUID).
+///
+/// The canonical projection exposes the UUID `conversationId` and the hex
+/// `groupId` as separate fields; the Rust orchestrator hex-decodes the id it
+/// is handed and encrypts under that MLS group. Every send must translate at
+/// the boundary or the orchestrator fails with "Invalid hex group ID".
+async fn resolve_group_id(state: &AppState, conversation_id: &str) -> Result<String, String> {
+    let user_did = state
+        .orchestrator
+        .api_client()
+        .current_did()
+        .await
+        .unwrap_or_default();
+    let convo = state
+        .orchestrator
+        .storage()
+        .get_conversation(&user_did, conversation_id)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+    convo
+        .map(|c| c.group_id)
+        .filter(|g| !g.is_empty())
+        .ok_or_else(|| format!("Conversation not found: {conversation_id}"))
+}
+
 #[tauri::command]
 pub async fn send_message(
     state: State<'_, AppState>,
@@ -962,16 +987,26 @@ pub async fn send_message(
         .map_err(|error| format!("Signed clean-chat send unavailable: {error}"))?;
     log_catmos!(" send_message: convo={}", conversation_id);
 
+    // The canonical projection exposes the UUID conversationId and the hex
+    // groupId as separate fields; the Rust orchestrator hex-decodes the id it
+    // is handed. Translate at the send boundary so the orchestrator encrypts
+    // under the MLS group, not the UUID.
+    let group_id = resolve_group_id(&state, &conversation_id).await?;
+
     let msg = state
         .orchestrator
-        .send_message(&conversation_id, &content)
+        .send_message(&group_id, &content)
         .await
         .map_err(|e| {
             log_catmos!(" send_message error: {:?}", e);
             format!("{:?}", e)
         })?;
 
-    Ok(ui_message_from_orchestrator(msg))
+    // The orchestrator stamps the hex group id on the message; the UI keys
+    // conversations by the canonical UUID, so restore it at the boundary.
+    let mut ui = ui_message_from_orchestrator(msg);
+    ui.conversation_id = conversation_id;
+    Ok(ui)
 }
 
 #[tauri::command]
@@ -1028,16 +1063,20 @@ pub async fn send_image(
     )
     .map_err(|e| e.to_string())?;
 
+    let group_id = resolve_group_id(&state, &conversation_id).await?;
+
     let msg = state
         .orchestrator
-        .send_message_with_embed(&conversation_id, &content, embed)
+        .send_message_with_embed(&group_id, &content, embed)
         .await
         .map_err(|e| {
             log_catmos!(" send_image error: {:?}", e);
             format!("{:?}", e)
         })?;
 
-    Ok(ui_message_from_orchestrator(msg))
+    let mut ui = ui_message_from_orchestrator(msg);
+    ui.conversation_id = conversation_id;
+    Ok(ui)
 }
 
 #[tauri::command]
