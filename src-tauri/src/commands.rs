@@ -31,6 +31,17 @@ fn log_file_path() -> std::path::PathBuf {
     base.join("catmos").join("catmos.log")
 }
 
+async fn cleanup_ws_handle(
+    handles: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, WsHandle>>>,
+    key: &str,
+    owner: &tokio::sync::watch::Sender<bool>,
+) {
+    let mut handles = handles.lock().await;
+    if handles.get(key).is_some_and(|handle| handle.owns(owner)) {
+        handles.remove(key);
+    }
+}
+
 /// Resolve the per-DID content-root key from disk and install it on the
 /// shared `MLSContext`. Best-effort: any error is logged and the storage
 /// layer keeps writing legacy plaintext columns until the next attempt.
@@ -1474,6 +1485,7 @@ pub async fn subscribe_conversation(
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let owner = shutdown_tx.clone();
     let orchestrator = state.orchestrator.clone();
 
     let handle = WsHandle {
@@ -1487,7 +1499,9 @@ pub async fn subscribe_conversation(
         .insert(conversation_id.clone(), handle);
 
     let convo_id = conversation_id.clone();
+    let task_convo_id = convo_id.clone();
     let api_client = state.api_client.clone();
+    let ws_handles = state.ws_handles.clone();
     tokio::spawn(async move {
         crate::websocket::subscribe_conversation(
             app,
@@ -1495,10 +1509,11 @@ pub async fn subscribe_conversation(
             api_client,
             base_url,
             token,
-            convo_id,
+            task_convo_id,
             shutdown_rx,
         )
         .await;
+        cleanup_ws_handle(&ws_handles, &convo_id, &owner).await;
     });
 
     log_catmos!(" subscribe_conversation: convo={}", conversation_id);
@@ -1550,6 +1565,7 @@ pub async fn subscribe_all_events(
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let owner = shutdown_tx.clone();
     let orchestrator = state.orchestrator.clone();
 
     state.ws_handles.lock().await.insert(
@@ -1560,6 +1576,7 @@ pub async fn subscribe_all_events(
     );
 
     let api_client = state.api_client.clone();
+    let ws_handles = state.ws_handles.clone();
     tokio::spawn(async move {
         crate::websocket::subscribe_all(
             app,
@@ -1570,6 +1587,7 @@ pub async fn subscribe_all_events(
             shutdown_rx,
         )
         .await;
+        cleanup_ws_handle(&ws_handles, GLOBAL_KEY, &owner).await;
     });
 
     log_catmos!(" subscribe_all_events: global WS opened");
@@ -1871,11 +1889,18 @@ pub async fn check_opt_in_status(
 }
 
 #[tauri::command]
+#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn promote_member(
     state: State<'_, AppState>,
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
+    return state
+        .api_client
+        .reject_legacy_mutation::<()>("promoteAdmin")
+        .map_err(|error| actionable_error(format!("{error:?}")));
+    #[allow(unreachable_code)]
+    let _ = (&conversation_id, &target_did);
     let token = state
         .api_client
         .get_auth_token()
@@ -1911,11 +1936,18 @@ pub async fn promote_member(
 }
 
 #[tauri::command]
+#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn demote_member(
     state: State<'_, AppState>,
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
+    return state
+        .api_client
+        .reject_legacy_mutation::<()>("demoteAdmin")
+        .map_err(|error| actionable_error(format!("{error:?}")));
+    #[allow(unreachable_code)]
+    let _ = (&conversation_id, &target_did);
     let token = state
         .api_client
         .get_auth_token()
@@ -2679,12 +2711,20 @@ pub async fn report_spam(
 }
 
 #[tauri::command]
+#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn reset_group(
     state: State<'_, AppState>,
     conversation_id: String,
     reason: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_catmos!("reset_group: convo={}", conversation_id);
+
+    return state
+        .api_client
+        .reject_legacy_mutation::<serde_json::Value>("resetGroup")
+        .map_err(|error| actionable_error(format!("{error:?}")));
+    #[allow(unreachable_code)]
+    let _ = (&conversation_id, &reason);
 
     let token = state
         .api_client
@@ -3037,7 +3077,10 @@ pub async fn confirm_manual_reset(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_current_group_id, restore_registered_signer, validate_current_group_id};
+    use super::{
+        cleanup_ws_handle, resolve_current_group_id, restore_registered_signer,
+        validate_current_group_id,
+    };
     use crate::credentials::KeyringCredentialStore;
     use crate::storage::SqliteStorage;
     use async_trait::async_trait;
@@ -3086,6 +3129,24 @@ mod tests {
         )
         .is_err());
         assert!(validate_current_group_id("missing", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_exit_only_removes_its_current_handle() {
+        let handles = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (old_owner, _old_rx) = tokio::sync::watch::channel(false);
+        let (new_owner, _new_rx) = tokio::sync::watch::channel(false);
+        handles.lock().await.insert(
+            "conversation".to_string(),
+            crate::WsHandle {
+                shutdown: new_owner.clone(),
+            },
+        );
+
+        cleanup_ws_handle(&handles, "conversation", &old_owner).await;
+        assert!(handles.lock().await.contains_key("conversation"));
+        cleanup_ws_handle(&handles, "conversation", &new_owner).await;
+        assert!(!handles.lock().await.contains_key("conversation"));
     }
 
     #[tokio::test]

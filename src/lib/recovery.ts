@@ -31,8 +31,15 @@ export function recoveryNotice(error: unknown): RecoveryNotice {
 	if (lower.includes('401') || lower.includes('unauthorized') || lower.includes('expired')) {
 		return { category: 'reauthenticate', message: raw };
 	}
-	if (lower.includes('403') || lower.includes('forbidden') || lower.includes('access ended')) {
+	if (
+		lower.includes('access ended') ||
+		lower.includes('not a member') ||
+		lower.includes('not_member')
+	) {
 		return { category: 'access-ended', message: raw };
+	}
+	if (lower.includes('403') || lower.includes('forbidden')) {
+		return { category: 'rebind', message: raw };
 	}
 	if (lower.includes('binding') || lower.includes('dpop') || lower.includes('signer')) {
 		return { category: 'rebind', message: raw };

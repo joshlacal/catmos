@@ -78,13 +78,19 @@ pub struct WsHandle {
     pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+impl WsHandle {
+    pub(crate) fn owns(&self, sender: &tokio::sync::watch::Sender<bool>) -> bool {
+        self.shutdown.same_channel(sender)
+    }
+}
+
 pub struct AppState {
     pub orchestrator: Arc<CatmosOrchestrator>,
     pub api_client: Arc<ReqwestApiClient>,
     /// Runtime-owned clean-chat auth capabilities. The provider contains
     /// opaque session/device/JKT state; commands never persist or log secrets.
     pub(crate) chat_auth: Arc<api_client::ChatAuthProvider>,
-    pub ws_handles: Mutex<HashMap<String, WsHandle>>,
+    pub ws_handles: Arc<Mutex<HashMap<String, WsHandle>>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Per-app data directory (`~/Library/Application Support/catmos` on macOS,
@@ -166,7 +172,7 @@ pub fn run() {
         orchestrator,
         chat_auth,
         api_client,
-        ws_handles: Mutex::new(HashMap::new()),
+        ws_handles: Arc::new(Mutex::new(HashMap::new())),
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
         data_dir,

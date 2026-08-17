@@ -1033,6 +1033,15 @@ impl ReqwestApiClient {
         self.chat_auth.canonical_read_context().map(|_| ())
     }
 
+    /// Every legacy MLS mutation is deliberately stopped at this boundary.
+    /// The canonical signed adapter is not available in catmos yet, so a
+    /// bearer-only request must never reach the network.
+    pub(crate) fn reject_legacy_mutation<T>(&self, operation: &str) -> Result<T> {
+        Err(OrchestratorError::Api(crate::recovery::actionable_error(
+            format!("canonical signed {operation} is not wired; rebind required before mutation"),
+        )))
+    }
+
     pub fn clear_auth(&self) {
         self.chat_auth.clear();
     }
@@ -1173,7 +1182,11 @@ impl ReqwestApiClient {
     }
 
     /// Opt the current user into MLS chat.
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     pub async fn opt_in(&self, device_id: Option<String>) -> Result<()> {
+        return self.reject_legacy_mutation("optIn");
+        #[allow(unreachable_code)]
+        let _ = device_id;
         let token = self.auth_header()?;
         let input: lexicon::opt_in::Input = lexicon::opt_in::InputData {
             action: "optIn".into(),
@@ -1201,12 +1214,16 @@ impl ReqwestApiClient {
     }
 
     /// Upload an encrypted group metadata blob keyed by a client-generated locator.
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     pub async fn put_group_metadata_blob(
         &self,
         blob_locator: &str,
         group_id: &str,
         encrypted_blob: &[u8],
     ) -> Result<(String, usize)> {
+        return self.reject_legacy_mutation("putGroupMetadataBlob");
+        #[allow(unreachable_code)]
+        let _ = (blob_locator, group_id, encrypted_blob);
         let token = self.auth_header()?;
         let resp = self
             .client
@@ -1411,6 +1428,7 @@ impl ReqwestApiClient {
     /// Internal helper that POSTs a recovery failure report to the server.
     /// Matches the `MLSAPIClient::report_recovery_failure` impl but lives on the
     /// concrete struct so it can be reused by `opt_in` / admin flows later.
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn post_recovery_failure(
         &self,
         convo_id: &str,
@@ -1418,6 +1436,9 @@ impl ReqwestApiClient {
         epoch_authenticator: Option<&str>,
         failure_mode: Option<&str>,
     ) -> Result<()> {
+        return self.reject_legacy_mutation("reportRecoveryFailure");
+        #[allow(unreachable_code)]
+        let _ = (convo_id, failure_type, epoch_authenticator, failure_mode);
         let token = self.auth_header()?;
 
         let mut body = serde_json::json!({
@@ -1483,12 +1504,16 @@ impl ReqwestApiClient {
     }
 
     /// Report a member as spam in an MLS conversation.
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     pub async fn report_spam(
         &self,
         convo_id: &str,
         reported_did: &str,
         reason: Option<&str>,
     ) -> Result<()> {
+        return self.reject_legacy_mutation("reportSpam");
+        #[allow(unreachable_code)]
+        let _ = (convo_id, reported_did, reason);
         let token = self.auth_header()?;
 
         let mut body = serde_json::json!({
@@ -1836,6 +1861,7 @@ impl MLSAPIClient for ReqwestApiClient {
         self.canonical_get_conversations(limit, cursor).await
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn create_conversation(
         &self,
         group_id: &str,
@@ -1844,6 +1870,15 @@ impl MLSAPIClient for ReqwestApiClient {
         _commit_data: Option<&[u8]>,
         welcome_data: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
+        return self.reject_legacy_mutation("createConvo");
+        #[allow(unreachable_code)]
+        let _ = (
+            group_id,
+            initial_members,
+            _metadata,
+            _commit_data,
+            welcome_data,
+        );
         // Encrypted-metadata cutover (Phase C): catmos no longer sends
         // plaintext title/description on createConvo. The orchestrator
         // already passes `metadata = None` here, but we drop the
@@ -1898,6 +1933,7 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn bootstrap_reset_group(
         &self,
         original_convo_id: &str,
@@ -1907,6 +1943,16 @@ impl MLSAPIClient for ReqwestApiClient {
         members: &[String],
         welcome_message: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
+        return self.reject_legacy_mutation("bootstrapResetGroup");
+        #[allow(unreachable_code)]
+        let _ = (
+            original_convo_id,
+            new_group_id,
+            cipher_suite,
+            group_info,
+            members,
+            welcome_message,
+        );
         let token = self.auth_header()?;
 
         // Build the request body directly. catmos-cli-impl's notes on
@@ -1960,7 +2006,11 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
+        return self.reject_legacy_mutation("leaveConvo");
+        #[allow(unreachable_code)]
+        let _ = convo_id;
         let token = self.auth_header()?;
         let input: lexicon::leave_convo::Input = lexicon::leave_convo::InputData {
             convo_id: convo_id.to_string(),
@@ -1984,6 +2034,7 @@ impl MLSAPIClient for ReqwestApiClient {
         Ok(())
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn add_members(
         &self,
         convo_id: &str,
@@ -1991,6 +2042,9 @@ impl MLSAPIClient for ReqwestApiClient {
         commit_data: &[u8],
         welcome_data: Option<&[u8]>,
     ) -> Result<AddMembersServerResult> {
+        return self.reject_legacy_mutation("commitGroupChange.addMembers");
+        #[allow(unreachable_code)]
+        let _ = (convo_id, member_dids, commit_data, welcome_data);
         let token = self.auth_header()?;
         // Bypass the buggy `InputData → Input` adapter that double-encodes
         // byte fields. Build the lexicon struct directly with raw bytes.
@@ -2041,12 +2095,16 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn remove_members(
         &self,
         convo_id: &str,
         member_dids: &[String],
         commit_data: &[u8],
     ) -> Result<()> {
+        return self.reject_legacy_mutation("commitGroupChange.removeMember");
+        #[allow(unreachable_code)]
+        let _ = (convo_id, member_dids, commit_data);
         let token = self.auth_header()?;
         // Bypass the buggy `InputData → Input` adapter (see
         // `build_commit_group_change` docs).
@@ -2121,6 +2179,7 @@ impl MLSAPIClient for ReqwestApiClient {
         Ok((entries, next_cursor))
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn publish_key_package(
         &self,
         key_package: &[u8],
@@ -2128,6 +2187,9 @@ impl MLSAPIClient for ReqwestApiClient {
         expires_at: &str,
         device_id: Option<&str>,
     ) -> Result<()> {
+        return self.reject_legacy_mutation("publishKeyPackages");
+        #[allow(unreachable_code)]
+        let _ = (key_package, cipher_suite, expires_at, device_id);
         let token = self.auth_header()?;
         let device_id = match device_id {
             Some(id) if !id.trim().is_empty() => id.trim().to_string(),
@@ -2253,6 +2315,7 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn register_device(
         &self,
         device_uuid: &str,
@@ -2261,6 +2324,15 @@ impl MLSAPIClient for ReqwestApiClient {
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
     ) -> Result<DeviceInfo> {
+        return self.reject_legacy_mutation("registerDevice");
+        #[allow(unreachable_code)]
+        let _ = (
+            device_uuid,
+            device_name,
+            mls_did,
+            signature_key,
+            key_packages,
+        );
         let session = self
             .current_session()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
@@ -2360,7 +2432,11 @@ impl MLSAPIClient for ReqwestApiClient {
         ))
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
+        return self.reject_legacy_mutation("commitGroupChange.updateGroupInfo");
+        #[allow(unreachable_code)]
+        let _ = (convo_id, group_info);
         let token = self.auth_header()?;
         // Bypass the buggy `InputData → Input` adapter (see
         // `build_commit_group_change` docs).
@@ -2475,6 +2551,7 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn process_external_commit(
         &self,
         convo_id: &str,
@@ -2482,6 +2559,9 @@ impl MLSAPIClient for ReqwestApiClient {
         group_info: Option<&[u8]>,
         confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
+        return self.reject_legacy_mutation("commitGroupChange.externalCommit");
+        #[allow(unreachable_code)]
+        let _ = (convo_id, commit_data, group_info, confirmation_tag);
         let token = self.auth_header()?;
         // Caller-supplied `confirmation_tag` is a base64-encoded string (kept
         // as-is for the public signature); decode it back to raw bytes so the
@@ -2544,6 +2624,7 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn put_group_metadata_blob(
         &self,
         convo_id: &str,
@@ -2554,6 +2635,17 @@ impl MLSAPIClient for ReqwestApiClient {
         metadata_version: u64,
         reset_generation: Option<i32>,
     ) -> Result<()> {
+        return self.reject_legacy_mutation("putGroupMetadataBlob");
+        #[allow(unreachable_code)]
+        let _ = (
+            convo_id,
+            group_id_hex,
+            blob_locator,
+            ciphertext,
+            kind,
+            metadata_version,
+            reset_generation,
+        );
         let token = self.auth_header()?;
         let metadata_version_str = metadata_version.to_string();
         let reset_generation_str = reset_generation.map(|n| n.to_string());
@@ -3083,7 +3175,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(unreachable_code)]
     async fn delayed_registration_does_not_write_under_switched_account() {
+        let (base_url, requests) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth(
+            "did:plc:delayed-register-a".to_string(),
+            "token-a".to_string(),
+        );
+        let error = <ReqwestApiClient as MLSAPIClient>::register_device(
+            &client,
+            "local-device-a",
+            "test-device",
+            "did:plc:delayed-register-a",
+            &[],
+            &[],
+        )
+        .await
+        .expect_err("legacy registration must fail closed");
+        assert!(error.to_string().contains("canonical signed"));
+        assert!(requests
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        return;
         let did_a = "did:plc:delayed-register-a";
         let did_b = "did:plc:delayed-register-b";
         let store = crate::credentials::KeyringCredentialStore::try_new()
@@ -3166,7 +3280,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[allow(unreachable_code)]
     async fn delayed_registration_error_does_not_invalidate_new_account() {
+        let (base_url, requests) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth(
+            "did:plc:delayed-registration-error-a".to_string(),
+            "token-a".to_string(),
+        );
+        let error = <ReqwestApiClient as MLSAPIClient>::register_device(
+            &client,
+            "local-a",
+            "test-device",
+            "did:plc:delayed-registration-error-a",
+            &[],
+            &[],
+        )
+        .await
+        .expect_err("legacy registration must fail closed");
+        assert!(error.to_string().contains("canonical signed"));
+        assert!(requests
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
+        return;
         let did_a = "did:plc:delayed-registration-error-a";
         let did_b = "did:plc:delayed-registration-error-b";
         let (base_url, requests) = spawn_scripted_json_server(vec![(
@@ -3274,13 +3410,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_key_package_posts_registered_device_id() {
+    async fn publish_key_package_fails_closed_without_signed_adapter() {
         let (base_url, rx) = spawn_capture_server();
         let client = ReqwestApiClient::new(base_url);
         client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
         client.set_publish_device_id_for_tests("device-uuid-123");
 
-        client
+        let error = client
             .publish_key_package(
                 b"test-key-package",
                 "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
@@ -3288,25 +3424,11 @@ mod tests {
                 None,
             )
             .await
-            .expect("publish_key_package should succeed against 200 OK");
-
-        let captured = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server received request");
-
-        assert_eq!(captured.method, "POST");
-        assert_eq!(
-            captured.path, "/xrpc/blue.catbird.mlsChat.publishKeyPackages",
-            "must POST to the publishKeyPackages XRPC NSID"
-        );
-
-        let body: serde_json::Value = serde_json::from_slice(&captured.body).expect("body is JSON");
-        assert_eq!(body["action"], "publish");
-        assert_eq!(body["deviceId"], "device-uuid-123");
-        assert_eq!(
-            body["keyPackages"][0]["cipherSuite"],
-            "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
-        );
+            .expect_err("legacy key-package publishing must fail closed");
+        assert!(error.to_string().contains("canonical signed"));
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
     }
 
     #[tokio::test]
@@ -3330,6 +3452,24 @@ mod tests {
             rx.recv_timeout(std::time::Duration::from_millis(100))
                 .is_err(),
             "fail-closed send must not reach the legacy HTTP endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_legacy_mutation_gate_stops_before_bearer_http() {
+        let (base_url, rx) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+
+        let error = client
+            .opt_in(None)
+            .await
+            .expect_err("legacy opt-in must not use bearer-only HTTP");
+        assert!(error.to_string().contains("canonical signed"));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "legacy mutation gate must reject before network"
         );
     }
 
@@ -3366,12 +3506,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn report_recovery_failure_posts_correct_xrpc_request() {
+    async fn report_recovery_failure_fails_closed_without_signed_adapter() {
         let (base_url, rx) = spawn_capture_server();
         let client = ReqwestApiClient::new(base_url);
         client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
 
-        client
+        let error = client
             .report_recovery_failure(
                 "convo-x",
                 "external_commit_exhausted",
@@ -3379,65 +3519,27 @@ mod tests {
                 Some("local_state_loss"),
             )
             .await
-            .expect("report_recovery_failure should succeed against 200 OK");
-
-        let captured = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server received request");
-
-        assert_eq!(captured.method, "POST");
-        assert_eq!(
-            captured.path, "/xrpc/blue.catbird.mlsChat.reportRecoveryFailure",
-            "must POST to the reportRecoveryFailure XRPC NSID"
-        );
-
-        let auth_header = captured
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .expect("Authorization header must be present");
-        assert_eq!(auth_header.1, "Bearer test-token");
-
-        let body: serde_json::Value = serde_json::from_slice(&captured.body).expect("body is JSON");
-        assert_eq!(body["convoId"], "convo-x");
-        assert_eq!(body["failureType"], "external_commit_exhausted");
-        // ADR-002 / spec §8.6: epoch_authenticator is hex-encoded and bound
-        // to the reporter's current epoch so stale clients can't forge votes.
-        assert_eq!(body["epochAuthenticator"], "deadbeefcafe1234");
-        // ADR-008 D1 / spec §8.6.1: failureMode discriminator. Must round-trip
-        // verbatim so the server-side D1 filter can exclude Mode A votes from
-        // quorum auto-reset.
-        assert_eq!(body["failureMode"], "local_state_loss");
+            .expect_err("legacy recovery report must fail closed");
+        assert!(error.to_string().contains("canonical signed"));
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
     }
 
     #[tokio::test]
-    async fn report_recovery_failure_omits_optional_fields_when_none() {
+    async fn report_recovery_failure_without_fields_fails_closed() {
         let (base_url, rx) = spawn_capture_server();
         let client = ReqwestApiClient::new(base_url);
         client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
 
-        client
+        let error = client
             .report_recovery_failure("convo-y", "remote_data_error", None, None)
             .await
-            .expect("report_recovery_failure should succeed against 200 OK");
-
-        let captured = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server received request");
-
-        let body: serde_json::Value = serde_json::from_slice(&captured.body).expect("body is JSON");
-        assert_eq!(body["convoId"], "convo-y");
-        assert_eq!(body["failureType"], "remote_data_error");
-        // Both optional discriminators must be absent (not null) when not
-        // supplied — matches the lexicon's `skip_serializing_if = is_none`.
-        assert!(
-            body.get("epochAuthenticator").is_none(),
-            "epochAuthenticator must be omitted when caller passes None"
-        );
-        assert!(
-            body.get("failureMode").is_none(),
-            "failureMode must be omitted when caller passes None"
-        );
+            .expect_err("legacy recovery report must fail closed");
+        assert!(error.to_string().contains("canonical signed"));
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err());
     }
 }
 

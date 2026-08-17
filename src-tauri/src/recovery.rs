@@ -59,9 +59,7 @@ pub(crate) fn classify_error(error: &str) -> RecoveryCategory {
         return RecoveryCategory::Reauthenticate;
     }
 
-    if lower.contains("session rejected by nest (403")
-        || lower.contains("forbidden")
-        || lower.contains("access ended")
+    if lower.contains("access ended")
         || lower.contains("device revoked")
         || lower.contains("not a member")
         || lower.contains("not_member")
@@ -76,6 +74,8 @@ pub(crate) fn classify_error(error: &str) -> RecoveryCategory {
         || lower.contains("signer")
         || lower.contains("reauthenticate")
         || lower.contains("rebind")
+        || lower.contains("403")
+        || lower.contains("forbidden")
         || lower.contains("not wired")
         || lower.contains("canonical subscription ticket transport is unavailable")
         || lower.contains("requires the shared signed")
@@ -151,8 +151,12 @@ mod tests {
             RecoveryCategory::Rejoin
         );
         assert_eq!(
-            classify_error("Session rejected by nest (403 Forbidden): revoked"),
+            classify_error("server says access ended for this conversation"),
             RecoveryCategory::AccessEnded
+        );
+        assert_eq!(
+            classify_error("403 Forbidden from canonical chat endpoint"),
+            RecoveryCategory::Rebind
         );
     }
 
