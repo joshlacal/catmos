@@ -18,7 +18,6 @@ use crate::types::string::Did;
 
 use crate::credentials::KeyringCredentialStore;
 use crate::{AppState, CatmosOrchestrator, WsHandle};
-use catbird_mls::orchestrator::credentials::CredentialStore;
 
 fn log_file_path() -> std::path::PathBuf {
     let base = dirs::cache_dir()
@@ -207,21 +206,57 @@ fn clear_saved_session_credentials() {
 }
 
 /// Install only opaque runtime capabilities after login/device enrollment.
-/// Persisted session, device, and DPoP material never enters command logs.
+/// Persisted session/device identifiers never enter command logs; DPoP
+/// binding evidence is admitted only through the runtime authority provider.
 async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
+    let previous_did = state.api_client.current_did().await;
+    if previous_did.as_deref() != Some(did) {
+        if let (Some(previous_did), Ok(store)) =
+            (previous_did.as_deref(), KeyringCredentialStore::try_new())
+        {
+            let _ = store.clear_server_device_authority(previous_did).await;
+        }
+    }
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
+    state.chat_auth.clear_device_authority();
 
     if let Ok(store) = KeyringCredentialStore::try_new() {
-        if let Ok(Some(device_id)) = store.get_device_uuid(did).await {
-            state.chat_auth.set_device_id(device_id);
-        }
-    }
-
-    if let Ok(entry) = keyring::Entry::new("catmos", "chat_dpop_jkt") {
-        if let Ok(jkt) = entry.get_password() {
-            let _ = state.chat_auth.observe_dpop_jkt(jkt);
+        match store.get_local_device_uuid(did).await {
+            Ok(Some(local_device_uuid)) => {
+                state
+                    .chat_auth
+                    .set_local_device_uuid(local_device_uuid.clone());
+                if let Err(error) = state
+                    .api_client
+                    .resolve_server_device_id_for_local_uuid(&local_device_uuid)
+                    .await
+                {
+                    // Chat authority remains absent on any zero/duplicate
+                    // listDevices match or transport error. Canonical reads
+                    // consequently fail closed until a fresh exact
+                    // reconciliation and binding admission succeed.
+                    log_catmos!(
+                        " chat device authority reconciliation deferred for {}: {}",
+                        did,
+                        error
+                    );
+                }
+            }
+            Ok(None) => {
+                log_catmos!(
+                    " chat device authority unavailable for {}: local device UUID is missing",
+                    did
+                );
+            }
+            Err(error) => {
+                log_catmos!(
+                    " chat device authority unavailable for {}: failed to load local UUID: {}",
+                    did,
+                    error
+                );
+            }
         }
     }
 }
@@ -675,6 +710,11 @@ pub async fn try_restore_session(
                         log_catmos!("Stored session was rejected; clearing saved login: {}", e);
                         clear_saved_session_credentials();
                         state.api_client.clear_auth();
+                        if let Some(user_did) = stored_did.as_deref() {
+                            if let Ok(store) = KeyringCredentialStore::try_new() {
+                                let _ = store.clear_server_device_authority(user_did).await;
+                            }
+                        }
                         return Ok(None);
                     }
                     log_catmos!(
@@ -753,7 +793,13 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     // wipe path (account removal) would also call `keys::delete_content_root_key`.
     state.orchestrator.mls_context().clear_content_root_key();
     state.orchestrator.shutdown().await;
+    let user_did = state.api_client.current_did().await;
     state.api_client.clear_auth();
+    if let Some(user_did) = user_did {
+        if let Ok(store) = KeyringCredentialStore::try_new() {
+            let _ = store.clear_server_device_authority(&user_did).await;
+        }
+    }
     clear_saved_session_credentials();
     Ok(())
 }
@@ -969,10 +1015,31 @@ async fn resolve_group_id(state: &AppState, conversation_id: &str) -> Result<Str
         .get_conversation(&user_did, conversation_id)
         .await
         .map_err(|e| format!("{:?}", e))?;
-    convo
+    let group_id = convo
         .map(|c| c.group_id)
         .filter(|g| !g.is_empty())
-        .ok_or_else(|| format!("Conversation not found: {conversation_id}"))
+        .ok_or_else(|| format!("Conversation not found: {conversation_id}"))?;
+
+    // The UI speaks in stable conversation UUIDs. MLS encryption and
+    // reactions speak in the current binary group coordinate encoded as hex.
+    // Reject missing, malformed, or stale local rows before handing anything
+    // to the orchestrator; it will not reinterpret a UUID as a group ID.
+    validate_current_group_id(conversation_id, &group_id)
+}
+
+fn validate_current_group_id(conversation_id: &str, group_id: &str) -> Result<String, String> {
+    let normalized = group_id.trim();
+    if normalized.is_empty()
+        || normalized.len() % 2 != 0
+        || hex::decode(normalized)
+            .map(|bytes| bytes.is_empty())
+            .unwrap_or(true)
+    {
+        return Err(format!(
+            "Conversation has no current hex MLS group ID: {conversation_id}"
+        ));
+    }
+    Ok(normalized.to_string())
 }
 
 #[tauri::command]
@@ -1388,9 +1455,13 @@ pub async fn send_reaction(
         catbird_mls::orchestrator::types::ReactionAction::Add
     };
 
+    // Resolve the stable conversation UUID to the current hex MLS group ID
+    // before the reaction enters the Rust orchestrator.
+    let group_id = resolve_group_id(&state, &conversation_id).await?;
+
     state
         .orchestrator
-        .send_reaction(&conversation_id, &message_id, &emoji, reaction_action)
+        .send_reaction(&group_id, &message_id, &emoji, reaction_action)
         .await
         .map_err(|e| {
             log_catmos!(" send_reaction error: {:?}", e);
@@ -2732,4 +2803,28 @@ pub async fn confirm_manual_reset(
         .user_confirmed_manual_reset(&conversation_id)
         .await
         .map_err(|e| format!("{:?}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_current_group_id;
+
+    #[test]
+    fn reaction_boundary_passes_the_current_hex_group_id() {
+        assert_eq!(
+            validate_current_group_id("00000000-0000-4000-8000-000000000001", "deadbeefcafe1234")
+                .expect("current group ID should be accepted"),
+            "deadbeefcafe1234"
+        );
+    }
+
+    #[test]
+    fn reaction_boundary_rejects_uuid_or_missing_group_id() {
+        assert!(validate_current_group_id(
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000001"
+        )
+        .is_err());
+        assert!(validate_current_group_id("missing", "").is_err());
+    }
 }
