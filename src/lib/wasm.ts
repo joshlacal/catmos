@@ -351,6 +351,52 @@ export async function setAuth(did: string, token: string): Promise<void> {
 }
 
 /**
+ * Install a browser-owned non-exporting Ed25519 signer for canonical chat
+ * preparation. The CryptoKey is passed to the worker as a structured-clone
+ * handle and never converted to private key bytes. WASM receives only the
+ * public binding and a callback that returns a 64-byte signature.
+ */
+export async function installBrowserSigner(params: {
+	actorDid: string;
+	deviceId: string;
+	dpopJkt: string;
+	publicKey: Uint8Array;
+	key: CryptoKey;
+	authGeneration?: number;
+}): Promise<void> {
+	if (isTauri) {
+		throw new Error('browser signer is unsupported in Tauri runtime');
+	}
+	const w = getWorker();
+	await w.setSignerBridge(
+		params.actorDid,
+		params.deviceId,
+		params.dpopJkt,
+		params.publicKey,
+		params.key,
+		params.authGeneration
+	);
+}
+
+/** Prepare an unsigned generated clean-chat request without returning auth. */
+export async function prepareUnsignedRequest(
+	operation: string,
+	requestJson: string
+): Promise<unknown> {
+	if (isTauri) throw new Error('browser unsigned preparation is unsupported in Tauri runtime');
+	return getWorker().prepareUnsignedRequest(operation, requestJson);
+}
+
+/** Prepare a signed generated clean-chat request through the worker WASM. */
+export async function prepareSignedRequest(
+	operation: string,
+	requestJson: string
+): Promise<unknown> {
+	if (isTauri) throw new Error('browser signed preparation is unsupported in Tauri runtime');
+	return getWorker().prepareSignedRequest(operation, requestJson);
+}
+
+/**
  * Clear auth credentials from the WASM MLS module.
  */
 export async function clearAuth(): Promise<void> {
