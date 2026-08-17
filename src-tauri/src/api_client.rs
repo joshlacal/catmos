@@ -1026,6 +1026,13 @@ impl ReqwestApiClient {
         self.chat_auth.clone()
     }
 
+    /// Require the server-admitted device binding before starting a
+    /// clean-chat subscription. A local UUID, bearer token, or legacy ticket
+    /// is not sufficient authority for the canonical stream.
+    pub(crate) fn require_canonical_admission(&self) -> std::result::Result<(), ChatAuthError> {
+        self.chat_auth.canonical_read_context().map(|_| ())
+    }
+
     pub fn clear_auth(&self) {
         self.chat_auth.clear();
     }
@@ -1291,55 +1298,49 @@ impl ReqwestApiClient {
 
     /// Upload a generic opaque blob. The server assigns the final blob ID.
     pub async fn upload_blob(&self, data: &[u8], convo_id: &str) -> Result<(String, usize)> {
-        let token = self.auth_header()?;
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::upload_blob::NSID))
-            .bearer_auth(&token)
-            .query(&[("convoId", convo_id)])
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(data.to_vec())
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::upload_blob::UploadBlobOutput<String>,
-        >(body.as_ref())?;
-        let size = usize::try_from(output.size)
-            .map_err(|_| OrchestratorError::Api("blob size out of range".into()))?;
-
-        Ok((output.blob_id.to_string(), size))
+        let _ = (data, convo_id);
+        self.require_canonical_admission()
+            .map_err(|error| OrchestratorError::Api(crate::recovery::actionable_error(error)))?;
+        Err(OrchestratorError::Api(crate::recovery::actionable_error(
+            "canonical blob upload requires the shared signed prepareBlobUpload and upload-ticket adapter",
+        )))
     }
 
-    /// Fetch a generic opaque blob by blob ID.
+    /// Fetch a clean-chat opaque blob by blob ID using the admitted canonical
+    /// device identity. Blob bytes remain opaque and are never JSON-decoded.
     pub async fn get_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
-        let token = self.auth_header()?;
+        let auth = self
+            .chat_auth
+            .canonical_read_context()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let route = catbird_mls::orchestrator::canonical_route(
+            catbird_mls::orchestrator::CanonicalOperation::GetBlob,
+        );
+        let path = format!("{}?blobId={}", route.path, urlencoding::encode(blob_id));
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_blob::NSID))
-            .bearer_auth(&token)
-            .query(&[("blobId", blob_id)])
+            .get(self.canonical_url(&path))
+            .header(reqwest::header::AUTHORIZATION, &auth.authorization)
+            .header("x-catbird-chat-device-id", &auth.device_id)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
+        if let Err(error) = self.observe_chat_binding(&resp, &auth.session) {
+            self.invalidate_device_authority_for_session(&auth.session)
+                .await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
+
         if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+            return Err(self.handle_error_for_session(resp, &auth.session).await);
         }
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.ensure_session_current(&auth.session)?;
         Ok(body.to_vec())
     }
 
@@ -1401,53 +1402,10 @@ impl ReqwestApiClient {
         epoch: u64,
         msg_id: &str,
     ) -> Result<SendMessageResponse> {
-        let token = self.auth_header()?;
-        // Ciphertext is already padded by catbird-mls encrypt_message.
-        // padded_size == ciphertext.len() since it's padded to bucket.
-        let padded_size = ciphertext.len() as u32;
-        tracing::info!(convo_id, epoch, padded_size, "Sending message to server");
-        let input: lexicon::send_message::Input = lexicon::send_message::InputData {
-            convo_id: convo_id.to_string(),
-            ciphertext: ciphertext.to_vec(),
-            epoch: epoch as usize,
-            msg_id: msg_id.to_string(),
-            padded_size: i64::from(padded_size),
-            delivery: None,
-            confirmation_tag: self.get_confirmation_tag_b64(convo_id),
-        }
-        .into();
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::send_message::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            if status == 409 {
-                tracing::error!(
-                    convo_id,
-                    client_epoch = epoch,
-                    "409 Conflict: epoch mismatch — server has different epoch"
-                );
-            }
-            return Err(self.handle_error(resp).await);
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let json: serde_json::Value =
-            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        Ok(SendMessageResponse {
-            message_id: json["messageId"].as_str().unwrap_or(msg_id).to_string(),
-            seq: json["seq"].as_u64().unwrap_or(0),
-            epoch: json["epoch"].as_u64().unwrap_or(epoch),
-        })
+        let _ = (convo_id, ciphertext, epoch, msg_id);
+        Err(OrchestratorError::Api(crate::recovery::actionable_error(
+            "legacy mlsChat sendMessage is disabled; canonical signed application transport is not wired for the generic MLS caller",
+        )))
     }
 
     /// Internal helper that POSTs a recovery failure report to the server.
@@ -1564,33 +1522,10 @@ impl ReqwestApiClient {
     /// command the same authenticated, typed transport boundary as the other
     /// API calls.
     pub async fn update_cursor(&self, convo_id: &str, cursor: &str) -> Result<()> {
-        let token = self.auth_header()?;
-        let input = blue_catbird::mlsChat::update_cursor::UpdateCursor::<String> {
-            convo_id: convo_id.to_string().into(),
-            cursor: cursor.to_string().into(),
-            extra_data: None,
-        };
-
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.updateCursor"))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let _output = parse_lexicon_json::<blue_catbird::mlsChat::update_cursor::UpdateCursorOutput>(
-            body.as_ref(),
-        )?;
-        Ok(())
+        let _ = (convo_id, cursor);
+        Err(OrchestratorError::Api(crate::recovery::actionable_error(
+            "legacy mlsChat updateCursor is disabled until a canonical subscription cursor adapter is available",
+        )))
     }
 
     fn canonical_url(&self, path: &str) -> String {
@@ -3372,6 +3307,62 @@ mod tests {
             body["keyPackages"][0]["cipherSuite"],
             "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
         );
+    }
+
+    #[tokio::test]
+    async fn generic_send_message_fails_closed_without_canonical_signed_adapter() {
+        let (base_url, rx) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+
+        let error = <ReqwestApiClient as MLSAPIClient>::send_message(
+            &client,
+            "conversation-id",
+            b"cipher",
+            7,
+        )
+        .await
+        .expect_err("generic MLS sends must not use an unsigned legacy route");
+        assert!(error
+            .to_string()
+            .contains("legacy mlsChat sendMessage is disabled"));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "fail-closed send must not reach the legacy HTTP endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_blob_uses_canonical_route_and_admitted_server_device() {
+        let (base_url, rx) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+        client
+            .chat_auth
+            .set_local_device_for_tests("local-device-1");
+        client.chat_auth.set_device_for_tests("server-device-1");
+        client.chat_auth.admit_for_tests(1);
+
+        let body = client
+            .get_blob("blob-1")
+            .await
+            .expect("admitted canonical blob read should accept opaque bytes");
+        assert_eq!(body, b"{}".to_vec());
+
+        let captured = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server received canonical blob request");
+        assert_eq!(
+            captured.path,
+            "/xrpc/blue.catbird.chat.getBlob?blobId=blob-1"
+        );
+        let device_header = captured
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-catbird-chat-device-id"))
+            .expect("canonical blob request must carry the server device ID");
+        assert_eq!(device_header.1, "server-device-1");
     }
 
     #[tokio::test]

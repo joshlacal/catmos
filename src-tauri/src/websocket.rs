@@ -3,15 +3,14 @@ use std::sync::Arc;
 
 use base64::Engine;
 use ciborium::Value as CborValue;
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
 use catbird_mls::orchestrator::types::IncomingEnvelope;
 use catbird_mls::orchestrator::MLSStorageBackend;
 
 use crate::api_client::ReqwestApiClient;
+use crate::recovery::{actionable_error, classify_error, RecoveryCategory};
 use crate::{commands, CatmosOrchestrator};
 
 macro_rules! log_ws {
@@ -158,6 +157,16 @@ pub async fn subscribe_conversation(
             }
             Err(e) => {
                 log_ws!("Error for convo {}: {}", convo_id, e);
+                let category = classify_error(&e);
+                let _ = app.emit("mls-ws-recovery", actionable_error(&e));
+                if category != RecoveryCategory::Retry {
+                    log_ws!(
+                        "Stopping reconnect loop for convo {} after {} recovery classification",
+                        convo_id,
+                        category
+                    );
+                    break;
+                }
             }
         }
 
@@ -227,6 +236,15 @@ pub async fn subscribe_all(
             }
             Err(e) => {
                 log_ws!("Error (global): {}", e);
+                let category = classify_error(&e);
+                let _ = app.emit("mls-ws-recovery", actionable_error(&e));
+                if category != RecoveryCategory::Retry {
+                    log_ws!(
+                        "Stopping global reconnect loop after {} recovery classification",
+                        category
+                    );
+                    break;
+                }
             }
         }
 
@@ -260,104 +278,32 @@ async fn do_subscribe(
     cursor: Option<&str>,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
 ) -> Result<Option<String>, String> {
-    const GLOBAL_CURSOR_KEY: &str = "__global__";
-    let cursor_key = convo_id.unwrap_or(GLOBAL_CURSOR_KEY);
-    let label_owned: String = convo_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "*".to_string());
-    let label: &str = &label_owned;
+    // The old mlsChat ticket endpoint accepted a bearer token and a local
+    // conversation identifier. It is not a valid clean-chat subscription
+    // authority. The generated canonical ticket also requires an
+    // inventory-session capability supplied by the platform admission flow;
+    // catmos must not invent one or silently fall back to the legacy route.
+    api_client
+        .require_canonical_admission()
+        .map_err(actionable_error)?;
 
-    // 1. Get subscription ticket
-    let client = reqwest::Client::new();
-    let ticket_body = match convo_id {
-        Some(c) => serde_json::json!({ "convoId": c }),
-        None => serde_json::json!({}),
-    };
-    let ticket_resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.getSubscriptionTicket",
-        api_base_url
-    )))
-    .bearer_auth(auth_token)
-    .json(&ticket_body)
-    .send()
-    .await
-    .map_err(|e| format!("Ticket request failed: {}", e))?;
-
-    if !ticket_resp.status().is_success() {
-        return Err(format!("Ticket request failed: {}", ticket_resp.status()));
-    }
-
-    let ticket_data: serde_json::Value = ticket_resp
-        .json()
-        .await
-        .map_err(|e| format!("Ticket parse failed: {}", e))?;
-
-    let ticket = ticket_data["ticket"]
-        .as_str()
-        .ok_or("No ticket in response")?;
-    let ws_endpoint = ticket_data["endpoint"]
-        .as_str()
-        .ok_or("No endpoint in response")?;
-
-    // 2. Connect to WebSocket. Omit convoId in global mode so the server sends
-    //    events from every conversation the user is a member of on one stream.
-    let mut ws_url = match convo_id {
-        Some(c) => format!("{}?convoId={}&ticket={}", ws_endpoint, c, ticket),
-        None => format!("{}?ticket={}", ws_endpoint, ticket),
-    };
-    if let Some(cur) = cursor {
-        ws_url.push_str(&format!("&cursor={}", cur));
-    }
-
-    let (mut ws_stream, _) = connect_async(&ws_url)
-        .await
-        .map_err(|e| format!("WebSocket connect failed: {}", e))?;
-
-    log_ws!("Connected to {}", label);
-    let _ = app.emit("mls-ws-connected", label);
-
-    let mut last_cursor: Option<String> = cursor.map(String::from);
-
-    loop {
-        tokio::select! {
-            msg = ws_stream.next() => {
-                match msg {
-                    Some(Ok(WsMessage::Binary(data))) => {
-                        log_ws!("Received binary frame: {} bytes ({})", data.len(), label);
-                        match handle_binary_frame(app, orchestrator, api_client, &data, label).await {
-                            Ok(Some(cur)) => {
-                                orchestrator.storage().set_ws_cursor(cursor_key, &cur);
-                                last_cursor = Some(cur);
-                            }
-                            Ok(None) => {},
-                            Err(e) => log_ws!("Frame error: {}", e),
-                        }
-                    }
-                    Some(Ok(WsMessage::Ping(data))) => {
-                        let _ = ws_stream.send(WsMessage::Pong(data)).await;
-                    }
-                    Some(Ok(WsMessage::Close(_))) => {
-                        log_ws!("Closed by server for {}", label);
-                        break;
-                    }
-                    Some(Err(e)) => {
-                        return Err(format!("WebSocket error: {}", e));
-                    }
-                    None => break,
-                    _ => {}
-                }
-            }
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    let _ = ws_stream.close(None).await;
-                    return Ok(last_cursor);
-                }
-            }
-        }
-    }
-
-    let _ = app.emit("mls-ws-disconnected", label);
-    Ok(last_cursor)
+    let _ = (
+        app,
+        orchestrator,
+        api_base_url,
+        auth_token,
+        convo_id,
+        cursor,
+        shutdown,
+    );
+    // Keep the unsupported path explicit at the function boundary. Once the
+    // platform supplies an inventory-session capability, this function will
+    // call the generated `blue.catbird.chat.getSubscriptionTicket` route and
+    // then connect to its returned endpoint; it must never revive the legacy
+    // mlsChat ticket request.
+    Err(actionable_error(
+        "canonical subscription ticket transport is unavailable until the platform supplies an admitted inventory session",
+    ))
 }
 
 /// Handle a binary DAG-CBOR WebSocket frame.

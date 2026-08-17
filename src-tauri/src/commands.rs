@@ -21,6 +21,7 @@ use crate::catbird::mls_chat as lexicon;
 use crate::types::string::Did;
 
 use crate::credentials::KeyringCredentialStore;
+use crate::recovery::actionable_error;
 use crate::{AppState, CatmosOrchestrator, WsHandle};
 
 fn log_file_path() -> std::path::PathBuf {
@@ -752,14 +753,16 @@ pub async fn complete_login(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<AuthResponse, String> {
-    let session = fetch_session_info(&session_id).await?;
+    let session = fetch_session_info(&session_id)
+        .await
+        .map_err(actionable_error)?;
 
     // Initialize orchestrator for this user
     state
         .orchestrator
         .initialize(&session.did)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| actionable_error(format!("{e:?}")))?;
 
     // Install the per-DID content-root key so the field-level (envelope)
     // encryption layer can encrypt subsequent message inserts. Best-effort:
@@ -774,34 +777,40 @@ pub async fn complete_login(
 
     // Reconcile a durable identity before any registration attempt. Only a
     // first-login device without a local UUID may create a new registration.
-    if reconcile_device_before_registration(&state, &session.did).await? {
+    if reconcile_device_before_registration(&state, &session.did)
+        .await
+        .map_err(actionable_error)?
+    {
         let authority_session = state
             .api_client
             .current_session()
-            .map_err(|error| error.to_string())?;
+            .map_err(actionable_error)?;
         if authority_session.actor_did != session.did || authority_session.token != session_id {
-            return Err("chat session changed before signer restoration".to_string());
+            return Err(actionable_error(
+                "chat session changed before signer restoration",
+            ));
         }
         state
             .api_client
             .ensure_session_current(&authority_session)
-            .map_err(|error| error.to_string())?;
+            .map_err(actionable_error)?;
         restore_registered_signer(
             state.orchestrator.mls_context().as_ref(),
             state.orchestrator.credentials().as_ref(),
             &session.did,
         )
-        .await?;
+        .await
+        .map_err(actionable_error)?;
         state
             .api_client
             .ensure_session_current(&authority_session)
-            .map_err(|error| error.to_string())?;
+            .map_err(actionable_error)?;
     } else {
         state
             .orchestrator
             .ensure_device_registered()
             .await
-            .map_err(|e| format!("{:?}", e))?;
+            .map_err(|e| actionable_error(format!("{e:?}")))?;
     }
     configure_chat_auth(&state, &session.did, &session_id).await;
 
@@ -856,7 +865,7 @@ pub async fn try_restore_session(
                         "Stored session could not be restored yet; keeping saved login: {}",
                         e
                     );
-                    return Err(e);
+                    return Err(actionable_error(e));
                 }
             };
 
@@ -874,7 +883,7 @@ pub async fn try_restore_session(
                 .orchestrator
                 .initialize(&session.did)
                 .await
-                .map_err(|e| format!("{:?}", e))?;
+                .map_err(|e| actionable_error(format!("{e:?}")))?;
             // Install the per-DID content-root key for the field-level
             // encryption layer; see `complete_login` for rationale.
             install_content_root_key(&state, &session.did);
@@ -883,34 +892,40 @@ pub async fn try_restore_session(
             // Reconcile before any registration. An existing UUID with a
             // missing/ambiguous server row fails closed instead of creating
             // another server device after a restart or transient 401/403.
-            if reconcile_device_before_registration(&state, &session.did).await? {
+            if reconcile_device_before_registration(&state, &session.did)
+                .await
+                .map_err(actionable_error)?
+            {
                 let authority_session = state
                     .api_client
                     .current_session()
-                    .map_err(|error| error.to_string())?;
+                    .map_err(actionable_error)?;
                 if authority_session.actor_did != session.did || authority_session.token != sid {
-                    return Err("chat session changed before signer restoration".to_string());
+                    return Err(actionable_error(
+                        "chat session changed before signer restoration",
+                    ));
                 }
                 state
                     .api_client
                     .ensure_session_current(&authority_session)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(actionable_error)?;
                 restore_registered_signer(
                     state.orchestrator.mls_context().as_ref(),
                     state.orchestrator.credentials().as_ref(),
                     &session.did,
                 )
-                .await?;
+                .await
+                .map_err(actionable_error)?;
                 state
                     .api_client
                     .ensure_session_current(&authority_session)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(actionable_error)?;
             } else {
                 state
                     .orchestrator
                     .ensure_device_registered()
                     .await
-                    .map_err(|e| format!("{:?}", e))?;
+                    .map_err(|e| actionable_error(format!("{e:?}")))?;
             }
             configure_chat_auth(&state, &session.did, &sid).await;
 
@@ -1243,7 +1258,9 @@ pub async fn send_message(
     state
         .api_client
         .require_signing_capability()
-        .map_err(|error| format!("Signed clean-chat send unavailable: {error}"))?;
+        .map_err(|error| {
+            actionable_error(format!("Signed clean-chat send unavailable: {error}"))
+        })?;
     log_catmos!(" send_message: convo={}", conversation_id);
 
     // The canonical projection exposes the UUID conversationId and the hex
@@ -1258,7 +1275,7 @@ pub async fn send_message(
         .await
         .map_err(|e| {
             log_catmos!(" send_message error: {:?}", e);
-            format!("{:?}", e)
+            actionable_error(format!("{e:?}"))
         })?;
 
     // The orchestrator stamps the hex group id on the message; the UI keys
@@ -1282,7 +1299,9 @@ pub async fn send_image(
     state
         .api_client
         .require_signing_capability()
-        .map_err(|error| format!("Signed clean-chat send unavailable: {error}"))?;
+        .map_err(|error| {
+            actionable_error(format!("Signed clean-chat send unavailable: {error}"))
+        })?;
     log_catmos!(
         " send_image: convo={} bytes={} type={} dims={}x{}",
         conversation_id,
@@ -1304,7 +1323,7 @@ pub async fn send_image(
         .api_client
         .upload_blob(&encrypted.ciphertext, &conversation_id)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| actionable_error(format!("{e:?}")))?;
 
     let embed = catbird_mls::orchestrator::types::MLSEmbedData::image(
         catbird_mls::orchestrator::types::MLSImageEmbed {
@@ -1330,7 +1349,7 @@ pub async fn send_image(
         .await
         .map_err(|e| {
             log_catmos!(" send_image error: {:?}", e);
-            format!("{:?}", e)
+            actionable_error(format!("{e:?}"))
         })?;
 
     let mut ui = ui_message_from_orchestrator(msg);
@@ -1357,7 +1376,7 @@ pub async fn get_image_attachment(
         .api_client
         .get_blob(&blob_id)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| actionable_error(format!("{e:?}")))?;
     let plaintext = decrypt_blob(&ciphertext, &key, &iv, &sha256).map_err(|e| e.to_string())?;
 
     Ok(format!(
@@ -1441,6 +1460,11 @@ pub async fn subscribe_conversation(
         }
     }
 
+    state
+        .api_client
+        .require_canonical_admission()
+        .map_err(actionable_error)?;
+
     let token = state
         .api_client
         .get_auth_token()
@@ -1511,6 +1535,11 @@ pub async fn subscribe_all_events(
             return Ok(());
         }
     }
+
+    state
+        .api_client
+        .require_canonical_admission()
+        .map_err(actionable_error)?;
 
     let token = state
         .api_client
@@ -1633,6 +1662,13 @@ pub async fn send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), String> {
+    state
+        .api_client
+        .require_signing_capability()
+        .map_err(|error| {
+            actionable_error(format!("Signed clean-chat reaction unavailable: {error}"))
+        })?;
+
     log_catmos!(
         " send_reaction: convo={}, msg={}, emoji={}, action={}",
         conversation_id,
@@ -1657,7 +1693,7 @@ pub async fn send_reaction(
         .await
         .map_err(|e| {
             log_catmos!(" send_reaction error: {:?}", e);
-            format!("{:?}", e)
+            actionable_error(format!("{e:?}"))
         })?;
 
     Ok(())
@@ -1681,7 +1717,9 @@ pub async fn send_typing(
     // a valid substitute. Do not emit a misleading network request until the
     // catmos signing adapter is available.
     let _ = (conversation_id, is_typing);
-    Err("Typing is temporarily unavailable: canonical signed typing transport is not wired".into())
+    Err(actionable_error(
+        "Typing is temporarily unavailable: canonical signed typing transport is not wired",
+    ))
 }
 
 #[tauri::command]
@@ -1700,7 +1738,7 @@ pub async fn update_cursor(
         .api_client
         .update_cursor(&conversation_id, &cursor)
         .await
-        .map_err(|e| format!("Update cursor failed: {e:?}"))
+        .map_err(|e| actionable_error(format!("Update cursor failed: {e:?}")))
 }
 
 fn parse_did(s: &str) -> Did {

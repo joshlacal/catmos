@@ -1,16 +1,17 @@
 <script lang="ts">
   import { connection } from '$lib/stores/connection';
+  import { recoveryLabel } from '$lib/recovery';
 
   let visible = $derived(
     $connection.state !== 'connected' && $connection.state !== 'connecting'
   );
-  let label = $derived(
-    $connection.state === 'offline'
+  let label = $derived($connection.category
+    ? recoveryLabel($connection.category)
+    : $connection.state === 'offline'
       ? 'Offline'
       : $connection.state === 'error'
         ? 'Connection failed'
-        : `Reconnecting${$connection.retryCount > 0 ? ` (${$connection.retryCount})` : ''}...`
-  );
+        : `Reconnecting${$connection.retryCount > 0 ? ` (${$connection.retryCount})` : ''}...`);
   let showSpinner = $derived($connection.state === 'reconnecting');
 </script>
 
@@ -30,6 +31,12 @@
       </svg>
     {/if}
     <span class="banner-text">{label}</span>
+    {#if $connection.lastError && $connection.category !== 'retry'}
+      <span class="banner-detail">{$connection.lastError}</span>
+    {/if}
+    {#if $connection.category === 'retry'}
+      <button type="button" onclick={() => connection.retryNow()}>Retry</button>
+    {/if}
   </div>
 {/if}
 
@@ -55,6 +62,24 @@
 
   .banner-text {
     line-height: 1;
+  }
+
+  .banner-detail {
+    max-width: min(60vw, 560px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 400;
+  }
+
+  button {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 3px 8px;
+    background: var(--bg);
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
   }
 
   .spinner {

@@ -43,6 +43,7 @@
 	let unlistenGroupReset: (() => void) | null = null;
 	let unlistenQuarantined: (() => void) | null = null;
 	let unlistenQuarantineCleared: (() => void) | null = null;
+	let unlistenRecovery: (() => void) | null = null;
 	let subscribedConvoId: string | null = null;
 	let blockReconcileRan = false;
 
@@ -115,6 +116,15 @@
 			quarantine.applyClearedEvent(payload);
 		}).then((unlisten) => {
 			unlistenQuarantineCleared = unlisten;
+		});
+
+		// Backend reconnect loops stop on explicit auth/device/MLS failures;
+		// surface the stable category so the banner can offer the correct next
+		// action without clearing persisted credentials.
+		listenForEvent<string>('mls-ws-recovery', (payload) => {
+			connection.setDisconnected(payload);
+		}).then((unlisten) => {
+			unlistenRecovery = unlisten;
 		});
 	});
 
@@ -267,6 +277,7 @@
 		unlistenGroupReset?.();
 		unlistenQuarantined?.();
 		unlistenQuarantineCleared?.();
+		unlistenRecovery?.();
 		if (subscribedConvoId) {
 			api.unsubscribeConversation(subscribedConvoId).catch(() => {});
 		}

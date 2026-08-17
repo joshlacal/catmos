@@ -1,4 +1,5 @@
 import { writable } from 'svelte/store';
+import { recoveryNotice, type RecoveryCategory } from '$lib/recovery';
 
 export type ConnectionState =
   | 'connected'
@@ -8,9 +9,10 @@ export type ConnectionState =
   | 'error';
 
 interface ConnectionStore {
-  state: ConnectionState;
-  retryCount: number;
-  lastError: string | null;
+	state: ConnectionState;
+	retryCount: number;
+	lastError: string | null;
+	category: RecoveryCategory | null;
 }
 
 const MAX_RETRIES = 10;
@@ -26,9 +28,10 @@ function backoffDelay(retryCount: number): number {
 
 function createConnectionStore() {
   const { subscribe, set, update } = writable<ConnectionStore>({
-    state: 'connecting',
-    retryCount: 0,
-    lastError: null
+		state: 'connecting',
+		retryCount: 0,
+		lastError: null,
+		category: null
   });
 
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -66,7 +69,8 @@ function createConnectionStore() {
       update((s) => ({
         ...s,
         state: 'error',
-        lastError: 'Max reconnection attempts reached'
+        lastError: 'Max reconnection attempts reached',
+        category: 'retry'
       }));
       return;
     }
@@ -81,14 +85,20 @@ function createConnectionStore() {
         if (onReconnectCallback) {
           await onReconnectCallback();
         }
-        set({ state: 'connected', retryCount: 0, lastError: null });
+        set({ state: 'connected', retryCount: 0, lastError: null, category: null });
       } catch (e) {
+        const notice = recoveryNotice(e);
+        if (notice.category !== 'retry') {
+          set({ state: 'error', retryCount: retryCount + 1, lastError: notice.message, category: notice.category });
+          return;
+        }
         const nextRetry = retryCount + 1;
         update((s) => ({
           ...s,
           state: 'reconnecting',
           retryCount: nextRetry,
-          lastError: String(e)
+          lastError: notice.message,
+          category: notice.category
         }));
         scheduleReconnect(nextRetry);
       }
@@ -101,7 +111,7 @@ function createConnectionStore() {
     window.addEventListener('offline', handleOffline);
     if (!navigator.onLine) {
       isOnline = false;
-      set({ state: 'offline', retryCount: 0, lastError: null });
+      set({ state: 'offline', retryCount: 0, lastError: null, category: null });
     }
   }
 
@@ -116,19 +126,26 @@ function createConnectionStore() {
     /** Mark the connection as successfully established. Resets backoff. */
     setConnected() {
       clearTimer();
-      set({ state: 'connected', retryCount: 0, lastError: null });
+      set({ state: 'connected', retryCount: 0, lastError: null, category: null });
     },
 
     /** Signal that the connection was lost. Starts reconnect cycle. */
     setDisconnected(reason?: string) {
+      const notice = recoveryNotice(reason ?? 'Connection lost');
+      if (notice.category !== 'retry') {
+        clearTimer();
+        set({ state: 'error', retryCount: 0, lastError: notice.message, category: notice.category });
+        return;
+      }
       if (!isOnline) {
-        set({ state: 'offline', retryCount: 0, lastError: reason ?? null });
+        set({ state: 'offline', retryCount: 0, lastError: notice.message, category: notice.category });
         return;
       }
       update((s) => ({
         ...s,
         state: 'reconnecting',
-        lastError: reason ?? null
+        lastError: notice.message,
+        category: notice.category
       }));
       // Read current retryCount after update
       let current: ConnectionStore | undefined;
@@ -137,10 +154,17 @@ function createConnectionStore() {
       scheduleReconnect(current?.retryCount ?? 0);
     },
 
+    /** User-requested retry; keeps credentials and starts one clean attempt. */
+    retryNow() {
+      clearTimer();
+      update((s) => ({ ...s, state: 'reconnecting', retryCount: 0, category: 'retry' }));
+      scheduleReconnect(0);
+    },
+
     /** Reset to initial connecting state. */
     reset() {
       clearTimer();
-      set({ state: 'connecting', retryCount: 0, lastError: null });
+      set({ state: 'connecting', retryCount: 0, lastError: null, category: null });
     }
   };
 }
