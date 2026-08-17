@@ -317,6 +317,7 @@ pub(crate) struct CanonicalReadContext {
     pub(crate) dpop_jkt: String,
     #[allow(dead_code)]
     pub(crate) auth_generation: u64,
+    session: ChatSessionSnapshot,
 }
 
 impl std::fmt::Debug for CanonicalReadContext {
@@ -368,6 +369,7 @@ impl std::fmt::Debug for CompletedDeviceBinding {
 struct ChatAuthSnapshot {
     actor_did: Option<String>,
     session_token: Option<String>,
+    session_revision: u64,
     local_device_uuid: Option<String>,
     server_device_id: Option<String>,
     binding: Option<CompletedDeviceBinding>,
@@ -379,11 +381,34 @@ impl Default for ChatAuthSnapshot {
         Self {
             actor_did: None,
             session_token: None,
+            session_revision: 0,
             local_device_uuid: None,
             server_device_id: None,
             binding: None,
             observed_dpop_jkt: None,
         }
+    }
+}
+
+/// Immutable actor/token/revision captured for one asynchronous operation.
+///
+/// The bearer is intentionally kept out of `Debug`; callers must carry this
+/// value through every await and revalidate it before a durable or runtime
+/// mutation so a late response cannot cross an account switch.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ChatSessionSnapshot {
+    pub(crate) actor_did: String,
+    pub(crate) token: String,
+    pub(crate) revision: u64,
+}
+
+impl std::fmt::Debug for ChatSessionSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ChatSessionSnapshot")
+            .field("actor_did", &self.actor_did)
+            .field("revision", &self.revision)
+            .finish_non_exhaustive()
     }
 }
 
@@ -418,19 +443,58 @@ impl ChatAuthProvider {
     pub(crate) fn set_session(&self, did: String, session_token: String) {
         let mut state = self.state.write().unwrap();
         if state.actor_did.as_deref() != Some(did.as_str()) {
+            let revision = state.session_revision.saturating_add(1).max(1);
             *state = ChatAuthSnapshot::default();
+            state.session_revision = revision;
         } else if state.session_token.as_deref() != Some(session_token.as_str()) {
             // A fresh session for the same DID may have a different gateway
             // binding. Keep durable identity for reconciliation, but do not
             // reuse proof/JKT authority across token generations.
+            let revision = state.session_revision.saturating_add(1).max(1);
             Self::clear_runtime_state(&mut state);
+            state.session_revision = revision;
+        }
+        if state.session_revision == 0 {
+            state.session_revision = 1;
         }
         state.actor_did = Some(did);
         state.session_token = Some(session_token);
     }
 
+    pub(crate) fn session_snapshot(
+        &self,
+    ) -> std::result::Result<ChatSessionSnapshot, ChatAuthError> {
+        let state = self.state.read().unwrap();
+        let actor_did = state
+            .actor_did
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ChatAuthError::MissingSession)?;
+        let token = state
+            .session_token
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or(ChatAuthError::MissingSession)?;
+        if state.session_revision == 0 {
+            return Err(ChatAuthError::MissingSession);
+        }
+        Ok(ChatSessionSnapshot {
+            actor_did,
+            token,
+            revision: state.session_revision,
+        })
+    }
+
+    pub(crate) fn session_is_current(&self, session: &ChatSessionSnapshot) -> bool {
+        let state = self.state.read().unwrap();
+        state.session_revision == session.revision
+            && state.actor_did.as_deref() == Some(session.actor_did.as_str())
+            && state.session_token.as_deref() == Some(session.token.as_str())
+    }
+
     /// Set the client-generated UUID. This value is not accepted as a server
     /// device identity; it is only the lookup key for `listDevices`.
+    #[cfg(test)]
     pub(crate) fn set_local_device_uuid(
         &self,
         actor_did: &str,
@@ -453,7 +517,33 @@ impl ChatAuthProvider {
         Ok(())
     }
 
+    pub(crate) fn set_local_device_uuid_for_session(
+        &self,
+        session: &ChatSessionSnapshot,
+        local_device_uuid: String,
+    ) -> std::result::Result<(), ChatAuthError> {
+        let local_device_uuid = local_device_uuid.trim().to_string();
+        if local_device_uuid.is_empty() {
+            return Err(ChatAuthError::MissingLocalDeviceUuid);
+        }
+        let mut state = self.state.write().unwrap();
+        if state.session_revision != session.revision
+            || state.actor_did.as_deref() != Some(session.actor_did.as_str())
+            || state.session_token.as_deref() != Some(session.token.as_str())
+        {
+            return Err(ChatAuthError::SessionChanged);
+        }
+        if state.local_device_uuid.as_deref() != Some(local_device_uuid.as_str()) {
+            state.server_device_id = None;
+            state.binding = None;
+            state.observed_dpop_jkt = None;
+        }
+        state.local_device_uuid = Some(local_device_uuid);
+        Ok(())
+    }
+
     /// Install the server-minted ID only after an exact `listDevices` match.
+    #[cfg(test)]
     fn set_resolved_server_device_id(
         &self,
         actor_did: &str,
@@ -476,6 +566,32 @@ impl ChatAuthProvider {
         Ok(())
     }
 
+    pub(crate) fn set_resolved_server_device_id_for_session(
+        &self,
+        session: &ChatSessionSnapshot,
+        server_device_id: String,
+    ) -> std::result::Result<(), ChatAuthError> {
+        let server_device_id = server_device_id.trim().to_string();
+        if server_device_id.is_empty() {
+            return Err(ChatAuthError::MissingDevice);
+        }
+        let mut state = self.state.write().unwrap();
+        if state.session_revision != session.revision
+            || state.actor_did.as_deref() != Some(session.actor_did.as_str())
+            || state.session_token.as_deref() != Some(session.token.as_str())
+        {
+            return Err(ChatAuthError::SessionChanged);
+        }
+        let changed = state.server_device_id.as_deref() != Some(server_device_id.as_str());
+        state.server_device_id = Some(server_device_id);
+        if changed {
+            state.binding = None;
+            state.observed_dpop_jkt = None;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn observe_dpop_jkt(
         &self,
         actor_did: &str,
@@ -487,6 +603,34 @@ impl ChatAuthProvider {
         }
         let mut state = self.state.write().unwrap();
         if state.actor_did.as_deref() != Some(actor_did) || state.session_token.is_none() {
+            return Err(ChatAuthError::SessionChanged);
+        }
+        if state
+            .binding
+            .as_ref()
+            .is_some_and(|binding| binding.dpop_jkt != jkt)
+        {
+            Self::clear_runtime_state(&mut state);
+            return Err(ChatAuthError::DpopJktMismatch);
+        }
+        state.observed_dpop_jkt = Some(jkt);
+        Ok(())
+    }
+
+    pub(crate) fn observe_dpop_jkt_for_session(
+        &self,
+        session: &ChatSessionSnapshot,
+        jkt: String,
+    ) -> std::result::Result<(), ChatAuthError> {
+        let jkt = jkt.trim().to_string();
+        if jkt.is_empty() {
+            return Err(ChatAuthError::MissingDpopJkt);
+        }
+        let mut state = self.state.write().unwrap();
+        if state.session_revision != session.revision
+            || state.actor_did.as_deref() != Some(session.actor_did.as_str())
+            || state.session_token.as_deref() != Some(session.token.as_str())
+        {
             return Err(ChatAuthError::SessionChanged);
         }
         if state
@@ -564,6 +708,7 @@ impl ChatAuthProvider {
 
     /// Clear runtime binding state while retaining local and server identity.
     /// Durable identity deletion is an explicit account-removal operation.
+    #[cfg(test)]
     pub(crate) fn clear_device_authority(&self) {
         let mut state = self.state.write().unwrap();
         Self::clear_runtime_state(&mut state);
@@ -574,12 +719,15 @@ impl ChatAuthProvider {
         state.observed_dpop_jkt = None;
     }
 
-    fn clear_runtime_state_for_actor(
+    pub(crate) fn clear_runtime_state_for_session(
         &self,
-        actor_did: &str,
+        session: &ChatSessionSnapshot,
     ) -> std::result::Result<(), ChatAuthError> {
         let mut state = self.state.write().unwrap();
-        if state.actor_did.as_deref() != Some(actor_did) {
+        if state.session_revision != session.revision
+            || state.actor_did.as_deref() != Some(session.actor_did.as_str())
+            || state.session_token.as_deref() != Some(session.token.as_str())
+        {
             return Err(ChatAuthError::SessionChanged);
         }
         Self::clear_runtime_state(&mut state);
@@ -587,6 +735,7 @@ impl ChatAuthProvider {
     }
 
     /// Invalidate a binding when the server reports a newer generation.
+    #[cfg(test)]
     pub(crate) fn invalidate_for_generation(
         &self,
         actor_did: &str,
@@ -612,8 +761,39 @@ impl ChatAuthProvider {
         Ok(())
     }
 
+    pub(crate) fn invalidate_for_generation_for_session(
+        &self,
+        session: &ChatSessionSnapshot,
+        observed_generation: u64,
+    ) -> std::result::Result<(), ChatAuthError> {
+        let mut state = self.state.write().unwrap();
+        if state.session_revision != session.revision
+            || state.actor_did.as_deref() != Some(session.actor_did.as_str())
+            || state.session_token.as_deref() != Some(session.token.as_str())
+        {
+            return Err(ChatAuthError::SessionChanged);
+        }
+        let expected = state
+            .binding
+            .as_ref()
+            .map(|binding| binding.auth_generation);
+        if let Some(expected) = expected {
+            if observed_generation != expected {
+                Self::clear_runtime_state(&mut state);
+                return Err(ChatAuthError::AuthGenerationMismatch {
+                    expected,
+                    observed: observed_generation,
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn clear(&self) {
-        *self.state.write().unwrap() = ChatAuthSnapshot::default();
+        let mut state = self.state.write().unwrap();
+        let revision = state.session_revision.saturating_add(1).max(1);
+        *state = ChatAuthSnapshot::default();
+        state.session_revision = revision;
     }
 
     /// Build canonical-read headers only after the exact device has completed
@@ -630,6 +810,11 @@ impl ChatAuthProvider {
             .session_token
             .clone()
             .ok_or(ChatAuthError::MissingSession)?;
+        let session = ChatSessionSnapshot {
+            actor_did: actor_did.clone(),
+            token: session_token.clone(),
+            revision: state.session_revision,
+        };
         let local_device_uuid = state
             .local_device_uuid
             .clone()
@@ -667,6 +852,7 @@ impl ChatAuthProvider {
             device_id,
             dpop_jkt,
             auth_generation: binding.auth_generation,
+            session,
         })
     }
 
@@ -750,16 +936,9 @@ impl ChatAuthProvider {
     }
 }
 
-/// HTTP API client for the mls-ds delivery service using reqwest.
-struct ApiSession {
-    actor_did: String,
-    token: String,
-}
-
 pub struct ReqwestApiClient {
     client: Client,
     base_url: String,
-    session: RwLock<Option<ApiSession>>,
     mls_context: RwLock<Option<std::sync::Arc<catbird_mls::MLSContext>>>,
     chat_auth: std::sync::Arc<ChatAuthProvider>,
     #[cfg(test)]
@@ -777,7 +956,6 @@ impl ReqwestApiClient {
         Self {
             client,
             base_url,
-            session: RwLock::new(None),
             mls_context: RwLock::new(None),
             chat_auth: std::sync::Arc::new(ChatAuthProvider::default()),
             #[cfg(test)]
@@ -816,19 +994,26 @@ impl ReqwestApiClient {
     }
 
     pub fn set_auth(&self, did: String, token: String) {
-        self.chat_auth.set_session(did.clone(), token.clone());
-        *self.session.write().unwrap() = Some(ApiSession {
-            actor_did: did,
-            token,
-        });
+        self.chat_auth.set_session(did, token);
     }
 
-    pub(crate) fn observe_chat_dpop_jkt(
+    pub(crate) fn current_session(
         &self,
-        actor_did: &str,
-        jkt: String,
-    ) -> std::result::Result<(), ChatAuthError> {
-        self.chat_auth.observe_dpop_jkt(actor_did, jkt)
+    ) -> std::result::Result<ChatSessionSnapshot, ChatAuthError> {
+        self.chat_auth.session_snapshot()
+    }
+
+    pub(crate) fn ensure_session_current(
+        &self,
+        session: &ChatSessionSnapshot,
+    ) -> std::result::Result<(), OrchestratorError> {
+        if self.chat_auth.session_is_current(session) {
+            Ok(())
+        } else {
+            Err(OrchestratorError::Api(
+                ChatAuthError::SessionChanged.to_string(),
+            ))
+        }
     }
 
     pub(crate) fn require_signing_capability(
@@ -842,29 +1027,20 @@ impl ReqwestApiClient {
     }
 
     pub fn clear_auth(&self) {
-        *self.session.write().unwrap() = None;
         self.chat_auth.clear();
     }
 
-    async fn invalidate_device_authority(&self) {
-        // HTTP authorization failures invalidate only in-memory proof/JKT
-        // state. Durable local/server identifiers remain available for the
-        // next exact listDevices reconciliation and are never churned here.
-        self.chat_auth.clear_device_authority();
-    }
-
-    async fn invalidate_device_authority_for_actor(&self, actor_did: &str) {
+    async fn invalidate_device_authority_for_session(&self, session: &ChatSessionSnapshot) {
         // A late response from a previous account may not invalidate the
         // current account's runtime snapshot.
-        let _ = self.chat_auth.clear_runtime_state_for_actor(actor_did);
+        let _ = self.chat_auth.clear_runtime_state_for_session(session);
     }
 
     pub fn get_auth_token(&self) -> Option<String> {
-        self.session
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.token.clone())
+        self.chat_auth
+            .session_snapshot()
+            .ok()
+            .map(|session| session.token)
     }
 
     #[cfg(test)]
@@ -881,16 +1057,13 @@ impl ReqwestApiClient {
             }
         }
 
-        let user_did = self
-            .session
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.actor_did.clone())
-            .ok_or(OrchestratorError::NotAuthenticated)?;
+        let session = self
+            .chat_auth
+            .session_snapshot()
+            .map_err(|_| OrchestratorError::NotAuthenticated)?;
         let store = crate::credentials::KeyringCredentialStore::try_new()?;
-        store
-            .get_server_device_id(&user_did)
+        let device_id = store
+            .get_server_device_id(&session.actor_did)
             .await?
             .map(|device_id| device_id.trim().to_string())
             .filter(|device_id| !device_id.is_empty())
@@ -898,48 +1071,60 @@ impl ReqwestApiClient {
                 OrchestratorError::Api(
                     "Cannot publish key package before MLS device registration".to_string(),
                 )
-            })
+            })?;
+        self.ensure_session_current(&session)?;
+        Ok(device_id)
     }
 
     /// Reconcile the client-generated UUID with exactly one server device
     /// record and persist the minted server ID separately. This is the only
     /// production path that installs `server_device_id` into chat authority.
+    #[cfg(test)]
     pub(crate) async fn resolve_server_device_id_for_local_uuid(
         &self,
         local_device_uuid: &str,
     ) -> Result<String> {
-        let user_did = self
-            .session
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.actor_did.clone())
-            .ok_or(OrchestratorError::NotAuthenticated)?;
-        let devices = match <Self as MLSAPIClient>::list_devices(self).await {
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.resolve_server_device_id_for_local_uuid_with_session(&session, local_device_uuid)
+            .await
+    }
+
+    pub(crate) async fn resolve_server_device_id_for_local_uuid_with_session(
+        &self,
+        session: &ChatSessionSnapshot,
+        local_device_uuid: &str,
+    ) -> Result<String> {
+        self.ensure_session_current(session)?;
+        let devices = match self.list_devices_for_session(session).await {
             Ok(devices) => devices,
             Err(error) => {
-                self.invalidate_device_authority().await;
+                self.invalidate_device_authority_for_session(session).await;
                 return Err(error);
             }
         };
         let server_device_id = match resolve_unique_server_device_id(&devices, local_device_uuid) {
             Ok(server_device_id) => server_device_id,
             Err(error) => {
-                self.invalidate_device_authority().await;
+                self.invalidate_device_authority_for_session(session).await;
                 return Err(error);
             }
         };
         let store = crate::credentials::KeyringCredentialStore::try_new()?;
+        self.ensure_session_current(session)?;
         if let Err(error) = store
-            .store_server_device_id(&user_did, &server_device_id)
+            .store_server_device_id(&session.actor_did, &server_device_id)
             .await
         {
-            self.invalidate_device_authority().await;
+            self.invalidate_device_authority_for_session(session).await;
             return Err(error);
         }
+        self.ensure_session_current(session)?;
         self.chat_auth
-            .set_resolved_server_device_id(&user_did, server_device_id.clone())
+            .set_resolved_server_device_id_for_session(session, server_device_id.clone())
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(session)?;
         Ok(server_device_id)
     }
 
@@ -1163,12 +1348,50 @@ impl ReqwestApiClient {
     }
 
     fn auth_header(&self) -> Result<String> {
-        self.session
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.token.clone())
-            .ok_or(OrchestratorError::NotAuthenticated)
+        self.current_session()
+            .map(|session| session.token)
+            .map_err(|_| OrchestratorError::NotAuthenticated)
+    }
+
+    async fn list_devices_for_session(
+        &self,
+        session: &ChatSessionSnapshot,
+    ) -> Result<Vec<DeviceInfo>> {
+        let resp = self
+            .client
+            .get(self.xrpc_url(lexicon::list_devices::NSID))
+            .bearer_auth(&session.token)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(self.handle_error_for_session(resp, session).await);
+        }
+
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let output = parse_lexicon_json::<
+            blue_catbird::mlsChat::list_devices::ListDevicesOutput<String>,
+        >(body.as_ref())?;
+        self.ensure_session_current(session)?;
+
+        Ok(output
+            .devices
+            .iter()
+            .map(|d| DeviceInfo {
+                device_id: d.device_id.to_string(),
+                mls_did: d.credential_did.to_string(),
+                device_uuid: d
+                    .device_uuid
+                    .as_ref()
+                    .map(|uuid| uuid.to_string())
+                    .unwrap_or_default(),
+                created_at: d.registered_at.as_ref().to_string().parse().ok(),
+            })
+            .collect())
     }
 
     async fn send_message_request(
@@ -1377,11 +1600,12 @@ impl ReqwestApiClient {
     fn observe_chat_binding(
         &self,
         response: &reqwest::Response,
-        actor_did: &str,
+        session: &ChatSessionSnapshot,
     ) -> std::result::Result<(), ChatAuthError> {
         if let Some(value) = response.headers().get("x-catbird-chat-dpop-jkt") {
             if let Ok(jkt) = value.to_str() {
-                self.observe_chat_dpop_jkt(actor_did, jkt.to_string())?;
+                self.chat_auth
+                    .observe_dpop_jkt_for_session(session, jkt.to_string())?;
             }
         }
         if let Some(value) = response.headers().get("x-catbird-chat-auth-generation") {
@@ -1391,7 +1615,7 @@ impl ReqwestApiClient {
                 .and_then(|value| value.trim().parse::<u64>().ok())
                 .ok_or(ChatAuthError::MissingAuthGeneration)?;
             self.chat_auth
-                .invalidate_for_generation(actor_did, generation)?;
+                .invalidate_for_generation_for_session(session, generation)?;
         }
         Ok(())
     }
@@ -1421,20 +1645,19 @@ impl ReqwestApiClient {
             .send()
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        if let Err(error) = self.observe_chat_binding(&response, &auth.actor_did) {
-            self.invalidate_device_authority_for_actor(&auth.actor_did)
+        if let Err(error) = self.observe_chat_binding(&response, &auth.session) {
+            self.invalidate_device_authority_for_session(&auth.session)
                 .await;
             return Err(OrchestratorError::Api(error.to_string()));
         }
         if !response.status().is_success() {
-            return Err(self
-                .handle_error_for_actor(response, Some(&auth.actor_did))
-                .await);
+            return Err(self.handle_error_for_session(response, &auth.session).await);
         }
         let body = response
             .bytes()
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&auth.session)?;
         let output = parse_lexicon_json::<
             catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
         >(body.as_ref())?;
@@ -1507,20 +1730,19 @@ impl ReqwestApiClient {
             .send()
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        if let Err(error) = self.observe_chat_binding(&response, &auth.actor_did) {
-            self.invalidate_device_authority_for_actor(&auth.actor_did)
+        if let Err(error) = self.observe_chat_binding(&response, &auth.session) {
+            self.invalidate_device_authority_for_session(&auth.session)
                 .await;
             return Err(OrchestratorError::Api(error.to_string()));
         }
         if !response.status().is_success() {
-            return Err(self
-                .handle_error_for_actor(response, Some(&auth.actor_did))
-                .await);
+            return Err(self.handle_error_for_session(response, &auth.session).await);
         }
         let body = response
             .bytes()
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&auth.session)?;
         let output = parse_lexicon_json::<
             catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
         >(body.as_ref())?;
@@ -1539,13 +1761,15 @@ impl ReqwestApiClient {
     }
 
     async fn handle_error(&self, resp: reqwest::Response) -> OrchestratorError {
-        self.handle_error_for_actor(resp, None).await
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        OrchestratorError::ServerError { status, body }
     }
 
-    async fn handle_error_for_actor(
+    async fn handle_error_for_session(
         &self,
         resp: reqwest::Response,
-        actor_did: Option<&str>,
+        session: &ChatSessionSnapshot,
     ) -> OrchestratorError {
         let status = resp.status().as_u16();
         let body = resp.text().await.unwrap_or_default();
@@ -1556,11 +1780,7 @@ impl ReqwestApiClient {
             || normalized.contains("auth_generation")
             || normalized.contains("device inactive")
         {
-            if let Some(actor_did) = actor_did {
-                self.invalidate_device_authority_for_actor(actor_did).await;
-            } else {
-                self.invalidate_device_authority().await;
-            }
+            self.invalidate_device_authority_for_session(session).await;
         }
         OrchestratorError::ServerError { status, body }
     }
@@ -1661,19 +1881,16 @@ fn convo_view_to_conversation<S: catbird_atproto::jacquard_common::BosStr + ToSt
 #[async_trait]
 impl MLSAPIClient for ReqwestApiClient {
     async fn is_authenticated_as(&self, did: &str) -> bool {
-        self.session
-            .read()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|session| session.actor_did == did)
+        self.chat_auth
+            .session_snapshot()
+            .is_ok_and(|session| session.actor_did == did)
     }
 
     async fn current_did(&self) -> Option<String> {
-        self.session
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.actor_did.clone())
+        self.chat_auth
+            .session_snapshot()
+            .ok()
+            .map(|session| session.actor_did)
     }
 
     async fn get_conversations(
@@ -2105,11 +2322,18 @@ impl MLSAPIClient for ReqwestApiClient {
         &self,
         device_uuid: &str,
         device_name: &str,
-        _mls_did: &str,
+        mls_did: &str,
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
     ) -> Result<DeviceInfo> {
-        let token = self.auth_header()?;
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        if mls_did != session.actor_did {
+            return Err(OrchestratorError::Api(
+                ChatAuthError::SessionChanged.to_string(),
+            ));
+        }
         let kp_items: Vec<lexicon::register_device::KeyPackageItem> = key_packages
             .iter()
             .map(|kp_bytes| {
@@ -2134,14 +2358,14 @@ impl MLSAPIClient for ReqwestApiClient {
         let resp = self
             .client
             .post(self.xrpc_url(lexicon::register_device::NSID))
-            .bearer_auth(&token)
+            .bearer_auth(&session.token)
             .json(&input)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+            return Err(self.handle_error_for_session(resp, &session).await);
         }
 
         let body = resp
@@ -2152,34 +2376,33 @@ impl MLSAPIClient for ReqwestApiClient {
             blue_catbird::mlsChat::register_device::RegisterDeviceOutput<String>,
         >(body.as_ref())?;
 
+        self.ensure_session_current(&session)?;
+
         // Keep the client-generated correlation UUID before the external MLS
         // credential trait stores the server-minted ID under its historical
         // `device_uuid` method name.
-        let user_did = self
-            .session
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.actor_did.clone())
-            .ok_or(OrchestratorError::NotAuthenticated)?;
         let store = crate::credentials::KeyringCredentialStore::try_new()?;
         store
-            .store_local_device_uuid(&user_did, device_uuid)
+            .store_local_device_uuid(&session.actor_did, device_uuid)
             .await?;
+
+        self.ensure_session_current(&session)?;
 
         // Reconcile the server's authoritative row before returning a
         // registration result. The response ID is not accepted on its own;
         // the exact local UUID match must be unique and byte-equal.
-        let devices = self.list_devices().await?;
+        let devices = self.list_devices_for_session(&session).await?;
         let resolved_device_id = resolve_unique_server_device_id(&devices, device_uuid)?;
         if resolved_device_id != output.device_id.trim() {
             return Err(OrchestratorError::Api(
                 "registerDevice response disagrees with its exact listDevices row".to_string(),
             ));
         }
+        self.ensure_session_current(&session)?;
         store
-            .store_server_device_id(&user_did, &resolved_device_id)
+            .store_server_device_id(&session.actor_did, &resolved_device_id)
             .await?;
+        self.ensure_session_current(&session)?;
 
         Ok(DeviceInfo {
             device_id: resolved_device_id,
@@ -2190,41 +2413,10 @@ impl MLSAPIClient for ReqwestApiClient {
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
-        let token = self.auth_header()?;
-        let resp = self
-            .client
-            .get(self.xrpc_url(lexicon::list_devices::NSID))
-            .bearer_auth(&token)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::list_devices::ListDevicesOutput<String>,
-        >(body.as_ref())?;
-
-        Ok(output
-            .devices
-            .iter()
-            .map(|d| DeviceInfo {
-                device_id: d.device_id.to_string(),
-                mls_did: d.credential_did.to_string(),
-                device_uuid: d
-                    .device_uuid
-                    .as_ref()
-                    .map(|uuid| uuid.to_string())
-                    .unwrap_or_default(),
-                created_at: d.registered_at.as_ref().to_string().parse().ok(),
-            })
-            .collect())
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.list_devices_for_session(&session).await
     }
 
     async fn remove_device(&self, _device_id: &str) -> Result<()> {
@@ -2484,6 +2676,7 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
+    use catbird_mls::orchestrator::credentials::CredentialStore;
 
     /// Nine bytes containing both printable-ASCII low values and non-ASCII
     /// high values so the single-encode vs double-encode distinction shows
@@ -2714,6 +2907,374 @@ mod tests {
         });
         (format!("http://127.0.0.1:{port}"), rx)
     }
+
+    fn spawn_scripted_json_server(
+        responses: Vec<(u16, String, std::time::Duration)>,
+    ) -> (String, mpsc::Receiver<CapturedRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = listener.local_addr().expect("local_addr").port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for (status, body_text, delay) in responses {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let captured = read_captured_request(&mut stream);
+                tx.send(captured).expect("send captured request");
+                std::thread::sleep(delay);
+                let reason = match status {
+                    401 => "Unauthorized",
+                    403 => "Forbidden",
+                    _ => "OK",
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                    body_text.len(),
+                    body_text
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), rx)
+    }
+
+    fn read_captured_request(stream: &mut std::net::TcpStream) -> CapturedRequest {
+        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 1024];
+        let header_end = loop {
+            let n = stream.read(&mut chunk).expect("read headers");
+            if n == 0 {
+                break buf.len();
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                break pos + 4;
+            }
+        };
+        let mut headers_buf = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers_buf);
+        req.parse(&buf[..header_end]).expect("parse request");
+        let method = req.method.unwrap_or("").to_string();
+        let path = req.path.unwrap_or("").to_string();
+        let mut content_length = 0usize;
+        let headers: Vec<(String, String)> = req
+            .headers
+            .iter()
+            .map(|h| {
+                let name = h.name.to_string();
+                let value = std::str::from_utf8(h.value).unwrap_or("").to_string();
+                if name.eq_ignore_ascii_case("content-length") {
+                    content_length = value.parse().unwrap_or(0);
+                }
+                (name, value)
+            })
+            .collect();
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut chunk).expect("read body");
+            if n == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+        body.truncate(content_length);
+        CapturedRequest {
+            method,
+            path,
+            headers,
+            body,
+        }
+    }
+
+    fn list_devices_body(did: &str, device_id: &str, device_uuid: &str) -> String {
+        format!(
+            r#"{{"devices":[{{"credentialDid":"{did}","deviceId":"{device_id}","deviceName":"test","deviceUuid":"{device_uuid}","keyPackageCount":1,"lastSeenAt":"2026-08-17T00:00:00.000Z","registeredAt":"2026-08-17T00:00:00.000Z"}}]}}"#
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_reconciliation_does_not_persist_after_account_switch() {
+        let did_a = "did:plc:delayed-reconcile-a";
+        let did_b = "did:plc:delayed-reconcile-b";
+        let store = crate::credentials::KeyringCredentialStore::try_new()
+            .expect("credential store should initialize");
+        store
+            .clear_all(did_a)
+            .await
+            .expect("clear account A fixture");
+        store
+            .clear_all(did_b)
+            .await
+            .expect("clear account B fixture");
+
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            200,
+            list_devices_body(did_a, "server-device-a", "local-device-a"),
+            std::time::Duration::from_millis(150),
+        )]);
+        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
+        client.set_auth(did_a.to_string(), "token-a".to_string());
+        let task_client = client.clone();
+        let task = tokio::spawn(async move {
+            task_client
+                .resolve_server_device_id_for_local_uuid("local-device-a")
+                .await
+        });
+
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("delayed listDevices request");
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value == "Bearer token-a"));
+        client.set_auth(did_b.to_string(), "token-b".to_string());
+
+        let error = task
+            .await
+            .expect("reconciliation task should join")
+            .expect_err("old reconciliation must fail after account switch");
+        assert!(
+            error.to_string().contains("session changed"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            store
+                .get_server_device_id(did_a)
+                .await
+                .expect("read account A server ID")
+                .is_none(),
+            "stale account A response must not persist device authority"
+        );
+        assert!(
+            store
+                .get_server_device_id(did_b)
+                .await
+                .expect("read account B server ID")
+                .is_none(),
+            "account B must not receive account A device authority"
+        );
+        store
+            .clear_all(did_a)
+            .await
+            .expect("clear account A fixture");
+        store
+            .clear_all(did_b)
+            .await
+            .expect("clear account B fixture");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_reconciliation_success_persists_only_for_captured_actor() {
+        let did = "did:plc:delayed-reconcile-success";
+        let store = crate::credentials::KeyringCredentialStore::try_new()
+            .expect("credential store should initialize");
+        store.clear_all(did).await.expect("clear success fixture");
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            200,
+            list_devices_body(did, "server-device-success", "local-device-success"),
+            std::time::Duration::from_millis(100),
+        )]);
+        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
+        client.set_auth(did.to_string(), "token-success".to_string());
+        let task_client = client.clone();
+        let task = tokio::spawn(async move {
+            task_client
+                .resolve_server_device_id_for_local_uuid("local-device-success")
+                .await
+        });
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("delayed listDevices request");
+        assert!(request
+            .headers
+            .iter()
+            .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                && value == "Bearer token-success"));
+        assert_eq!(
+            task.await
+                .expect("reconciliation task should join")
+                .expect("captured actor should reconcile successfully"),
+            "server-device-success"
+        );
+        assert_eq!(
+            store
+                .get_server_device_id(did)
+                .await
+                .expect("read reconciled server ID")
+                .as_deref(),
+            Some("server-device-success")
+        );
+        store.clear_all(did).await.expect("clear success fixture");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_reconciliation_error_does_not_invalidate_new_account() {
+        let did_a = "did:plc:delayed-error-a";
+        let did_b = "did:plc:delayed-error-b";
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            401,
+            "{}".to_string(),
+            std::time::Duration::from_millis(150),
+        )]);
+        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
+        client.set_auth(did_a.to_string(), "token-a".to_string());
+        client.chat_auth.set_local_device_for_tests("local-a");
+        client.chat_auth.set_device_for_tests("server-a");
+        client.chat_auth.admit_for_tests(1);
+        let task_client = client.clone();
+        let task = tokio::spawn(async move {
+            task_client
+                .resolve_server_device_id_for_local_uuid("local-a")
+                .await
+        });
+
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("delayed listDevices request");
+        client.set_auth(did_b.to_string(), "token-b".to_string());
+        client.chat_auth.set_local_device_for_tests("local-b");
+        client.chat_auth.set_device_for_tests("server-b");
+        client.chat_auth.admit_for_tests(1);
+
+        let error = task
+            .await
+            .expect("reconciliation task should join")
+            .expect_err("401 reconciliation must fail");
+        assert!(error.to_string().contains("401"));
+        assert!(
+            client.chat_auth.canonical_read_context().is_ok(),
+            "account B authority must survive account A's delayed 401"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_registration_does_not_write_under_switched_account() {
+        let did_a = "did:plc:delayed-register-a";
+        let did_b = "did:plc:delayed-register-b";
+        let store = crate::credentials::KeyringCredentialStore::try_new()
+            .expect("credential store should initialize");
+        store
+            .clear_all(did_a)
+            .await
+            .expect("clear account A fixture");
+        store
+            .clear_all(did_b)
+            .await
+            .expect("clear account B fixture");
+        let responses = vec![
+            (
+                200,
+                r#"{"deviceId":"server-device-a","mlsDid":"did:plc:delayed-register-a","autoJoinedConvos":[]}"#
+                    .to_string(),
+                std::time::Duration::from_millis(150),
+            ),
+        ];
+        let (base_url, requests) = spawn_scripted_json_server(responses);
+        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
+        client.set_auth(did_a.to_string(), "token-a".to_string());
+        let task_client = client.clone();
+        let task = tokio::spawn(async move {
+            <ReqwestApiClient as MLSAPIClient>::register_device(
+                &*task_client,
+                "local-device-a",
+                "test-device",
+                did_a,
+                &[],
+                &[],
+            )
+            .await
+        });
+
+        let first = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("delayed registerDevice request");
+        assert!(first.path.contains("registerDevice"));
+        client.set_auth(did_b.to_string(), "token-b".to_string());
+
+        let error = task
+            .await
+            .expect("registration task should join")
+            .expect_err("registration must fail after account switch");
+        assert!(
+            error.to_string().contains("session changed"),
+            "unexpected error: {error}"
+        );
+        assert!(store
+            .get_local_device_uuid(did_a)
+            .await
+            .expect("read account A local UUID")
+            .is_none());
+        assert!(
+            store
+                .get_local_device_uuid(did_b)
+                .await
+                .expect("read account B local UUID")
+                .is_none(),
+            "account B must not receive account A registration identity"
+        );
+        assert!(
+            store
+                .get_server_device_id(did_b)
+                .await
+                .expect("read account B server ID")
+                .is_none(),
+            "account B must not receive account A server device ID"
+        );
+        store
+            .clear_all(did_a)
+            .await
+            .expect("clear account A fixture");
+        store
+            .clear_all(did_b)
+            .await
+            .expect("clear account B fixture");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delayed_registration_error_does_not_invalidate_new_account() {
+        let did_a = "did:plc:delayed-registration-error-a";
+        let did_b = "did:plc:delayed-registration-error-b";
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            401,
+            "{}".to_string(),
+            std::time::Duration::from_millis(150),
+        )]);
+        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
+        client.set_auth(did_a.to_string(), "token-a".to_string());
+        client.chat_auth.set_local_device_for_tests("local-a");
+        client.chat_auth.set_device_for_tests("server-a");
+        client.chat_auth.admit_for_tests(1);
+        let task_client = client.clone();
+        let task = tokio::spawn(async move {
+            <ReqwestApiClient as MLSAPIClient>::register_device(
+                &*task_client,
+                "local-a",
+                "test-device",
+                did_a,
+                &[],
+                &[],
+            )
+            .await
+        });
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("delayed registerDevice request");
+        client.set_auth(did_b.to_string(), "token-b".to_string());
+        client.chat_auth.set_local_device_for_tests("local-b");
+        client.chat_auth.set_device_for_tests("server-b");
+        client.chat_auth.admit_for_tests(1);
+
+        let error = task
+            .await
+            .expect("registration task should join")
+            .expect_err("delayed registration 401 must fail");
+        assert!(error.to_string().contains("401"));
+        assert!(
+            client.chat_auth.canonical_read_context().is_ok(),
+            "account B authority must survive account A's delayed registration error"
+        );
+    }
+
     #[tokio::test]
     async fn canonical_read_blocks_before_completed_binding() {
         let client = ReqwestApiClient::new("http://127.0.0.1:1".to_string());
@@ -2906,6 +3467,11 @@ fn canonical_context_debug_redacts_bearer_and_jkt_material() {
         device_id: "server-device-1".to_string(),
         dpop_jkt: "jkt-secret-for-red-test".to_string(),
         auth_generation: 7,
+        session: ChatSessionSnapshot {
+            actor_did: "did:plc:redaction".to_string(),
+            token: "bearer-secret-for-red-test".to_string(),
+            revision: 1,
+        },
     };
     let rendered = format!("{context:?}");
     assert!(
@@ -3090,6 +3656,33 @@ fn concurrent_account_updates_keep_one_actor_bound_snapshot() {
         }
         actor => panic!("unexpected actor snapshot: {actor:?}"),
     }
+}
+
+#[test]
+fn session_revision_rejects_late_mutation_after_token_refresh() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:revision", "token-one");
+    let first = provider
+        .session_snapshot()
+        .expect("first immutable session snapshot");
+    provider.set_session_for_tests("did:plc:revision", "token-two");
+    assert!(!provider.session_is_current(&first));
+    assert_eq!(
+        provider
+            .set_local_device_uuid_for_session(&first, "local-stale".to_string())
+            .expect_err("stale session must not mutate current authority"),
+        ChatAuthError::SessionChanged
+    );
+    let current = provider
+        .session_snapshot()
+        .expect("refreshed immutable session snapshot");
+    provider
+        .set_local_device_uuid_for_session(&current, "local-current".to_string())
+        .expect("current session may mutate authority");
+    assert_eq!(
+        provider.state.read().unwrap().local_device_uuid.as_deref(),
+        Some("local-current")
+    );
 }
 
 #[test]

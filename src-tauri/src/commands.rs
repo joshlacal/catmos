@@ -3,6 +3,8 @@ use base64::Engine;
 use catbird_atproto::blue_catbird;
 use catbird_atproto::jacquard_common::IntoStatic;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
+use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
 use catbird_mls::orchestrator::types::{
     ConversationState, DeliveryStatus, Message as OrchestratorMessage,
 };
@@ -214,14 +216,21 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
-    state.chat_auth.clear_device_authority();
+    let session = match state.api_client.current_session() {
+        Ok(session) => session,
+        Err(error) => {
+            log_catmos!(" chat device authority unavailable for {}: {}", did, error);
+            return;
+        }
+    };
+    let _ = state.chat_auth.clear_runtime_state_for_session(&session);
 
     if let Ok(store) = KeyringCredentialStore::try_new() {
         match store.get_local_device_uuid(did).await {
             Ok(Some(local_device_uuid)) => {
                 if let Err(error) = state
                     .chat_auth
-                    .set_local_device_uuid(did, local_device_uuid.clone())
+                    .set_local_device_uuid_for_session(&session, local_device_uuid.clone())
                 {
                     log_catmos!(
                         " chat device authority actor mismatch for {}: {}",
@@ -230,20 +239,40 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
                     );
                     return;
                 }
-                if let Err(error) = state
-                    .api_client
-                    .resolve_server_device_id_for_local_uuid(&local_device_uuid)
-                    .await
-                {
-                    // Chat authority remains absent on any zero/duplicate
-                    // listDevices match or transport error. Canonical reads
-                    // consequently fail closed until a fresh exact
-                    // reconciliation and binding admission succeed.
+                if let Err(error) = state.api_client.ensure_session_current(&session) {
                     log_catmos!(
-                        " chat device authority reconciliation deferred for {}: {}",
+                        " chat device authority actor changed during configuration for {}: {}",
                         did,
                         error
                     );
+                    return;
+                }
+                match store.get_server_device_id(did).await {
+                    Ok(Some(server_device_id)) => {
+                        if let Err(error) = state
+                            .chat_auth
+                            .set_resolved_server_device_id_for_session(&session, server_device_id)
+                        {
+                            log_catmos!(
+                                " chat device authority server ID could not be installed for {}: {}",
+                                did,
+                                error
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        log_catmos!(
+                            " chat device authority unavailable for {}: server device ID is missing",
+                            did
+                        );
+                    }
+                    Err(error) => {
+                        log_catmos!(
+                            " chat device authority unavailable for {}: failed to load server device ID: {}",
+                            did,
+                            error
+                        );
+                    }
                 }
             }
             Ok(None) => {
@@ -263,6 +292,47 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
     }
 }
 
+/// Restore the durable signer for an already-reconciled device.
+///
+/// A local UUID plus an exact `listDevices` row identifies the existing
+/// server device, but does not restore the private signer after a local MLS
+/// storage restart.  Import the keychain-held keypair before allowing the
+/// session to continue; if the key is unavailable or cannot be imported, fail
+/// closed rather than registering a second device with a new signer.
+async fn restore_registered_signer<M, C>(
+    mls_context: &M,
+    credentials: &C,
+    did: &str,
+) -> Result<(), String>
+where
+    M: MlsCryptoContext + ?Sized,
+    C: CredentialStore + ?Sized,
+{
+    let signing_key = credentials
+        .get_signing_key(did)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "durable registered signer is missing; refusing device re-registration".to_string()
+        })?;
+    mls_context
+        .import_identity_key(did.as_bytes().to_vec(), signing_key)
+        .map_err(|error| format!("failed to restore durable registered signer: {error}"))?;
+    // The platform import operation must make the signer observable to the
+    // same crypto context before login can continue.  Some providers can
+    // report a successful write while leaving the signer lookup unavailable;
+    // accepting that result would make the next key package mint a new device
+    // key and strand the server registration.
+    mls_context
+        .export_identity_key(did.as_bytes().to_vec())
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "durable signer import was not observable for registered identity; refusing re-registration: {error}"
+            )
+        })
+}
+
 /// Reconcile a previously registered device before allowing the orchestrator
 /// to register anything. A durable local UUID is an identity anchor, not
 /// proof of authority: an existing UUID must have exactly one current
@@ -270,6 +340,13 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
 /// accidental device churn. A missing local UUID is the only case that may
 /// proceed to first registration.
 async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Result<bool, String> {
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|error| error.to_string())?;
+    if session.actor_did != did {
+        return Err("chat session changed before device reconciliation".to_string());
+    }
     let store = KeyringCredentialStore::try_new().map_err(|error| error.to_string())?;
     let local_device_uuid = store
         .get_local_device_uuid(did)
@@ -281,11 +358,15 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
 
     state
         .chat_auth
-        .set_local_device_uuid(did, local_device_uuid.clone())
+        .set_local_device_uuid_for_session(&session, local_device_uuid.clone())
         .map_err(|error| error.to_string())?;
     state
         .api_client
-        .resolve_server_device_id_for_local_uuid(&local_device_uuid)
+        .ensure_session_current(&session)
+        .map_err(|error| error.to_string())?;
+    state
+        .api_client
+        .resolve_server_device_id_for_local_uuid_with_session(&session, &local_device_uuid)
         .await
         .map(|_| true)
         .map_err(|error| {
@@ -693,7 +774,29 @@ pub async fn complete_login(
 
     // Reconcile a durable identity before any registration attempt. Only a
     // first-login device without a local UUID may create a new registration.
-    if !reconcile_device_before_registration(&state, &session.did).await? {
+    if reconcile_device_before_registration(&state, &session.did).await? {
+        let authority_session = state
+            .api_client
+            .current_session()
+            .map_err(|error| error.to_string())?;
+        if authority_session.actor_did != session.did || authority_session.token != session_id {
+            return Err("chat session changed before signer restoration".to_string());
+        }
+        state
+            .api_client
+            .ensure_session_current(&authority_session)
+            .map_err(|error| error.to_string())?;
+        restore_registered_signer(
+            state.orchestrator.mls_context().as_ref(),
+            state.orchestrator.credentials().as_ref(),
+            &session.did,
+        )
+        .await?;
+        state
+            .api_client
+            .ensure_session_current(&authority_session)
+            .map_err(|error| error.to_string())?;
+    } else {
         state
             .orchestrator
             .ensure_device_registered()
@@ -780,7 +883,29 @@ pub async fn try_restore_session(
             // Reconcile before any registration. An existing UUID with a
             // missing/ambiguous server row fails closed instead of creating
             // another server device after a restart or transient 401/403.
-            if !reconcile_device_before_registration(&state, &session.did).await? {
+            if reconcile_device_before_registration(&state, &session.did).await? {
+                let authority_session = state
+                    .api_client
+                    .current_session()
+                    .map_err(|error| error.to_string())?;
+                if authority_session.actor_did != session.did || authority_session.token != sid {
+                    return Err("chat session changed before signer restoration".to_string());
+                }
+                state
+                    .api_client
+                    .ensure_session_current(&authority_session)
+                    .map_err(|error| error.to_string())?;
+                restore_registered_signer(
+                    state.orchestrator.mls_context().as_ref(),
+                    state.orchestrator.credentials().as_ref(),
+                    &session.did,
+                )
+                .await?;
+                state
+                    .api_client
+                    .ensure_session_current(&authority_session)
+                    .map_err(|error| error.to_string())?;
+            } else {
                 state
                     .orchestrator
                     .ensure_device_registered()
@@ -2874,9 +2999,11 @@ pub async fn confirm_manual_reset(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_current_group_id, validate_current_group_id};
+    use super::{resolve_current_group_id, restore_registered_signer, validate_current_group_id};
+    use crate::credentials::KeyringCredentialStore;
     use crate::storage::SqliteStorage;
     use async_trait::async_trait;
+    use catbird_mls::orchestrator::credentials::CredentialStore;
     use catbird_mls::orchestrator::storage::MLSStorageBackend;
     use catbird_mls::orchestrator::types::{ConversationState, GroupState};
     use catbird_mls::{KeychainAccess, MLSContext, MLSError};
@@ -3061,5 +3188,63 @@ mod tests {
             !error.to_string().contains("Invalid hex group ID"),
             "actual orchestrator call must receive the resolved hex group ID: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_refuses_unverified_durable_signer_without_registering_a_new_device() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let initial_db = temp.path().join("signer-initial.sqlite");
+        let restarted_db = temp.path().join("signer-restarted.sqlite");
+        let did = "did:plc:restart-signer";
+        let initial_context = MLSContext::new(
+            initial_db.to_string_lossy().to_string(),
+            "test-key".to_string(),
+            Box::new(TestKeychain {
+                values: Mutex::new(HashMap::new()),
+            }),
+        )
+        .expect("initial MLS context should initialize");
+        let _initial_key_package = initial_context
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("initial signer should create a key package");
+        let signing_key = initial_context
+            .export_identity_key(did.to_string())
+            .expect("initial signer should export its durable key");
+        let credentials =
+            KeyringCredentialStore::try_new().expect("credential store should initialize");
+        credentials
+            .clear_all(did)
+            .await
+            .expect("clear signer fixture before test");
+        credentials
+            .store_signing_key(did, &signing_key)
+            .await
+            .expect("store durable signer fixture");
+
+        let restarted_context = MLSContext::new(
+            restarted_db.to_string_lossy().to_string(),
+            "test-key".to_string(),
+            Box::new(TestKeychain {
+                values: Mutex::new(HashMap::new()),
+            }),
+        )
+        .expect("restarted MLS context should initialize");
+        let error = restore_registered_signer(restarted_context.as_ref(), &credentials, did)
+            .await
+            .expect_err("unverified signer import must fail closed");
+        assert!(
+            error.contains("refusing re-registration"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            restarted_context
+                .export_identity_key(did.to_string())
+                .is_err(),
+            "a failed restore must not make an unverified signer look ready"
+        );
+        credentials
+            .clear_all(did)
+            .await
+            .expect("clear signer fixture after test");
     }
 }
