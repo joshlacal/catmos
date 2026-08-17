@@ -3,7 +3,9 @@ use base64::Engine;
 use catbird_atproto::blue_catbird;
 use catbird_atproto::jacquard_common::IntoStatic;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
-use catbird_mls::orchestrator::types::{DeliveryStatus, Message as OrchestratorMessage};
+use catbird_mls::orchestrator::types::{
+    ConversationState, DeliveryStatus, Message as OrchestratorMessage,
+};
 use catbird_mls::orchestrator::MLSAPIClient;
 use catbird_mls::orchestrator::MLSStorageBackend;
 use serde::{Deserialize, Serialize};
@@ -209,14 +211,6 @@ fn clear_saved_session_credentials() {
 /// Persisted session/device identifiers never enter command logs; DPoP
 /// binding evidence is admitted only through the runtime authority provider.
 async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
-    let previous_did = state.api_client.current_did().await;
-    if previous_did.as_deref() != Some(did) {
-        if let (Some(previous_did), Ok(store)) =
-            (previous_did.as_deref(), KeyringCredentialStore::try_new())
-        {
-            let _ = store.clear_server_device_authority(previous_did).await;
-        }
-    }
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
@@ -225,9 +219,17 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
     if let Ok(store) = KeyringCredentialStore::try_new() {
         match store.get_local_device_uuid(did).await {
             Ok(Some(local_device_uuid)) => {
-                state
+                if let Err(error) = state
                     .chat_auth
-                    .set_local_device_uuid(local_device_uuid.clone());
+                    .set_local_device_uuid(did, local_device_uuid.clone())
+                {
+                    log_catmos!(
+                        " chat device authority actor mismatch for {}: {}",
+                        did,
+                        error
+                    );
+                    return;
+                }
                 if let Err(error) = state
                     .api_client
                     .resolve_server_device_id_for_local_uuid(&local_device_uuid)
@@ -259,6 +261,38 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
             }
         }
     }
+}
+
+/// Reconcile a previously registered device before allowing the orchestrator
+/// to register anything. A durable local UUID is an identity anchor, not
+/// proof of authority: an existing UUID must have exactly one current
+/// listDevices row. Zero/duplicate/error results stop login and prevent
+/// accidental device churn. A missing local UUID is the only case that may
+/// proceed to first registration.
+async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Result<bool, String> {
+    let store = KeyringCredentialStore::try_new().map_err(|error| error.to_string())?;
+    let local_device_uuid = store
+        .get_local_device_uuid(did)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(local_device_uuid) = local_device_uuid else {
+        return Ok(false);
+    };
+
+    state
+        .chat_auth
+        .set_local_device_uuid(did, local_device_uuid.clone())
+        .map_err(|error| error.to_string())?;
+    state
+        .api_client
+        .resolve_server_device_id_for_local_uuid(&local_device_uuid)
+        .await
+        .map(|_| true)
+        .map_err(|error| {
+            format!(
+                "existing local chat device UUID did not reconcile to exactly one server device; refusing re-registration: {error}"
+            )
+        })
 }
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
@@ -657,12 +691,15 @@ pub async fn complete_login(
         .api_client
         .set_auth(session.did.clone(), session_id.clone());
 
-    // Ensure device is registered with MLS service (generates keys, publishes key packages)
-    state
-        .orchestrator
-        .ensure_device_registered()
-        .await
-        .map_err(|e| format!("{:?}", e))?;
+    // Reconcile a durable identity before any registration attempt. Only a
+    // first-login device without a local UUID may create a new registration.
+    if !reconcile_device_before_registration(&state, &session.did).await? {
+        state
+            .orchestrator
+            .ensure_device_registered()
+            .await
+            .map_err(|e| format!("{:?}", e))?;
+    }
     configure_chat_auth(&state, &session.did, &session_id).await;
 
     // Auto opt-in to MLS (non-blocking — failures are logged only)
@@ -710,11 +747,6 @@ pub async fn try_restore_session(
                         log_catmos!("Stored session was rejected; clearing saved login: {}", e);
                         clear_saved_session_credentials();
                         state.api_client.clear_auth();
-                        if let Some(user_did) = stored_did.as_deref() {
-                            if let Ok(store) = KeyringCredentialStore::try_new() {
-                                let _ = store.clear_server_device_authority(user_did).await;
-                            }
-                        }
                         return Ok(None);
                     }
                     log_catmos!(
@@ -745,12 +777,16 @@ pub async fn try_restore_session(
             install_content_root_key(&state, &session.did);
             state.api_client.set_auth(session.did.clone(), sid.clone());
 
-            // Ensure device is registered (idempotent — skips if already done)
-            state
-                .orchestrator
-                .ensure_device_registered()
-                .await
-                .map_err(|e| format!("{:?}", e))?;
+            // Reconcile before any registration. An existing UUID with a
+            // missing/ambiguous server row fails closed instead of creating
+            // another server device after a restart or transient 401/403.
+            if !reconcile_device_before_registration(&state, &session.did).await? {
+                state
+                    .orchestrator
+                    .ensure_device_registered()
+                    .await
+                    .map_err(|e| format!("{:?}", e))?;
+            }
             configure_chat_auth(&state, &session.did, &sid).await;
 
             // Auto opt-in to MLS (non-blocking — failures are logged only)
@@ -793,13 +829,10 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     // wipe path (account removal) would also call `keys::delete_content_root_key`.
     state.orchestrator.mls_context().clear_content_root_key();
     state.orchestrator.shutdown().await;
-    let user_did = state.api_client.current_did().await;
     state.api_client.clear_auth();
-    if let Some(user_did) = user_did {
-        if let Ok(store) = KeyringCredentialStore::try_new() {
-            let _ = store.clear_server_device_authority(&user_did).await;
-        }
-    }
+    // Logout revokes only runtime authority and saved session credentials.
+    // The local UUID and server device ID remain durable so the next login
+    // can reconcile listDevices before considering registration.
     clear_saved_session_credentials();
     Ok(())
 }
@@ -1009,21 +1042,55 @@ async fn resolve_group_id(state: &AppState, conversation_id: &str) -> Result<Str
         .current_did()
         .await
         .unwrap_or_default();
-    let convo = state
-        .orchestrator
-        .storage()
-        .get_conversation(&user_did, conversation_id)
+    resolve_current_group_id(
+        state.orchestrator.storage().as_ref(),
+        &user_did,
+        conversation_id,
+    )
+    .await
+}
+
+/// Resolve a reaction/send coordinate only when the persisted group state
+/// still belongs to the requested stable conversation. A syntactically valid
+/// hex value in a stale `conversations.group_id` row is rejected rather than
+/// handed to the MLS orchestrator after a reset or restart.
+async fn resolve_current_group_id<S: MLSStorageBackend + ?Sized>(
+    storage: &S,
+    user_did: &str,
+    conversation_id: &str,
+) -> Result<String, String> {
+    let convo = storage
+        .get_conversation(user_did, conversation_id)
         .await
         .map_err(|e| format!("{:?}", e))?;
     let group_id = convo
         .map(|c| c.group_id)
-        .filter(|g| !g.is_empty())
+        .filter(|g| !g.trim().is_empty())
         .ok_or_else(|| format!("Conversation not found: {conversation_id}"))?;
+    let lifecycle = storage
+        .get_conversation_state(conversation_id)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+    if !matches!(lifecycle, Some(ConversationState::Active)) {
+        return Err(format!(
+            "Conversation group mapping is not current after lifecycle change: {conversation_id}"
+        ));
+    }
+    let state = storage
+        .get_group_state(&group_id)
+        .await
+        .map_err(|e| format!("{:?}", e))?
+        .ok_or_else(|| {
+            format!("Conversation has no current MLS group state after reset: {conversation_id}")
+        })?;
+    if state.conversation_id != conversation_id || state.group_id != group_id {
+        return Err(format!(
+            "Conversation group mapping is stale or belongs to another conversation: {conversation_id}"
+        ));
+    }
 
     // The UI speaks in stable conversation UUIDs. MLS encryption and
     // reactions speak in the current binary group coordinate encoded as hex.
-    // Reject missing, malformed, or stale local rows before handing anything
-    // to the orchestrator; it will not reinterpret a UUID as a group ID.
     validate_current_group_id(conversation_id, &group_id)
 }
 
@@ -2807,7 +2874,35 @@ pub async fn confirm_manual_reset(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_current_group_id;
+    use super::{resolve_current_group_id, validate_current_group_id};
+    use crate::storage::SqliteStorage;
+    use async_trait::async_trait;
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
+    use catbird_mls::orchestrator::types::{ConversationState, GroupState};
+    use catbird_mls::{KeychainAccess, MLSContext, MLSError};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct TestKeychain {
+        values: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl KeychainAccess for TestKeychain {
+        async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
+            Ok(self.values.lock().unwrap().get(&key).cloned())
+        }
+
+        async fn write(&self, key: String, value: Vec<u8>) -> Result<(), MLSError> {
+            self.values.lock().unwrap().insert(key, value);
+            Ok(())
+        }
+
+        async fn delete(&self, key: String) -> Result<(), MLSError> {
+            self.values.lock().unwrap().remove(&key);
+            Ok(())
+        }
+    }
 
     #[test]
     fn reaction_boundary_passes_the_current_hex_group_id() {
@@ -2826,5 +2921,145 @@ mod tests {
         )
         .is_err());
         assert!(validate_current_group_id("missing", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn reaction_mapping_must_be_the_storage_current_group_for_conversation() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let db_path = temp.path().join("commands-reaction.sqlite");
+        let storage =
+            SqliteStorage::new(db_path.to_str().unwrap(), "test-key").expect("storage should open");
+        let did = "did:plc:reaction-owner";
+        let conversation_id = "00000000-0000-4000-8000-000000000001";
+        let stale_group_id = "deadbeefcafe1234";
+        let current_group_id = "0123456789abcdef";
+
+        storage
+            .ensure_conversation_exists(did, conversation_id, stale_group_id)
+            .await
+            .expect("conversation row should be created");
+        storage
+            .set_group_state(&GroupState {
+                group_id: current_group_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                epoch: 4,
+                members: vec![did.to_string()],
+            })
+            .await
+            .expect("current group state should be persisted");
+
+        assert!(
+            resolve_current_group_id(&storage, did, conversation_id)
+                .await
+                .is_err(),
+            "reaction resolution must fail closed while the conversation row points at a stale group"
+        );
+
+        storage
+            .update_conversation_group_id(conversation_id, current_group_id)
+            .expect("conversation should adopt the current group mapping");
+        assert_eq!(
+            resolve_current_group_id(&storage, did, conversation_id)
+                .await
+                .expect("current storage mapping should resolve"),
+            current_group_id
+        );
+
+        storage
+            .set_conversation_state(
+                conversation_id,
+                ConversationState::ResetPending {
+                    new_group_id: current_group_id.to_string(),
+                    reset_generation: 2,
+                    notified_at_ms: 1,
+                },
+            )
+            .await
+            .expect("reset lifecycle should be persisted");
+        assert!(
+            resolve_current_group_id(&storage, did, conversation_id)
+                .await
+                .is_err(),
+            "a valid old group row must still fail closed while reset is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_resolution_feeds_the_actual_orchestrator_call() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let storage_db = temp.path().join("commands-orchestrator.sqlite");
+        let mls_db = temp.path().join("commands-orchestrator-mls.sqlite");
+        let storage = Arc::new(
+            SqliteStorage::new(storage_db.to_str().unwrap(), "test-key")
+                .expect("storage should open"),
+        );
+        let did = "did:plc:reaction-owner";
+        let conversation_id = "00000000-0000-4000-8000-000000000002";
+        let group_id = "0123456789abcdef";
+        storage
+            .ensure_conversation_exists(did, conversation_id, group_id)
+            .await
+            .expect("conversation row should be created");
+        storage
+            .set_group_state(&GroupState {
+                group_id: group_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                epoch: 1,
+                members: vec![did.to_string()],
+            })
+            .await
+            .expect("group state should be persisted");
+        // New SQLite rows use the historical `Active` default for backwards
+        // compatibility, while the orchestrator rehydrates JSON. Seed the
+        // canonical JSON state before exercising the real initialize/send
+        // path so this test reaches the transport boundary.
+        storage
+            .set_conversation_state(conversation_id, ConversationState::Active)
+            .await
+            .expect("conversation state should be persisted");
+
+        let resolved = resolve_current_group_id(storage.as_ref(), did, conversation_id)
+            .await
+            .expect("fresh storage mapping should resolve");
+        let context = MLSContext::new(
+            mls_db.to_string_lossy().to_string(),
+            "test-key".to_string(),
+            Box::new(TestKeychain {
+                values: Mutex::new(HashMap::new()),
+            }),
+        )
+        .expect("MLS context should initialize");
+        let api_client = Arc::new(crate::api_client::ReqwestApiClient::new(
+            "http://127.0.0.1:1".to_string(),
+        ));
+        let credentials = Arc::new(
+            crate::credentials::KeyringCredentialStore::try_new()
+                .expect("credential store should initialize"),
+        );
+        let orchestrator = Arc::new(crate::CatmosOrchestrator::new(
+            context,
+            storage,
+            api_client,
+            credentials,
+            catbird_mls::orchestrator::OrchestratorConfig::default(),
+        ));
+        orchestrator
+            .initialize(did)
+            .await
+            .expect("orchestrator should initialize");
+
+        let error = orchestrator
+            .send_reaction(
+                &resolved,
+                "00000000-0000-4000-8000-000000000003",
+                "👍",
+                catbird_mls::orchestrator::types::ReactionAction::Add,
+            )
+            .await
+            .expect_err("the unauthenticated fixture should stop at transport");
+        assert!(
+            !error.to_string().contains("Invalid hex group ID"),
+            "actual orchestrator call must receive the resolved hex group ID: {error}"
+        );
     }
 }

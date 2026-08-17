@@ -856,6 +856,13 @@ impl MLSStorageBackend for SqliteStorage {
         if s.is_empty() {
             return Ok(None);
         }
+        // Fresh installs historically used the SQL default `Active` before
+        // state persistence was JSON-backed. Treat that legacy value as the
+        // canonical enum so callers can still apply lifecycle freshness gates
+        // without accepting an unparseable state as proof of currency.
+        if s == "Active" {
+            return Ok(Some(ConversationState::Active));
+        }
         serde_json::from_str::<ConversationState>(&s)
             .map(Some)
             .map_err(|e| OrchestratorError::Storage(e.to_string()))
