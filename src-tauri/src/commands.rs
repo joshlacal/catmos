@@ -3191,7 +3191,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn restart_refuses_unverified_durable_signer_without_registering_a_new_device() {
+    async fn restart_restores_durable_signer_before_registration() {
         let temp = tempfile::tempdir().expect("temporary storage directory");
         let initial_db = temp.path().join("signer-initial.sqlite");
         let restarted_db = temp.path().join("signer-restarted.sqlite");
@@ -3229,18 +3229,15 @@ mod tests {
             }),
         )
         .expect("restarted MLS context should initialize");
-        let error = restore_registered_signer(restarted_context.as_ref(), &credentials, did)
+        restore_registered_signer(restarted_context.as_ref(), &credentials, did)
             .await
-            .expect_err("unverified signer import must fail closed");
-        assert!(
-            error.contains("refusing re-registration"),
-            "unexpected error: {error}"
-        );
-        assert!(
-            restarted_context
-                .export_identity_key(did.to_string())
-                .is_err(),
-            "a failed restore must not make an unverified signer look ready"
+            .expect("Task 1 storage-key fix should make the imported signer observable");
+        let restored_signing_key = restarted_context
+            .export_identity_key(did.to_string())
+            .expect("restored signer should be readable after import");
+        assert_eq!(
+            restored_signing_key, signing_key,
+            "a restored signer must be observable before device registration"
         );
         credentials
             .clear_all(did)
