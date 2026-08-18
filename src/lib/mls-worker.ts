@@ -28,7 +28,61 @@ const api = {
 	},
 	clearAuth: () => {
 		wasm.catbird_mls_clear_auth();
+		(wasm as unknown as { catbird_mls_clear_signer_bridge: () => void }).catbird_mls_clear_signer_bridge();
 	},
+	// Browser signer bridge. The CryptoKey remains owned by the worker's
+	// WebCrypto implementation; only its public key and a callback cross into
+	// WASM. No private key bytes, access token, DPoP proof, or JKT is exported.
+	setSignerBridge: async (
+		actorDid: string,
+		deviceId: string,
+		dpopJkt: string,
+		publicKey: Uint8Array,
+		key: CryptoKey,
+		authGeneration?: number
+	) => {
+		const sign = (transcript: Uint8Array) =>
+			crypto.subtle
+				.sign({ name: 'Ed25519' }, key, transcript as BufferSource)
+				.then((signature) => new Uint8Array(signature));
+		(wasm as unknown as {
+			catbird_mls_set_signer_bridge: (
+				callback: (transcript: Uint8Array) => Promise<Uint8Array>,
+				actorDid: string,
+				deviceId: string,
+				dpopJkt: string,
+				publicKey: Uint8Array,
+				authGeneration?: number
+			) => void;
+		}).catbird_mls_set_signer_bridge(
+			sign,
+			actorDid,
+			deviceId,
+			dpopJkt,
+			publicKey,
+			authGeneration
+		);
+	},
+	hasSignerBridge: () =>
+		(wasm as unknown as { catbird_mls_has_signer_bridge: () => boolean }).catbird_mls_has_signer_bridge(),
+	prepareUnsignedRequest: (operation: string, requestJson: string) =>
+		plain(
+			(wasm as unknown as {
+				catbird_mls_prepare_unsigned_request: (
+					operation: string,
+					requestJson: string
+				) => unknown;
+			}).catbird_mls_prepare_unsigned_request(operation, requestJson)
+		),
+	prepareSignedRequest: async (operation: string, requestJson: string) =>
+		plain(
+			await (wasm as unknown as {
+				catbird_mls_prepare_signed_request: (
+					operation: string,
+					requestJson: string
+				) => Promise<unknown>;
+			}).catbird_mls_prepare_signed_request(operation, requestJson)
+		),
 	// Field-level encryption (Stage 6 / Task 22): install the 32-byte
 	// per-DID content root key. Pushed by the main thread after pulling
 	// the bytes from localStorage. wasm-bindgen exports the function as

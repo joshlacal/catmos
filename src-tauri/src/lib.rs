@@ -7,6 +7,8 @@ mod keychain;
 mod keys;
 mod mls_proxy;
 mod quarantine_observer;
+mod recovery;
+mod session_restore;
 mod storage;
 mod websocket;
 
@@ -76,13 +78,21 @@ pub struct WsHandle {
     pub shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+impl WsHandle {
+    pub(crate) fn owns(&self, sender: &tokio::sync::watch::Sender<bool>) -> bool {
+        self.shutdown.same_channel(sender)
+    }
+}
+
 pub struct AppState {
     pub orchestrator: Arc<CatmosOrchestrator>,
     pub api_client: Arc<ReqwestApiClient>,
-    pub ws_handles: Mutex<HashMap<String, WsHandle>>,
+    /// Runtime-owned clean-chat auth capabilities. The provider contains
+    /// opaque session/device/JKT state; commands never persist or log secrets.
+    pub(crate) chat_auth: Arc<api_client::ChatAuthProvider>,
+    pub ws_handles: Arc<Mutex<HashMap<String, WsHandle>>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    pub pending_oauth: Mutex<Option<commands::PendingOAuth>>,
     /// Per-app data directory (`~/Library/Application Support/catmos` on macOS,
     /// platform-equivalent elsewhere). Used by the auth flow to resolve the
     /// per-DID content-root key file (`keys::load_or_create_content_root_key`).
@@ -157,14 +167,14 @@ pub fn run() {
         cred_store,
         catbird_mls::orchestrator::OrchestratorConfig::default(),
     ));
-
+    let chat_auth = api_client.chat_auth_provider();
     let app_state = AppState {
         orchestrator,
+        chat_auth,
         api_client,
-        ws_handles: Mutex::new(HashMap::new()),
+        ws_handles: Arc::new(Mutex::new(HashMap::new())),
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
-        pending_oauth: Mutex::new(None),
         data_dir,
     };
 
@@ -173,7 +183,6 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::start_login,
-            commands::cancel_login,
             commands::complete_login,
             commands::try_restore_session,
             commands::logout,

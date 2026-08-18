@@ -54,12 +54,6 @@ import type {
 
 import { wrap, proxy, type Remote } from 'comlink';
 import type { WorkerApi } from './mls-worker';
-import {
-	beginOAuthExchange,
-	cancelOAuthExchange,
-	consumeOAuthNonce,
-	redeemOAuthCode
-} from './oauth-exchange';
 
 // ---------------------------------------------------------------------------
 // Environment detection
@@ -291,35 +285,30 @@ function clearBrowserAuth(): void {
 	sessionStorage.removeItem(SS_ACTIVE_DID);
 }
 
-export async function startLogin(identifier: string): Promise<string | null> {
+export async function startLogin(identifier: string): Promise<void> {
 	if (isTauri) {
-		return tauriInvoke<string>('start_login', { identifier });
+		return tauriInvoke('start_login', { identifier });
 	}
-	// Keep the exact initiating origin, including loopback hostname and port,
-	// because sessionStorage (and therefore the nonce) is origin-scoped.
-	const redirectTo = `${window.location.origin}/auth/callback`;
-	window.location.href = beginOAuthExchange(
-		NEST_URL,
-		identifier,
-		redirectTo,
-		sessionStorage
-	).toString();
-	return null;
+	const { hostname, port } = window.location;
+	let callbackBase: string;
+	if (hostname === 'localhost' || hostname === '127.0.0.1') {
+		callbackBase = `http://127.0.0.1:${port || '80'}`;
+	} else {
+		callbackBase = window.location.origin;
+	}
+	const redirectTo = `${callbackBase}/auth/callback`;
+	const loginUrl =
+		`${NEST_URL}/auth/login` +
+		`?identifier=${encodeURIComponent(identifier)}` +
+		`&client=catmos` +
+		`&redirect_to=${encodeURIComponent(redirectTo)}`;
+	window.location.href = loginUrl;
 }
 
-export async function cancelLogin(): Promise<void> {
-	if (isTauri) return tauriInvoke('cancel_login');
-	cancelOAuthExchange(sessionStorage);
-}
-
-export async function completeLogin(code: string, redirectOrigin?: string): Promise<AuthState> {
+export async function completeLogin(sessionId: string): Promise<AuthState> {
 	if (isTauri) {
-		if (!redirectOrigin) throw new Error('OAuth callback origin is missing');
-		return tauriInvoke('complete_login', { code, redirectOrigin });
+		return tauriInvoke('complete_login', { sessionId });
 	}
-	const nonce = consumeOAuthNonce(sessionStorage);
-	if (!nonce) throw new Error('OAuth login state is missing or already used');
-	const sessionId = await redeemOAuthCode(NEST_URL, code, nonce);
 	const resp = await fetch(`${NEST_URL}/auth/session`, {
 		headers: { Authorization: `Bearer ${sessionId}` }
 	});
@@ -362,6 +351,52 @@ export async function setAuth(did: string, token: string): Promise<void> {
 }
 
 /**
+ * Install a browser-owned non-exporting Ed25519 signer for canonical chat
+ * preparation. The CryptoKey is passed to the worker as a structured-clone
+ * handle and never converted to private key bytes. WASM receives only the
+ * public binding and a callback that returns a 64-byte signature.
+ */
+export async function installBrowserSigner(params: {
+	actorDid: string;
+	deviceId: string;
+	dpopJkt: string;
+	publicKey: Uint8Array;
+	key: CryptoKey;
+	authGeneration?: number;
+}): Promise<void> {
+	if (isTauri) {
+		throw new Error('browser signer is unsupported in Tauri runtime');
+	}
+	const w = getWorker();
+	await w.setSignerBridge(
+		params.actorDid,
+		params.deviceId,
+		params.dpopJkt,
+		params.publicKey,
+		params.key,
+		params.authGeneration
+	);
+}
+
+/** Prepare an unsigned generated clean-chat request without returning auth. */
+export async function prepareUnsignedRequest(
+	operation: string,
+	requestJson: string
+): Promise<unknown> {
+	if (isTauri) throw new Error('browser unsigned preparation is unsupported in Tauri runtime');
+	return getWorker().prepareUnsignedRequest(operation, requestJson);
+}
+
+/** Prepare a signed generated clean-chat request through the worker WASM. */
+export async function prepareSignedRequest(
+	operation: string,
+	requestJson: string
+): Promise<unknown> {
+	if (isTauri) throw new Error('browser signed preparation is unsupported in Tauri runtime');
+	return getWorker().prepareSignedRequest(operation, requestJson);
+}
+
+/**
  * Clear auth credentials from the WASM MLS module.
  */
 export async function clearAuth(): Promise<void> {
@@ -393,7 +428,13 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		const resp = await fetch(`${NEST_URL}/auth/session`, {
 			headers: { Authorization: `Bearer ${sessionId}` }
 		});
-		if (!resp.ok) return null;
+		if (!resp.ok) {
+			if (resp.status === 401 || resp.status === 403) {
+				clearBrowserAuth();
+				return null;
+			}
+			throw new Error(`Failed to restore session: ${resp.status}`);
+		}
 		const info = await resp.json();
 
 		// Push restored credentials to Worker
@@ -410,8 +451,8 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		startKeyPackageReplenishment();
 
 		return { did: info.did, handle: info.handle ?? info.did };
-	} catch {
-		return null;
+	} catch (error) {
+		throw error;
 	}
 }
 

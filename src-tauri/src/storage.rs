@@ -40,29 +40,6 @@ struct CanonicalMessageBodyOwned {
 /// Version tag stamped into `payload_key_version` on every encrypted row.
 const PAYLOAD_KEY_VERSION_V1: i64 = 1;
 
-/// A reset tag is deliberately not a complete persisted authority. The
-/// authoritative payload lives in the three reset columns and is committed
-/// together with this tag by `mark_reset_pending`.
-const RESET_PENDING_STATE_TAG: &str = "reset_pending";
-
-fn reset_pending_intent_tag(
-    new_group_id: &str,
-    reset_generation: i32,
-    notified_at_ms: i64,
-) -> String {
-    use sha2::Digest;
-
-    let mut digest = sha2::Sha256::new();
-    digest.update((new_group_id.len() as u64).to_be_bytes());
-    digest.update(new_group_id.as_bytes());
-    digest.update(reset_generation.to_be_bytes());
-    digest.update(notified_at_ms.to_be_bytes());
-    format!(
-        "{RESET_PENDING_STATE_TAG}:{}",
-        hex::encode(digest.finalize())
-    )
-}
-
 /// SQLite-backed storage for Catmos desktop.
 pub struct SqliteStorage {
     conn: Mutex<Connection>,
@@ -548,109 +525,38 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Rehydrate persisted conversation state. A reset marker is only valid
-    /// when every dedicated payload column is present. Treating an incomplete
-    /// marker as an error prevents a crash between the generic state write and
-    /// the reset commit from authorizing destructive recovery after restart.
-    fn load_persisted_conversation_state(
-        &self,
-        conversation_id: &str,
-    ) -> Result<Option<ConversationState>> {
+    /// Rehydrate a `ConversationState::ResetPending` payload from the
+    /// persisted columns (spec §8.5). Returns `Some(ResetPending { .. })`
+    /// only when all three reset columns are non-NULL — partial rows are
+    /// treated as "no payload" and yield `None`. Callers that need to
+    /// repopulate the orchestrator's in-memory `conversation_states` map
+    /// after restart should consult this helper.
+    pub fn get_reset_pending(&self, conversation_id: &str) -> Option<ConversationState> {
         let conn = self.conn.lock().unwrap();
-        let persisted = conn
-            .query_row(
-                "SELECT state, reset_new_group_id, reset_generation, reset_notified_at_ms
+        conn.query_row(
+            "SELECT reset_new_group_id, reset_generation, reset_notified_at_ms
              FROM conversations WHERE conversation_id = ?1",
-                rusqlite::params![conversation_id],
-                |row| {
-                    let state: String = row.get(0)?;
-                    let new_group_id: Option<String> = row.get(1)?;
-                    let reset_generation: Option<i64> = row.get(2)?;
-                    let notified_at_ms: Option<i64> = row.get(3)?;
-                    Ok((state, new_group_id, reset_generation, notified_at_ms))
-                },
-            )
-            .optional()
-            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-
-        let Some((state, new_group_id, reset_generation, notified_at_ms)) = persisted else {
-            return Ok(None);
-        };
-        // Older builds serialized the complete ResetPending enum into
-        // `state`. Recognize that as a reset marker for migration purposes,
-        // but never trust its embedded payload; the sidecar columns remain
-        // the sole authority.
-        let serialized_state = serde_json::from_str::<ConversationState>(&state).ok();
-        let is_reset_intent = state.starts_with(&format!("{RESET_PENDING_STATE_TAG}:"));
-        let is_committed_reset = state == RESET_PENDING_STATE_TAG
-            || matches!(
-                serialized_state,
-                Some(ConversationState::ResetPending { .. })
-            );
-        let reset_sidecar_count = usize::from(new_group_id.is_some())
-            + usize::from(reset_generation.is_some())
-            + usize::from(notified_at_ms.is_some());
-        if is_reset_intent {
-            return Err(OrchestratorError::Storage(format!(
-                "uncommitted reset_pending intent for {conversation_id}"
-            )));
-        }
-        if is_committed_reset {
-            return match (new_group_id, reset_generation, notified_at_ms) {
-                (Some(new_group_id), Some(reset_generation), Some(notified_at_ms))
-                    if !new_group_id.is_empty() =>
-                {
-                    let reset_generation = i32::try_from(reset_generation).map_err(|_| {
-                        OrchestratorError::Storage(format!(
-                            "invalid reset_pending generation for {conversation_id}"
-                        ))
-                    })?;
-                    Ok(Some(ConversationState::ResetPending {
+            rusqlite::params![conversation_id],
+            |row| {
+                let new_group_id: Option<String> = row.get(0)?;
+                let reset_generation: Option<i64> = row.get(1)?;
+                let notified_at_ms: Option<i64> = row.get(2)?;
+                Ok((new_group_id, reset_generation, notified_at_ms))
+            },
+        )
+        .ok()
+        .and_then(|(new_group_id, reset_generation, notified_at_ms)| {
+            match (new_group_id, reset_generation, notified_at_ms) {
+                (Some(new_group_id), Some(reset_generation), Some(notified_at_ms)) => {
+                    Some(ConversationState::ResetPending {
                         new_group_id,
-                        reset_generation,
+                        reset_generation: reset_generation as i32,
                         notified_at_ms,
-                    }))
+                    })
                 }
-                _ => Err(OrchestratorError::Storage(format!(
-                    "incomplete reset_pending authority for {conversation_id}"
-                ))),
-            };
-        }
-
-        if reset_sidecar_count != 0 {
-            return Err(OrchestratorError::Storage(format!(
-                "reset_pending sidecar without reset marker for {conversation_id}"
-            )));
-        }
-        if state.is_empty() {
-            return Ok(None);
-        }
-
-        if let Some(state) = serialized_state {
-            return Ok(Some(state));
-        }
-
-        // The initial schema used an unquoted `Active` default. Preserve
-        // compatibility for rows that have never gone through the setter.
-        match state.as_str() {
-            "Initializing" => Ok(Some(ConversationState::Initializing)),
-            "Active" => Ok(Some(ConversationState::Active)),
-            "ForkDetected" => Ok(Some(ConversationState::ForkDetected)),
-            "NeedsRejoin" => Ok(Some(ConversationState::NeedsRejoin)),
-            "Failed" => Ok(Some(ConversationState::Failed)),
-            _ => Err(OrchestratorError::Storage(format!(
-                "invalid persisted conversation state for {conversation_id}"
-            ))),
-        }
-    }
-
-    /// Read only a committed ResetPending payload. Incomplete markers return
-    /// an error instead of being mistaken for absent state.
-    pub fn get_reset_pending(&self, conversation_id: &str) -> Result<Option<ConversationState>> {
-        match self.load_persisted_conversation_state(conversation_id)? {
-            state @ Some(ConversationState::ResetPending { .. }) => Ok(state),
-            _ => Ok(None),
-        }
+                _ => None,
+            }
+        })
     }
 
     /// Persist the decrypted `GroupMetadataV1` payload (as JSON) along with
@@ -766,40 +672,6 @@ impl SqliteStorage {
             |row| row.get(0),
         )
         .ok()
-    }
-}
-
-impl SqliteStorage {
-    /// Clear a RESET_PENDING intent without generation fencing (catmos-internal
-    /// helper). Retained as an inherent method: the `MLSStorageBackend` trait no
-    /// longer declares a bare `clear_reset_pending` (it now exposes the
-    /// generation-fenced `clear_reset_pending_for_delete`); adopting that path is
-    /// deferred forward-migration work, so this preserves existing behavior.
-    #[allow(dead_code)]
-    async fn clear_reset_pending(&self, conversation_id: &str) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let failed_state = serde_json::to_string(&ConversationState::Failed)
-            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        conn.execute(
-            "UPDATE conversations
-             SET state = CASE
-                     WHEN state = ?1 OR state LIKE ?2 OR state LIKE ?3 THEN ?4
-                     ELSE state
-                 END,
-                 reset_new_group_id = NULL,
-                 reset_generation = NULL,
-                 reset_notified_at_ms = NULL
-             WHERE conversation_id = ?5",
-            rusqlite::params![
-                RESET_PENDING_STATE_TAG,
-                "reset_pending:%",
-                "{\"ResetPending\":%",
-                failed_state,
-                conversation_id
-            ],
-        )
-        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        Ok(())
     }
 }
 
@@ -951,42 +823,49 @@ impl MLSStorageBackend for SqliteStorage {
         state: ConversationState,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        let state_str = match state {
-            ConversationState::ResetPending {
-                new_group_id,
-                reset_generation,
-                notified_at_ms,
-            } => reset_pending_intent_tag(&new_group_id, reset_generation, notified_at_ms),
-            state => serde_json::to_string(&state)
-                .map_err(|e| OrchestratorError::Storage(e.to_string()))?,
-        };
-        let updated = conn
-            .execute(
-                "UPDATE conversations
-                 SET state = ?1,
-                     reset_new_group_id = NULL,
-                     reset_generation = NULL,
-                     reset_notified_at_ms = NULL
-                 WHERE conversation_id = ?2",
-                rusqlite::params![state_str, conversation_id],
-            )
-            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        if updated != 1 {
-            return Err(OrchestratorError::Storage(format!(
-                "conversation not found while setting state: {conversation_id}"
-            )));
-        }
+        let state_str =
+            serde_json::to_string(&state).map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        conn.execute(
+            "UPDATE conversations SET state = ?1 WHERE conversation_id = ?2",
+            rusqlite::params![state_str, conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
     }
 
-    /// Read persisted state (spec §8.2). ResetPending is reconstructed only
-    /// from the tag plus the three columns atomically written by
-    /// `mark_reset_pending`; a tag without a complete sidecar fails closed.
+    /// Read the persisted conversation state (spec §8.2). The `state` column
+    /// stores a JSON-serialized `ConversationState`, so we round-trip through
+    /// serde and the full payload (including `ResetPending {..}`) survives.
+    /// Returns `Ok(None)` when the row is missing or the column is NULL/empty.
     async fn get_conversation_state(
         &self,
         conversation_id: &str,
     ) -> Result<Option<ConversationState>> {
-        self.load_persisted_conversation_state(conversation_id)
+        let conn = self.conn.lock().unwrap();
+        let state_str: Option<String> = conn
+            .query_row(
+                "SELECT state FROM conversations WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten();
+        let Some(s) = state_str else {
+            return Ok(None);
+        };
+        if s.is_empty() {
+            return Ok(None);
+        }
+        // Fresh installs historically used the SQL default `Active` before
+        // state persistence was JSON-backed. Treat that legacy value as the
+        // canonical enum so callers can still apply lifecycle freshness gates
+        // without accepting an unparseable state as proof of currency.
+        if s == "Active" {
+            return Ok(Some(ConversationState::Active));
+        }
+        serde_json::from_str::<ConversationState>(&s)
+            .map(Some)
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))
     }
 
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> Result<()> {
@@ -1031,47 +910,40 @@ impl MLSStorageBackend for SqliteStorage {
         reset_generation: i32,
         notified_at_ms: i64,
     ) -> Result<()> {
-        if new_group_id_hex.is_empty() {
-            return Err(OrchestratorError::Storage(format!(
-                "empty reset_pending group id for {conversation_id}"
-            )));
-        }
-        let intent_tag =
-            reset_pending_intent_tag(new_group_id_hex, reset_generation, notified_at_ms);
         let conn = self.conn.lock().unwrap();
-        let updated = conn
-            .execute(
-                "UPDATE conversations
-             SET state = ?1,
-                 reset_new_group_id = ?2,
-                 reset_generation = ?3,
-                 reset_notified_at_ms = ?4
-             WHERE conversation_id = ?5
-               AND (
-                   state = ?6
-                   OR (
-                       state = ?1
-                       AND reset_new_group_id = ?2
-                       AND reset_generation = ?3
-                       AND reset_notified_at_ms = ?4
-                   )
-               )",
-                rusqlite::params![
-                    RESET_PENDING_STATE_TAG,
-                    new_group_id_hex,
-                    reset_generation as i64,
-                    notified_at_ms,
-                    conversation_id,
-                    intent_tag,
-                ],
-            )
-            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        if updated != 1 {
-            return Err(OrchestratorError::Storage(format!(
-                "reset_pending intent mismatch while committing: {conversation_id}"
-            )));
-        }
+        conn.execute(
+            "UPDATE conversations
+             SET reset_new_group_id = ?1,
+                 reset_generation = ?2,
+                 reset_notified_at_ms = ?3
+             WHERE conversation_id = ?4",
+            rusqlite::params![
+                new_group_id_hex,
+                reset_generation as i64,
+                notified_at_ms,
+                conversation_id,
+            ],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    async fn clear_reset_pending_for_delete(
+        &self,
+        conversation_id: &str,
+        expected_generation: i32,
+    ) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE conversations
+             SET reset_new_group_id = NULL,
+                 reset_generation = NULL,
+                 reset_notified_at_ms = NULL
+             WHERE conversation_id = ?1 AND reset_generation = ?2",
+            rusqlite::params![conversation_id, expected_generation],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(true)
     }
 
     async fn set_conversation_sequencer(
@@ -1372,7 +1244,7 @@ impl MLSStorageBackend for SqliteStorage {
         &[
             "get_conversation_state",
             "mark_reset_pending",
-            "clear_reset_pending",
+            "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
             "mark_quarantined",
             "clear_quarantine",
@@ -1519,271 +1391,6 @@ mod field_encryption_tests {
         let storage =
             SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("open SqliteStorage");
         (tmp, storage)
-    }
-
-    #[tokio::test]
-    async fn reset_state_tag_is_not_authority_until_payload_commit() {
-        let (_tmp, storage) = new_temp_storage();
-        let conversation_id = "conv-reset-tag";
-        storage
-            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
-            .await
-            .expect("create conversation");
-
-        storage
-            .set_conversation_state(
-                conversation_id,
-                ConversationState::ResetPending {
-                    new_group_id: "uncommitted-group".into(),
-                    reset_generation: 8,
-                    notified_at_ms: 1_717_000_000_008,
-                },
-            )
-            .await
-            .expect("write reset tag");
-
-        {
-            let conn = storage.conn.lock().unwrap();
-            let (state, new_group_id, generation, notified_at_ms): (
-                String,
-                Option<String>,
-                Option<i64>,
-                Option<i64>,
-            ) = conn
-                .query_row(
-                    "SELECT state, reset_new_group_id, reset_generation, reset_notified_at_ms
-                     FROM conversations WHERE conversation_id = ?1",
-                    [conversation_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .unwrap();
-            assert!(
-                state.starts_with("reset_pending:"),
-                "state must persist only an opaque reset intent tag: {state}"
-            );
-            assert_eq!(
-                (new_group_id, generation, notified_at_ms),
-                (None, None, None)
-            );
-        }
-
-        let err = storage
-            .get_conversation_state(conversation_id)
-            .await
-            .expect_err("an incomplete reset tag must fail closed");
-        assert!(
-            err.to_string().contains("uncommitted reset_pending"),
-            "unexpected error: {err}"
-        );
-
-        // Even if corruption or a stale writer fills every sidecar column,
-        // the pre-commit intent tag must never become readable authority.
-        {
-            let conn = storage.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE conversations
-                 SET reset_new_group_id = 'uncommitted-group',
-                     reset_generation = 8,
-                     reset_notified_at_ms = 1717000000008
-                 WHERE conversation_id = ?1",
-                [conversation_id],
-            )
-            .unwrap();
-        }
-        storage
-            .get_conversation_state(conversation_id)
-            .await
-            .expect_err("a full sidecar under an intent tag must remain uncommitted");
-    }
-
-    #[tokio::test]
-    async fn mark_reset_pending_atomically_commits_authority_and_survives_restart() {
-        let tmp = tempfile::tempdir().expect("temp dir");
-        let db_path = tmp.path().join("catmos-reset-restart.db");
-        let conversation_id = "conv-reset-restart";
-
-        {
-            let storage =
-                SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("open storage");
-            storage
-                .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
-                .await
-                .expect("create conversation");
-            storage
-                .set_conversation_state(
-                    conversation_id,
-                    ConversationState::ResetPending {
-                        new_group_id: "committed-group".into(),
-                        reset_generation: 9,
-                        notified_at_ms: 1_717_000_000_009,
-                    },
-                )
-                .await
-                .expect("persist reset intent");
-            storage
-                .mark_reset_pending(conversation_id, "committed-group", 9, 1_717_000_000_009)
-                .await
-                .expect("commit reset authority");
-            assert_eq!(
-                storage
-                    .get_conversation_state(conversation_id)
-                    .await
-                    .expect("read committed state"),
-                Some(ConversationState::ResetPending {
-                    new_group_id: "committed-group".into(),
-                    reset_generation: 9,
-                    notified_at_ms: 1_717_000_000_009,
-                })
-            );
-        }
-
-        let reopened =
-            SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("reopen storage");
-        assert_eq!(
-            reopened
-                .get_conversation_state(conversation_id)
-                .await
-                .expect("rehydrate committed state"),
-            Some(ConversationState::ResetPending {
-                new_group_id: "committed-group".into(),
-                reset_generation: 9,
-                notified_at_ms: 1_717_000_000_009,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn partial_reset_sidecar_under_non_reset_state_fails_closed() {
-        let (_tmp, storage) = new_temp_storage();
-        let conversation_id = "conv-partial-sidecar";
-        storage
-            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
-            .await
-            .expect("create conversation");
-        {
-            let conn = storage.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE conversations SET reset_generation = 12 WHERE conversation_id = ?1",
-                [conversation_id],
-            )
-            .unwrap();
-        }
-
-        storage
-            .get_conversation_state(conversation_id)
-            .await
-            .expect_err("an orphaned partial reset sidecar must fail closed");
-    }
-
-    #[tokio::test]
-    async fn delayed_stale_reset_commit_cannot_replace_newer_authority() {
-        let (_tmp, storage) = new_temp_storage();
-        let conversation_id = "conv-delayed-reset";
-        storage
-            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
-            .await
-            .expect("create conversation");
-
-        storage
-            .set_conversation_state(
-                conversation_id,
-                ConversationState::ResetPending {
-                    new_group_id: "stale-group".into(),
-                    reset_generation: 13,
-                    notified_at_ms: 1_717_000_000_013,
-                },
-            )
-            .await
-            .expect("persist stale intent");
-        storage
-            .set_conversation_state(
-                conversation_id,
-                ConversationState::ResetPending {
-                    new_group_id: "new-group".into(),
-                    reset_generation: 14,
-                    notified_at_ms: 1_717_000_000_014,
-                },
-            )
-            .await
-            .expect("supersede with new intent");
-        storage
-            .mark_reset_pending(conversation_id, "new-group", 14, 1_717_000_000_014)
-            .await
-            .expect("commit new authority");
-
-        storage
-            .mark_reset_pending(conversation_id, "stale-group", 13, 1_717_000_000_013)
-            .await
-            .expect_err("delayed stale commit must lose the intent CAS");
-        assert_eq!(
-            storage
-                .get_conversation_state(conversation_id)
-                .await
-                .expect("read winning reset"),
-            Some(ConversationState::ResetPending {
-                new_group_id: "new-group".into(),
-                reset_generation: 14,
-                notified_at_ms: 1_717_000_000_014,
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn new_reset_tag_invalidates_stale_committed_payload_and_clear_fails_closed() {
-        let (_tmp, storage) = new_temp_storage();
-        let conversation_id = "conv-reset-replace";
-        storage
-            .ensure_conversation_exists("did:plc:alice", conversation_id, "old-group")
-            .await
-            .expect("create conversation");
-        storage
-            .set_conversation_state(
-                conversation_id,
-                ConversationState::ResetPending {
-                    new_group_id: "stale-group".into(),
-                    reset_generation: 3,
-                    notified_at_ms: 1_717_000_000_003,
-                },
-            )
-            .await
-            .expect("persist old reset intent");
-        storage
-            .mark_reset_pending(conversation_id, "stale-group", 3, 1_717_000_000_003)
-            .await
-            .expect("commit old reset");
-
-        storage
-            .set_conversation_state(
-                conversation_id,
-                ConversationState::ResetPending {
-                    new_group_id: "replacement-group".into(),
-                    reset_generation: 4,
-                    notified_at_ms: 1_717_000_000_004,
-                },
-            )
-            .await
-            .expect("begin replacement reset");
-        storage
-            .get_conversation_state(conversation_id)
-            .await
-            .expect_err("stale committed payload must not authorize a replacement tag");
-
-        storage
-            .mark_reset_pending(conversation_id, "replacement-group", 4, 1_717_000_000_004)
-            .await
-            .expect("commit replacement reset");
-        storage
-            .clear_reset_pending(conversation_id)
-            .await
-            .expect("clear committed reset");
-        assert_eq!(
-            storage
-                .get_conversation_state(conversation_id)
-                .await
-                .expect("read safe state after clear"),
-            Some(ConversationState::Failed),
-            "clearing a still-active reset must leave a fail-closed state"
-        );
     }
 
     /// Smoke-test the schema migration: after `SqliteStorage::new` the new

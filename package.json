@@ -9,13 +9,12 @@
     "preview": "vite preview",
     "predev": "bash scripts/generate-brand.sh",
     "prebuild": "bash scripts/generate-brand.sh",
-		"brand:gen": "bash scripts/generate-brand.sh",
-		"test": "vitest run",
+    "brand:gen": "bash scripts/generate-brand.sh",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "check:rust": "cd src-tauri && cargo check",
+    "check:rust": "cd src-tauri && cargo check --locked",
     "check:android": "bash ./scripts/check-android.sh",
     "check:linux": "cd src-tauri && cargo check --target x86_64-unknown-linux-gnu",
     "check:windows": "cd src-tauri && cargo check --target x86_64-pc-windows-msvc",
@@ -31,8 +30,7 @@
     "svelte": "^5.0.0",
     "svelte-check": "^4.0.0",
     "typescript": "^5.0.0",
-		"vite": "^6.0.0",
-		"vitest": "^3.2.4"
+    "vite": "^6.0.0"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

@@ -1,14 +1,18 @@
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_atproto::blue_catbird;
 use catbird_atproto::jacquard_common::IntoStatic;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
-use catbird_mls::orchestrator::types::{DeliveryStatus, Message as OrchestratorMessage};
+use catbird_mls::orchestrator::credentials::CredentialStore;
+use catbird_mls::orchestrator::mls_provider::MlsCryptoContext;
+use catbird_mls::orchestrator::types::{
+    ConversationState, DeliveryStatus, Message as OrchestratorMessage,
+};
 use catbird_mls::orchestrator::MLSAPIClient;
 use catbird_mls::orchestrator::MLSStorageBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -16,6 +20,8 @@ use tokio::net::TcpListener;
 use crate::catbird::mls_chat as lexicon;
 use crate::types::string::Did;
 
+use crate::credentials::KeyringCredentialStore;
+use crate::recovery::actionable_error;
 use crate::{AppState, CatmosOrchestrator, WsHandle};
 
 fn log_file_path() -> std::path::PathBuf {
@@ -23,6 +29,17 @@ fn log_file_path() -> std::path::PathBuf {
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(std::env::temp_dir);
     base.join("catmos").join("catmos.log")
+}
+
+async fn cleanup_ws_handle(
+    handles: &Arc<tokio::sync::Mutex<std::collections::HashMap<String, WsHandle>>>,
+    key: &str,
+    owner: &tokio::sync::watch::Sender<bool>,
+) {
+    let mut handles = handles.lock().await;
+    if handles.get(key).is_some_and(|handle| handle.owns(owner)) {
+        handles.remove(key);
+    }
 }
 
 /// Resolve the per-DID content-root key from disk and install it on the
@@ -190,177 +207,185 @@ pub struct AuthResponse {
     pub avatar: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OAuthCallbackEvent {
-    code: String,
-    redirect_origin: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct OAuthErrorEvent {
-    message: String,
-    redirect_origin: String,
-}
-
 #[derive(Debug, Clone)]
 struct SessionInfo {
     did: String,
     handle: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct PendingOAuth {
-    nonce: String,
-    origin: String,
-}
-
-impl PendingOAuth {
-    fn new(nonce: String, origin: String) -> Self {
-        Self { nonce, origin }
-    }
-}
-
-async fn take_pending_oauth_for_origin(
-    slot: &tokio::sync::Mutex<Option<PendingOAuth>>,
-    origin: &str,
-) -> Result<PendingOAuth, String> {
-    let mut pending = slot.lock().await;
-    if pending.as_ref().is_none_or(|flow| flow.origin != origin) {
-        return Err("OAuth login state is missing, mismatched, or already used".to_string());
-    }
-    pending
-        .take()
-        .ok_or_else(|| "OAuth login state is missing, mismatched, or already used".to_string())
-}
-
-async fn clear_pending_oauth_if_origin(
-    slot: &tokio::sync::Mutex<Option<PendingOAuth>>,
-    origin: &str,
-) -> bool {
-    let mut pending = slot.lock().await;
-    if pending.as_ref().is_some_and(|flow| flow.origin == origin) {
-        pending.take();
-        true
-    } else {
-        false
-    }
-}
-
-#[derive(Serialize)]
-struct OAuthExchangeRequest<'a> {
-    code: &'a str,
-    browser_nonce: &'a str,
-}
-
-#[derive(Deserialize)]
-struct OAuthExchangeResponse {
-    session_id: String,
-}
-
-async fn redeem_oauth_code(
-    nest_url: &str,
-    code: &str,
-    pending: &PendingOAuth,
-) -> Result<String, String> {
-    redeem_oauth_code_with_limits(
-        nest_url,
-        code,
-        pending,
-        std::time::Duration::from_secs(10),
-        4096,
-    )
-    .await
-}
-
-async fn redeem_oauth_code_with_limits(
-    nest_url: &str,
-    code: &str,
-    pending: &PendingOAuth,
-    timeout: std::time::Duration,
-    max_response_bytes: usize,
-) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| "OAuth exchange request could not be built".to_string())?;
-    let request = build_oauth_exchange_request(&client, nest_url, code, pending)?;
-    let mut response = client
-        .execute(request)
-        .await
-        .map_err(map_oauth_exchange_transport_error)?;
-    if !response.status().is_success() {
-        return Err("OAuth exchange failed".to_string());
-    }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .map(str::to_ascii_lowercase);
-    if content_type.as_deref() != Some("application/json") {
-        return Err("OAuth exchange returned an invalid content type".to_string());
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > max_response_bytes as u64)
-    {
-        return Err("OAuth exchange response is too large".to_string());
-    }
-    let mut body = Vec::new();
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(map_oauth_exchange_transport_error)?
-    {
-        if body.len().saturating_add(chunk.len()) > max_response_bytes {
-            return Err("OAuth exchange response is too large".to_string());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    let exchange: OAuthExchangeResponse = serde_json::from_slice(&body)
-        .map_err(|_| "OAuth exchange returned an invalid response".to_string())?;
-    if exchange.session_id.is_empty() {
-        return Err("OAuth exchange returned an invalid response".to_string());
-    }
-    Ok(exchange.session_id)
-}
-
-fn map_oauth_exchange_transport_error(error: reqwest::Error) -> String {
-    if error.is_timeout() {
-        "OAuth exchange timed out".to_string()
-    } else {
-        "OAuth exchange request failed".to_string()
-    }
-}
-
-fn build_oauth_exchange_request(
-    client: &reqwest::Client,
-    nest_url: &str,
-    code: &str,
-    pending: &PendingOAuth,
-) -> Result<reqwest::Request, String> {
-    client
-        .post(format!("{}/auth/exchange", nest_url.trim_end_matches('/')))
-        .header(reqwest::header::ORIGIN, &pending.origin)
-        .json(&OAuthExchangeRequest {
-            code,
-            browser_nonce: &pending.nonce,
-        })
-        .build()
-        .map_err(|_| "OAuth exchange request could not be built".to_string())
-}
-
 fn clear_saved_session_credentials() {
-    if let Ok(entry) = keyring::Entry::new("catmos", "session_id") {
-        let _ = entry.delete_credential();
+    for key in ["session_id", "user_did", "chat_dpop_jkt"] {
+        if let Ok(entry) = keyring::Entry::new("catmos", key) {
+            let _ = entry.delete_credential();
+        }
     }
-    if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
-        let _ = entry.delete_credential();
+}
+
+/// Install only opaque runtime capabilities after login/device enrollment.
+/// Persisted session/device identifiers never enter command logs; DPoP
+/// binding evidence is admitted only through the runtime authority provider.
+async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
+    state
+        .api_client
+        .set_auth(did.to_string(), session_id.to_string());
+    let session = match state.api_client.current_session() {
+        Ok(session) => session,
+        Err(error) => {
+            log_catmos!(" chat device authority unavailable for {}: {}", did, error);
+            return;
+        }
+    };
+    let _ = state.chat_auth.clear_runtime_state_for_session(&session);
+
+    if let Ok(store) = KeyringCredentialStore::try_new() {
+        match store.get_local_device_uuid(did).await {
+            Ok(Some(local_device_uuid)) => {
+                if let Err(error) = state
+                    .chat_auth
+                    .set_local_device_uuid_for_session(&session, local_device_uuid.clone())
+                {
+                    log_catmos!(
+                        " chat device authority actor mismatch for {}: {}",
+                        did,
+                        error
+                    );
+                    return;
+                }
+                if let Err(error) = state.api_client.ensure_session_current(&session) {
+                    log_catmos!(
+                        " chat device authority actor changed during configuration for {}: {}",
+                        did,
+                        error
+                    );
+                    return;
+                }
+                match store.get_server_device_id(did).await {
+                    Ok(Some(server_device_id)) => {
+                        if let Err(error) = state
+                            .chat_auth
+                            .set_resolved_server_device_id_for_session(&session, server_device_id)
+                        {
+                            log_catmos!(
+                                " chat device authority server ID could not be installed for {}: {}",
+                                did,
+                                error
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        log_catmos!(
+                            " chat device authority unavailable for {}: server device ID is missing",
+                            did
+                        );
+                    }
+                    Err(error) => {
+                        log_catmos!(
+                            " chat device authority unavailable for {}: failed to load server device ID: {}",
+                            did,
+                            error
+                        );
+                    }
+                }
+            }
+            Ok(None) => {
+                log_catmos!(
+                    " chat device authority unavailable for {}: local device UUID is missing",
+                    did
+                );
+            }
+            Err(error) => {
+                log_catmos!(
+                    " chat device authority unavailable for {}: failed to load local UUID: {}",
+                    did,
+                    error
+                );
+            }
+        }
     }
+}
+
+/// Restore the durable signer for an already-reconciled device.
+///
+/// A local UUID plus an exact `listDevices` row identifies the existing
+/// server device, but does not restore the private signer after a local MLS
+/// storage restart.  Import the keychain-held keypair before allowing the
+/// session to continue; if the key is unavailable or cannot be imported, fail
+/// closed rather than registering a second device with a new signer.
+async fn restore_registered_signer<M, C>(
+    mls_context: &M,
+    credentials: &C,
+    did: &str,
+) -> Result<(), String>
+where
+    M: MlsCryptoContext + ?Sized,
+    C: CredentialStore + ?Sized,
+{
+    let signing_key = credentials
+        .get_signing_key(did)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "durable registered signer is missing; refusing device re-registration".to_string()
+        })?;
+    mls_context
+        .import_identity_key(did.as_bytes().to_vec(), signing_key)
+        .map_err(|error| format!("failed to restore durable registered signer: {error}"))?;
+    // The platform import operation must make the signer observable to the
+    // same crypto context before login can continue.  Some providers can
+    // report a successful write while leaving the signer lookup unavailable;
+    // accepting that result would make the next key package mint a new device
+    // key and strand the server registration.
+    mls_context
+        .export_identity_key(did.as_bytes().to_vec())
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "durable signer import was not observable for registered identity; refusing re-registration: {error}"
+            )
+        })
+}
+
+/// Reconcile a previously registered device before allowing the orchestrator
+/// to register anything. A durable local UUID is an identity anchor, not
+/// proof of authority: an existing UUID must have exactly one current
+/// listDevices row. Zero/duplicate/error results stop login and prevent
+/// accidental device churn. A missing local UUID is the only case that may
+/// proceed to first registration.
+async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Result<bool, String> {
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|error| error.to_string())?;
+    if session.actor_did != did {
+        return Err("chat session changed before device reconciliation".to_string());
+    }
+    let store = KeyringCredentialStore::try_new().map_err(|error| error.to_string())?;
+    let local_device_uuid = store
+        .get_local_device_uuid(did)
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(local_device_uuid) = local_device_uuid else {
+        return Ok(false);
+    };
+
+    state
+        .chat_auth
+        .set_local_device_uuid_for_session(&session, local_device_uuid.clone())
+        .map_err(|error| error.to_string())?;
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|error| error.to_string())?;
+    state
+        .api_client
+        .resolve_server_device_id_for_local_uuid_with_session(&session, &local_device_uuid)
+        .await
+        .map(|_| true)
+        .map_err(|error| {
+            format!(
+                "existing local chat device UUID did not reconcile to exactly one server device; refusing re-registration: {error}"
+            )
+        })
 }
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
@@ -611,11 +636,7 @@ pub struct GroupMember {
 }
 
 #[tauri::command]
-pub async fn start_login(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    identifier: String,
-) -> Result<String, String> {
+pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
     let nest_url =
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
@@ -628,37 +649,24 @@ pub async fn start_login(
         .map_err(|e| format!("Failed to get port: {}", e))?
         .port();
 
-    let origin = format!("http://127.0.0.1:{}", port);
-    let redirect_to = format!("{}/callback", origin);
-    let mut nonce_bytes = [0u8; 32];
-    getrandom::getrandom(&mut nonce_bytes)
-        .map_err(|_| "Failed to generate OAuth nonce".to_string())?;
-    let browser_nonce = URL_SAFE_NO_PAD.encode(nonce_bytes);
-    *state.pending_oauth.lock().await = Some(PendingOAuth::new(browser_nonce.clone(), origin));
+    let redirect_to = format!("http://127.0.0.1:{}/callback", port);
     let login_url = format!(
-        "{}/auth/login?identifier={}&client=catmos&redirect_to={}&browser_nonce={}",
+        "{}/auth/login?identifier={}&client=catmos&redirect_to={}",
         nest_url,
         urlencoding::encode(&identifier),
-        urlencoding::encode(&redirect_to),
-        urlencoding::encode(&browser_nonce)
+        urlencoding::encode(&redirect_to)
     );
 
     // Open system browser
     #[allow(deprecated)]
     {
-        if let Err(error) = app.shell().open(&login_url, None) {
-            state.pending_oauth.lock().await.take();
-            return Err(error.to_string());
-        }
+        app.shell()
+            .open(&login_url, None)
+            .map_err(|e| e.to_string())?;
     }
 
     // Spawn async task to wait for the OAuth callback
     let app_handle = app.clone();
-    let callback_origin = redirect_to
-        .strip_suffix("/callback")
-        .expect("callback suffix is constant")
-        .to_string();
-    let returned_origin = callback_origin.clone();
     tokio::spawn(async move {
         match tokio::time::timeout(
             std::time::Duration::from_secs(300),
@@ -666,67 +674,20 @@ pub async fn start_login(
         )
         .await
         {
-            Ok(Ok(code)) => {
-                let state = app_handle.state::<AppState>();
-                if state
-                    .pending_oauth
-                    .lock()
-                    .await
-                    .as_ref()
-                    .is_some_and(|flow| flow.origin == callback_origin)
-                {
-                    let _ = app_handle.emit(
-                        "oauth-callback",
-                        OAuthCallbackEvent {
-                            code,
-                            redirect_origin: callback_origin,
-                        },
-                    );
-                }
+            Ok(Ok(session_id)) => {
+                let _ = app_handle.emit("oauth-callback", &session_id);
             }
             Ok(Err(e)) => {
-                if clear_pending_oauth_if_origin(
-                    &app_handle.state::<AppState>().pending_oauth,
-                    &callback_origin,
-                )
-                .await
-                {
-                    log_catmos!("OAuth callback error: {}", e);
-                    let _ = app_handle.emit(
-                        "oauth-error",
-                        OAuthErrorEvent {
-                            message: e,
-                            redirect_origin: callback_origin,
-                        },
-                    );
-                }
+                log_catmos!("OAuth callback error: {}", e);
+                let _ = app_handle.emit("oauth-error", &e);
             }
             Err(_) => {
-                if clear_pending_oauth_if_origin(
-                    &app_handle.state::<AppState>().pending_oauth,
-                    &callback_origin,
-                )
-                .await
-                {
-                    log_catmos!("OAuth callback timed out");
-                    let _ = app_handle.emit(
-                        "oauth-error",
-                        OAuthErrorEvent {
-                            message: "Login timed out".to_string(),
-                            redirect_origin: callback_origin,
-                        },
-                    );
-                }
+                log_catmos!("OAuth callback timed out");
+                let _ = app_handle.emit("oauth-error", "Login timed out");
             }
         }
     });
 
-    Ok(returned_origin)
-}
-
-#[tauri::command]
-pub async fn cancel_login(state: State<'_, AppState>) -> Result<(), String> {
-    state.pending_oauth.lock().await.take();
     Ok(())
 }
 
@@ -767,7 +728,23 @@ async fn wait_for_callback(listener: TcpListener) -> Result<String, String> {
 
     let path = req.path.ok_or("No path in HTTP request")?;
 
-    let code = parse_callback_code(path)?;
+    // Extract query string from the path
+    let query = path
+        .split_once('?')
+        .map(|(_, q)| q)
+        .ok_or("No query string in callback URL")?;
+
+    // Find session_id parameter and URL-decode its value
+    let session_id = query
+        .split('&')
+        .find_map(|param| {
+            param.strip_prefix("session_id=").map(|v| {
+                urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned()
+            })
+        })
+        .ok_or_else(|| "No session_id in callback".to_string())?;
 
     // Send HTML response telling user to close the tab
     let html = r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>✅ Signed in!</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#;
@@ -779,207 +756,24 @@ async fn wait_for_callback(listener: TcpListener) -> Result<String, String> {
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
 
-    Ok(code)
-}
-
-fn parse_callback_code(path: &str) -> Result<String, String> {
-    let (callback_path, query) = path
-        .split_once('?')
-        .ok_or_else(|| "Invalid OAuth callback".to_string())?;
-    if callback_path != "/callback" {
-        return Err("Invalid OAuth callback".to_string());
-    }
-    let mut params = query.split('&');
-    let parameter = params
-        .next()
-        .filter(|_| params.next().is_none())
-        .ok_or_else(|| "Invalid OAuth callback".to_string())?;
-    let encoded = parameter
-        .strip_prefix("code=")
-        .ok_or_else(|| "Invalid OAuth callback".to_string())?;
-    let code = urlencoding::decode(encoded)
-        .map_err(|_| "Invalid OAuth callback".to_string())?
-        .into_owned();
-    if code.len() != 43
-        || !code
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return Err("Invalid OAuth callback".to_string());
-    }
-    Ok(code)
-}
-
-#[cfg(test)]
-mod oauth_exchange_tests {
-    use super::*;
-
-    async fn spawn_exchange_server(response_parts: Vec<Vec<u8>>, delay_ms: u64) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = vec![0u8; 2048];
-            let _ = stream.read(&mut request).await;
-            if delay_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-            }
-            for part in response_parts {
-                if stream.write_all(&part).await.is_err() {
-                    break;
-                }
-            }
-        });
-        format!("http://{}", address)
-    }
-
-    #[test]
-    fn callback_accepts_only_exchange_code() {
-        assert_eq!(
-            parse_callback_code(&format!("/callback?code={}", "A".repeat(43))).unwrap(),
-            "A".repeat(43)
-        );
-        assert!(parse_callback_code("/callback?session_id=credential").is_err());
-        assert!(parse_callback_code("/callback?code=bad!").is_err());
-    }
-
-    #[tokio::test]
-    async fn pending_oauth_flow_is_origin_bound_and_single_use() {
-        let pending =
-            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:1234".into());
-        let slot = tokio::sync::Mutex::new(Some(pending));
-        assert!(
-            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:9999")
-                .await
-                .is_err()
-        );
-        assert!(
-            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:1234")
-                .await
-                .is_ok()
-        );
-        assert!(
-            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:1234")
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_callback_cannot_clear_a_newer_login() {
-        let slot = tokio::sync::Mutex::new(Some(PendingOAuth::new(
-            "new-nonce-value-123456".into(),
-            "http://127.0.0.1:2222".into(),
-        )));
-        assert!(!clear_pending_oauth_if_origin(&slot, "http://127.0.0.1:1111").await);
-        assert!(
-            take_pending_oauth_for_origin(&slot, "http://127.0.0.1:2222")
-                .await
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn exchange_request_binds_exact_origin_and_contains_no_credential_in_url() {
-        let pending =
-            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:43210".into());
-        let request = build_oauth_exchange_request(
-            &reqwest::Client::new(),
-            "https://api.catbird.blue",
-            &"A".repeat(43),
-            &pending,
-        )
-        .unwrap();
-        assert_eq!(
-            request.url().as_str(),
-            "https://api.catbird.blue/auth/exchange"
-        );
-        assert_eq!(
-            request.headers()[reqwest::header::ORIGIN],
-            "http://127.0.0.1:43210"
-        );
-        assert!(!request.url().as_str().contains("session_id"));
-    }
-
-    #[tokio::test]
-    async fn exchange_rejects_delayed_response() {
-        let server = spawn_exchange_server(
-            vec![b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\n\r\n{\"session_id\":\"credential\"}".to_vec()],
-            100,
-        )
-        .await;
-        let pending =
-            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:43210".into());
-        let result = redeem_oauth_code_with_limits(
-            &server,
-            &"A".repeat(43),
-            &pending,
-            std::time::Duration::from_millis(10),
-            4096,
-        )
-        .await;
-        assert_eq!(result.unwrap_err(), "OAuth exchange timed out");
-    }
-
-    #[tokio::test]
-    async fn exchange_rejects_oversized_content_length_and_chunked_body() {
-        let pending =
-            PendingOAuth::new("nonce-value-123456".into(), "http://127.0.0.1:43210".into());
-        let content_length_server = spawn_exchange_server(
-            vec![b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4097\r\n\r\n".to_vec()],
-            0,
-        )
-        .await;
-        let length_error = redeem_oauth_code_with_limits(
-            &content_length_server,
-            &"A".repeat(43),
-            &pending,
-            std::time::Duration::from_secs(1),
-            4096,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(length_error, "OAuth exchange response is too large");
-
-        let chunk = vec![b'x'; 3000];
-        let mut first = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", chunk.len()).into_bytes();
-        first.extend_from_slice(&chunk);
-        first.extend_from_slice(b"\r\n");
-        let mut second = format!("{:x}\r\n", chunk.len()).into_bytes();
-        second.extend_from_slice(&chunk);
-        second.extend_from_slice(b"\r\n0\r\n\r\n");
-        let chunked_server = spawn_exchange_server(vec![first, second], 0).await;
-        let chunked_error = redeem_oauth_code_with_limits(
-            &chunked_server,
-            &"A".repeat(43),
-            &pending,
-            std::time::Duration::from_secs(1),
-            4096,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(chunked_error, "OAuth exchange response is too large");
-    }
+    Ok(session_id)
 }
 
 #[tauri::command]
 pub async fn complete_login(
     state: State<'_, AppState>,
-    code: String,
-    redirect_origin: String,
+    session_id: String,
 ) -> Result<AuthResponse, String> {
-    let pending = take_pending_oauth_for_origin(&state.pending_oauth, &redirect_origin).await?;
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-    let session_id = redeem_oauth_code(&nest_url, &code, &pending).await?;
-    let session = fetch_session_info(&session_id).await?;
+    let session = fetch_session_info(&session_id)
+        .await
+        .map_err(actionable_error)?;
 
     // Initialize orchestrator for this user
     state
         .orchestrator
         .initialize(&session.did)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| actionable_error(format!("{e:?}")))?;
 
     // Install the per-DID content-root key so the field-level (envelope)
     // encryption layer can encrypt subsequent message inserts. Best-effort:
@@ -992,12 +786,44 @@ pub async fn complete_login(
         .api_client
         .set_auth(session.did.clone(), session_id.clone());
 
-    // Ensure device is registered with MLS service (generates keys, publishes key packages)
-    state
-        .orchestrator
-        .ensure_device_registered()
+    // Reconcile a durable identity before any registration attempt. Only a
+    // first-login device without a local UUID may create a new registration.
+    if reconcile_device_before_registration(&state, &session.did)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(actionable_error)?
+    {
+        let authority_session = state
+            .api_client
+            .current_session()
+            .map_err(actionable_error)?;
+        if authority_session.actor_did != session.did || authority_session.token != session_id {
+            return Err(actionable_error(
+                "chat session changed before signer restoration",
+            ));
+        }
+        state
+            .api_client
+            .ensure_session_current(&authority_session)
+            .map_err(actionable_error)?;
+        restore_registered_signer(
+            state.orchestrator.mls_context().as_ref(),
+            state.orchestrator.credentials().as_ref(),
+            &session.did,
+        )
+        .await
+        .map_err(actionable_error)?;
+        state
+            .api_client
+            .ensure_session_current(&authority_session)
+            .map_err(actionable_error)?;
+    } else {
+        state
+            .orchestrator
+            .ensure_device_registered()
+            .await
+            .map_err(|e| actionable_error(format!("{e:?}")))?;
+    }
+    configure_chat_auth(&state, &session.did, &session_id).await;
 
     // Auto opt-in to MLS (non-blocking — failures are logged only)
     ensure_opted_in(&state).await;
@@ -1040,10 +866,17 @@ pub async fn try_restore_session(
             let session = match fetch_session_info(&sid).await {
                 Ok(session) => session,
                 Err(e) => {
-                    log_catmos!("Stored session is invalid; clearing saved login: {}", e);
-                    clear_saved_session_credentials();
-                    state.api_client.clear_auth();
-                    return Ok(None);
+                    if crate::session_restore::session_error_invalidates_credentials(&e) {
+                        log_catmos!("Stored session was rejected; clearing saved login: {}", e);
+                        clear_saved_session_credentials();
+                        state.api_client.clear_auth();
+                        return Ok(None);
+                    }
+                    log_catmos!(
+                        "Stored session could not be restored yet; keeping saved login: {}",
+                        e
+                    );
+                    return Err(actionable_error(e));
                 }
             };
 
@@ -1061,18 +894,51 @@ pub async fn try_restore_session(
                 .orchestrator
                 .initialize(&session.did)
                 .await
-                .map_err(|e| format!("{:?}", e))?;
+                .map_err(|e| actionable_error(format!("{e:?}")))?;
             // Install the per-DID content-root key for the field-level
             // encryption layer; see `complete_login` for rationale.
             install_content_root_key(&state, &session.did);
             state.api_client.set_auth(session.did.clone(), sid.clone());
 
-            // Ensure device is registered (idempotent — skips if already done)
-            state
-                .orchestrator
-                .ensure_device_registered()
+            // Reconcile before any registration. An existing UUID with a
+            // missing/ambiguous server row fails closed instead of creating
+            // another server device after a restart or transient 401/403.
+            if reconcile_device_before_registration(&state, &session.did)
                 .await
-                .map_err(|e| format!("{:?}", e))?;
+                .map_err(actionable_error)?
+            {
+                let authority_session = state
+                    .api_client
+                    .current_session()
+                    .map_err(actionable_error)?;
+                if authority_session.actor_did != session.did || authority_session.token != sid {
+                    return Err(actionable_error(
+                        "chat session changed before signer restoration",
+                    ));
+                }
+                state
+                    .api_client
+                    .ensure_session_current(&authority_session)
+                    .map_err(actionable_error)?;
+                restore_registered_signer(
+                    state.orchestrator.mls_context().as_ref(),
+                    state.orchestrator.credentials().as_ref(),
+                    &session.did,
+                )
+                .await
+                .map_err(actionable_error)?;
+                state
+                    .api_client
+                    .ensure_session_current(&authority_session)
+                    .map_err(actionable_error)?;
+            } else {
+                state
+                    .orchestrator
+                    .ensure_device_registered()
+                    .await
+                    .map_err(|e| actionable_error(format!("{e:?}")))?;
+            }
+            configure_chat_auth(&state, &session.did, &sid).await;
 
             // Auto opt-in to MLS (non-blocking — failures are logged only)
             ensure_opted_in(&state).await;
@@ -1115,6 +981,9 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     state.orchestrator.mls_context().clear_content_root_key();
     state.orchestrator.shutdown().await;
     state.api_client.clear_auth();
+    // Logout revokes only runtime authority and saved session credentials.
+    // The local UUID and server device ID remain durable so the next login
+    // can reconcile listDevices before considering registration.
     clear_saved_session_credentials();
     Ok(())
 }
@@ -1311,24 +1180,120 @@ pub async fn create_group(
     })
 }
 
+/// Resolve the hex MLS group id for a canonical conversation id (UUID).
+///
+/// The canonical projection exposes the UUID `conversationId` and the hex
+/// `groupId` as separate fields; the Rust orchestrator hex-decodes the id it
+/// is handed and encrypts under that MLS group. Every send must translate at
+/// the boundary or the orchestrator fails with "Invalid hex group ID".
+async fn resolve_group_id(state: &AppState, conversation_id: &str) -> Result<String, String> {
+    let user_did = state
+        .orchestrator
+        .api_client()
+        .current_did()
+        .await
+        .unwrap_or_default();
+    resolve_current_group_id(
+        state.orchestrator.storage().as_ref(),
+        &user_did,
+        conversation_id,
+    )
+    .await
+}
+
+/// Resolve a reaction/send coordinate only when the persisted group state
+/// still belongs to the requested stable conversation. A syntactically valid
+/// hex value in a stale `conversations.group_id` row is rejected rather than
+/// handed to the MLS orchestrator after a reset or restart.
+async fn resolve_current_group_id<S: MLSStorageBackend + ?Sized>(
+    storage: &S,
+    user_did: &str,
+    conversation_id: &str,
+) -> Result<String, String> {
+    let convo = storage
+        .get_conversation(user_did, conversation_id)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+    let group_id = convo
+        .map(|c| c.group_id)
+        .filter(|g| !g.trim().is_empty())
+        .ok_or_else(|| format!("Conversation not found: {conversation_id}"))?;
+    let lifecycle = storage
+        .get_conversation_state(conversation_id)
+        .await
+        .map_err(|e| format!("{:?}", e))?;
+    if !matches!(lifecycle, Some(ConversationState::Active)) {
+        return Err(format!(
+            "Conversation group mapping is not current after lifecycle change: {conversation_id}"
+        ));
+    }
+    let state = storage
+        .get_group_state(&group_id)
+        .await
+        .map_err(|e| format!("{:?}", e))?
+        .ok_or_else(|| {
+            format!("Conversation has no current MLS group state after reset: {conversation_id}")
+        })?;
+    if state.conversation_id != conversation_id || state.group_id != group_id {
+        return Err(format!(
+            "Conversation group mapping is stale or belongs to another conversation: {conversation_id}"
+        ));
+    }
+
+    // The UI speaks in stable conversation UUIDs. MLS encryption and
+    // reactions speak in the current binary group coordinate encoded as hex.
+    validate_current_group_id(conversation_id, &group_id)
+}
+
+fn validate_current_group_id(conversation_id: &str, group_id: &str) -> Result<String, String> {
+    let normalized = group_id.trim();
+    if normalized.is_empty()
+        || normalized.len() % 2 != 0
+        || hex::decode(normalized)
+            .map(|bytes| bytes.is_empty())
+            .unwrap_or(true)
+    {
+        return Err(format!(
+            "Conversation has no current hex MLS group ID: {conversation_id}"
+        ));
+    }
+    Ok(normalized.to_string())
+}
+
 #[tauri::command]
 pub async fn send_message(
     state: State<'_, AppState>,
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
+    state
+        .api_client
+        .require_signing_capability()
+        .map_err(|error| {
+            actionable_error(format!("Signed clean-chat send unavailable: {error}"))
+        })?;
     log_catmos!(" send_message: convo={}", conversation_id);
+
+    // The canonical projection exposes the UUID conversationId and the hex
+    // groupId as separate fields; the Rust orchestrator hex-decodes the id it
+    // is handed. Translate at the send boundary so the orchestrator encrypts
+    // under the MLS group, not the UUID.
+    let group_id = resolve_group_id(&state, &conversation_id).await?;
 
     let msg = state
         .orchestrator
-        .send_message(&conversation_id, &content)
+        .send_message(&group_id, &content)
         .await
         .map_err(|e| {
             log_catmos!(" send_message error: {:?}", e);
-            format!("{:?}", e)
+            actionable_error(format!("{e:?}"))
         })?;
 
-    Ok(ui_message_from_orchestrator(msg))
+    // The orchestrator stamps the hex group id on the message; the UI keys
+    // conversations by the canonical UUID, so restore it at the boundary.
+    let mut ui = ui_message_from_orchestrator(msg);
+    ui.conversation_id = conversation_id;
+    Ok(ui)
 }
 
 #[tauri::command]
@@ -1342,6 +1307,12 @@ pub async fn send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<Message, String> {
+    state
+        .api_client
+        .require_signing_capability()
+        .map_err(|error| {
+            actionable_error(format!("Signed clean-chat send unavailable: {error}"))
+        })?;
     log_catmos!(
         " send_image: convo={} bytes={} type={} dims={}x{}",
         conversation_id,
@@ -1363,7 +1334,7 @@ pub async fn send_image(
         .api_client
         .upload_blob(&encrypted.ciphertext, &conversation_id)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| actionable_error(format!("{e:?}")))?;
 
     let embed = catbird_mls::orchestrator::types::MLSEmbedData::image(
         catbird_mls::orchestrator::types::MLSImageEmbed {
@@ -1381,16 +1352,20 @@ pub async fn send_image(
     )
     .map_err(|e| e.to_string())?;
 
+    let group_id = resolve_group_id(&state, &conversation_id).await?;
+
     let msg = state
         .orchestrator
-        .send_message_with_embed(&conversation_id, &content, embed)
+        .send_message_with_embed(&group_id, &content, embed)
         .await
         .map_err(|e| {
             log_catmos!(" send_image error: {:?}", e);
-            format!("{:?}", e)
+            actionable_error(format!("{e:?}"))
         })?;
 
-    Ok(ui_message_from_orchestrator(msg))
+    let mut ui = ui_message_from_orchestrator(msg);
+    ui.conversation_id = conversation_id;
+    Ok(ui)
 }
 
 #[tauri::command]
@@ -1412,7 +1387,7 @@ pub async fn get_image_attachment(
         .api_client
         .get_blob(&blob_id)
         .await
-        .map_err(|e| format!("{:?}", e))?;
+        .map_err(|e| actionable_error(format!("{e:?}")))?;
     let plaintext = decrypt_blob(&ciphertext, &key, &iv, &sha256).map_err(|e| e.to_string())?;
 
     Ok(format!(
@@ -1496,6 +1471,11 @@ pub async fn subscribe_conversation(
         }
     }
 
+    state
+        .api_client
+        .require_canonical_admission()
+        .map_err(actionable_error)?;
+
     let token = state
         .api_client
         .get_auth_token()
@@ -1505,6 +1485,7 @@ pub async fn subscribe_conversation(
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let owner = shutdown_tx.clone();
     let orchestrator = state.orchestrator.clone();
 
     let handle = WsHandle {
@@ -1518,7 +1499,9 @@ pub async fn subscribe_conversation(
         .insert(conversation_id.clone(), handle);
 
     let convo_id = conversation_id.clone();
+    let task_convo_id = convo_id.clone();
     let api_client = state.api_client.clone();
+    let ws_handles = state.ws_handles.clone();
     tokio::spawn(async move {
         crate::websocket::subscribe_conversation(
             app,
@@ -1526,10 +1509,11 @@ pub async fn subscribe_conversation(
             api_client,
             base_url,
             token,
-            convo_id,
+            task_convo_id,
             shutdown_rx,
         )
         .await;
+        cleanup_ws_handle(&ws_handles, &convo_id, &owner).await;
     });
 
     log_catmos!(" subscribe_conversation: convo={}", conversation_id);
@@ -1567,6 +1551,11 @@ pub async fn subscribe_all_events(
         }
     }
 
+    state
+        .api_client
+        .require_canonical_admission()
+        .map_err(actionable_error)?;
+
     let token = state
         .api_client
         .get_auth_token()
@@ -1576,6 +1565,7 @@ pub async fn subscribe_all_events(
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let owner = shutdown_tx.clone();
     let orchestrator = state.orchestrator.clone();
 
     state.ws_handles.lock().await.insert(
@@ -1586,6 +1576,7 @@ pub async fn subscribe_all_events(
     );
 
     let api_client = state.api_client.clone();
+    let ws_handles = state.ws_handles.clone();
     tokio::spawn(async move {
         crate::websocket::subscribe_all(
             app,
@@ -1596,6 +1587,7 @@ pub async fn subscribe_all_events(
             shutdown_rx,
         )
         .await;
+        cleanup_ws_handle(&ws_handles, GLOBAL_KEY, &owner).await;
     });
 
     log_catmos!(" subscribe_all_events: global WS opened");
@@ -1688,6 +1680,13 @@ pub async fn send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), String> {
+    state
+        .api_client
+        .require_signing_capability()
+        .map_err(|error| {
+            actionable_error(format!("Signed clean-chat reaction unavailable: {error}"))
+        })?;
+
     log_catmos!(
         " send_reaction: convo={}, msg={}, emoji={}, action={}",
         conversation_id,
@@ -1702,13 +1701,17 @@ pub async fn send_reaction(
         catbird_mls::orchestrator::types::ReactionAction::Add
     };
 
+    // Resolve the stable conversation UUID to the current hex MLS group ID
+    // before the reaction enters the Rust orchestrator.
+    let group_id = resolve_group_id(&state, &conversation_id).await?;
+
     state
         .orchestrator
-        .send_reaction(&conversation_id, &message_id, &emoji, reaction_action)
+        .send_reaction(&group_id, &message_id, &emoji, reaction_action)
         .await
         .map_err(|e| {
             log_catmos!(" send_reaction error: {:?}", e);
-            format!("{:?}", e)
+            actionable_error(format!("{e:?}"))
         })?;
 
     Ok(())
@@ -1716,7 +1719,7 @@ pub async fn send_reaction(
 
 #[tauri::command]
 pub async fn send_typing(
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
     conversation_id: String,
     is_typing: bool,
 ) -> Result<(), String> {
@@ -1726,45 +1729,15 @@ pub async fn send_typing(
         is_typing
     );
 
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let client = reqwest::Client::new();
-    let action_name = if is_typing { "typing" } else { "typingStop" };
-    let no_op_ciphertext = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 512]);
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "delivery": "ephemeral",
-        "action": action_name,
-        // These are required by sendMessage schema for ephemeral sub-actions.
-        "msgId": uuid::Uuid::new_v4().to_string(),
-        "epoch": 0,
-        "paddedSize": 512,
-        "ciphertext": { "$bytes": no_op_ciphertext },
-    });
-    let resp = client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.sendMessage",
-        nest_url
-    ));
-    let resp = crate::mls_proxy::with_mls_proxy_header(resp)
-        .bearer_auth(&token)
-        .json(&input)
-        .send()
-        .await
-        .map_err(|e| format!("Typing update failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Typing update failed ({}): {}", status, body));
-    }
-
-    Ok(())
+    // The canonical blue.catbird.chat.publishTyping endpoint requires a
+    // signed request (device identity, DPoP binding, and typing body). The
+    // old mlsChat.sendMessage/ephemeral shim fabricated ciphertext and is not
+    // a valid substitute. Do not emit a misleading network request until the
+    // catmos signing adapter is available.
+    let _ = (conversation_id, is_typing);
+    Err(actionable_error(
+        "Typing is temporarily unavailable: canonical signed typing transport is not wired",
+    ))
 }
 
 #[tauri::command]
@@ -1779,37 +1752,11 @@ pub async fn update_cursor(
         cursor
     );
 
-    let token = state
+    state
         .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let input = serde_json::json!({
-        "convoId": conversation_id,
-        "cursor": cursor,
-    });
-
-    let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/blue.catbird.mlsChat.updateCursor",
-        nest_url
-    )))
-    .bearer_auth(&token)
-    .json(&input)
-    .send()
-    .await
-    .map_err(|e| format!("Update cursor failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Update cursor failed ({}): {}", status, body));
-    }
-
-    Ok(())
+        .update_cursor(&conversation_id, &cursor)
+        .await
+        .map_err(|e| actionable_error(format!("Update cursor failed: {e:?}")))
 }
 
 fn parse_did(s: &str) -> Did {
@@ -1927,7 +1874,8 @@ pub async fn check_opt_in_status(
     }
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let output = parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput>(body.as_ref())?;
+    let output =
+        parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<String>>(body.as_ref())?;
 
     Ok(output
         .statuses
@@ -1941,11 +1889,18 @@ pub async fn check_opt_in_status(
 }
 
 #[tauri::command]
+#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn promote_member(
     state: State<'_, AppState>,
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
+    return state
+        .api_client
+        .reject_legacy_mutation::<()>("promoteAdmin")
+        .map_err(|error| actionable_error(format!("{error:?}")));
+    #[allow(unreachable_code)]
+    let _ = (&conversation_id, &target_did);
     let token = state
         .api_client
         .get_auth_token()
@@ -1981,11 +1936,18 @@ pub async fn promote_member(
 }
 
 #[tauri::command]
+#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn demote_member(
     state: State<'_, AppState>,
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
+    return state
+        .api_client
+        .reject_legacy_mutation::<()>("demoteAdmin")
+        .map_err(|error| actionable_error(format!("{error:?}")));
+    #[allow(unreachable_code)]
+    let _ = (&conversation_id, &target_did);
     let token = state
         .api_client
         .get_auth_token()
@@ -2749,12 +2711,20 @@ pub async fn report_spam(
 }
 
 #[tauri::command]
+#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn reset_group(
     state: State<'_, AppState>,
     conversation_id: String,
     reason: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_catmos!("reset_group: convo={}", conversation_id);
+
+    return state
+        .api_client
+        .reject_legacy_mutation::<serde_json::Value>("resetGroup")
+        .map_err(|error| actionable_error(format!("{error:?}")));
+    #[allow(unreachable_code)]
+    let _ = (&conversation_id, &reason);
 
     let token = state
         .api_client
@@ -3103,4 +3073,274 @@ pub async fn confirm_manual_reset(
         .user_confirmed_manual_reset(&conversation_id)
         .await
         .map_err(|e| format!("{:?}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cleanup_ws_handle, resolve_current_group_id, restore_registered_signer,
+        validate_current_group_id,
+    };
+    use crate::credentials::KeyringCredentialStore;
+    use crate::storage::SqliteStorage;
+    use async_trait::async_trait;
+    use catbird_mls::orchestrator::credentials::CredentialStore;
+    use catbird_mls::orchestrator::storage::MLSStorageBackend;
+    use catbird_mls::orchestrator::types::{ConversationState, GroupState};
+    use catbird_mls::{KeychainAccess, MLSContext, MLSError};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    struct TestKeychain {
+        values: Mutex<HashMap<String, Vec<u8>>>,
+    }
+
+    #[async_trait]
+    impl KeychainAccess for TestKeychain {
+        async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
+            Ok(self.values.lock().unwrap().get(&key).cloned())
+        }
+
+        async fn write(&self, key: String, value: Vec<u8>) -> Result<(), MLSError> {
+            self.values.lock().unwrap().insert(key, value);
+            Ok(())
+        }
+
+        async fn delete(&self, key: String) -> Result<(), MLSError> {
+            self.values.lock().unwrap().remove(&key);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reaction_boundary_passes_the_current_hex_group_id() {
+        assert_eq!(
+            validate_current_group_id("00000000-0000-4000-8000-000000000001", "deadbeefcafe1234")
+                .expect("current group ID should be accepted"),
+            "deadbeefcafe1234"
+        );
+    }
+
+    #[test]
+    fn reaction_boundary_rejects_uuid_or_missing_group_id() {
+        assert!(validate_current_group_id(
+            "00000000-0000-4000-8000-000000000001",
+            "00000000-0000-4000-8000-000000000001"
+        )
+        .is_err());
+        assert!(validate_current_group_id("missing", "").is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_exit_only_removes_its_current_handle() {
+        let handles = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let (old_owner, _old_rx) = tokio::sync::watch::channel(false);
+        let (new_owner, _new_rx) = tokio::sync::watch::channel(false);
+        handles.lock().await.insert(
+            "conversation".to_string(),
+            crate::WsHandle {
+                shutdown: new_owner.clone(),
+            },
+        );
+
+        cleanup_ws_handle(&handles, "conversation", &old_owner).await;
+        assert!(handles.lock().await.contains_key("conversation"));
+        cleanup_ws_handle(&handles, "conversation", &new_owner).await;
+        assert!(!handles.lock().await.contains_key("conversation"));
+    }
+
+    #[tokio::test]
+    async fn reaction_mapping_must_be_the_storage_current_group_for_conversation() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let db_path = temp.path().join("commands-reaction.sqlite");
+        let storage =
+            SqliteStorage::new(db_path.to_str().unwrap(), "test-key").expect("storage should open");
+        let did = "did:plc:reaction-owner";
+        let conversation_id = "00000000-0000-4000-8000-000000000001";
+        let stale_group_id = "deadbeefcafe1234";
+        let current_group_id = "0123456789abcdef";
+
+        storage
+            .ensure_conversation_exists(did, conversation_id, stale_group_id)
+            .await
+            .expect("conversation row should be created");
+        storage
+            .set_group_state(&GroupState {
+                group_id: current_group_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                epoch: 4,
+                members: vec![did.to_string()],
+            })
+            .await
+            .expect("current group state should be persisted");
+
+        assert!(
+            resolve_current_group_id(&storage, did, conversation_id)
+                .await
+                .is_err(),
+            "reaction resolution must fail closed while the conversation row points at a stale group"
+        );
+
+        storage
+            .update_conversation_group_id(conversation_id, current_group_id)
+            .expect("conversation should adopt the current group mapping");
+        assert_eq!(
+            resolve_current_group_id(&storage, did, conversation_id)
+                .await
+                .expect("current storage mapping should resolve"),
+            current_group_id
+        );
+
+        storage
+            .set_conversation_state(
+                conversation_id,
+                ConversationState::ResetPending {
+                    new_group_id: current_group_id.to_string(),
+                    reset_generation: 2,
+                    notified_at_ms: 1,
+                },
+            )
+            .await
+            .expect("reset lifecycle should be persisted");
+        assert!(
+            resolve_current_group_id(&storage, did, conversation_id)
+                .await
+                .is_err(),
+            "a valid old group row must still fail closed while reset is pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_resolution_feeds_the_actual_orchestrator_call() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let storage_db = temp.path().join("commands-orchestrator.sqlite");
+        let mls_db = temp.path().join("commands-orchestrator-mls.sqlite");
+        let storage = Arc::new(
+            SqliteStorage::new(storage_db.to_str().unwrap(), "test-key")
+                .expect("storage should open"),
+        );
+        let did = "did:plc:reaction-owner";
+        let conversation_id = "00000000-0000-4000-8000-000000000002";
+        let group_id = "0123456789abcdef";
+        storage
+            .ensure_conversation_exists(did, conversation_id, group_id)
+            .await
+            .expect("conversation row should be created");
+        storage
+            .set_group_state(&GroupState {
+                group_id: group_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                epoch: 1,
+                members: vec![did.to_string()],
+            })
+            .await
+            .expect("group state should be persisted");
+        // New SQLite rows use the historical `Active` default for backwards
+        // compatibility, while the orchestrator rehydrates JSON. Seed the
+        // canonical JSON state before exercising the real initialize/send
+        // path so this test reaches the transport boundary.
+        storage
+            .set_conversation_state(conversation_id, ConversationState::Active)
+            .await
+            .expect("conversation state should be persisted");
+
+        let resolved = resolve_current_group_id(storage.as_ref(), did, conversation_id)
+            .await
+            .expect("fresh storage mapping should resolve");
+        let context = MLSContext::new(
+            mls_db.to_string_lossy().to_string(),
+            "test-key".to_string(),
+            Box::new(TestKeychain {
+                values: Mutex::new(HashMap::new()),
+            }),
+        )
+        .expect("MLS context should initialize");
+        let api_client = Arc::new(crate::api_client::ReqwestApiClient::new(
+            "http://127.0.0.1:1".to_string(),
+        ));
+        let credentials = Arc::new(
+            crate::credentials::KeyringCredentialStore::try_new()
+                .expect("credential store should initialize"),
+        );
+        let orchestrator = Arc::new(crate::CatmosOrchestrator::new(
+            context,
+            storage,
+            api_client,
+            credentials,
+            catbird_mls::orchestrator::OrchestratorConfig::default(),
+        ));
+        orchestrator
+            .initialize(did)
+            .await
+            .expect("orchestrator should initialize");
+
+        let error = orchestrator
+            .send_reaction(
+                &resolved,
+                "00000000-0000-4000-8000-000000000003",
+                "👍",
+                catbird_mls::orchestrator::types::ReactionAction::Add,
+            )
+            .await
+            .expect_err("the unauthenticated fixture should stop at transport");
+        assert!(
+            !error.to_string().contains("Invalid hex group ID"),
+            "actual orchestrator call must receive the resolved hex group ID: {error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restart_restores_durable_signer_before_registration() {
+        let temp = tempfile::tempdir().expect("temporary storage directory");
+        let initial_db = temp.path().join("signer-initial.sqlite");
+        let restarted_db = temp.path().join("signer-restarted.sqlite");
+        let did = "did:plc:restart-signer";
+        let initial_context = MLSContext::new(
+            initial_db.to_string_lossy().to_string(),
+            "test-key".to_string(),
+            Box::new(TestKeychain {
+                values: Mutex::new(HashMap::new()),
+            }),
+        )
+        .expect("initial MLS context should initialize");
+        let _initial_key_package = initial_context
+            .create_key_package(did.as_bytes().to_vec())
+            .expect("initial signer should create a key package");
+        let signing_key = initial_context
+            .export_identity_key(did.to_string())
+            .expect("initial signer should export its durable key");
+        let credentials =
+            KeyringCredentialStore::try_new().expect("credential store should initialize");
+        credentials
+            .clear_all(did)
+            .await
+            .expect("clear signer fixture before test");
+        credentials
+            .store_signing_key(did, &signing_key)
+            .await
+            .expect("store durable signer fixture");
+
+        let restarted_context = MLSContext::new(
+            restarted_db.to_string_lossy().to_string(),
+            "test-key".to_string(),
+            Box::new(TestKeychain {
+                values: Mutex::new(HashMap::new()),
+            }),
+        )
+        .expect("restarted MLS context should initialize");
+        restore_registered_signer(restarted_context.as_ref(), &credentials, did)
+            .await
+            .expect("Task 1 storage-key fix should make the imported signer observable");
+        let restored_signing_key = restarted_context
+            .export_identity_key(did.to_string())
+            .expect("restored signer should be readable after import");
+        assert_eq!(
+            restored_signing_key, signing_key,
+            "a restored signer must be observable before device registration"
+        );
+        credentials
+            .clear_all(did)
+            .await
+            .expect("clear signer fixture after test");
+    }
 }

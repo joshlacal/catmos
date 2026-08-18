@@ -3,7 +3,6 @@ import * as api from '$lib/wasm';
 import { listenForEvent, isTauri } from '$lib/wasm';
 import type { AuthState } from '$lib/tauri';
 import { profiles } from './profiles';
-import { OAuthFlowGeneration } from '$lib/oauth-exchange';
 
 interface AuthStore {
 	user: AuthState | null;
@@ -33,85 +32,34 @@ async function fetchOwnProfile(user: AuthState) {
 function createAuthStore() {
 	const { subscribe, set, update } = writable<AuthStore>(initialState);
 
-	const oauthFlows = new OAuthFlowGeneration();
-	let activeCleanup: (() => void) | null = null;
-
-	function invalidateOAuthFlow() {
-		oauthFlows.cancel();
-		activeCleanup?.();
-		activeCleanup = null;
-	}
+	let unlistenOAuth: (() => void) | null = null;
 
 	return {
 		subscribe,
 		async startLogin(identifier: string) {
-			const generation = oauthFlows.begin();
-			activeCleanup?.();
-			activeCleanup = null;
 			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
 			try {
 				if (isTauri) {
-					await api.cancelLogin();
-					if (!oauthFlows.isActive(generation)) return;
-					let unlistenCallback: (() => void) | null = null;
-					let unlistenError: (() => void) | null = null;
-					let originPromise: Promise<string | null> | null = null;
-					const cleanup = () => {
-						unlistenCallback?.();
-						unlistenError?.();
-						unlistenCallback = null;
-						unlistenError = null;
-					};
-					activeCleanup = cleanup;
 					// Tauri: listen for oauth-callback IPC event, then completeLogin
-					unlistenCallback = await listenForEvent<{ code: string; redirectOrigin: string }>('oauth-callback', async (callback) => {
-						const expectedOrigin = await originPromise;
-						if (!oauthFlows.isActive(generation) || callback.redirectOrigin !== expectedOrigin || !oauthFlows.claim(generation)) return;
-						cleanup();
+					unlistenOAuth = await listenForEvent<string>('oauth-callback', async (sessionId) => {
 						try {
-							const user = await api.completeLogin(callback.code, callback.redirectOrigin);
-							if (!oauthFlows.isActive(generation)) return;
+							const user = await api.completeLogin(sessionId);
 							await fetchOwnProfile(user);
-							if (!oauthFlows.isActive(generation)) return;
 							set({ user, loading: false, error: null, waitingForOAuth: false });
 						} catch (e) {
-							if (!oauthFlows.isActive(generation)) return;
 							set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 						}
+						if (unlistenOAuth) unlistenOAuth();
 					});
-					if (!oauthFlows.isActive(generation)) {
-						cleanup();
-						return;
-					}
-					unlistenError = await listenForEvent<{ message: string; redirectOrigin: string }>('oauth-error', async (event) => {
-						const expectedOrigin = await originPromise;
-						if (!oauthFlows.isActive(generation) || event.redirectOrigin !== expectedOrigin || !oauthFlows.claim(generation)) return;
-						cleanup();
-						set({ user: null, loading: false, error: event.message, waitingForOAuth: false });
-					});
-					if (!oauthFlows.isActive(generation)) {
-						cleanup();
-						return;
-					}
-					originPromise = api.startLogin(identifier);
-					await originPromise;
-					if (!oauthFlows.isActive(generation)) cleanup();
-				} else {
-					// Browser: startLogin redirects to nest OAuth — page navigates away.
-					await api.startLogin(identifier);
-					if (!oauthFlows.isActive(generation)) return;
 				}
+				// Browser: startLogin redirects to nest OAuth — page navigates away.
+				await api.startLogin(identifier);
 			} catch (e) {
-				if (!oauthFlows.isActive(generation)) return;
-				oauthFlows.claim(generation);
-				activeCleanup?.();
-				activeCleanup = null;
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
 		cancelLogin() {
-			invalidateOAuthFlow();
-			void api.cancelLogin();
+			if (unlistenOAuth) unlistenOAuth();
 			set(initialState);
 		},
 		async logout() {
@@ -122,26 +70,31 @@ function createAuthStore() {
 			}
 		},
 		async tryRestore() {
+			update((s) => ({ ...s, loading: true, error: null }));
 			try {
 				const user = await api.tryRestoreSession();
 				if (user) {
 					await fetchOwnProfile(user);
 					set({ user, loading: false, error: null, waitingForOAuth: false });
+				} else {
+					set({ ...initialState, loading: false });
 				}
-			} catch {
-				// No saved session, that's fine
+			} catch (e) {
+				// A transient restore failure must be visible and retryable. The
+				// desktop backend intentionally keeps the keychained session so a
+				// retry can resume the existing encrypted transcript.
+				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
 		/** Called from /auth/callback route after browser OAuth completes. */
-		async completeOAuthCallback(code: string) {
+		async completeOAuthCallback(sessionId: string) {
 			update((s) => ({ ...s, loading: true, error: null }));
 			try {
-				const user = await api.completeLogin(code);
+				const user = await api.completeLogin(sessionId);
 				await fetchOwnProfile(user);
 				set({ user, loading: false, error: null, waitingForOAuth: false });
 			} catch (e) {
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
-				throw e;
 			}
 		},
 		setUser(user: AuthState) {
