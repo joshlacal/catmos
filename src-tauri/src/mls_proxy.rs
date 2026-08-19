@@ -1,6 +1,6 @@
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
-pub const DEFAULT_ATPROTO_PROXY_DID: &str = "did:web:mlschat.catbird.blue#atproto_mls";
+pub const DEFAULT_ATPROTO_PROXY_DID: &str = "did:web:chat.catbird.blue#atproto_chat";
 
 pub fn atproto_proxy_header_value() -> String {
     std::env::var("ATPROTO_PROXY_HEADER")

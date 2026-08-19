@@ -946,7 +946,7 @@ export async function resetGroup(
 		cipherSuite: 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519'
 	};
 	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.mlsChat.resetGroup`, {
+	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.chat.requestReset`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
@@ -978,7 +978,7 @@ export async function reportSpam(
 	if (!saved) throw new Error('Not authenticated');
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
 	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.mlsChat.reportSpam`, {
+	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.chat.reportSpam`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',

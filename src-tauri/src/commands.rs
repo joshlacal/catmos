@@ -1,6 +1,5 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use catbird_atproto::blue_catbird;
 use catbird_atproto::jacquard_common::IntoStatic;
 use catbird_mls::blob_crypto::{decrypt_blob, encrypt_blob};
 use catbird_mls::orchestrator::credentials::CredentialStore;
@@ -17,7 +16,6 @@ use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use crate::catbird::mls_chat as lexicon;
 use crate::types::string::Did;
 
 use crate::credentials::KeyringCredentialStore;
@@ -1854,17 +1852,14 @@ pub async fn check_opt_in_status(
     let url = format!(
         "{}/xrpc/{}",
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string()),
-        lexicon::get_opt_in_status::NSID,
+        "blue.catbird.chat.getDevices",
     );
-    let input: lexicon::get_opt_in_status::Input = lexicon::get_opt_in_status::InputData {
-        dids: dids.iter().map(|did| parse_did(did)).collect(),
-    }
-    .into();
+    let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
+    let query_params: Vec<(&str, &str)> = parsed_dids.iter().map(|d| ("userDids", d.as_str())).collect();
 
     let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(&url))
+    let resp = crate::mls_proxy::with_mls_proxy_header(client.get(&url).query(&query_params))
         .bearer_auth(&token)
-        .json(&input)
         .send()
         .await
         .map_err(|e| format!("Opt-in check failed: {}", e))?;
@@ -1875,15 +1870,22 @@ pub async fn check_opt_in_status(
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
     let output =
-        parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<String>>(body.as_ref())?;
+        parse_lexicon_json::<catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>>(body.as_ref())?;
 
-    Ok(output
-        .statuses
-        .unwrap_or_default()
+    let active_dids: std::collections::HashSet<&str> = output
+        .devices
         .iter()
-        .map(|s| OptInStatusResult {
-            did: s.did.to_string(),
-            opted_in: s.opted_in,
+        .map(|d| d.user_did.as_str())
+        .collect();
+
+    Ok(dids
+        .into_iter()
+        .map(|did| {
+            let opted_in = active_dids.contains(did.as_str());
+            OptInStatusResult {
+                did,
+                opted_in,
+            }
         })
         .collect())
 }
@@ -1895,44 +1897,11 @@ pub async fn promote_member(
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
-    return state
+    let _ = (&conversation_id, &target_did);
+    state
         .api_client
         .reject_legacy_mutation::<()>("promoteAdmin")
-        .map_err(|error| actionable_error(format!("{error:?}")));
-    #[allow(unreachable_code)]
-    let _ = (&conversation_id, &target_did);
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let input: lexicon::promote_admin::Input = lexicon::promote_admin::InputData {
-        convo_id: conversation_id,
-        target_did: parse_did(&target_did),
-    }
-    .into();
-
-    let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/{}",
-        nest_url,
-        lexicon::promote_admin::NSID
-    )))
-    .bearer_auth(&token)
-    .json(&input)
-    .send()
-    .await
-    .map_err(|e| format!("Promote failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Promote failed: {}", body));
-    }
-
-    Ok(())
+        .map_err(|error| actionable_error(format!("{error:?}")))
 }
 
 #[tauri::command]
@@ -1942,44 +1911,11 @@ pub async fn demote_member(
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
-    return state
+    let _ = (&conversation_id, &target_did);
+    state
         .api_client
         .reject_legacy_mutation::<()>("demoteAdmin")
-        .map_err(|error| actionable_error(format!("{error:?}")));
-    #[allow(unreachable_code)]
-    let _ = (&conversation_id, &target_did);
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    let input: lexicon::demote_admin::Input = lexicon::demote_admin::InputData {
-        convo_id: conversation_id,
-        target_did: parse_did(&target_did),
-    }
-    .into();
-
-    let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.post(format!(
-        "{}/xrpc/{}",
-        nest_url,
-        lexicon::demote_admin::NSID
-    )))
-    .bearer_auth(&token)
-    .json(&input)
-    .send()
-    .await
-    .map_err(|e| format!("Demote failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Demote failed: {}", body));
-    }
-
-    Ok(())
+        .map_err(|error| actionable_error(format!("{error:?}")))
 }
 
 #[tauri::command]
@@ -2746,7 +2682,7 @@ pub async fn reset_group(
 
     let client = reqwest::Client::new();
     let resp = crate::mls_proxy::with_mls_proxy_header(
-        client.post(format!("{}/xrpc/blue.catbird.mlsChat.resetGroup", nest_url)),
+        client.post(format!("{}/xrpc/blue.catbird.chat.requestReset", nest_url)),
     )
     .bearer_auth(&token)
     .json(&body)

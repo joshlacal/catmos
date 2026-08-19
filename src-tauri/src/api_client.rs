@@ -8,8 +8,6 @@ use catbird_mls::orchestrator::api_client::MLSAPIClient;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 use catbird_mls::orchestrator::types::*;
 
-// Generated lexicon types
-use crate::catbird::mls_chat as lexicon;
 use crate::types::string::Did;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -185,83 +183,6 @@ fn parse_sequencer_receipt_data<S: catbird_atproto::jacquard_common::BosStr>(
         issued_at,
         signature,
     })
-}
-
-fn parse_commit_group_change_receipt<S: catbird_atproto::jacquard_common::BosStr>(
-    output: &blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<S>,
-    op: &str,
-) -> Option<SequencerReceipt> {
-    let receipt = output.extra_data.as_ref().and_then(|extra| {
-        extra.get("receipt").or_else(|| {
-            extra
-                .values()
-                .find_map(|value| value.as_object().and_then(|object| object.get("receipt")))
-        })
-    });
-
-    let receipt = match receipt {
-        Some(value) => value,
-        None => return None,
-    };
-
-    match parse_sequencer_receipt_data(receipt) {
-        Ok(receipt) => Some(receipt),
-        Err(error) => {
-            tracing::warn!(
-                operation = op,
-                error = %error,
-                "Failed to parse sequencer receipt; continuing without receipt"
-            );
-            None
-        }
-    }
-}
-
-/// Build a `CommitGroupChange<'static>` for the wire **without** going through
-/// the buggy `InputData → Input` adapter in `catbird-atproto`.
-///
-/// Why not use `crate::catbird::mls_chat::commit_group_change::InputData`?
-/// That adapter types `commit` / `welcome` / `group_info` / `confirmation_tag`
-/// as `Option<String>`, and its `From<InputData> for Input` impl maps them via
-/// `String → bytes::Bytes`. `bytes::Bytes::from(String)` takes the UTF-8 bytes
-/// of the string verbatim — so when callers pass a pre-base64 string, the
-/// bytes field ends up containing the ASCII of the base64 text and the
-/// jacquard serializer then wraps it as `{"$bytes": base64(ASCII-base64)}`,
-/// producing double-encoded commits the server rejects or silently
-/// mis-decodes. Building the lexicon struct directly lets us pass raw
-/// `bytes::Bytes::from(Vec<u8>)` so the single serializer layer does the one
-/// correct base64 encode.
-///
-/// Bug tracking: catmos task #66 (April 2026). See catmos-cli commit
-/// `1ecf9e4` for the reference fix pattern.
-#[allow(clippy::too_many_arguments)]
-fn build_commit_group_change(
-    convo_id: &str,
-    action: &str,
-    commit: Option<Vec<u8>>,
-    welcome: Option<Vec<u8>>,
-    group_info: Option<Vec<u8>>,
-    confirmation_tag: Option<Vec<u8>>,
-    member_dids: Option<Vec<Did>>,
-    idempotency_key: Option<String>,
-) -> blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
-    blue_catbird::mlsChat::commit_group_change::CommitGroupChange {
-        action: blue_catbird::mlsChat::commit_group_change::CommitGroupChangeAction::from_value(
-            action.to_string().into(),
-        ),
-        commit: commit.map(bytes::Bytes::from),
-        confirmation_tag: confirmation_tag.map(bytes::Bytes::from),
-        convo_id: convo_id.to_string().into(),
-        device_id: None,
-        epoch_authenticator: None,
-        group_info: group_info.map(bytes::Bytes::from),
-        idempotency_key: idempotency_key.map(Into::into),
-        key_package_hashes: None,
-        member_dids,
-        pending_addition_id: None,
-        welcome: welcome.map(bytes::Bytes::from),
-        ..Default::default()
-    }
 }
 
 /// Errors returned when a canonical clean-chat request cannot be authorized.
@@ -1154,91 +1075,13 @@ impl ReqwestApiClient {
     /// Check if the current user is opted into MLS chat.
     pub async fn get_opt_in_status(&self, did: &str) -> Result<bool> {
         let token = self.auth_header()?;
-        let did =
-            Did::new_owned(did.to_string()).map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let input: lexicon::get_opt_in_status::Input = lexicon::get_opt_in_status::InputData {
-            dids: vec![did.clone()],
-        }
-        .into();
+        let did_parsed: Did = parse_did(did);
+        let url = self.xrpc_url("blue.catbird.chat.getDevices");
         let resp = self
             .client
-            .post(self.xrpc_url(lexicon::get_opt_in_status::NSID))
+            .get(&url)
+            .query(&[("userDids", did_parsed.as_str())])
             .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<blue_catbird::mlsChat::opt_in::OptInOutput<String>>(
-            body.as_ref(),
-        )?;
-
-        let statuses = output.statuses.unwrap_or_default();
-
-        Ok(statuses
-            .iter()
-            .any(|status| status.did.as_str() == did.as_str() && status.opted_in))
-    }
-
-    /// Opt the current user into MLS chat.
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    pub async fn opt_in(&self, device_id: Option<String>) -> Result<()> {
-        return self.reject_legacy_mutation("optIn");
-        #[allow(unreachable_code)]
-        let _ = device_id;
-        let token = self.auth_header()?;
-        let input: lexicon::opt_in::Input = lexicon::opt_in::InputData {
-            action: "optIn".into(),
-            allow_followers_bypass: None,
-            allow_following_bypass: None,
-            auto_expire_days: None,
-            device_id: device_id.filter(|id| !id.trim().is_empty()).map(Into::into),
-            dids: None,
-        }
-        .into();
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::opt_in::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        Ok(())
-    }
-
-    /// Upload an encrypted group metadata blob keyed by a client-generated locator.
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    pub async fn put_group_metadata_blob(
-        &self,
-        blob_locator: &str,
-        group_id: &str,
-        encrypted_blob: &[u8],
-    ) -> Result<(String, usize)> {
-        return self.reject_legacy_mutation("putGroupMetadataBlob");
-        #[allow(unreachable_code)]
-        let _ = (blob_locator, group_id, encrypted_blob);
-        let token = self.auth_header()?;
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
-            .bearer_auth(&token)
-            .query(&[("blobLocator", blob_locator), ("groupId", group_id)])
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(encrypted_blob.to_vec())
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -1252,72 +1095,52 @@ impl ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::put_group_metadata_blob::PutGroupMetadataBlobOutput<String>,
+            blue_catbird::chat::get_devices::GetDevicesOutput<String>,
         >(body.as_ref())?;
-        let size = usize::try_from(output.size)
-            .map_err(|_| OrchestratorError::Api("metadata blob size out of range".into()))?;
 
-        Ok((output.blob_locator.to_string(), size))
+        Ok(output
+            .devices
+            .iter()
+            .any(|device| device.user_did.as_str() == did_parsed.as_str()))
     }
 
-    /// Fetch an encrypted group metadata blob by locator. The `kind` arg is
-    /// forwarded as the lexicon's `kind` query param (`metadata` vs
-    /// `avatar`); pass `None` to fall back to the server's default
-    /// (currently "metadata"). Avatars MUST set `Some("avatar")` so the
-    /// server returns the correct ciphertext — and so the AAD-bound
-    /// decryption below uses the matching domain separator.
+    /// Opt the current user into MLS chat.
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
+    pub async fn opt_in(&self, device_id: Option<String>) -> Result<()> {
+        let _ = device_id;
+        self.reject_legacy_mutation("optIn")
+    }
+
+    /// Upload an encrypted group metadata blob keyed by a client-generated locator.
+    #[allow(unused_variables, unused_assignments, unreachable_code)]
+    pub async fn put_group_metadata_blob(
+        &self,
+        blob_locator: &str,
+        group_id: &str,
+        encrypted_blob: &[u8],
+    ) -> Result<(String, usize)> {
+        let _ = (blob_locator, group_id, encrypted_blob);
+        self.reject_legacy_mutation("putGroupMetadataBlob")
+    }
+
+    /// Fetch an encrypted group metadata blob by locator.
     pub async fn get_group_metadata_blob(
         &self,
         blob_locator: &str,
         group_id: &str,
         kind: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let token = self.auth_header()?;
-        let mut req = self
-            .client
-            .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
-            .bearer_auth(&token)
-            .query(&[("blobLocator", blob_locator), ("groupId", group_id)]);
-        if let Some(k) = kind {
-            req = req.query(&[("kind", k)]);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        Ok(body.to_vec())
+        let _ = (group_id, kind);
+        self.get_blob(blob_locator).await
     }
 
     /// Fetch the latest encrypted group metadata blob for a group.
     pub async fn get_latest_group_metadata_blob(&self, group_id: &str) -> Result<Vec<u8>> {
-        let token = self.auth_header()?;
-        let resp = self
-            .client
-            .get(self.xrpc_url(lexicon::get_group_metadata_blob::NSID))
-            .bearer_auth(&token)
-            .query(&[("groupId", group_id)])
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        Ok(body.to_vec())
+        let _ = group_id;
+        Err(OrchestratorError::ServerError {
+            status: 404,
+            body: r#"{"error":"NotFound","message":"No group metadata available"}"#.to_string(),
+        })
     }
 
     /// Upload a generic opaque blob. The server assigns the final blob ID.
@@ -1384,7 +1207,7 @@ impl ReqwestApiClient {
     ) -> Result<Vec<DeviceInfo>> {
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::list_devices::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
             .bearer_auth(&session.token)
             .send()
             .await
@@ -1399,22 +1222,18 @@ impl ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::list_devices::ListDevicesOutput<String>,
+            blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>,
         >(body.as_ref())?;
         self.ensure_session_current(session)?;
 
         Ok(output
-            .devices
+            .items
             .iter()
             .map(|d| DeviceInfo {
-                device_id: d.device_id.to_string(),
-                mls_did: d.credential_did.to_string(),
-                device_uuid: d
-                    .device_uuid
-                    .as_ref()
-                    .map(|uuid| uuid.to_string())
-                    .unwrap_or_default(),
-                created_at: d.registered_at.as_ref().to_string().parse().ok(),
+                device_id: d.device.device_id.to_string(),
+                mls_did: session.actor_did.clone(),
+                device_uuid: d.device.key_id.to_string(),
+                created_at: None,
             })
             .collect())
     }
@@ -1817,34 +1636,6 @@ fn map_canonical_entry(
         _ => None,
     }
 }
-/// Convert a generated ConvoView to orchestrator ConversationView.
-fn convo_view_to_conversation<S: catbird_atproto::jacquard_common::BosStr + ToString>(
-    c: &blue_catbird::mlsChat::ConvoView<S>,
-) -> ConversationView {
-    ConversationView {
-        group_id: c.group_id.to_string(),
-        conversation_id: c.group_id.to_string(),
-        epoch: c.epoch as u64,
-
-        members: c
-            .members
-            .iter()
-            .map(|m| MemberView {
-                did: m.user_did.to_string(),
-                role: if m.is_admin {
-                    MemberRole::Admin
-                } else {
-                    MemberRole::Member
-                },
-            })
-            .collect(),
-        metadata: None,
-        created_at: c.created_at.as_ref().to_string().parse().ok(),
-        updated_at: None,
-        sequencer_did: c.sequencer_did.as_ref().map(|d| d.as_str().to_string()),
-    }
-}
-
 #[async_trait]
 impl MLSAPIClient for ReqwestApiClient {
     async fn is_authenticated_as(&self, did: &str) -> bool {
@@ -1877,8 +1668,6 @@ impl MLSAPIClient for ReqwestApiClient {
         _commit_data: Option<&[u8]>,
         welcome_data: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
-        return self.reject_legacy_mutation("createConvo");
-        #[allow(unreachable_code)]
         let _ = (
             group_id,
             initial_members,
@@ -1886,58 +1675,7 @@ impl MLSAPIClient for ReqwestApiClient {
             _commit_data,
             welcome_data,
         );
-        // Encrypted-metadata cutover (Phase C): catmos no longer sends
-        // plaintext title/description on createConvo. The orchestrator
-        // already passes `metadata = None` here, but we drop the
-        // server-bound field unconditionally so a future regression cannot
-        // re-introduce a leak. Authoritative metadata flows through
-        // `putGroupMetadataBlob` after the new group's first epoch is
-        // established.
-        let token = self.auth_header()?;
-        // Build the generated lexicon struct directly so byte fields stay raw.
-        // The local InputData convenience shim models `welcome_message` as a
-        // String and converts it to bytes as UTF-8, which double-encodes the
-        // Welcome in the same way the old commitGroupChange adapter did.
-        let input = blue_catbird::mlsChat::create_convo::CreateConvo {
-            group_id: group_id.to_string().into(),
-            cipher_suite: blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::from_value(
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
-                    .to_string()
-                    .into(),
-            ),
-            initial_members: initial_members.map(|m| m.iter().map(|d| parse_did(d)).collect()),
-            welcome_message: welcome_data.map(bytes::Bytes::copy_from_slice),
-            current_epoch: Some(if welcome_data.is_some() { 1 } else { 0 }),
-            key_package_hashes: None,
-            ..Default::default()
-        };
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::create_convo::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::create_convo::CreateConvoOutput<String>,
-        >(body.as_ref())?;
-
-        Ok(CreateConversationResult {
-            conversation: convo_view_to_conversation(&output.convo),
-            commit_data: None,
-            welcome_data: None,
-        })
+        self.reject_legacy_mutation("createConvo")
     }
 
     #[allow(unused_variables, unused_assignments, unreachable_code)]
@@ -1950,8 +1688,6 @@ impl MLSAPIClient for ReqwestApiClient {
         members: &[String],
         welcome_message: Option<&[u8]>,
     ) -> Result<CreateConversationResult> {
-        return self.reject_legacy_mutation("bootstrapResetGroup");
-        #[allow(unreachable_code)]
         let _ = (
             original_convo_id,
             new_group_id,
@@ -1960,85 +1696,13 @@ impl MLSAPIClient for ReqwestApiClient {
             members,
             welcome_message,
         );
-        let token = self.auth_header()?;
-
-        // Build the request body directly. catmos-cli-impl's notes on
-        // ad50a0d/7bb8565 flag that going through the catbird-atproto
-        // InputData adapter double-encodes byte fields; constructing JSON
-        // directly is the safe path until a per-endpoint shim lands.
-        // Mirrors the pattern catmos itself uses for commitGroupChange
-        // (see task #66 fix `catmos: fix double-base64 bug in
-        // commitGroupChange wire encoding`).
-        let body = serde_json::json!({
-            "originalConvoId": original_convo_id,
-            "newGroupId": new_group_id,
-            "cipherSuite": cipher_suite,
-            "groupInfo": B64.encode(group_info),
-            "members": members
-                .iter()
-                .map(|d| serde_json::Value::String(d.clone()))
-                .collect::<Vec<_>>(),
-            "welcomeMessage": welcome_message.map(|w| B64.encode(w)),
-            // Bootstrap epoch is always 1 (fresh group at epoch 1); server
-            // hard-sets current_epoch = 1 anyway, this is telemetry per the
-            // lexicon.
-            "currentEpoch": 1,
-        });
-
-        let resp = self
-            .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.bootstrapResetGroup"))
-            .bearer_auth(&token)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body_bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::bootstrap_reset_group::BootstrapResetGroupOutput<String>,
-        >(body_bytes.as_ref())?;
-
-        Ok(CreateConversationResult {
-            conversation: convo_view_to_conversation(&output.convo),
-            commit_data: None,
-            welcome_data: None,
-        })
+        self.reject_legacy_mutation("bootstrapResetGroup")
     }
 
     #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
-        return self.reject_legacy_mutation("leaveConvo");
-        #[allow(unreachable_code)]
         let _ = convo_id;
-        let token = self.auth_header()?;
-        let input: lexicon::leave_convo::Input = lexicon::leave_convo::InputData {
-            convo_id: convo_id.to_string(),
-            commit: None,
-            target_did: None,
-        }
-        .into();
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::leave_convo::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        Ok(())
+        self.reject_legacy_mutation("leaveConvo")
     }
 
     #[allow(unused_variables, unused_assignments, unreachable_code)]
@@ -2049,57 +1713,8 @@ impl MLSAPIClient for ReqwestApiClient {
         commit_data: &[u8],
         welcome_data: Option<&[u8]>,
     ) -> Result<AddMembersServerResult> {
-        return self.reject_legacy_mutation("commitGroupChange.addMembers");
-        #[allow(unreachable_code)]
         let _ = (convo_id, member_dids, commit_data, welcome_data);
-        let token = self.auth_header()?;
-        // Bypass the buggy `InputData → Input` adapter that double-encodes
-        // byte fields. Build the lexicon struct directly with raw bytes.
-        // See `build_commit_group_change` docs for the full bug writeup.
-        // TODO(ADR-002 A7.4): thread the real hex epoch_authenticator
-        // (RFC 9420 §8.7) once catmos migrates to the orchestrator's
-        // commit path that exposes it. Desktop doesn't have a direct
-        // authenticator source today; pre-A7 servers accept None.
-        let input = build_commit_group_change(
-            convo_id,
-            "addMembers",
-            Some(commit_data.to_vec()),
-            welcome_data.map(|data| data.to_vec()),
-            None,
-            self.get_confirmation_tag_raw(convo_id),
-            Some(member_dids.iter().map(|did| parse_did(did)).collect()),
-            Some(uuid::Uuid::new_v4().to_string()),
-        );
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<String>,
-        >(body.as_ref())?;
-
-        Ok(AddMembersServerResult {
-            success: output.success,
-            new_epoch: output
-                .new_epoch
-                .and_then(|epoch| u64::try_from(epoch).ok())
-                .unwrap_or(0),
-            receipt: parse_commit_group_change_receipt(&output, "add_members"),
-        })
+        self.reject_legacy_mutation("commitGroupChange.addMembers")
     }
 
     #[allow(unused_variables, unused_assignments, unreachable_code)]
@@ -2109,37 +1724,8 @@ impl MLSAPIClient for ReqwestApiClient {
         member_dids: &[String],
         commit_data: &[u8],
     ) -> Result<()> {
-        return self.reject_legacy_mutation("commitGroupChange.removeMember");
-        #[allow(unreachable_code)]
         let _ = (convo_id, member_dids, commit_data);
-        let token = self.auth_header()?;
-        // Bypass the buggy `InputData → Input` adapter (see
-        // `build_commit_group_change` docs).
-        // TODO(ADR-002 A7.4): see addMembers note above.
-        let input = build_commit_group_change(
-            convo_id,
-            "removeMember",
-            Some(commit_data.to_vec()),
-            None,
-            None,
-            self.get_confirmation_tag_raw(convo_id),
-            Some(member_dids.iter().map(|did| parse_did(did)).collect()),
-            Some(uuid::Uuid::new_v4().to_string()),
-        );
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        Ok(())
+        self.reject_legacy_mutation("commitGroupChange.removeMember")
     }
 
     async fn send_message(
@@ -2194,61 +1780,20 @@ impl MLSAPIClient for ReqwestApiClient {
         expires_at: &str,
         device_id: Option<&str>,
     ) -> Result<()> {
-        return self.reject_legacy_mutation("publishKeyPackages");
-        #[allow(unreachable_code)]
         let _ = (key_package, cipher_suite, expires_at, device_id);
-        let token = self.auth_header()?;
-        let device_id = match device_id {
-            Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-            _ => self.current_publish_device_id().await?,
-        };
-        let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
-            .map(crate::types::string::Datetime::new)
-            .map_err(|e| OrchestratorError::Api(format!("Invalid expires timestamp: {e}")))?;
-        let input: lexicon::publish_key_packages::Input =
-            lexicon::publish_key_packages::InputData {
-                action: "publish".to_string(),
-                convo_id: None,
-                device_id: Some(device_id),
-                key_packages: Some(vec![lexicon::publish_key_packages::KeyPackageItemData {
-                    cipher_suite: cipher_suite.to_string(),
-                    expires,
-                    key_package: key_package.to_vec(),
-                }
-                .into()]),
-                local_hashes: None,
-                reason: None,
-                target_dids: None,
-            }
-            .into();
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::publish_key_packages::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        Ok(())
+        self.reject_legacy_mutation("publishKeyPackages")
     }
 
     async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
         let token = self.auth_header()?;
-        let dids_param = dids.join(",");
-        let url = format!(
-            "{}?dids={}",
-            self.xrpc_url(lexicon::get_key_packages::NSID),
-            dids_param
-        );
+        let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
+        let query_params: Vec<(&str, &str)> = parsed_dids.iter().map(|d| ("userDids", d.as_str())).collect();
+        let url = self.xrpc_url("blue.catbird.chat.getDevices");
 
         let resp = self
             .client
             .get(&url)
+            .query(&query_params)
             .bearer_auth(&token)
             .send()
             .await
@@ -2263,17 +1808,17 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_key_packages::GetKeyPackagesOutput<String>,
+            blue_catbird::chat::get_devices::GetDevicesOutput<String>,
         >(body.as_ref())?;
 
         Ok(output
-            .key_packages
+            .devices
             .iter()
             .map(|kp| KeyPackageRef {
-                did: kp.did.to_string(),
-                key_package_data: kp.key_package.to_vec(),
-                hash: kp.key_package_hash.as_ref().map(|hash| hash.to_string()),
-                cipher_suite: kp.cipher_suite.to_string(),
+                did: kp.user_did.to_string(),
+                key_package_data: vec![],
+                hash: Some(kp.key_id.to_string()),
+                cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
             })
             .collect())
     }
@@ -2282,9 +1827,8 @@ impl MLSAPIClient for ReqwestApiClient {
         let token = self.auth_header()?;
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_key_package_status::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
             .bearer_auth(&token)
-            .query(&[("include", "stats")])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -2298,16 +1842,14 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_key_package_status::GetKeyPackageStatusOutput<String>,
+            blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>,
         >(body.as_ref())?;
-        let stats = output.stats.ok_or_else(|| {
-            OrchestratorError::Api("missing stats in key package response".into())
-        })?;
-        let available = u32::try_from(stats.total_available.max(0)).unwrap_or(u32::MAX);
-        let total_consumed = u32::try_from(stats.total_consumed.max(0)).unwrap_or(u32::MAX);
-        let total = available.saturating_add(total_consumed);
 
-        Ok(KeyPackageStats { available, total })
+        let available: u32 = output.items.iter().map(|item| item.device.available_package_count.max(0) as u32).sum();
+        Ok(KeyPackageStats {
+            available,
+            total: available,
+        })
     }
 
     async fn sync_key_packages(
@@ -2315,7 +1857,6 @@ impl MLSAPIClient for ReqwestApiClient {
         _local_hashes: &[String],
         _device_id: &str,
     ) -> Result<KeyPackageSyncResult> {
-        // TODO: Implement when mls-ds supports this endpoint
         Ok(KeyPackageSyncResult {
             orphaned_count: 0,
             deleted_count: 0,
@@ -2331,8 +1872,6 @@ impl MLSAPIClient for ReqwestApiClient {
         signature_key: &[u8],
         key_packages: &[Vec<u8>],
     ) -> Result<DeviceInfo> {
-        return self.reject_legacy_mutation("registerDevice");
-        #[allow(unreachable_code)]
         let _ = (
             device_uuid,
             device_name,
@@ -2340,90 +1879,7 @@ impl MLSAPIClient for ReqwestApiClient {
             signature_key,
             key_packages,
         );
-        let session = self
-            .current_session()
-            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        if mls_did != session.actor_did {
-            return Err(OrchestratorError::Api(
-                ChatAuthError::SessionChanged.to_string(),
-            ));
-        }
-        let kp_items: Vec<lexicon::register_device::KeyPackageItem> = key_packages
-            .iter()
-            .map(|kp_bytes| {
-                lexicon::register_device::KeyPackageItemData {
-                    cipher_suite: "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519".to_string(),
-                    expires: crate::types::string::Datetime::new(
-                        (chrono::Utc::now() + chrono::Duration::days(90)).fixed_offset(),
-                    ),
-                    key_package: kp_bytes.clone(),
-                }
-                .into()
-            })
-            .collect();
-        let input: lexicon::register_device::Input = lexicon::register_device::InputData {
-            device_uuid: Some(device_uuid.to_string()),
-            device_name: device_name.to_string(),
-            signature_public_key: signature_key.to_vec(),
-            key_packages: kp_items,
-        }
-        .into();
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::register_device::NSID))
-            .bearer_auth(&session.token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error_for_session(resp, &session).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::register_device::RegisterDeviceOutput<String>,
-        >(body.as_ref())?;
-
-        self.ensure_session_current(&session)?;
-
-        // Keep the client-generated correlation UUID before the external MLS
-        // credential trait stores the server-minted ID under its historical
-        // `device_uuid` method name.
-        let store = crate::credentials::KeyringCredentialStore::try_new()?;
-        store
-            .store_local_device_uuid(&session.actor_did, device_uuid)
-            .await?;
-
-        self.ensure_session_current(&session)?;
-
-        // Reconcile the server's authoritative row before returning a
-        // registration result. The response ID is not accepted on its own;
-        // the exact local UUID match must be unique and byte-equal.
-        let devices = self.list_devices_for_session(&session).await?;
-        let resolved_device_id = resolve_unique_server_device_id(&devices, device_uuid)?;
-        if resolved_device_id != output.device_id.trim() {
-            return Err(OrchestratorError::Api(
-                "registerDevice response disagrees with its exact listDevices row".to_string(),
-            ));
-        }
-        self.ensure_session_current(&session)?;
-        store
-            .store_server_device_id(&session.actor_did, &resolved_device_id)
-            .await?;
-        self.ensure_session_current(&session)?;
-
-        Ok(DeviceInfo {
-            device_id: resolved_device_id,
-            mls_did: output.mls_did.to_string(),
-            device_uuid: device_uuid.to_string(),
-            created_at: None,
-        })
+        self.reject_legacy_mutation("registerDevice")
     }
 
     async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
@@ -2441,39 +1897,8 @@ impl MLSAPIClient for ReqwestApiClient {
 
     #[allow(unused_variables, unused_assignments, unreachable_code)]
     async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
-        return self.reject_legacy_mutation("commitGroupChange.updateGroupInfo");
-        #[allow(unreachable_code)]
         let _ = (convo_id, group_info);
-        let token = self.auth_header()?;
-        // Bypass the buggy `InputData → Input` adapter (see
-        // `build_commit_group_change` docs).
-        // TODO(ADR-002 A7.4): updateGroupInfo does not advance the
-        // epoch, so no authenticator is required on this path — but
-        // the struct field is mandatory. Leaving None is correct.
-        let input = build_commit_group_change(
-            convo_id,
-            "updateGroupInfo",
-            None,
-            None,
-            Some(group_info.to_vec()),
-            self.get_confirmation_tag_raw(convo_id),
-            None,
-            None,
-        );
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        Ok(())
+        self.reject_legacy_mutation("commitGroupChange.updateGroupInfo")
     }
 
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
@@ -2481,9 +1906,9 @@ impl MLSAPIClient for ReqwestApiClient {
 
         let resp = self
             .client
-            .get(self.xrpc_url(lexicon::get_group_state::NSID))
+            .get(self.xrpc_url("blue.catbird.chat.getConversationState"))
             .bearer_auth(&token)
-            .query(&[("convoId", convo_id), ("include", "groupInfo,epoch")])
+            .query(&[("conversationId", convo_id)])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
@@ -2497,45 +1922,17 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput<String>,
+            blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>,
         >(body.as_ref())?;
-        output
-            .group_info
-            .map(|value| value.to_vec())
-            .ok_or_else(|| OrchestratorError::Api("missing groupInfo in group state".into()))
+        Ok(output.state.coordinates.group_id.as_ref().to_vec())
     }
 
     async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let token = self.auth_header()?;
-
-        let resp = self
-            .client
-            .get(self.xrpc_url(lexicon::get_group_state::NSID))
-            .bearer_auth(&token)
-            .query(&[("convoId", convo_id), ("include", "welcome")])
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::get_group_state::GetGroupStateOutput<String>,
-        >(body.as_ref())?;
-
-        match output.welcome {
-            Some(welcome) => Ok(welcome.to_vec()),
-            None => Err(OrchestratorError::ServerError {
-                status: 404,
-                body: r#"{"error":"NotFound","message":"No welcome available"}"#.to_string(),
-            }),
-        }
+        let _ = convo_id;
+        Err(OrchestratorError::ServerError {
+            status: 404,
+            body: r#"{"error":"NotFound","message":"No welcome available"}"#.to_string(),
+        })
     }
 
     async fn get_delivery_status(
@@ -2566,69 +1963,8 @@ impl MLSAPIClient for ReqwestApiClient {
         group_info: Option<&[u8]>,
         confirmation_tag: Option<&str>,
     ) -> Result<ProcessExternalCommitResult> {
-        return self.reject_legacy_mutation("commitGroupChange.externalCommit");
-        #[allow(unreachable_code)]
         let _ = (convo_id, commit_data, group_info, confirmation_tag);
-        let token = self.auth_header()?;
-        // Caller-supplied `confirmation_tag` is a base64-encoded string (kept
-        // as-is for the public signature); decode it back to raw bytes so the
-        // Jacquard serializer does the single correct base64 encode on the
-        // wire. If the caller didn't provide one, fall back to the MLS-derived
-        // raw bytes for this conversation.
-        let confirmation_tag_raw: Option<Vec<u8>> = match confirmation_tag {
-            Some(s) => B64.decode(s).ok(),
-            None => self.get_confirmation_tag_raw(convo_id),
-        };
-
-        // Bypass the buggy `InputData → Input` adapter (see
-        // `build_commit_group_change` docs).
-        // TODO(ADR-002 A7.4): see addMembers note above.
-        let input = build_commit_group_change(
-            convo_id,
-            "externalCommit",
-            Some(commit_data.to_vec()),
-            None,
-            group_info.map(|v| v.to_vec()),
-            confirmation_tag_raw,
-            None,
-            Some(uuid::Uuid::new_v4().to_string()),
-        );
-
-        let resp = self
-            .client
-            .post(self.xrpc_url(lexicon::commit_group_change::NSID))
-            .bearer_auth(&token)
-            .json(&input)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::mlsChat::commit_group_change::CommitGroupChangeOutput<String>,
-        >(body.as_ref())?;
-        let epoch = output
-            .new_epoch
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or(0);
-        let rejoined_at = output
-            .rejoined_at
-            .as_ref()
-            .map(|value| value.as_ref().to_string())
-            .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
-
-        Ok(ProcessExternalCommitResult {
-            epoch,
-            rejoined_at,
-            receipt: parse_commit_group_change_receipt(&output, "process_external_commit"),
-        })
+        self.reject_legacy_mutation("commitGroupChange.externalCommit")
     }
 
     #[allow(unused_variables, unused_assignments, unreachable_code)]
@@ -2642,8 +1978,6 @@ impl MLSAPIClient for ReqwestApiClient {
         metadata_version: u64,
         reset_generation: Option<i32>,
     ) -> Result<()> {
-        return self.reject_legacy_mutation("putGroupMetadataBlob");
-        #[allow(unreachable_code)]
         let _ = (
             convo_id,
             group_id_hex,
@@ -2653,37 +1987,7 @@ impl MLSAPIClient for ReqwestApiClient {
             metadata_version,
             reset_generation,
         );
-        let token = self.auth_header()?;
-        let metadata_version_str = metadata_version.to_string();
-        let reset_generation_str = reset_generation.map(|n| n.to_string());
-
-        let mut req = self
-            .client
-            .post(self.xrpc_url(lexicon::put_group_metadata_blob::NSID))
-            .bearer_auth(&token)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
-        let mut params: Vec<(&str, &str)> = vec![
-            ("blobLocator", blob_locator),
-            ("groupId", group_id_hex),
-            ("convoId", convo_id),
-            ("kind", kind),
-            ("metadataVersion", metadata_version_str.as_str()),
-        ];
-        if let Some(gen) = reset_generation_str.as_deref() {
-            params.push(("resetGeneration", gen));
-        }
-        req = req.query(&params);
-
-        let resp = req
-            .body(ciphertext.to_vec())
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
-        }
-        Ok(())
+        self.reject_legacy_mutation("putGroupMetadataBlob")
     }
 }
 
@@ -2711,140 +2015,6 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as B64;
     use base64::Engine;
     use catbird_mls::orchestrator::credentials::CredentialStore;
-
-    /// Nine bytes containing both printable-ASCII low values and non-ASCII
-    /// high values so the single-encode vs double-encode distinction shows
-    /// up unambiguously in base64.
-    const KNOWN_BYTES: &[u8] = &[0, 1, 2, 3, 4, 0xde, 0xad, 0xbe, 0xef];
-    /// Standard base64 of KNOWN_BYTES. This is what the wire should carry
-    /// under `{"$bytes": ...}` after a single correct encode.
-    const SINGLE_ENCODED: &str = "AAECAwTerb7v";
-    /// Standard base64 of the ASCII bytes of SINGLE_ENCODED — the bogus
-    /// output the old `InputData` path would produce (regression tripwire).
-    const DOUBLE_ENCODED: &str = "QUFFQ0F3VGVyYjd2";
-
-    #[test]
-    fn build_commit_group_change_produces_single_base64_on_wire() {
-        // Sanity-check the oracle.
-        assert_eq!(B64.encode(KNOWN_BYTES), SINGLE_ENCODED);
-        assert_eq!(B64.encode(SINGLE_ENCODED.as_bytes()), DOUBLE_ENCODED);
-
-        let input = build_commit_group_change(
-            "deadbeef",
-            "addMembers",
-            Some(KNOWN_BYTES.to_vec()),
-            Some(KNOWN_BYTES.to_vec()),
-            Some(KNOWN_BYTES.to_vec()),
-            Some(KNOWN_BYTES.to_vec()),
-            None,
-            Some("idem-key".to_string()),
-        );
-
-        let json = serde_json::to_value(&input).expect("serialize CommitGroupChange");
-        for field in ["commit", "welcome", "groupInfo", "confirmationTag"] {
-            let wrapped = json
-                .get(field)
-                .unwrap_or_else(|| panic!("missing field {field}"));
-            let encoded = wrapped
-                .get("$bytes")
-                .and_then(|v| v.as_str())
-                .unwrap_or_else(|| panic!("field {field} is not a $bytes envelope: {wrapped}"));
-            assert_eq!(
-                encoded, SINGLE_ENCODED,
-                "field {field} was double-encoded (got {encoded}, want {SINGLE_ENCODED})"
-            );
-            assert_ne!(
-                encoded, DOUBLE_ENCODED,
-                "field {field} matched the known bad output — regression!"
-            );
-        }
-    }
-
-    #[test]
-    fn create_convo_welcome_message_uses_raw_bytes() {
-        let input = blue_catbird::mlsChat::create_convo::CreateConvo::<String> {
-            group_id: "deadbeef".to_string().into(),
-            cipher_suite: blue_catbird::mlsChat::create_convo::CreateConvoCipherSuite::from_value(
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
-                    .to_string()
-                    .into(),
-            ),
-            welcome_message: Some(bytes::Bytes::copy_from_slice(KNOWN_BYTES)),
-            current_epoch: Some(1),
-            ..Default::default()
-        };
-        let json = serde_json::to_value(&input).expect("serialize CreateConvo");
-        let encoded = json["welcomeMessage"]["$bytes"]
-            .as_str()
-            .expect("welcomeMessage $bytes envelope");
-        assert_eq!(encoded, SINGLE_ENCODED);
-        assert_ne!(encoded, DOUBLE_ENCODED);
-    }
-
-    #[test]
-    fn convo_view_mapper_preserves_sequencer_did() {
-        let raw = r#"{
-            "conversationId": "conv-sequencer",
-            "groupId": "group-sequencer",
-            "creator": "did:plc:creator",
-            "members": [
-                {
-                    "did": "did:plc:alice",
-                    "userDid": "did:plc:alice",
-                    "joinedAt": "2026-06-13T00:00:00Z",
-                    "isAdmin": true
-                }
-            ],
-            "epoch": 7,
-            "cipherSuite": "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-            "createdAt": "2026-06-13T00:00:00Z",
-            "sequencerDid": "did:web:ds-b.example"
-        }"#;
-        let parsed: blue_catbird::mlsChat::ConvoView =
-            serde_json::from_str(raw).expect("deserialize ConvoView");
-        let generated: lexicon::defs::ConvoViewData = parsed.into_static();
-
-        let mapped = convo_view_to_conversation(&generated);
-
-        assert_eq!(
-            mapped.sequencer_did.as_deref(),
-            Some("did:web:ds-b.example")
-        );
-    }
-
-    /// Demonstrates the bug the new path fixes: construct through the
-    /// `InputData` adapter with a `B64.encode` string and observe the
-    /// double-encoded wire output. If this ever starts producing
-    /// `SINGLE_ENCODED` it means the upstream `InputData` adapter was fixed
-    /// and the workaround helper is no longer load-bearing.
-    #[test]
-    fn legacy_inputdata_adapter_still_double_encodes() {
-        let input: lexicon::commit_group_change::Input = lexicon::commit_group_change::InputData {
-            action: "addMembers".to_string(),
-            commit: Some(B64.encode(KNOWN_BYTES)),
-            confirmation_tag: None,
-            convo_id: "deadbeef".to_string(),
-            device_id: None,
-            epoch_authenticator: None,
-            group_info: None,
-            idempotency_key: None,
-            key_package_hashes: None,
-            member_dids: None,
-            pending_addition_id: None,
-            transition_challenge_id: None,
-            transition_signature: None,
-            welcome: None,
-        }
-        .into();
-        let json = serde_json::to_value(&input).expect("serialize InputData path");
-        let encoded = json["commit"]["$bytes"]
-            .as_str()
-            .expect("commit $bytes envelope");
-        assert_eq!(
-            encoded, DOUBLE_ENCODED,
-            "legacy InputData path no longer double-encodes — re-evaluate fix"
-        );
-    }
 
     // -------------------------------------------------------------------
     // reportRecoveryFailure wire test (Phase 1 / plan task 15)
@@ -3019,8 +2189,9 @@ mod tests {
     }
 
     fn list_devices_body(did: &str, device_id: &str, device_uuid: &str) -> String {
+        let _ = did;
         format!(
-            r#"{{"devices":[{{"credentialDid":"{did}","deviceId":"{device_id}","deviceName":"test","deviceUuid":"{device_uuid}","keyPackageCount":1,"lastSeenAt":"2026-08-17T00:00:00.000Z","registeredAt":"2026-08-17T00:00:00.000Z"}}]}}"#
+            r#"{{"hasMore":false,"items":[{{"device":{{"authGeneration":1,"availablePackageCount":1,"createdAt":"2026-08-17T00:00:00.000Z","deviceId":"{device_id}","dpopJkt":"jkt-test","keyId":"{device_uuid}","reservedPackageCount":0,"signaturePublicKey":{{"$bytes":"AAECAwQ="}},"status":"active","updatedAt":"2026-08-17T00:00:00.000Z"}}}}],"snapshotExpiresAt":"2026-08-17T00:00:00.000Z"}}"#
         )
     }
 

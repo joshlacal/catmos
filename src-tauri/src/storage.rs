@@ -238,6 +238,18 @@ impl SqliteStorage {
                 conversation_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS recovery_backoffs (
+                conversation_id TEXT PRIMARY KEY,
+                failed_rejoin_count INTEGER NOT NULL,
+                last_attempt_at_ms INTEGER NOT NULL,
+                quarantined_until_ms INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS recovery_globals (
+                key TEXT PRIMARY KEY,
+                val_int INTEGER
+            );
             ",
         )?;
         Self::ensure_messages_delivery_status_column(&conn)?;
@@ -1240,6 +1252,83 @@ impl MLSStorageBackend for SqliteStorage {
         Ok(rows > 0)
     }
 
+    async fn get_recovery_state(&self) -> Result<PersistedRecoveryState> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT conversation_id, failed_rejoin_count, last_attempt_at_ms, quarantined_until_ms
+                 FROM recovery_backoffs",
+            )
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PersistedRecoveryBackoff {
+                    conversation_id: row.get(0)?,
+                    failed_rejoin_count: row.get(1)?,
+                    last_attempt_at_ms: row.get(2)?,
+                    quarantined_until_ms: row.get(3)?,
+                })
+            })
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+
+        let mut entries = Vec::new();
+        for r in rows {
+            entries.push(r.map_err(|e| OrchestratorError::Storage(e.to_string()))?);
+        }
+
+        let last_global_rejoin_attempt_at_ms = conn
+            .query_row(
+                "SELECT val_int FROM recovery_globals WHERE key = 'last_global_rejoin_attempt_at_ms'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+
+        Ok(PersistedRecoveryState {
+            entries,
+            last_global_rejoin_attempt_at_ms,
+        })
+    }
+
+    async fn set_recovery_backoff(&self, entry: &PersistedRecoveryBackoff) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO recovery_backoffs
+             (conversation_id, failed_rejoin_count, last_attempt_at_ms, quarantined_until_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                entry.conversation_id,
+                entry.failed_rejoin_count,
+                entry.last_attempt_at_ms,
+                entry.quarantined_until_ms,
+            ],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn clear_recovery_backoff(&self, conversation_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM recovery_backoffs WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn set_last_global_rejoin_attempt_at(&self, at_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO recovery_globals (key, val_int)
+             VALUES ('last_global_rejoin_attempt_at_ms', ?1)",
+            rusqlite::params![at_ms],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
             "get_conversation_state",
@@ -1250,6 +1339,10 @@ impl MLSStorageBackend for SqliteStorage {
             "clear_quarantine",
             "store_pending_message",
             "remove_pending_message",
+            "get_recovery_state",
+            "set_recovery_backoff",
+            "clear_recovery_backoff",
+            "set_last_global_rejoin_attempt_at",
         ]
     }
 }
