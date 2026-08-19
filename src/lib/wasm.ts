@@ -387,6 +387,19 @@ export async function prepareUnsignedRequest(
 	return getWorker().prepareUnsignedRequest(operation, requestJson);
 }
 
+export interface PreparedGatewayRequest {
+	operation: string;
+	method: string;
+	path: string;
+	body?: string;
+}
+
+export interface GatewayResponse {
+	status: number;
+	contentType?: string | null;
+	body: string;
+}
+
 /** Prepare a signed generated clean-chat request through the worker WASM. */
 export async function prepareSignedRequest(
 	operation: string,
@@ -394,6 +407,56 @@ export async function prepareSignedRequest(
 ): Promise<unknown> {
 	if (isTauri) throw new Error('browser signed preparation is unsupported in Tauri runtime');
 	return getWorker().prepareSignedRequest(operation, requestJson);
+}
+
+/**
+ * Submit an exact WASM-prepared request over the opaque session transport.
+ * Fenced to the active session DID; verifies that session has not switched.
+ */
+export async function submitPreparedRequest(
+	prepared: PreparedGatewayRequest,
+	expectedDid?: string
+): Promise<GatewayResponse> {
+	if (isTauri) {
+		throw new Error('submitPreparedRequest is a browser transport; desktop routes via Rust');
+	}
+	const saved = readBrowserAuth();
+	if (!saved) {
+		throw new Error('Not authenticated');
+	}
+	if (expectedDid && saved.did !== expectedDid) {
+		throw new Error('Session changed: prepared request actor DID does not match current session');
+	}
+
+	const url = `${NEST_URL}${prepared.path}`;
+	const headers: Record<string, string> = {
+		Authorization: `Bearer ${saved.sessionId}`,
+		'atproto-proxy': 'did:web:chat.catbird.blue#atproto_mls'
+	};
+	if (prepared.body) {
+		headers['Content-Type'] = 'application/json';
+	}
+
+	const resp = await fetch(url, {
+		method: prepared.method,
+		headers,
+		body: prepared.body
+	});
+
+	// Re-verify session has not changed while request was in-flight
+	const current = readBrowserAuth();
+	if (!current || current.did !== saved.did || current.sessionId !== saved.sessionId) {
+		throw new Error('Session changed during request execution');
+	}
+
+	const bodyText = await resp.text();
+	const contentType = resp.headers.get('content-type');
+
+	return {
+		status: resp.status,
+		contentType,
+		body: bodyText
+	};
 }
 
 /**
@@ -936,29 +999,21 @@ export async function resetGroup(
 	if (isTauri) {
 		return tauriInvoke('reset_group', { conversationId, reason });
 	}
-	// Browser: call the XRPC endpoint directly via nest BFF
 	const saved = readBrowserAuth();
 	if (!saved) throw new Error('Not authenticated');
-	const newGroupId = crypto.randomUUID();
-	const body: Record<string, string> = {
+	const requestJson = JSON.stringify({
 		convoId: conversationId,
-		newGroupId,
-		cipherSuite: 'MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519'
-	};
-	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.chat.requestReset`, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${saved.sessionId}`
-		},
-		body: JSON.stringify(body)
+		reason: reason ?? undefined
 	});
-	if (!resp.ok) {
-		const text = await resp.text();
-		throw new Error(`Reset group failed: ${resp.status} ${text}`);
+	const prepared = (await prepareSignedRequest(
+		'requestReset',
+		requestJson
+	)) as PreparedGatewayRequest;
+	const resp = await submitPreparedRequest(prepared, saved.did);
+	if (resp.status < 200 || resp.status >= 300) {
+		throw new Error(`Reset group failed: ${resp.status} ${resp.body}`);
 	}
-	return resp.json();
+	return resp.body ? JSON.parse(resp.body) : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -973,7 +1028,6 @@ export async function reportSpam(
 	if (isTauri) {
 		return tauriInvoke('report_spam', { conversationId, reportedDid, reason });
 	}
-	// Browser: call the XRPC endpoint directly via nest BFF
 	const saved = readBrowserAuth();
 	if (!saved) throw new Error('Not authenticated');
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
@@ -982,7 +1036,8 @@ export async function reportSpam(
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
-			Authorization: `Bearer ${saved.sessionId}`
+			Authorization: `Bearer ${saved.sessionId}`,
+			'atproto-proxy': 'did:web:chat.catbird.blue#atproto_mls'
 		},
 		body: JSON.stringify(body)
 	});

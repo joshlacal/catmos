@@ -1262,38 +1262,35 @@ impl ReqwestApiClient {
         epoch_authenticator: Option<&str>,
         failure_mode: Option<&str>,
     ) -> Result<()> {
-        return self.reject_legacy_mutation("reportRecoveryFailure");
-        #[allow(unreachable_code)]
-        let _ = (convo_id, failure_type, epoch_authenticator, failure_mode);
-        let token = self.auth_header()?;
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
 
         let mut body = serde_json::json!({
             "convoId": convo_id,
             "failureType": failure_type,
         });
-        // TODO(ADR-002 A7): once task #26 lands (`epochAuthenticator` in the
-        // `reportRecoveryFailure` lexicon + generated type), switch to the
-        // typed lexicon input instead of a raw JSON map. For now we only send
-        // the field when the orchestrator produced one so pre-A7 servers keep
-        // accepting our reports unchanged.
         if let Some(auth) = epoch_authenticator {
             body["epochAuthenticator"] = serde_json::Value::String(auth.to_string());
         }
-        // ADR-008 D1 (spec §8.6.1): include failureMode when the orchestrator
-        // produced one. Servers without D1 enforcement ignore the field;
-        // servers with D1 enforcement use it to filter Mode A from quorum.
         if let Some(mode) = failure_mode {
             body["failureMode"] = serde_json::Value::String(mode.to_string());
         }
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.reportRecoveryFailure"))
-            .bearer_auth(&token)
+            .post(self.xrpc_url("blue.catbird.chat.requestLeafRecovery"))
+            .bearer_auth(&session.token)
             .json(&body)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        if let Err(error) = self.observe_chat_binding(&resp, &session) {
+            self.invalidate_device_authority_for_session(&session).await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
 
         let status = resp.status();
         if status.is_success() {
@@ -1303,9 +1300,6 @@ impl ReqwestApiClient {
         let status_code = status.as_u16();
         let body_text = resp.text().await.unwrap_or_default();
 
-        // 403 = caller is no longer a member (stale membership state on this
-        // device). There's nothing actionable server-side; treat as a soft
-        // ack so we don't spin the retry loop.
         if status_code == 403 {
             tracing::info!(
                 convo_id,
@@ -1330,17 +1324,16 @@ impl ReqwestApiClient {
     }
 
     /// Report a member as spam in an MLS conversation.
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
     pub async fn report_spam(
         &self,
         convo_id: &str,
         reported_did: &str,
         reason: Option<&str>,
     ) -> Result<()> {
-        return self.reject_legacy_mutation("reportSpam");
-        #[allow(unreachable_code)]
-        let _ = (convo_id, reported_did, reason);
-        let token = self.auth_header()?;
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
 
         let mut body = serde_json::json!({
             "convoId": convo_id,
@@ -1352,15 +1345,20 @@ impl ReqwestApiClient {
 
         let resp = self
             .client
-            .post(self.xrpc_url("blue.catbird.mlsChat.reportSpam"))
-            .bearer_auth(&token)
+            .post(self.xrpc_url("blue.catbird.chat.reportSpam"))
+            .bearer_auth(&session.token)
             .json(&body)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
+        if let Err(error) = self.observe_chat_binding(&resp, &session) {
+            self.invalidate_device_authority_for_session(&session).await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
+
         if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+            return Err(self.handle_error_for_session(resp, &session).await);
         }
         Ok(())
     }
@@ -1585,6 +1583,11 @@ fn canonical_entry_matches_type(
             entry,
             catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(_)
         ),
+        Some("control") => !matches!(
+            entry,
+            catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(_)
+                | catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(_)
+        ),
         _ => true,
     }
 }
@@ -1651,103 +1654,72 @@ impl MLSAPIClient for ReqwestApiClient {
             .map(|session| session.actor_did)
     }
 
+    async fn submit_prepared_request(
+        &self,
+        request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
+    ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
+
+        let url = self.canonical_url(&request.path);
+        let mut builder = match request.method.as_str() {
+            "POST" => self.client.post(&url),
+            "GET" => self.client.get(&url),
+            "PUT" => self.client.put(&url),
+            "DELETE" => self.client.delete(&url),
+            _ => self.client.post(&url),
+        };
+        builder = builder.bearer_auth(&session.token);
+        if let Some(body) = request.body {
+            builder = builder
+                .body(body)
+                .header(reqwest::header::CONTENT_TYPE, "application/json");
+        }
+
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+
+        if let Err(error) = self.observe_chat_binding(&resp, &session) {
+            self.invalidate_device_authority_for_session(&session).await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
+
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+
+        if matches!(status, 401 | 403) {
+            self.invalidate_device_authority_for_session(&session).await;
+        }
+
+        let body = resp
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?
+            .to_vec();
+
+        self.ensure_session_current(&session)?;
+
+        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+            status,
+            content_type,
+            body,
+        })
+    }
+
     async fn get_conversations(
         &self,
         limit: u32,
         cursor: Option<&str>,
     ) -> Result<ConversationListPage> {
         self.canonical_get_conversations(limit, cursor).await
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn create_conversation(
-        &self,
-        group_id: &str,
-        initial_members: Option<&[String]>,
-        _metadata: Option<&ConversationMetadata>,
-        _commit_data: Option<&[u8]>,
-        welcome_data: Option<&[u8]>,
-    ) -> Result<CreateConversationResult> {
-        let _ = (
-            group_id,
-            initial_members,
-            _metadata,
-            _commit_data,
-            welcome_data,
-        );
-        self.reject_legacy_mutation("createConvo")
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn bootstrap_reset_group(
-        &self,
-        original_convo_id: &str,
-        new_group_id: &str,
-        cipher_suite: &str,
-        group_info: &[u8],
-        members: &[String],
-        welcome_message: Option<&[u8]>,
-    ) -> Result<CreateConversationResult> {
-        let _ = (
-            original_convo_id,
-            new_group_id,
-            cipher_suite,
-            group_info,
-            members,
-            welcome_message,
-        );
-        self.reject_legacy_mutation("bootstrapResetGroup")
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn leave_conversation(&self, convo_id: &str) -> Result<()> {
-        let _ = convo_id;
-        self.reject_legacy_mutation("leaveConvo")
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn add_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-        welcome_data: Option<&[u8]>,
-    ) -> Result<AddMembersServerResult> {
-        let _ = (convo_id, member_dids, commit_data, welcome_data);
-        self.reject_legacy_mutation("commitGroupChange.addMembers")
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn remove_members(
-        &self,
-        convo_id: &str,
-        member_dids: &[String],
-        commit_data: &[u8],
-    ) -> Result<()> {
-        let _ = (convo_id, member_dids, commit_data);
-        self.reject_legacy_mutation("commitGroupChange.removeMember")
-    }
-
-    async fn send_message(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-    ) -> Result<SendMessageResponse> {
-        let msg_id = uuid::Uuid::new_v4().to_string();
-        self.send_message_request(convo_id, ciphertext, epoch, &msg_id)
-            .await
-    }
-
-    async fn send_message_with_id(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-        msg_id: &str,
-    ) -> Result<SendMessageResponse> {
-        self.send_message_request(convo_id, ciphertext, epoch, msg_id)
-            .await
     }
 
     async fn get_messages(
@@ -1772,41 +1744,45 @@ impl MLSAPIClient for ReqwestApiClient {
         Ok((entries, next_cursor))
     }
 
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn publish_key_package(
+    async fn get_key_packages(
         &self,
-        key_package: &[u8],
-        cipher_suite: &str,
-        expires_at: &str,
-        device_id: Option<&str>,
-    ) -> Result<()> {
-        let _ = (key_package, cipher_suite, expires_at, device_id);
-        self.reject_legacy_mutation("publishKeyPackages")
-    }
+        actor_device_id: &str,
+        dids: &[String],
+    ) -> Result<Vec<KeyPackageRef>> {
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
 
-    async fn get_key_packages(&self, dids: &[String]) -> Result<Vec<KeyPackageRef>> {
-        let token = self.auth_header()?;
-        let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
-        let query_params: Vec<(&str, &str)> = parsed_dids.iter().map(|d| ("userDids", d.as_str())).collect();
+        let mut query_params: Vec<(&str, &str)> = vec![("actorDeviceId", actor_device_id)];
+        for did in dids {
+            query_params.push(("userDids", did.as_str()));
+        }
         let url = self.xrpc_url("blue.catbird.chat.getDevices");
 
         let resp = self
             .client
             .get(&url)
             .query(&query_params)
-            .bearer_auth(&token)
+            .bearer_auth(&session.token)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
+        if let Err(error) = self.observe_chat_binding(&resp, &session) {
+            self.invalidate_device_authority_for_session(&session).await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
+
         if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+            return Err(self.handle_error_for_session(resp, &session).await);
         }
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.ensure_session_current(&session)?;
         let output = parse_lexicon_json::<
             blue_catbird::chat::get_devices::GetDevicesOutput<String>,
         >(body.as_ref())?;
@@ -1824,28 +1800,42 @@ impl MLSAPIClient for ReqwestApiClient {
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
-        let token = self.auth_header()?;
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
+
         let resp = self
             .client
             .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
-            .bearer_auth(&token)
+            .bearer_auth(&session.token)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
+        if let Err(error) = self.observe_chat_binding(&resp, &session) {
+            self.invalidate_device_authority_for_session(&session).await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
+
         if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+            return Err(self.handle_error_for_session(resp, &session).await);
         }
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.ensure_session_current(&session)?;
         let output = parse_lexicon_json::<
             blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>,
         >(body.as_ref())?;
 
-        let available: u32 = output.items.iter().map(|item| item.device.available_package_count.max(0) as u32).sum();
+        let available: u32 = output
+            .items
+            .iter()
+            .map(|item| item.device.available_package_count.max(0) as u32)
+            .sum();
         Ok(KeyPackageStats {
             available,
             total: available,
@@ -1863,72 +1853,50 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn register_device(
-        &self,
-        device_uuid: &str,
-        device_name: &str,
-        mls_did: &str,
-        signature_key: &[u8],
-        key_packages: &[Vec<u8>],
-    ) -> Result<DeviceInfo> {
-        let _ = (
-            device_uuid,
-            device_name,
-            mls_did,
-            signature_key,
-            key_packages,
-        );
-        self.reject_legacy_mutation("registerDevice")
-    }
-
-    async fn list_devices(&self) -> Result<Vec<DeviceInfo>> {
+    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
         let session = self
             .current_session()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
         self.list_devices_for_session(&session).await
     }
 
-    async fn remove_device(&self, _device_id: &str) -> Result<()> {
-        Err(OrchestratorError::Api(
-            "Device removal not yet supported by server".to_string(),
-        ))
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn publish_group_info(&self, convo_id: &str, group_info: &[u8]) -> Result<()> {
-        let _ = (convo_id, group_info);
-        self.reject_legacy_mutation("commitGroupChange.updateGroupInfo")
-    }
-
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let token = self.auth_header()?;
+        let session = self
+            .current_session()
+            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        self.ensure_session_current(&session)?;
 
         let resp = self
             .client
             .get(self.xrpc_url("blue.catbird.chat.getConversationState"))
-            .bearer_auth(&token)
+            .bearer_auth(&session.token)
             .query(&[("conversationId", convo_id)])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
+        if let Err(error) = self.observe_chat_binding(&resp, &session) {
+            self.invalidate_device_authority_for_session(&session).await;
+            return Err(OrchestratorError::Api(error.to_string()));
+        }
+
         if !resp.status().is_success() {
-            return Err(self.handle_error(resp).await);
+            return Err(self.handle_error_for_session(resp, &session).await);
         }
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.ensure_session_current(&session)?;
         let output = parse_lexicon_json::<
             blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>,
         >(body.as_ref())?;
         Ok(output.state.coordinates.group_id.as_ref().to_vec())
     }
 
-    async fn get_welcome(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let _ = convo_id;
+    async fn get_welcome(&self, _convo_id: &str) -> Result<Vec<u8>> {
         Err(OrchestratorError::ServerError {
             status: 404,
             body: r#"{"error":"NotFound","message":"No welcome available"}"#.to_string(),
@@ -1937,57 +1905,19 @@ impl MLSAPIClient for ReqwestApiClient {
 
     async fn get_delivery_status(
         &self,
-        convo_id: &str,
-        message_ids: &[String],
+        _convo_id: &str,
+        _message_ids: &[String],
     ) -> Result<Vec<(String, DeliveryStatus)>> {
-        let _ = (convo_id, message_ids);
         Ok(vec![])
     }
 
-    async fn report_recovery_failure(
+    async fn get_group_metadata_blob(
         &self,
-        convo_id: &str,
-        failure_type: &str,
-        epoch_authenticator: Option<&str>,
-        failure_mode: Option<&str>,
-    ) -> Result<()> {
-        self.post_recovery_failure(convo_id, failure_type, epoch_authenticator, failure_mode)
-            .await
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn process_external_commit(
-        &self,
-        convo_id: &str,
-        commit_data: &[u8],
-        group_info: Option<&[u8]>,
-        confirmation_tag: Option<&str>,
-    ) -> Result<ProcessExternalCommitResult> {
-        let _ = (convo_id, commit_data, group_info, confirmation_tag);
-        self.reject_legacy_mutation("commitGroupChange.externalCommit")
-    }
-
-    #[allow(unused_variables, unused_assignments, unreachable_code)]
-    async fn put_group_metadata_blob(
-        &self,
-        convo_id: &str,
-        group_id_hex: &str,
+        _convo_id: &str,
+        _group_id_hex: &str,
         blob_locator: &str,
-        ciphertext: &[u8],
-        kind: &str,
-        metadata_version: u64,
-        reset_generation: Option<i32>,
-    ) -> Result<()> {
-        let _ = (
-            convo_id,
-            group_id_hex,
-            blob_locator,
-            ciphertext,
-            kind,
-            metadata_version,
-            reset_generation,
-        );
-        self.reject_legacy_mutation("putGroupMetadataBlob")
+    ) -> Result<Vec<u8>> {
+        self.get_blob(blob_locator).await
     }
 }
 

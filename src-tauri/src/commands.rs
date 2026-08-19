@@ -2647,7 +2647,6 @@ pub async fn report_spam(
 }
 
 #[tauri::command]
-#[allow(unused_variables, unused_assignments, unreachable_code)]
 pub async fn reset_group(
     state: State<'_, AppState>,
     conversation_id: String,
@@ -2655,96 +2654,40 @@ pub async fn reset_group(
 ) -> Result<serde_json::Value, String> {
     log_catmos!("reset_group: convo={}", conversation_id);
 
-    return state
-        .api_client
-        .reject_legacy_mutation::<serde_json::Value>("resetGroup")
-        .map_err(|error| actionable_error(format!("{error:?}")));
-    #[allow(unreachable_code)]
-    let _ = (&conversation_id, &reason);
-
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
-    // Generate a new group ID (random UUID-based identifier)
-    let new_group_id = uuid::Uuid::new_v4().to_string();
-
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "convoId": conversation_id,
-        "newGroupId": new_group_id,
-        "cipherSuite": "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519",
-        "reason": reason,
     });
-
-    let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(
-        client.post(format!("{}/xrpc/blue.catbird.chat.requestReset", nest_url)),
-    )
-    .bearer_auth(&token)
-    .json(&body)
-    .send()
-    .await
-    .map_err(|e| format!("Reset group failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Reset group failed: {}", body));
+    if let Some(r) = reason {
+        body["reason"] = serde_json::Value::String(r);
     }
 
-    let result: serde_json::Value = resp
-        .json()
+    let req = catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset,
+        method: "POST".to_string(),
+        path: "/xrpc/blue.catbird.chat.requestReset".to_string(),
+        authorization: String::new(),
+        dpop: String::new(),
+        body: Some(serde_json::to_vec(&body).map_err(|e| format!("JSON error: {e}"))?),
+    };
+
+    let resp = state
+        .api_client
+        .submit_prepared_request(req)
         .await
-        .map_err(|e| format!("Failed to parse reset response: {}", e))?;
+        .map_err(|e| format!("Reset group failed: {e}"))?;
+
+    if resp.status != 200 {
+        return Err(format!(
+            "Reset group failed with status {}: {}",
+            resp.status,
+            String::from_utf8_lossy(&resp.body)
+        ));
+    }
+
+    let result: serde_json::Value = serde_json::from_slice(&resp.body)
+        .map_err(|e| format!("Failed to parse reset response: {e}"))?;
 
     log_catmos!("reset_group success: {:?}", result);
-
-    // Best-effort metadata re-emission. After the server returns success the
-    // orchestrator + websocket recovery path will eventually merge an
-    // External Commit that joins the new group. The new group's epoch
-    // exporter is only available locally AFTER that merge — there's no
-    // synchronous signal at this point. The caller (frontend) is expected
-    // to invoke `republish_group_metadata` once the
-    // `mls:group-reset` → first-merge cycle has completed; the helper here
-    // is a no-op-ish probe that succeeds only when the new group is already
-    // joined locally.
-    if let Some(title_or_desc) = state
-        .orchestrator
-        .storage()
-        .get_metadata_snapshot(&conversation_id)
-        .and_then(|s| s.metadata_json)
-        .and_then(|j| serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(&j).ok())
-    {
-        let avatar_pair = state.orchestrator.storage().get_avatar(&conversation_id);
-        let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
-        let avatar_content_type = avatar_pair.and_then(|(_, ct)| ct);
-        if let Err(e) = republish_group_metadata_after_reset(
-            &state,
-            &conversation_id,
-            &new_group_id,
-            // Use a wall-clock millis tick as the version floor when the
-            // server response doesn't expose `resetGeneration` — the server
-            // increments its own copy on every reset, and we just need a
-            // monotonically-fresh value bound to AAD.
-            chrono::Utc::now().timestamp_millis(),
-            Some(title_or_desc.title.clone()).filter(|t| !t.is_empty()),
-            Some(title_or_desc.description.clone()).filter(|d| !d.is_empty()),
-            avatar_bytes,
-            avatar_content_type,
-        )
-        .await
-        {
-            log_catmos!(
-                "reset_group: republish_group_metadata_after_reset deferred for convo={} (will retry via republish_group_metadata command): {}",
-                conversation_id,
-                e
-            );
-        }
-    }
-
     Ok(result)
 }
 
