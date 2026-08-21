@@ -2665,8 +2665,6 @@ pub async fn reset_group(
         operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.requestReset".to_string(),
-        authorization: String::new(),
-        dpop: String::new(),
         body: Some(serde_json::to_vec(&body).map_err(|e| format!("JSON error: {e}"))?),
     };
 

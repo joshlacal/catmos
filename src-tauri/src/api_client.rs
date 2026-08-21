@@ -1234,6 +1234,12 @@ impl ReqwestApiClient {
                 mls_did: session.actor_did.clone(),
                 device_uuid: d.device.key_id.to_string(),
                 created_at: None,
+                key_id: Some(d.device.key_id.to_string()),
+                signature_public_key: None,
+                auth_generation: Some(i64::try_from(d.device.auth_generation).unwrap_or(i64::MAX)),
+                status: Some(d.device.status.to_string()),
+                available_package_count: d.device.available_package_count.try_into().ok(),
+                reserved_package_count: d.device.reserved_package_count.try_into().ok(),
             })
             .collect())
     }
@@ -2692,6 +2698,12 @@ fn test_device_info(device_id: &str, device_uuid: &str) -> DeviceInfo {
         mls_did: "did:plc:catmos".to_string(),
         device_uuid: device_uuid.to_string(),
         created_at: None,
+        key_id: None,
+        signature_public_key: None,
+        auth_generation: None,
+        status: None,
+        available_package_count: None,
+        reserved_package_count: None,
     }
 }
 
