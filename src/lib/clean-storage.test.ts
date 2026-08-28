@@ -1,7 +1,7 @@
 /**
  * Clean storage isolation and state table unit tests for Catmos web/browser host.
  *
- * Enforces:
+ * Imports canonical constants directly from $lib/wasm to prevent drift:
  * - Generation token and filesystem/logical suffix `-clean-v2-openmls-v09`
  * - Exact storagePrefix and dbPrefix
  * - Content root key format with sha256(did) and clean suffix
@@ -11,16 +11,16 @@
  * - Explicit reset marker-last ordering
  */
 
-export const CLEAN_STORAGE_GENERATION_TOKEN = 'mls-state-clean-v2-openmls-v09';
-export const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
-export const DEFAULT_CLEAN_STORAGE_PREFIX = `catbird_mls${CLEAN_STORAGE_SUFFIX}`;
-export const DEFAULT_CLEAN_DB_PREFIX = `catbird-mls${CLEAN_STORAGE_SUFFIX}`;
-export const CONTENT_ROOT_PREFIX = 'mls.content.root.';
-export const CURSOR_PREFIX = `catbird_ws_cursor${CLEAN_STORAGE_SUFFIX}`;
-
-export function didKey(did: string, suffix: string): string {
-	return `catbird_mls:${did}:${suffix}${CLEAN_STORAGE_SUFFIX}`;
-}
+import {
+	CLEAN_STORAGE_GENERATION_TOKEN,
+	CLEAN_STORAGE_SUFFIX,
+	STORAGE_PREFIX as DEFAULT_CLEAN_STORAGE_PREFIX,
+	DB_PREFIX as DEFAULT_CLEAN_DB_PREFIX,
+	CONTENT_ROOT_PREFIX,
+	MLS_DB_KEY_PREFIX,
+	INIT_RECORD_PREFIX,
+	didKey
+} from './wasm';
 
 export async function computeContentRootKeyName(userDid: string): Promise<string> {
 	const bytes = new TextEncoder().encode(userDid);
@@ -48,7 +48,16 @@ export function testCleanStorageInvariants(): { passed: boolean; details: string
 	}
 	details.push('Default storage and DB prefixes verified');
 
-	// 2. Per-DID key naming
+	// 2. Canonical key formatting
+	if (MLS_DB_KEY_PREFIX !== 'catbird_mls-clean-v2-openmls-v09_mls_db_key') {
+		throw new Error(`Invalid MLS_DB_KEY_PREFIX: ${MLS_DB_KEY_PREFIX}`);
+	}
+	if (INIT_RECORD_PREFIX !== 'catbird_mls-clean-v2-openmls-v09_init_record') {
+		throw new Error(`Invalid INIT_RECORD_PREFIX: ${INIT_RECORD_PREFIX}`);
+	}
+	details.push('Canonical database and marker prefixes verified');
+
+	// 3. Per-DID key naming
 	const aliceDid = 'did:plc:alice1234567890';
 	const sessionKey = didKey(aliceDid, 'session_id');
 	const mlsDbKey = didKey(aliceDid, 'mls_db_key');
@@ -65,7 +74,7 @@ export function testCleanStorageInvariants(): { passed: boolean; details: string
 	}
 	details.push('Per-DID namespaced keys verified');
 
-	// 3. Legacy isolation
+	// 4. Legacy isolation
 	const legacyKeys = [
 		'catbird_mls_active_did',
 		'catbird_mls_mls_db_key',

@@ -37,14 +37,15 @@ const api = {
 		subscriptions.clear();
 		(wasm as unknown as { catbird_mls_close?: () => void }).catbird_mls_close?.();
 	},
-	resetCleanStorage: (config?: object) => {
+	resetCleanStorage: async (config?: object) => {
 		for (const sub of subscriptions.values()) {
 			sub.close();
 		}
 		subscriptions.clear();
-		(
+		await wasmReady;
+		await (
 			wasm as unknown as {
-				catbird_mls_reset_clean_storage?: (c?: unknown) => void;
+				catbird_mls_reset_clean_storage?: (c?: unknown) => Promise<void>;
 			}
 		).catbird_mls_reset_clean_storage?.(config);
 	},

@@ -1,13 +1,15 @@
 /**
  * Single-tab enforcement for Catmos Web.
  *
- * Uses the Web Locks API to acquire an exclusive lock named "catmos-mls-session".
+ * Uses the Web Locks API to acquire an exclusive lock named "catmos-mls-session-clean-v2-openmls-v09".
  * If another tab already holds the lock, the caller is notified so it can show
  * a blocked UI instead of the app (preventing MLS epoch conflicts).
  *
  * Falls back gracefully when the Web Locks API is unavailable (older browsers,
  * Tauri desktop) — the lock is simply granted immediately.
  */
+
+const TAB_LOCK_NAME = 'catmos-mls-session-clean-v2-openmls-v09';
 
 export type TabLockStatus = 'acquiring' | 'granted' | 'blocked';
 
@@ -38,7 +40,7 @@ export function acquireTabLock(onStatusChange: TabLockCallback): { steal: () => 
   // Try to grab the lock without waiting. If unavailable, we know another
   // tab has it and can show the blocked UI right away.
   navigator.locks.request(
-    'catmos-mls-session',
+    TAB_LOCK_NAME,
     { ifAvailable: true },
     async (lock) => {
       if (lock) {
@@ -62,7 +64,7 @@ export function acquireTabLock(onStatusChange: TabLockCallback): { steal: () => 
 
     // Request the lock *with* waiting. When the other tab releases (or the
     // user closes it), this will fire.
-    navigator.locks.request('catmos-mls-session', { steal: true }, async () => {
+    navigator.locks.request(TAB_LOCK_NAME, { steal: true }, async () => {
       onStatusChange('granted');
       stealResolver = null;
       return new Promise<void>((resolve) => {
