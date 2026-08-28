@@ -970,11 +970,7 @@ pub async fn try_restore_session(
 }
 
 #[tauri::command]
-pub async fn logout(
-    state: State<'_, AppState>,
-    wipe_clean_storage: Option<bool>,
-) -> Result<(), String> {
-    let did = state.api_client.current_did().await;
+pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     // Stop key package monitor
     if let Some(handle) = state.kp_monitor.lock().await.take() {
         handle.abort();
@@ -994,16 +990,6 @@ pub async fn logout(
     // can reconcile listDevices before considering registration.
     clear_saved_session_credentials();
 
-    if wipe_clean_storage == Some(true) {
-        crate::storage::reset_clean_storage(
-            &state.data_dir,
-            did.as_deref(),
-            None,
-            Some(state.orchestrator.mls_context().as_ref()),
-            crate::storage::DB_KEYRING_SERVICE,
-        )
-        .await?;
-    }
     Ok(())
 }
 

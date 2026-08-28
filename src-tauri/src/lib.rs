@@ -90,6 +90,21 @@ pub fn run() {
 
     let db_path = data_dir.join(format!("catmos-{}.db", storage::MLS_KEY_SUFFIX));
 
+    // Process explicit recovery opt-in switch if supplied
+    let should_reset = std::env::args().any(|arg| arg == "--reset-mls-storage");
+    if should_reset {
+        tracing::info!("[catmos] Explicit --reset-mls-storage requested; resetting clean storage generation");
+        if let Err(e) = tauri::async_runtime::block_on(storage::reset_clean_storage(
+            &data_dir,
+            None,
+            None,
+            None,
+            storage::DB_KEYRING_SERVICE,
+        )) {
+            panic!("Failed to reset clean storage via --reset-mls-storage: {e}");
+        }
+    }
+
     // Route XRPC calls through nest BFF (handles DPoP auth, session management)
     let mls_ds_url =
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
@@ -97,7 +112,12 @@ pub fn run() {
     // Create platform implementations
     let storage = Arc::new(
         storage::open_clean_sqlite_storage(&db_path, storage::DB_KEYRING_SERVICE)
-            .expect("Failed to initialize clean SQLite storage"),
+            .unwrap_or_else(|e| {
+                panic!(
+                    "Failed to initialize clean SQLite storage ({e}). \
+                     To recover from a mixed or interrupted storage state, restart with --reset-mls-storage."
+                )
+            }),
     );
     let api_client = Arc::new(ReqwestApiClient::new(mls_ds_url));
     let cred_store = Arc::new(KeyringCredentialStore::new());
@@ -109,8 +129,12 @@ pub fn run() {
     let mls_db_path = mls_state_dir.join("mls.db");
     let keychain = Box::new(KeyringKeychainAccess::new());
     let mls_context = storage::open_clean_mls_context(&mls_db_path, storage::DB_KEYRING_SERVICE, keychain)
-        .expect("Failed to initialize clean MLS context");
-    // Clear leftover WAL from previous session — ensures all committed data is
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to initialize clean MLS context ({e}). \
+                 To recover from a mixed or interrupted storage state, restart with --reset-mls-storage."
+            )
+        });
     // checkpointed into the main database file before we start reading.
     if let Err(e) = mls_context.launch_checkpoint() {
         eprintln!(

@@ -191,14 +191,80 @@ pub fn write_marker_complete(
     Ok(())
 }
 
-pub fn load_db_key_from_keyring(
+pub trait DbKeyStore: Send + Sync {
+    fn get_password(&self, service: &str, label: &str) -> std::result::Result<Option<String>, DatabaseInitError>;
+    fn set_password(&self, service: &str, label: &str, password: &str) -> std::result::Result<(), DatabaseInitError>;
+    fn delete_password(&self, service: &str, label: &str) -> std::result::Result<(), DatabaseInitError>;
+}
+
+pub struct KeyringDbKeyStore;
+
+impl DbKeyStore for KeyringDbKeyStore {
+    fn get_password(&self, service: &str, label: &str) -> std::result::Result<Option<String>, DatabaseInitError> {
+        let entry = keyring::Entry::new(service, label)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+        match entry.get_password() {
+            Ok(val) => Ok(Some(val)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+        }
+    }
+
+    fn set_password(&self, service: &str, label: &str, password: &str) -> std::result::Result<(), DatabaseInitError> {
+        let entry = keyring::Entry::new(service, label)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+        entry
+            .set_password(password)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))
+    }
+
+    fn delete_password(&self, service: &str, label: &str) -> std::result::Result<(), DatabaseInitError> {
+        let entry = keyring::Entry::new(service, label)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct MemoryDbKeyStore {
+    entries: Mutex<HashMap<(String, String), String>>,
+}
+
+impl MemoryDbKeyStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl DbKeyStore for MemoryDbKeyStore {
+    fn get_password(&self, service: &str, label: &str) -> std::result::Result<Option<String>, DatabaseInitError> {
+        let guard = self.entries.lock().unwrap();
+        Ok(guard.get(&(service.to_string(), label.to_string())).cloned())
+    }
+
+    fn set_password(&self, service: &str, label: &str, password: &str) -> std::result::Result<(), DatabaseInitError> {
+        let mut guard = self.entries.lock().unwrap();
+        guard.insert((service.to_string(), label.to_string()), password.to_string());
+        Ok(())
+    }
+
+    fn delete_password(&self, service: &str, label: &str) -> std::result::Result<(), DatabaseInitError> {
+        let mut guard = self.entries.lock().unwrap();
+        guard.remove(&(service.to_string(), label.to_string()));
+        Ok(())
+    }
+}
+
+pub fn load_db_key_from_store(
+    store: &dyn DbKeyStore,
     service: &str,
     label: &str,
 ) -> std::result::Result<Option<String>, DatabaseInitError> {
-    let entry = keyring::Entry::new(service, label)
-        .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
-    match entry.get_password() {
-        Ok(pwd) => {
+    match store.get_password(service, label)? {
+        Some(pwd) => {
             let trimmed = pwd.trim();
             if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
                 Ok(Some(trimmed.to_string()))
@@ -206,19 +272,17 @@ pub fn load_db_key_from_keyring(
                 Err(DatabaseInitError::InvalidKeyFormat)
             }
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+        None => Ok(None),
     }
 }
 
-pub fn create_db_key_in_keyring(
+pub fn create_db_key_in_store(
+    store: &dyn DbKeyStore,
     service: &str,
     label: &str,
 ) -> std::result::Result<String, DatabaseInitError> {
-    let entry = keyring::Entry::new(service, label)
-        .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
-    match entry.get_password() {
-        Ok(existing) => {
+    match store.get_password(service, label)? {
+        Some(existing) => {
             let trimmed = existing.trim();
             if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
                 Ok(trimmed.to_string())
@@ -226,17 +290,15 @@ pub fn create_db_key_in_keyring(
                 Err(DatabaseInitError::InvalidKeyFormat)
             }
         }
-        Err(keyring::Error::NoEntry) => {
+        None => {
             let mut key_bytes = [0u8; 32];
             getrandom::getrandom(&mut key_bytes)
                 .map_err(|e| DatabaseInitError::ValidationFailed(format!("RNG failure: {e}")))?;
             let hex_key = hex::encode(key_bytes);
-            entry
-                .set_password(&hex_key)
-                .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
-            let winner = entry
-                .get_password()
-                .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+            store.set_password(service, label, &hex_key)?;
+            let winner = store
+                .get_password(service, label)?
+                .ok_or_else(|| DatabaseInitError::KeyringError("key missing after set".into()))?;
             let trimmed_winner = winner.trim();
             if trimmed_winner.len() == 64 && hex::decode(trimmed_winner).is_ok() {
                 Ok(trimmed_winner.to_string())
@@ -244,13 +306,34 @@ pub fn create_db_key_in_keyring(
                 Err(DatabaseInitError::InvalidKeyFormat)
             }
         }
-        Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
     }
+}
+
+pub fn load_db_key_from_keyring(
+    service: &str,
+    label: &str,
+) -> std::result::Result<Option<String>, DatabaseInitError> {
+    load_db_key_from_store(&KeyringDbKeyStore, service, label)
+}
+
+pub fn create_db_key_in_keyring(
+    service: &str,
+    label: &str,
+) -> std::result::Result<String, DatabaseInitError> {
+    create_db_key_in_store(&KeyringDbKeyStore, service, label)
 }
 
 pub fn open_clean_sqlite_storage(
     db_path: &Path,
     service: &str,
+) -> std::result::Result<SqliteStorage, DatabaseInitError> {
+    open_clean_sqlite_storage_with_store(db_path, service, &KeyringDbKeyStore)
+}
+
+pub fn open_clean_sqlite_storage_with_store(
+    db_path: &Path,
+    service: &str,
+    store: &dyn DbKeyStore,
 ) -> std::result::Result<SqliteStorage, DatabaseInitError> {
     let db_file_name = db_path
         .file_name()
@@ -258,7 +341,7 @@ pub fn open_clean_sqlite_storage(
         .unwrap_or("");
     let marker_file = marker_path(db_path);
     let db_exists = db_path.exists();
-    let key_opt = load_db_key_from_keyring(service, CONVERSATION_DB_KEY_LABEL)?;
+    let key_opt = load_db_key_from_store(store, service, CONVERSATION_DB_KEY_LABEL)?;
     let marker_opt = read_marker(&marker_file, db_file_name)?;
 
     match (db_exists, key_opt.is_some(), marker_opt) {
@@ -267,7 +350,7 @@ pub fn open_clean_sqlite_storage(
                 std::fs::create_dir_all(parent)?;
             }
             write_marker_creating(&marker_file, db_file_name)?;
-            let key = create_db_key_in_keyring(service, CONVERSATION_DB_KEY_LABEL)?;
+            let key = create_db_key_in_store(store, service, CONVERSATION_DB_KEY_LABEL)?;
             let storage = SqliteStorage::new(&db_path.to_string_lossy(), &key)?;
             storage.validate()?;
             write_marker_complete(&marker_file, db_file_name)?;
@@ -301,13 +384,22 @@ pub fn open_clean_mls_context(
     service: &str,
     keychain: Box<dyn catbird_mls::KeychainAccess>,
 ) -> std::result::Result<Arc<catbird_mls::MLSContext>, DatabaseInitError> {
+    open_clean_mls_context_with_store(mls_db_path, service, keychain, &KeyringDbKeyStore)
+}
+
+pub fn open_clean_mls_context_with_store(
+    mls_db_path: &Path,
+    service: &str,
+    keychain: Box<dyn catbird_mls::KeychainAccess>,
+    store: &dyn DbKeyStore,
+) -> std::result::Result<Arc<catbird_mls::MLSContext>, DatabaseInitError> {
     let db_file_name = mls_db_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
     let marker_file = marker_path(mls_db_path);
     let db_exists = mls_db_path.exists();
-    let key_opt = load_db_key_from_keyring(service, MLS_DB_KEY_LABEL)?;
+    let key_opt = load_db_key_from_store(store, service, MLS_DB_KEY_LABEL)?;
     let marker_opt = read_marker(&marker_file, db_file_name)?;
 
     match (db_exists, key_opt.is_some(), marker_opt) {
@@ -316,7 +408,7 @@ pub fn open_clean_mls_context(
                 std::fs::create_dir_all(parent)?;
             }
             write_marker_creating(&marker_file, db_file_name)?;
-            let key = create_db_key_in_keyring(service, MLS_DB_KEY_LABEL)?;
+            let key = create_db_key_in_store(store, service, MLS_DB_KEY_LABEL)?;
             let mls_context = catbird_mls::MLSContext::new(
                 mls_db_path.to_string_lossy().to_string(),
                 key,
@@ -360,6 +452,17 @@ pub async fn reset_clean_storage(
     mls_context: Option<&catbird_mls::MLSContext>,
     service: &str,
 ) -> std::result::Result<(), String> {
+    reset_clean_storage_with_store(data_dir, user_did, storage, mls_context, service, &KeyringDbKeyStore).await
+}
+
+pub async fn reset_clean_storage_with_store(
+    data_dir: &Path,
+    user_did: Option<&str>,
+    storage: Option<SqliteStorage>,
+    mls_context: Option<&catbird_mls::MLSContext>,
+    service: &str,
+    store: &dyn DbKeyStore,
+) -> std::result::Result<(), String> {
     // 1. Close MLSContext if provided
     if let Some(ctx) = mls_context {
         ctx.clear_content_root_key();
@@ -368,35 +471,10 @@ pub async fn reset_clean_storage(
             .map_err(|e| format!("MLSContext flush_and_prepare_close failed: {e:?}"))?;
     }
 
-    // 2. Clear credentials and content-root key for user_did if provided
-    if let Some(did) = user_did {
-        if let Err(e) = crate::keys::delete_content_root_key(data_dir, did) {
-            return Err(format!("failed to delete content-root key: {e}"));
-        }
-        let store = crate::credentials::KeyringCredentialStore::try_new()
-            .map_err(|e| format!("failed to open credential store: {e}"))?;
-        use catbird_mls::orchestrator::credentials::CredentialStore;
-        store
-            .clear_all(did)
-            .await
-            .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
-
-        if let Ok(keychain) = crate::keychain::KeyringKeychainAccess::try_new() {
-            use catbird_mls::KeychainAccess;
-            let _ = keychain.delete(format!("signature_key_pair:{did}")).await;
-            let _ = keychain.delete(format!("signing_key:{did}")).await;
-            let _ = keychain.delete(did.to_string()).await;
-        }
-    }
-
-    // 3. Clear session credentials only when running against the production DB service
-    if service == DB_KEYRING_SERVICE {
-        crate::commands::clear_saved_session_credentials();
-    }
-
-    // 4. Close and drop SqliteStorage handle before unlinking files, then delete Clean Application Database and sidecars
+    // 2. Close and drop SqliteStorage handle before unlinking files
     drop(storage);
 
+    // 3. Delete Clean Application Database and sidecars
     let app_db_path = data_dir.join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
     let app_db_wal = data_dir.join(format!("catmos-{}.db-wal", MLS_KEY_SUFFIX));
     let app_db_shm = data_dir.join(format!("catmos-{}.db-shm", MLS_KEY_SUFFIX));
@@ -408,22 +486,12 @@ pub async fn reset_clean_storage(
         }
     }
 
-    // 5. Delete App DB keyring key
-    let entry = keyring::Entry::new(service, CONVERSATION_DB_KEY_LABEL)
-        .map_err(|e| format!("failed to open conversation DB keyring entry: {e}"))?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(e) => return Err(format!("failed to delete conversation DB key: {e}")),
-    }
+    // 4. Delete App DB keyring key from store
+    store
+        .delete_password(service, CONVERSATION_DB_KEY_LABEL)
+        .map_err(|e| format!("failed to delete conversation DB key: {e}"))?;
 
-    // 6. Delete App DB marker file LAST
-    let app_marker = marker_path(&app_db_path);
-    if app_marker.exists() {
-        std::fs::remove_file(&app_marker)
-            .map_err(|e| format!("failed to remove marker {}: {e}", app_marker.display()))?;
-    }
-
-    // 7. Delete Clean MLS Database and sidecars
+    // 5. Delete Clean MLS Database and sidecars
     let mls_state_dir = data_dir.join(MLS_STORAGE_GENERATION);
     let mls_db_path = mls_state_dir.join("mls.db");
     let mls_db_wal = mls_state_dir.join("mls.db-wal");
@@ -436,15 +504,31 @@ pub async fn reset_clean_storage(
         }
     }
 
-    // 8. Delete MLS DB keyring key
-    let entry = keyring::Entry::new(service, MLS_DB_KEY_LABEL)
-        .map_err(|e| format!("failed to open MLS DB keyring entry: {e}"))?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(e) => return Err(format!("failed to delete MLS DB key: {e}")),
+    // 6. Delete MLS DB keyring key from store
+    store
+        .delete_password(service, MLS_DB_KEY_LABEL)
+        .map_err(|e| format!("failed to delete MLS DB key: {e}"))?;
+
+    // 7. Delete optional credentials and content-root key for user_did AFTER DBs and keys are deleted
+    if let Some(did) = user_did {
+        if let Ok(cred_store) = crate::credentials::KeyringCredentialStore::try_new() {
+            use catbird_mls::orchestrator::credentials::CredentialStore;
+            cred_store
+                .clear_all(did)
+                .await
+                .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
+        }
+        if let Err(e) = crate::keys::delete_content_root_key(data_dir, did) {
+            return Err(format!("failed to delete content-root key: {e}"));
+        }
     }
 
-    // 9. Delete MLS DB marker file LAST
+    // 8. Delete marker files LAST
+    let app_marker = marker_path(&app_db_path);
+    if app_marker.exists() {
+        std::fs::remove_file(&app_marker)
+            .map_err(|e| format!("failed to remove marker {}: {e}", app_marker.display()))?;
+    }
     let mls_marker = marker_path(&mls_db_path);
     if mls_marker.exists() {
         std::fs::remove_file(&mls_marker)
@@ -2287,7 +2371,8 @@ mod storage_cutover_tests {
 
     #[test]
     fn clean_storage_fresh_creation_and_reopen() {
-        let test_service = format!("catmos-test-{}", uuid::Uuid::new_v4());
+        let store = MemoryDbKeyStore::new();
+        let test_service = "catmos-test";
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
         let marker_file = marker_path(&db_path);
@@ -2297,14 +2382,16 @@ mod storage_cutover_tests {
         assert!(!marker_file.exists());
 
         // First open: creates key, DB, and marker
-        let storage = open_clean_sqlite_storage(&db_path, &test_service).expect("first open should succeed");
+        let storage = open_clean_sqlite_storage_with_store(&db_path, test_service, &store)
+            .expect("first open should succeed");
         assert!(db_path.exists());
         assert!(marker_file.exists());
         let marker = read_marker(&marker_file, db_file_name).unwrap();
         assert_eq!(marker, Some(MarkerStatus::Complete));
 
         // Second open: reopens existing valid DB
-        let storage2 = open_clean_sqlite_storage(&db_path, &test_service).expect("reopen should succeed");
+        let storage2 = open_clean_sqlite_storage_with_store(&db_path, test_service, &store)
+            .expect("reopen should succeed");
         storage2.validate().expect("reopened DB must be valid");
         drop(storage);
         drop(storage2);
@@ -2318,55 +2405,55 @@ mod storage_cutover_tests {
         let db_file_name = db_path.file_name().unwrap().to_str().unwrap();
 
         // Case 1: absent DB, present key
-        let service1 = format!("catmos-test-{}", uuid::Uuid::new_v4());
-        let _ = create_db_key_in_keyring(&service1, CONVERSATION_DB_KEY_LABEL).unwrap();
-        let err = open_clean_sqlite_storage(&db_path, &service1).unwrap_err();
+        let store1 = MemoryDbKeyStore::new();
+        let _ = create_db_key_in_store(&store1, "s1", CONVERSATION_DB_KEY_LABEL).unwrap();
+        let err = open_clean_sqlite_storage_with_store(&db_path, "s1", &store1).unwrap_err();
         assert!(matches!(err, DatabaseInitError::MixedStateAbsentDbPresentKey));
 
         // Case 2: present DB, absent key
-        let service2 = format!("catmos-test-{}", uuid::Uuid::new_v4());
+        let store2 = MemoryDbKeyStore::new();
         fs::write(&db_path, b"fake-db-bytes").unwrap();
-        let err = open_clean_sqlite_storage(&db_path, &service2).unwrap_err();
+        let err = open_clean_sqlite_storage_with_store(&db_path, "s2", &store2).unwrap_err();
         assert!(matches!(err, DatabaseInitError::MixedStatePresentDbAbsentKey));
         let _ = fs::remove_file(&db_path);
 
         // Case 3: creating marker with present DB and present key (InitializationIncomplete)
-        let service3 = format!("catmos-test-{}", uuid::Uuid::new_v4());
-        let _ = create_db_key_in_keyring(&service3, CONVERSATION_DB_KEY_LABEL).unwrap();
+        let store3 = MemoryDbKeyStore::new();
+        let _ = create_db_key_in_store(&store3, "s3", CONVERSATION_DB_KEY_LABEL).unwrap();
         fs::write(&db_path, b"fake-db-bytes").unwrap();
         write_marker_creating(&marker_file, db_file_name).unwrap();
-        let err = open_clean_sqlite_storage(&db_path, &service3).unwrap_err();
+        let err = open_clean_sqlite_storage_with_store(&db_path, "s3", &store3).unwrap_err();
         assert!(matches!(err, DatabaseInitError::InitializationIncomplete));
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_file(&marker_file);
 
         // Case 4: orphan complete marker (DB and key absent) -> InvalidMarker
-        let service4 = format!("catmos-test-{}", uuid::Uuid::new_v4());
+        let store4 = MemoryDbKeyStore::new();
         write_marker_complete(&marker_file, db_file_name).unwrap();
-        let err = open_clean_sqlite_storage(&db_path, &service4).unwrap_err();
+        let err = open_clean_sqlite_storage_with_store(&db_path, "s4", &store4).unwrap_err();
         assert!(matches!(err, DatabaseInitError::InvalidMarker(_)));
         let _ = fs::remove_file(&marker_file);
 
         // Case 5: missing marker with present DB and present key
-        let service5 = format!("catmos-test-{}", uuid::Uuid::new_v4());
-        let _ = create_db_key_in_keyring(&service5, CONVERSATION_DB_KEY_LABEL).unwrap();
+        let store5 = MemoryDbKeyStore::new();
+        let _ = create_db_key_in_store(&store5, "s5", CONVERSATION_DB_KEY_LABEL).unwrap();
         fs::write(&db_path, b"fake-db-bytes").unwrap();
-        let err = open_clean_sqlite_storage(&db_path, &service5).unwrap_err();
+        let err = open_clean_sqlite_storage_with_store(&db_path, "s5", &store5).unwrap_err();
         assert!(matches!(err, DatabaseInitError::MixedStateMissingMarker));
         let _ = fs::remove_file(&db_path);
 
         // Case 6: invalid key format
-        let service6 = format!("catmos-test-{}", uuid::Uuid::new_v4());
-        let entry = keyring::Entry::new(&service6, CONVERSATION_DB_KEY_LABEL).unwrap();
-        entry.set_password("short-not-hex").unwrap();
-        let err = open_clean_sqlite_storage(&db_path, &service6).unwrap_err();
+        let store6 = MemoryDbKeyStore::new();
+        store6.set_password("s6", CONVERSATION_DB_KEY_LABEL, "short-not-hex").unwrap();
+        let err = open_clean_sqlite_storage_with_store(&db_path, "s6", &store6).unwrap_err();
         assert!(matches!(err, DatabaseInitError::InvalidKeyFormat));
         assert!(!db_path.exists());
     }
 
     #[tokio::test]
     async fn clean_storage_reset_and_legacy_isolation() {
-        let test_service = format!("catmos-test-{}", uuid::Uuid::new_v4());
+        let store = MemoryDbKeyStore::new();
+        let test_service = "catmos-test";
         let tmp = tempfile::tempdir().unwrap();
 
         // Set up legacy sentinels
@@ -2379,17 +2466,18 @@ mod storage_cutover_tests {
 
         // Set up clean database
         let clean_db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
-        let storage = open_clean_sqlite_storage(&clean_db_path, &test_service).unwrap();
+        let storage = open_clean_sqlite_storage_with_store(&clean_db_path, test_service, &store).unwrap();
         assert!(clean_db_path.exists());
         assert!(marker_path(&clean_db_path).exists());
 
         // Perform explicit reset
-        reset_clean_storage(
+        reset_clean_storage_with_store(
             tmp.path(),
-            Some("did:plc:test-reset"),
+            None,
             Some(storage),
             None,
-            &test_service,
+            test_service,
+            &store,
         )
         .await
         .expect("reset should succeed");
@@ -2407,16 +2495,17 @@ mod storage_cutover_tests {
 
     #[test]
     fn clean_storage_corrupt_db_no_mutation() {
-        let test_service = format!("catmos-test-{}", uuid::Uuid::new_v4());
+        let store = MemoryDbKeyStore::new();
+        let test_service = "catmos-test";
         let tmp = tempfile::tempdir().unwrap();
         let clean_db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
-        let storage = open_clean_sqlite_storage(&clean_db_path, &test_service).unwrap();
+        let storage = open_clean_sqlite_storage_with_store(&clean_db_path, test_service, &store).unwrap();
         drop(storage);
 
         let corrupt_payload = b"not-a-valid-sqlcipher-database-corrupted-bytes";
         fs::write(&clean_db_path, corrupt_payload).unwrap();
 
-        let err = open_clean_sqlite_storage(&clean_db_path, &test_service).unwrap_err();
+        let err = open_clean_sqlite_storage_with_store(&clean_db_path, test_service, &store).unwrap_err();
         assert!(matches!(
             err,
             DatabaseInitError::ValidationFailed(_) | DatabaseInitError::Sqlite(_)
