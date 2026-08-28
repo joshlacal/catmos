@@ -187,7 +187,7 @@ pub fn write_marker_complete(
     }
     let content = format!("complete\n{}\n{}\n", MLS_STORAGE_GENERATION, db_file_name);
     let tmp_path = format!("{}.tmp.{}", marker_path.display(), uuid::Uuid::new_v4());
-    let write_res = (|| -> Result<(), std::io::Error> {
+    let write_res = (|| -> std::result::Result<(), std::io::Error> {
         use std::io::Write;
         let mut file = std::fs::File::create(&tmp_path)?;
         file.write_all(content.as_bytes())?;
