@@ -16,6 +16,7 @@
 // Re-export all types from tauri.ts (canonical type definitions)
 export type {
 	Conversation,
+	ConversationMember,
 	Message,
 	ImageAttachment,
 	AudioAttachment,
@@ -106,10 +107,9 @@ function getWorker(): Remote<WorkerApi> {
  * Get or create the MLS DB encryption key, namespaced per-DID in sessionStorage.
  * Falls back to an unnamespaced key when no DID is known yet (pre-login init).
  */
-function getOrCreateMlsDbKey(): string {
-	const did = sessionStorage.getItem(SS_ACTIVE_DID);
+function getOrCreateMlsDbKey(targetDid?: string): string {
+	const did = targetDid || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
 	const storageKey = did ? didKey(did, 'mls_db_key') : 'catbird_mls_mls_db_key';
-
 	let key = sessionStorage.getItem(storageKey);
 	if (key) return key;
 
@@ -185,20 +185,16 @@ async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> 
  * Push the per-DID content root key into the WASM module. Called once per
  * session after `setAuth` resolves so that subsequent `setup()` and any
  * message encrypt/decrypt has the key bound.
+ *
+ * Propagates errors on failure to enforce fail-closed security (no legacy
+ * plaintext fallback).
  */
 async function installContentRootKey(did: string): Promise<void> {
 	const key = await loadOrCreateContentRootKey(did);
 	const w = getWorker();
-	try {
-		await (
-			w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
-		).setContentRootKey(key);
-	} catch (e) {
-		console.warn(
-			'[catmos] setContentRootKey failed; messages will fall back to legacy plaintext storage:',
-			e
-		);
-	}
+	await (
+		w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
+	).setContentRootKey(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -223,11 +219,13 @@ const NEST_URL = (() => {
  * Generates/retrieves the MLS DB key from sessionStorage and passes it to the
  * Worker (which has no sessionStorage access).
  */
-export async function initWasm(): Promise<void> {
+export async function initWasm(did?: string): Promise<void> {
 	if (isTauri) return;
 	const w = getWorker();
-	const mlsDbKey = getOrCreateMlsDbKey();
-	await w.init({ baseUrl: NEST_URL, mlsDbKey });
+	const activeDid = did || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
+	const mlsDbKey = getOrCreateMlsDbKey(activeDid || undefined);
+	const db_prefix = activeDid ? `catbird_mls_${activeDid.replace(/[:.]/g, '_')}` : undefined;
+	await w.init({ baseUrl: NEST_URL, mlsDbKey, db_prefix });
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +253,26 @@ export async function listenForEvent<T>(
 
 /** Base keys -- the DID key is unnamespaced (bootstrap). */
 const SS_ACTIVE_DID = 'catbird_mls_active_did';
+const SS_PENDING_BROWSER_NONCE = 'catbird_mls_pending_browser_nonce';
+
+/** Generate a cryptographically secure 32-byte unpadded base64url challenge nonce (43 chars). */
+export function generateBrowserNonce(): string {
+	const bytes = new Uint8Array(32);
+	crypto.getRandomValues(bytes);
+	let binary = '';
+	for (let i = 0; i < bytes.length; i++) {
+		binary += String.fromCharCode(bytes[i]);
+	}
+	return btoa(binary)
+		.replace(/\+/g, '-')
+		.replace(/\//g, '_')
+		.replace(/=+$/, '');
+}
+
+/** Clear any pending browser OAuth nonce from sessionStorage. */
+export function clearPendingOAuthLogin(): void {
+	sessionStorage.removeItem(SS_PENDING_BROWSER_NONCE);
+}
 
 /** Return a per-DID namespaced key for browser sessionStorage. */
 function didKey(did: string, suffix: string): string {
@@ -289,20 +307,54 @@ export async function startLogin(identifier: string): Promise<void> {
 	if (isTauri) {
 		return tauriInvoke('start_login', { identifier });
 	}
-	const { hostname, port } = window.location;
-	let callbackBase: string;
-	if (hostname === 'localhost' || hostname === '127.0.0.1') {
-		callbackBase = `http://127.0.0.1:${port || '80'}`;
-	} else {
-		callbackBase = window.location.origin;
-	}
-	const redirectTo = `${callbackBase}/auth/callback`;
+	const redirectTo = `${window.location.origin}/auth/callback`;
+	const browserNonce = generateBrowserNonce();
+	sessionStorage.setItem(SS_PENDING_BROWSER_NONCE, browserNonce);
+
 	const loginUrl =
 		`${NEST_URL}/auth/login` +
 		`?identifier=${encodeURIComponent(identifier)}` +
 		`&client=catmos` +
-		`&redirect_to=${encodeURIComponent(redirectTo)}`;
+		`&redirect_to=${encodeURIComponent(redirectTo)}` +
+		`&browser_nonce=${encodeURIComponent(browserNonce)}`;
 	window.location.href = loginUrl;
+}
+
+/**
+ * Exchange a one-time OAuth code for a session ID using the single-use browser nonce.
+ * Consumes and clears the pending nonce immediately upon attempt.
+ */
+export async function exchangeOAuthCode(code: string): Promise<string> {
+	const browserNonce = sessionStorage.getItem(SS_PENDING_BROWSER_NONCE);
+	// Single-use: clear pending nonce immediately
+	clearPendingOAuthLogin();
+
+	if (!browserNonce) {
+		throw new Error('Missing or expired browser login nonce. Please try signing in again.');
+	}
+
+	const resp = await fetch(`${NEST_URL}/auth/exchange`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json'
+		},
+		body: JSON.stringify({
+			code,
+			browser_nonce: browserNonce
+		})
+	});
+
+	if (!resp.ok) {
+		const errText = await resp.text().catch(() => '');
+		throw new Error(`Authentication exchange failed (${resp.status}): ${errText || resp.statusText}`);
+	}
+
+	const data = await resp.json();
+	if (!data || typeof data.session_id !== 'string' || !data.session_id.trim()) {
+		throw new Error('Invalid exchange response from auth gateway: missing session_id');
+	}
+
+	return data.session_id;
 }
 
 export async function completeLogin(sessionId: string): Promise<AuthState> {
@@ -317,37 +369,109 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 	const did: string = info.did;
 	const handle: string = info.handle ?? did;
 
-	// Persist session on main thread (sessionStorage, per-DID namespaced)
-	persistBrowserAuth(did, sessionId);
-
-	// Push credentials to Worker and run MLS setup
+	// Push credentials to Worker and complete MLS activation before persisting auth
 	const w = getWorker();
-	await w.setAuth(did, sessionId);
-	// Install the per-DID content root key BEFORE setup() so the field-
-	// level encryption layer is ready for the very first message that
-	// setup() may decrypt during initial sync.
-	await installContentRootKey(did);
-	await w.setup();
+	try {
+		await w.setAuth(did, sessionId);
+		// Install the per-DID content root key BEFORE setup() so the field-
+		// level encryption layer is ready for the very first message that
+		// setup() may decrypt during initial sync.
+		await installContentRootKey(did);
+		await w.setup();
 
-	// Ensure key packages are available for other clients to send us Welcomes
-	replenishKeyPackages();
-	startKeyPackageReplenishment();
+		// Ensure key packages are available for other clients to send us Welcomes
+		replenishKeyPackages();
+		startKeyPackageReplenishment();
 
-	return { did, handle };
+		// Final commit: persist session on main thread only after successful activation
+		persistBrowserAuth(did, sessionId);
+
+		return { did, handle };
+	} catch (error) {
+		// On activation failure clear partial worker auth/key/setup state
+		// using existing reset/log-out seam and do not persist new bearer
+		if (_replenishInterval) {
+			clearInterval(_replenishInterval);
+			_replenishInterval = null;
+		}
+		clearBrowserAuth();
+		try {
+			if (_worker) {
+				try {
+					await (
+						_worker as unknown as { clearContentRootKey: () => Promise<void> }
+					).clearContentRootKey();
+				} catch (e) {
+					console.warn('[catmos] clearContentRootKey failed during activation rollback:', e);
+				}
+				await _worker.clearAuth();
+			}
+		} finally {
+			if (_rawWorker) {
+				_rawWorker.terminate();
+				_rawWorker = null;
+			}
+			_worker = null;
+		}
+		throw error;
+	}
 }
-
 /**
  * Set auth credentials for the WASM MLS module.
  * Called by catmos's auth store after completing OAuth.
  */
 export async function setAuth(did: string, token: string): Promise<void> {
 	if (isTauri) return;
-	persistBrowserAuth(did, token);
 	const w = getWorker();
-	await w.setAuth(did, token);
-	// Install the per-DID content root key after auth so the field-level
-	// encryption layer is bound before any subsequent message flow.
-	await installContentRootKey(did);
+	try {
+		await w.setAuth(did, token);
+		// Install the per-DID content root key after auth so the field-level
+		// encryption layer is bound before any subsequent message flow.
+		await installContentRootKey(did);
+		persistBrowserAuth(did, token);
+	} catch (error) {
+		clearBrowserAuth();
+		try {
+			if (_worker) {
+				try {
+					await (
+						_worker as unknown as { clearContentRootKey: () => Promise<void> }
+					).clearContentRootKey();
+				} catch (e) {
+					console.warn('[catmos] clearContentRootKey failed during setAuth rollback:', e);
+				}
+				await _worker.clearAuth();
+			}
+		} finally {
+			if (_rawWorker) {
+				_rawWorker.terminate();
+				_rawWorker = null;
+			}
+			_worker = null;
+		}
+		throw error;
+	}
+}
+
+/** Run one deferred reset/history recovery pass in the browser worker. */
+export async function runDeferredRecovery(): Promise<unknown> {
+	if (isTauri) throw new Error('deferred recovery is owned by the Tauri orchestrator');
+	const w = getWorker();
+	return w.runDeferredRecovery();
+}
+
+/** Start the crate-owned browser recovery timer after setup/auth. */
+export async function startBackgroundRecovery(intervalMs = 30_000): Promise<void> {
+	if (isTauri) return;
+	const w = getWorker();
+	await w.startBackgroundTasks(intervalMs);
+}
+
+/** Stop the crate-owned browser recovery timer before logout/tenant switch. */
+export async function stopBackgroundRecovery(): Promise<void> {
+	if (isTauri) return;
+	const w = getWorker();
+	await w.stopBackgroundTasks();
 }
 
 /**
@@ -515,6 +639,29 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 
 		return { did: info.did, handle: info.handle ?? info.did };
 	} catch (error) {
+		if (_replenishInterval) {
+			clearInterval(_replenishInterval);
+			_replenishInterval = null;
+		}
+		clearBrowserAuth();
+		try {
+			if (_worker) {
+				try {
+					await (
+						_worker as unknown as { clearContentRootKey: () => Promise<void> }
+					).clearContentRootKey();
+				} catch (e) {
+					console.warn('[catmos] clearContentRootKey failed during restore rollback:', e);
+				}
+				await _worker.clearAuth();
+			}
+		} finally {
+			if (_rawWorker) {
+				_rawWorker.terminate();
+				_rawWorker = null;
+			}
+			_worker = null;
+		}
 		throw error;
 	}
 }

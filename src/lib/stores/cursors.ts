@@ -1,3 +1,6 @@
+import { get } from 'svelte/store';
+import { auth } from './auth';
+
 /**
  * Persists per-conversation WebSocket subscription cursors (last-seen message ID)
  * so that on restart, subscriptions can resume from where they left off.
@@ -5,10 +8,12 @@
  * - Desktop (Tauri): persists to localStorage (survives restarts)
  * - Web (browser): persists to sessionStorage (cleared on tab close)
  *
- * Keys are namespaced by DID + convoId to prevent data leakage across accounts.
+ * Keys are namespaced by DID + convoId + generation suffix to prevent data leakage across accounts.
  */
 
 const CURSOR_PREFIX = 'catbird_ws_cursor';
+const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+const SS_ACTIVE_DID = 'catbird_mls_active_did';
 
 /** True when running inside Tauri desktop shell. */
 const isTauri: boolean =
@@ -19,12 +24,28 @@ function getStorage(): Storage {
 }
 
 function storageKey(did: string, convoId: string): string {
-  return `${CURSOR_PREFIX}:${did}:${convoId}`;
+  return `${CURSOR_PREFIX}:${did}:${convoId}${CLEAN_STORAGE_SUFFIX}`;
 }
 
-/** Read the current DID from localStorage (set by wasm.ts on login). */
+/**
+ * Read the current authoritative DID.
+ *
+ * Uses the authoritative auth store user DID or the generation-scoped
+ * sessionStorage active DID. Never falls back to unsuffixed legacy
+ * localStorage keys (e.g. `catbird_active_did` / `catbird_mls_user_did`).
+ */
 function getCurrentDid(): string | null {
-  return localStorage.getItem('catbird_mls_user_did');
+  const authState = get(auth);
+  if (authState?.user?.did) {
+    return authState.user.did;
+  }
+  if (typeof sessionStorage !== 'undefined') {
+    const did = sessionStorage.getItem(SS_ACTIVE_DID);
+    if (did && did.startsWith('did:')) {
+      return did;
+    }
+  }
+  return null;
 }
 
 /**

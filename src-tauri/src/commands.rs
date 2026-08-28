@@ -374,9 +374,14 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
         .api_client
         .ensure_session_current(&session)
         .map_err(|error| error.to_string())?;
+    let public_key = state
+        .orchestrator
+        .mls_context()
+        .identity_public_key(did.to_string())
+        .map_err(|error| error.to_string())?;
     state
         .api_client
-        .resolve_server_device_id_for_local_uuid_with_session(&session, &local_device_uuid)
+        .resolve_server_device_id_for_local_uuid_with_session(&session, &local_device_uuid, &public_key)
         .await
         .map(|_| true)
         .map_err(|error| {
@@ -388,7 +393,7 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
     let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        crate::nest_url();
 
     let resp = reqwest::Client::new()
         .get(format!("{}/auth/session", nest_url))
@@ -636,7 +641,7 @@ pub struct GroupMember {
 #[tauri::command]
 pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
     let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        crate::nest_url();
 
     // Bind a temporary HTTP server on a random localhost port
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1266,7 +1271,7 @@ pub async fn send_message(
 ) -> Result<Message, String> {
     state
         .api_client
-        .require_signing_capability()
+        .require_canonical_admission()
         .map_err(|error| {
             actionable_error(format!("Signed clean-chat send unavailable: {error}"))
         })?;
@@ -1307,7 +1312,7 @@ pub async fn send_image(
 ) -> Result<Message, String> {
     state
         .api_client
-        .require_signing_capability()
+        .require_canonical_admission()
         .map_err(|error| {
             actionable_error(format!("Signed clean-chat send unavailable: {error}"))
         })?;
@@ -1480,7 +1485,7 @@ pub async fn subscribe_conversation(
         .ok_or("Not authenticated")?;
 
     let base_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        crate::nest_url();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
@@ -1560,7 +1565,7 @@ pub async fn subscribe_all_events(
         .ok_or("Not authenticated")?;
 
     let base_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        crate::nest_url();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
@@ -1680,7 +1685,7 @@ pub async fn send_reaction(
 ) -> Result<(), String> {
     state
         .api_client
-        .require_signing_capability()
+        .require_canonical_admission()
         .map_err(|error| {
             actionable_error(format!("Signed clean-chat reaction unavailable: {error}"))
         })?;
@@ -1851,7 +1856,7 @@ pub async fn check_opt_in_status(
 
     let url = format!(
         "{}/xrpc/{}",
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string()),
+        crate::nest_url(),
         "blue.catbird.chat.getDevices",
     );
     let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
@@ -2665,11 +2670,8 @@ pub async fn reset_group(
         operation: catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset,
         method: "POST".to_string(),
         path: "/xrpc/blue.catbird.chat.requestReset".to_string(),
-        authorization: String::new(),
-        dpop: String::new(),
         body: Some(serde_json::to_vec(&body).map_err(|e| format!("JSON error: {e}"))?),
     };
-
     let resp = state
         .api_client
         .submit_prepared_request(req)
@@ -2765,7 +2767,7 @@ pub async fn create_block(
         .ok_or("Not authenticated")?;
 
     let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        crate::nest_url();
 
     let body = serde_json::json!({
         "repo": did,
@@ -2830,7 +2832,7 @@ pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, 
     log_catmos!("list_own_blocks: did={}", did);
 
     let nest_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
+        crate::nest_url();
 
     let client = reqwest::Client::new();
     let mut blocked: Vec<String> = Vec::new();

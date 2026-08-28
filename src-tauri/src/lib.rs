@@ -13,6 +13,9 @@ mod storage;
 mod websocket;
 
 use std::collections::HashMap;
+pub(crate) fn nest_url() -> String {
+    std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string())
+}
 use std::sync::Arc;
 
 use api_client::ReqwestApiClient;
@@ -115,9 +118,7 @@ pub fn run() {
     let db_path_str = db_path.to_string_lossy().to_string();
 
     // Route XRPC calls through nest BFF (handles DPoP auth, session management)
-    let mls_ds_url =
-        std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
-
+    let mls_ds_url = nest_url();
     // Create platform implementations
     let conversation_encryption_key = get_or_create_db_key("conversation-db");
     let storage = Arc::new(
