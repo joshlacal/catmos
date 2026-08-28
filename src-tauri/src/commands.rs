@@ -20,6 +20,7 @@ use crate::types::string::Did;
 
 use crate::credentials::KeyringCredentialStore;
 use crate::recovery::actionable_error;
+use crate::storage;
 use crate::{AppState, CatmosOrchestrator, WsHandle};
 
 fn log_file_path() -> std::path::PathBuf {
@@ -37,41 +38,6 @@ async fn cleanup_ws_handle(
     let mut handles = handles.lock().await;
     if handles.get(key).is_some_and(|handle| handle.owns(owner)) {
         handles.remove(key);
-    }
-}
-
-/// Resolve the per-DID content-root key from disk and install it on the
-/// shared `MLSContext`. Best-effort: any error is logged and the storage
-/// layer keeps writing legacy plaintext columns until the next attempt.
-/// Idempotent — re-running with the same DID is a no-op once the in-memory
-/// key matches the file on disk.
-fn install_content_root_key(state: &AppState, user_did: &str) {
-    match crate::keys::load_or_create_content_root_key(&state.data_dir, user_did) {
-        Ok(root_key) => {
-            if let Err(err) = state
-                .orchestrator
-                .mls_context()
-                .set_content_root_key(root_key)
-            {
-                tracing::warn!(
-                    user_did = %user_did,
-                    error = ?err,
-                    "install_content_root_key: set_content_root_key failed"
-                );
-            } else {
-                tracing::info!(
-                    user_did = %user_did,
-                    "install_content_root_key: field-level encryption key installed"
-                );
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                user_did = %user_did,
-                error = %err,
-                "install_content_root_key: load_or_create_content_root_key failed; storage will fall back to plaintext columns"
-            );
-        }
     }
 }
 
@@ -128,11 +94,14 @@ pub fn spawn_key_package_monitor(
 /// Ensure the user is opted into MLS. Checks status first, then opts in if needed.
 /// Failures are logged but never propagated — opt-in should not block login.
 async fn ensure_opted_in(state: &AppState) {
-    let did = match state.orchestrator.api_client().current_did().await {
+    let orchestrator = match state.get_orchestrator().await {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let did = match orchestrator.api_client().current_did().await {
         Some(d) => d,
         None => return,
     };
-
     // Check current status
     match state.api_client.get_opt_in_status(&did).await {
         Ok(true) => {
@@ -168,11 +137,17 @@ async fn ensure_opted_in(state: &AppState) {
 }
 
 async fn start_kp_monitor(state: &AppState) {
+    let orchestrator = match state.get_orchestrator().await {
+        Ok(o) => o,
+        Err(_) => return,
+    };
     let mut guard = state.kp_monitor.lock().await;
-    if let Some(handle) = guard.take() {
-        handle.abort();
+    if let Some(existing) = guard.as_ref() {
+        if !existing.is_finished() {
+            return;
+        }
     }
-    *guard = Some(spawn_key_package_monitor(state.orchestrator.clone()));
+    *guard = Some(spawn_key_package_monitor(orchestrator));
 }
 
 /// Periodic sync loop — calls sync_with_server every SYNC_INTERVAL_SECS (spec §6.1).
@@ -189,11 +164,17 @@ fn spawn_sync_loop(orchestrator: Arc<CatmosOrchestrator>) -> tokio::task::JoinHa
 }
 
 async fn start_sync_loop(state: &AppState) {
+    let orchestrator = match state.get_orchestrator().await {
+        Ok(o) => o,
+        Err(_) => return,
+    };
     let mut guard = state.sync_loop.lock().await;
-    if let Some(handle) = guard.take() {
-        handle.abort();
+    if let Some(existing) = guard.as_ref() {
+        if !existing.is_finished() {
+            return;
+        }
     }
-    *guard = Some(spawn_sync_loop(state.orchestrator.clone()));
+    *guard = Some(spawn_sync_loop(orchestrator));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,12 +194,12 @@ struct SessionInfo {
 
 pub(crate) const SESSION_KEYRING_SERVICE: &str = "catmos-clean-v2-openmls-v09";
 
-pub(crate) fn get_saved_session_did() -> Result<Option<String>, String> {
-    get_saved_session_did_for_service(SESSION_KEYRING_SERVICE)
-}
+/// Session credential slots, ordered so `user_did` is deleted last: it stays
+/// behind as a retry hint for storage cleanup if an earlier deletion fails.
+pub(crate) const SESSION_CREDENTIAL_KEYS: [&str; 3] = ["session_id", "chat_dpop_jkt", "user_did"];
 
-pub(crate) fn get_saved_session_did_for_service(service: &str) -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new(service, "user_did")
+pub(crate) fn get_saved_session_did() -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did")
         .map_err(|e| format!("failed to access keyring entry for user_did: {e}"))?;
     match entry.get_password() {
         Ok(did) => {
@@ -235,14 +216,8 @@ pub(crate) fn get_saved_session_did_for_service(service: &str) -> Result<Option<
 }
 
 pub(crate) fn delete_saved_session_credentials() -> Result<(), String> {
-    delete_saved_session_credentials_for_service(SESSION_KEYRING_SERVICE)
-}
-
-pub(crate) fn delete_saved_session_credentials_for_service(service: &str) -> Result<(), String> {
-    // Delete non-DID session tokens first; delete user_did last so it remains
-    // a retry hint for storage cleanup if an earlier deletion fails.
-    for key in ["session_id", "chat_dpop_jkt", "user_did"] {
-        let entry = keyring::Entry::new(service, key)
+    for key in SESSION_CREDENTIAL_KEYS {
+        let entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, key)
             .map_err(|e| format!("failed to create keyring entry for {key}: {e}"))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => {}
@@ -255,84 +230,56 @@ pub(crate) fn delete_saved_session_credentials_for_service(service: &str) -> Res
 /// Install only opaque runtime capabilities after login/device enrollment.
 /// Persisted session/device identifiers never enter command logs; DPoP
 /// binding evidence is admitted only through the runtime authority provider.
-async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
+async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) -> Result<(), String> {
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
-    let session = match state.api_client.current_session() {
-        Ok(session) => session,
-        Err(error) => {
-            log_catmos!(" chat device authority unavailable for {}: {}", did, error);
-            return;
-        }
-    };
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|error| format!("chat device authority unavailable for {did}: {error}"))?;
+
     let _ = state.chat_auth.clear_runtime_state_for_session(&session);
 
-    if let Ok(store) = KeyringCredentialStore::try_new() {
-        match store.get_local_device_uuid(did).await {
-            Ok(Some(local_device_uuid)) => {
-                if let Err(error) = state
-                    .chat_auth
-                    .set_local_device_uuid_for_session(&session, local_device_uuid.clone())
-                {
-                    log_catmos!(
-                        " chat device authority actor mismatch for {}: {}",
-                        did,
-                        error
-                    );
-                    return;
-                }
-                if let Err(error) = state.api_client.ensure_session_current(&session) {
-                    log_catmos!(
-                        " chat device authority actor changed during configuration for {}: {}",
-                        did,
-                        error
-                    );
-                    return;
-                }
-                match store.get_server_device_id(did).await {
-                    Ok(Some(server_device_id)) => {
-                        if let Err(error) = state
-                            .chat_auth
-                            .set_resolved_server_device_id_for_session(&session, server_device_id)
-                        {
-                            log_catmos!(
-                                " chat device authority server ID could not be installed for {}: {}",
-                                did,
-                                error
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        log_catmos!(
-                            " chat device authority unavailable for {}: server device ID is missing",
-                            did
-                        );
-                    }
-                    Err(error) => {
-                        log_catmos!(
-                            " chat device authority unavailable for {}: failed to load server device ID: {}",
-                            did,
-                            error
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                log_catmos!(
-                    " chat device authority unavailable for {}: local device UUID is missing",
-                    did
-                );
-            }
-            Err(error) => {
-                log_catmos!(
-                    " chat device authority unavailable for {}: failed to load local UUID: {}",
-                    did,
-                    error
-                );
-            }
-        }
-    }
+    let store = KeyringCredentialStore::try_new()
+        .map_err(|e| format!("failed to initialize credential store for chat auth: {e}"))?;
+
+    let local_device_uuid = store
+        .get_local_device_uuid(did)
+        .await
+        .map_err(|e| format!("failed to load local UUID for {did}: {e}"))?
+        .ok_or_else(|| {
+            format!("chat device authority unavailable for {did}: local device UUID is missing")
+        })?;
+
+    state
+        .chat_auth
+        .set_local_device_uuid_for_session(&session, local_device_uuid)
+        .map_err(|error| format!("chat device authority actor mismatch for {did}: {error}"))?;
+
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|error| {
+            format!("chat device authority actor changed during configuration for {did}: {error}")
+        })?;
+
+    let server_device_id = store
+        .get_server_device_id(did)
+        .await
+        .map_err(|e| format!("failed to load server device ID for {did}: {e}"))?
+        .ok_or_else(|| {
+            format!("chat device authority unavailable for {did}: server device ID is missing")
+        })?;
+
+    state
+        .chat_auth
+        .set_resolved_server_device_id_for_session(&session, server_device_id)
+        .map_err(|error| {
+            format!("chat device authority server ID could not be installed for {did}: {error}")
+        })?;
+
+    Ok(())
 }
 
 /// Restore the durable signer for an already-reconciled device.
@@ -417,6 +364,130 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
                 "existing local chat device UUID did not reconcile to exactly one server device; refusing re-registration: {error}"
             )
         })
+}
+
+/// Strictly read-only device verification for cold Complete reopen.
+/// Validates that the persisted local device UUID matches exactly one active server device row,
+/// that the resolved server device ID matches the persisted server_device_id, and that the
+/// local identity public key in MLSContext matches the registered signature public key.
+/// Performs ZERO mutations to keyring, database, marker, or server.
+async fn verify_device_reconciliation_readonly(
+    state: &AppState,
+    mls_context: &catbird_mls::MLSContext,
+    did: &str,
+) -> Result<(), String> {
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|error| error.to_string())?;
+    if session.actor_did != did {
+        return Err("chat session changed before device reconciliation".to_string());
+    }
+
+    let store = KeyringCredentialStore::try_new().map_err(|error| error.to_string())?;
+    let local_device_uuid = store
+        .get_local_device_uuid(did)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "local device UUID missing for account on Complete reopen".to_string())?;
+    let persisted_server_device_id = store
+        .get_server_device_id(did)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "server device ID missing for account on Complete reopen".to_string())?;
+
+    let persisted_mls_did = store
+        .get_mls_did(did)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "persisted MLS DID missing for account on Complete reopen".to_string())?;
+
+    let norm_did = crate::keys::normalize_did(did);
+    let expected_mls_did = format!("{norm_did}#{local_device_uuid}");
+    if persisted_mls_did != expected_mls_did {
+        return Err(format!(
+            "persisted mls_did `{persisted_mls_did}` does not bind to explicit `{expected_mls_did}`"
+        ));
+    }
+
+    let devices = state
+        .api_client
+        .list_devices_readonly(&session)
+        .await
+        .map_err(|error| format!("failed to list devices from server: {error}"))?;
+
+    let matches: Vec<_> = devices
+        .iter()
+        .filter(|dev| dev.device_uuid == local_device_uuid)
+        .collect();
+
+    if matches.is_empty() {
+        return Err(format!(
+            "local device UUID `{local_device_uuid}` is not registered on server or has been revoked"
+        ));
+    }
+    if matches.len() > 1 {
+        return Err(format!(
+            "ambiguous server registration: found {} matches for local device UUID `{local_device_uuid}`",
+            matches.len()
+        ));
+    }
+
+    let matched_dev = matches[0];
+    if matched_dev.device_id != persisted_server_device_id {
+        return Err(format!(
+            "server device ID mismatch on Complete reopen: server returned `{}`, expected persisted `{}`",
+            matched_dev.device_id, persisted_server_device_id
+        ));
+    }
+
+    match &matched_dev.status {
+        Some(status) if status == "active" => {}
+        Some(status) => {
+            return Err(format!(
+                "server device record for `{local_device_uuid}` has non-active status: `{status}`"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "server device record for `{local_device_uuid}` is missing status field"
+            ));
+        }
+    }
+
+    let local_pubkey = mls_context
+        .identity_public_key(persisted_mls_did.clone())
+        .map_err(|e| format!("failed to retrieve identity public key from MLSContext for `{persisted_mls_did}`: {e:?}"))?;
+    if local_pubkey.len() != 32 {
+        return Err(format!(
+            "local signer public key length invalid: expected 32, got {}",
+            local_pubkey.len()
+        ));
+    }
+
+    match &matched_dev.signature_public_key {
+        Some(server_pubkey) => {
+            if server_pubkey.len() != 32 {
+                return Err(format!(
+                    "server signature public key has invalid length: expected 32, got {}",
+                    server_pubkey.len()
+                ));
+            }
+            if server_pubkey != &local_pubkey {
+                return Err(
+                    "public key mismatch between local signer and server device record on Complete reopen"
+                        .to_string(),
+                );
+            }
+        }
+        None => {
+            return Err(format!(
+                "server device record for `{local_device_uuid}` is missing signature_public_key"
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
@@ -587,6 +658,10 @@ async fn refresh_message_delivery_statuses(
     conversation_id: &str,
     messages: &mut [OrchestratorMessage],
 ) {
+    let orchestrator = match state.get_orchestrator().await {
+        Ok(o) => o,
+        Err(_) => return,
+    };
     let own_ids: Vec<String> = messages
         .iter()
         .filter(|m| m.is_own)
@@ -598,8 +673,7 @@ async fn refresh_message_delivery_statuses(
 
     let mut status_by_id = std::collections::HashMap::<String, DeliveryStatus>::new();
     for chunk in own_ids.chunks(50) {
-        match state
-            .orchestrator
+        match orchestrator
             .api_client()
             .get_delivery_status(conversation_id, chunk)
             .await
@@ -628,7 +702,7 @@ async fn refresh_message_delivery_statuses(
             continue;
         }
         message.delivery_status = Some(status.clone());
-        if let Err(e) = state.orchestrator.storage().store_message(message).await {
+        if let Err(e) = orchestrator.storage().store_message(message).await {
             log_catmos!(
                 " persist delivery status failed: convo={} msg={} err={:?}",
                 conversation_id,
@@ -795,82 +869,40 @@ pub async fn complete_login(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<AuthResponse, String> {
+    let _guard = state.lifecycle_lock.lock().await;
+
     let session = fetch_session_info(&session_id)
         .await
         .map_err(actionable_error)?;
 
-    // Initialize orchestrator for this user
-    state
-        .orchestrator
-        .initialize(&session.did)
-        .await
-        .map_err(|e| actionable_error(format!("{e:?}")))?;
-
-    // Install the per-DID content-root key so the field-level (envelope)
-    // encryption layer can encrypt subsequent message inserts. Best-effort:
-    // a failure here downgrades to legacy plaintext writes with a warning
-    // rather than blocking login.
-    install_content_root_key(&state, &session.did);
-
-    // Set auth on API client (before device registration and opt-in, which need auth)
-    state
-        .api_client
-        .set_auth(session.did.clone(), session_id.clone());
-
-    // Reconcile a durable identity before any registration attempt. Only a
-    // first-login device without a local UUID may create a new registration.
-    if reconcile_device_before_registration(&state, &session.did)
-        .await
-        .map_err(actionable_error)?
-    {
-        let authority_session = state
-            .api_client
-            .current_session()
-            .map_err(actionable_error)?;
-        if authority_session.actor_did != session.did || authority_session.token != session_id {
-            return Err(actionable_error(
-                "chat session changed before signer restoration",
-            ));
-        }
-        state
-            .api_client
-            .ensure_session_current(&authority_session)
-            .map_err(actionable_error)?;
-        restore_registered_signer(
-            state.orchestrator.mls_context().as_ref(),
-            state.orchestrator.credentials().as_ref(),
-            &session.did,
-        )
+    enroll_and_publish_runtime(&state, &session.did, &session_id)
         .await
         .map_err(actionable_error)?;
-        state
-            .api_client
-            .ensure_session_current(&authority_session)
-            .map_err(actionable_error)?;
-    } else {
-        state
-            .orchestrator
-            .ensure_device_registered()
-            .await
-            .map_err(|e| actionable_error(format!("{e:?}")))?;
+
+    // Persist session to keyring with verified reads
+    let entry_sid = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id")
+        .map_err(|e| format!("failed to create session_id keyring entry: {e}"))?;
+    entry_sid
+        .set_password(&session_id)
+        .map_err(|e| format!("failed to save session_id to keyring: {e}"))?;
+
+    let entry_did = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did")
+        .map_err(|e| format!("failed to create user_did keyring entry: {e}"))?;
+    entry_did
+        .set_password(&session.did)
+        .map_err(|e| format!("failed to save user_did to keyring: {e}"))?;
+
+    let read_sid = entry_sid
+        .get_password()
+        .map_err(|e| format!("failed to verify session_id read from keyring: {e}"))?;
+    if read_sid.trim() != session_id.trim() {
+        return Err("keyring verification failed: stored session_id mismatch".to_string());
     }
-    configure_chat_auth(&state, &session.did, &session_id).await;
-
-    // Auto opt-in to MLS (non-blocking — failures are logged only)
-    ensure_opted_in(&state).await;
-
-    // Start background key package replenishment
-    start_kp_monitor(&state).await;
-
-    // Start periodic sync loop (spec §6.1)
-    start_sync_loop(&state).await;
-
-    // Persist session to keyring
-    if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id") {
-        let _ = entry.set_password(&session_id);
-    }
-    if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did") {
-        let _ = entry.set_password(&session.did);
+    let read_did = entry_did
+        .get_password()
+        .map_err(|e| format!("failed to verify user_did read from keyring: {e}"))?;
+    if read_did.trim() != session.did.trim() {
+        return Err("keyring verification failed: stored user_did mismatch".to_string());
     }
 
     Ok(AuthResponse {
@@ -880,11 +912,204 @@ pub async fn complete_login(
         avatar: None,
     })
 }
+/// Single safe public enrollment transaction entrypoint:
+/// strictly executes provisional initialization, credential & read-only device reconciliation,
+/// complete marker finalization, and atomic publication to active runtime.
+pub async fn enroll_account_runtime(
+    state: &AppState,
+    did: &str,
+    session_id: &str,
+) -> Result<Arc<CatmosOrchestrator>, String> {
+    let _guard = state.lifecycle_lock.lock().await;
+    enroll_and_publish_runtime(state, did, session_id).await
+}
+
+async fn enroll_and_publish_runtime(
+    state: &AppState,
+    did: &str,
+    session_id: &str,
+) -> Result<Arc<CatmosOrchestrator>, String> {
+    let normalized_did = crate::keys::normalize_did(did);
+
+    // Coalesce check: if already active and fully enrolled for this DID, rebind/verify token and return existing
+    if let Some(current) = &*state.active_runtime.read().await {
+        if current.user_did == normalized_did {
+            state
+                .api_client
+                .set_auth(normalized_did.clone(), session_id.to_string());
+            configure_chat_auth(state, &normalized_did, session_id).await?;
+            return Ok(current.orchestrator.clone());
+        }
+    }
+
+    state
+        .api_client
+        .set_auth(normalized_did.clone(), session_id.to_string());
+
+    let provisional = match state
+        .create_provisional_account_runtime(&normalized_did)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            state.api_client.clear_auth();
+            return Err(e);
+        }
+    };
+
+    let enroll_result: Result<(), String> = async {
+        // Initialize orchestrator for this user
+        provisional
+            .orchestrator
+            .initialize(&normalized_did)
+            .await
+            .map_err(|e| format!("orchestrator initialization failed: {e:?}"))?;
+
+        let account_id = crate::keys::derive_account_id(&normalized_did);
+        let app_db_name = storage::app_db_file_name(&account_id);
+        let mls_db_name = storage::mls_db_file_name(&account_id);
+        let marker_file = storage::account_marker_path(&state.data_dir, &account_id);
+
+        let marker_status = storage::read_account_marker(
+            &marker_file,
+            &normalized_did,
+            &account_id,
+            &app_db_name,
+            &mls_db_name,
+        )
+        .map_err(|e| format!("failed to read account marker: {e}"))?;
+
+        let is_creating =
+            marker_status == Some(storage::MarkerStatus::Creating) || marker_status.is_none();
+
+        if is_creating {
+            // Reconcile a durable identity before any registration attempt. Only a
+            // first-login device without a local UUID may create a new registration.
+            if reconcile_device_before_registration(state, &normalized_did).await? {
+                let authority_session = state
+                    .api_client
+                    .current_session()
+                    .map_err(|e| format!("current_session failed: {e:?}"))?;
+                if authority_session.actor_did != normalized_did
+                    || authority_session.token != session_id
+                {
+                    return Err("chat session changed before signer restoration".to_string());
+                }
+                state
+                    .api_client
+                    .ensure_session_current(&authority_session)
+                    .map_err(|e| format!("ensure_session_current failed: {e:?}"))?;
+                restore_registered_signer(
+                    provisional.orchestrator.mls_context().as_ref(),
+                    provisional.orchestrator.credentials().as_ref(),
+                    &normalized_did,
+                )
+                .await?;
+                state
+                    .api_client
+                    .ensure_session_current(&authority_session)
+                    .map_err(|e| format!("ensure_session_current post-restore failed: {e:?}"))?;
+            } else {
+                let mls_did = provisional
+                    .orchestrator
+                    .ensure_device_registered()
+                    .await
+                    .map_err(|e| format!("device registration failed: {e:?}"))?;
+                let store = KeyringCredentialStore::try_new()
+                    .map_err(|e| format!("failed to initialize credential store: {e:?}"))?;
+                let server_dev_id = store
+                    .get_server_device_id(&normalized_did)
+                    .await
+                    .map_err(|e| format!("get_server_device_id failed: {e:?}"))?
+                    .unwrap_or_else(|| mls_did.split('#').last().unwrap_or(&mls_did).to_string());
+                if store
+                    .get_local_device_uuid(&normalized_did)
+                    .await
+                    .map_err(|e| format!("get_local_device_uuid failed: {e:?}"))?
+                    .is_none()
+                {
+                    store
+                        .store_local_device_uuid(&normalized_did, &server_dev_id)
+                        .await
+                        .map_err(|e| format!("store_local_device_uuid failed: {e:?}"))?;
+                }
+            }
+
+            // Verify enrollment tuple completeness
+            let cred_state = KeyringCredentialStore::check_credential_state(&normalized_did)
+                .map_err(|e| format!("credential enrollment check failed: {e}"))?;
+            if cred_state != crate::credentials::CredentialEnrollmentState::FullyEnrolled {
+                return Err(format!(
+                    "incomplete device credential enrollment state: {cred_state:?}"
+                ));
+            }
+
+            storage::write_account_marker_complete(
+                &marker_file,
+                &normalized_did,
+                &account_id,
+                &app_db_name,
+                &mls_db_name,
+            )
+            .map_err(|e| format!("failed to complete account marker: {e}"))?;
+        } else {
+            // Complete reopen: verify credentials are FullyEnrolled and run strictly read-only reconciliation
+            let cred_state = KeyringCredentialStore::check_credential_state(&normalized_did)
+                .map_err(|e| format!("credential enrollment check failed: {e}"))?;
+            if cred_state != crate::credentials::CredentialEnrollmentState::FullyEnrolled {
+                return Err(format!(
+                    "incomplete device credential enrollment state on reopen: {cred_state:?}"
+                ));
+            }
+
+            // Strictly read-only reconciliation: verifies exact 1 clientUuid match, resolved ID == persisted server ID, and pubkey binding with zero writes
+            verify_device_reconciliation_readonly(
+                state,
+                provisional.mls_context.as_ref(),
+                &normalized_did,
+            )
+            .await?;
+        }
+
+        configure_chat_auth(state, &normalized_did, session_id).await?;
+        Ok(())
+    }
+    .await;
+
+    match enroll_result {
+        Ok(()) => {
+            // Atomically publish active runtime only now!
+            let orchestrator = match state.publish_active_runtime(provisional).await {
+                Ok(o) => o,
+                Err(e) => {
+                    state.api_client.clear_auth();
+                    return Err(e);
+                }
+            };
+
+            // Auto opt-in to MLS (non-blocking — failures are logged only)
+            ensure_opted_in(state).await;
+
+            // Start background tasks
+            start_kp_monitor(state).await;
+            start_sync_loop(state).await;
+
+            Ok(orchestrator)
+        }
+        Err(e) => {
+            provisional.drop_runtime().await;
+            state.api_client.clear_auth();
+            Err(e)
+        }
+    }
+}
 
 #[tauri::command]
 pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
+    let _guard = state.lifecycle_lock.lock().await;
+
     let session_entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id")
         .map_err(|e| format!("failed to access session_id keyring entry: {e}"))?;
     let session_id = match session_entry.get_password() {
@@ -920,7 +1145,7 @@ pub async fn try_restore_session(
                 }
             };
 
-            if let Some(ref d) = stored_did {
+            if let Some(d) = &stored_did {
                 if d != &session.did {
                     log_catmos!(
                         "Saved DID {} did not match nest session DID {}; using nest session DID",
@@ -930,68 +1155,23 @@ pub async fn try_restore_session(
                 }
             }
             log_catmos!("Restoring session for DID: {}", session.did);
-            state
-                .orchestrator
-                .initialize(&session.did)
-                .await
-                .map_err(|e| actionable_error(format!("{e:?}")))?;
-            // Install the per-DID content-root key for the field-level
-            // encryption layer; see `complete_login` for rationale.
-            install_content_root_key(&state, &session.did);
-            state.api_client.set_auth(session.did.clone(), sid.clone());
 
-            // Reconcile before any registration. An existing UUID with a
-            // missing/ambiguous server row fails closed instead of creating
-            // another server device after a restart or transient 401/403.
-            if reconcile_device_before_registration(&state, &session.did)
-                .await
-                .map_err(actionable_error)?
-            {
-                let authority_session = state
-                    .api_client
-                    .current_session()
-                    .map_err(actionable_error)?;
-                if authority_session.actor_did != session.did || authority_session.token != sid {
-                    return Err(actionable_error(
-                        "chat session changed before signer restoration",
-                    ));
-                }
-                state
-                    .api_client
-                    .ensure_session_current(&authority_session)
-                    .map_err(actionable_error)?;
-                restore_registered_signer(
-                    state.orchestrator.mls_context().as_ref(),
-                    state.orchestrator.credentials().as_ref(),
-                    &session.did,
-                )
+            enroll_and_publish_runtime(&state, &session.did, &sid)
                 .await
                 .map_err(actionable_error)?;
-                state
-                    .api_client
-                    .ensure_session_current(&authority_session)
-                    .map_err(actionable_error)?;
-            } else {
-                state
-                    .orchestrator
-                    .ensure_device_registered()
-                    .await
-                    .map_err(|e| actionable_error(format!("{e:?}")))?;
+
+            let entry_did = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did")
+                .map_err(|e| format!("failed to create user_did keyring entry: {e}"))?;
+            entry_did
+                .set_password(&session.did)
+                .map_err(|e| format!("failed to save user_did to keyring: {e}"))?;
+            let read_did = entry_did
+                .get_password()
+                .map_err(|e| format!("failed to verify user_did read from keyring: {e}"))?;
+            if read_did.trim() != session.did.trim() {
+                return Err("keyring verification failed: stored user_did mismatch".to_string());
             }
-            configure_chat_auth(&state, &session.did, &sid).await;
 
-            // Auto opt-in to MLS (non-blocking — failures are logged only)
-            ensure_opted_in(&state).await;
-
-            // Start background key package replenishment
-            start_kp_monitor(&state).await;
-
-            // Start periodic sync loop (spec §6.1)
-            start_sync_loop(&state).await;
-
-            if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did") {
-                let _ = entry.set_password(&session.did);
-            }
             log_catmos!("Session restored: handle={}", session.handle);
 
             Ok(Some(AuthResponse {
@@ -1015,12 +1195,16 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     if let Some(handle) = state.sync_loop.lock().await.take() {
         handle.abort();
     }
-    // Drop the in-memory content-root key. The file on disk is preserved so
-    // re-login on the same machine resumes the same chain seed; an explicit
-    // wipe path (account removal) would also call `keys::delete_content_root_key`.
-    state.orchestrator.mls_context().clear_content_root_key();
-    state.orchestrator.shutdown().await;
+    let mut ws = state.ws_handles.lock().await;
+    for (_, handle) in ws.drain() {
+        let _ = handle.shutdown.send(true);
+    }
+    drop(ws);
+
+    // Drop the active account runtime (clears in-memory MLS context, shuts down orchestrator, clears API client MLS context)
+    state.drop_account_runtime().await?;
     state.api_client.clear_auth();
+
     // Logout revokes only runtime authority and saved session credentials.
     // The local UUID and server device ID remain durable so the next login
     // can reconcile listDevices before considering registration.
@@ -1031,13 +1215,13 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, String> {
+    let orchestrator = state.get_orchestrator().await?;
     // Sync with server first — joins any groups we were added to
-    if let Err(e) = state.orchestrator.sync_with_server(false).await {
+    if let Err(e) = orchestrator.sync_with_server(false).await {
         log_catmos!(" sync_with_server warning: {}", e);
     }
 
-    let page = state
-        .orchestrator
+    let page = orchestrator
         .api_client()
         .get_conversations(50, None)
         .await
@@ -1057,8 +1241,7 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
 
         // Lazy bootstrap on miss. Best-effort; failure leaves the snapshot
         // empty and we fall back to a member-DID join below.
-        let mut snapshot = state
-            .orchestrator
+        let mut snapshot = orchestrator
             .storage()
             .get_metadata_snapshot(&c.conversation_id);
         let needs_bootstrap = snapshot
@@ -1074,8 +1257,7 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
                     e
                 );
             }
-            snapshot = state
-                .orchestrator
+            snapshot = orchestrator
                 .storage()
                 .get_metadata_snapshot(&c.conversation_id);
         }
@@ -1095,14 +1277,14 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
             .map(|p| p.description.clone())
             .filter(|d| !d.is_empty());
 
-        let avatar_data_url = state
-            .orchestrator
-            .storage()
-            .get_avatar(&c.conversation_id)
-            .map(|(bytes, ct)| {
-                let mime = ct.unwrap_or_else(|| "image/jpeg".to_string());
-                format!("data:{};base64,{}", mime, B64.encode(&bytes))
-            });
+        let avatar_data_url =
+            orchestrator
+                .storage()
+                .get_avatar(&c.conversation_id)
+                .map(|(bytes, ct)| {
+                    let mime = ct.unwrap_or_else(|| "image/jpeg".to_string());
+                    format!("data:{};base64,{}", mime, B64.encode(&bytes))
+                });
 
         convos.push(Conversation {
             id: c.conversation_id.clone(),
@@ -1128,6 +1310,7 @@ pub async fn create_group(
     member_dids: Vec<String>,
     description: Option<String>,
 ) -> Result<Conversation, String> {
+    let orchestrator = state.get_orchestrator().await?;
     log_catmos!(
         " create_group called: name={}, members={:?}, description={:?}",
         name,
@@ -1141,8 +1324,7 @@ pub async fn create_group(
         Some(member_dids.as_slice())
     };
 
-    let convo = state
-        .orchestrator
+    let convo = orchestrator
         .create_group(&name, members, description.as_deref())
         .await
         .map_err(|e| {
@@ -1169,8 +1351,7 @@ pub async fn create_group(
         );
     }
 
-    let snapshot = state
-        .orchestrator
+    let snapshot = orchestrator
         .storage()
         .get_metadata_snapshot(&convo.conversation_id);
     let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
@@ -1198,8 +1379,7 @@ pub async fn create_group(
         .filter(|d| !d.is_empty())
         .or_else(|| description.clone());
 
-    let avatar_data_url = state
-        .orchestrator
+    let avatar_data_url = orchestrator
         .storage()
         .get_avatar(&convo.conversation_id)
         .map(|(bytes, ct)| {
@@ -1228,18 +1408,13 @@ pub async fn create_group(
 /// is handed and encrypts under that MLS group. Every send must translate at
 /// the boundary or the orchestrator fails with "Invalid hex group ID".
 async fn resolve_group_id(state: &AppState, conversation_id: &str) -> Result<String, String> {
-    let user_did = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let user_did = orchestrator
         .api_client()
         .current_did()
         .await
         .unwrap_or_default();
-    resolve_current_group_id(
-        state.orchestrator.storage().as_ref(),
-        &user_did,
-        conversation_id,
-    )
-    .await
+    resolve_current_group_id(orchestrator.storage().as_ref(), &user_did, conversation_id).await
 }
 
 /// Resolve a reaction/send coordinate only when the persisted group state
@@ -1307,6 +1482,7 @@ pub async fn send_message(
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
+    let orchestrator = state.get_orchestrator().await?;
     state
         .api_client
         .require_signing_capability()
@@ -1321,8 +1497,7 @@ pub async fn send_message(
     // under the MLS group, not the UUID.
     let group_id = resolve_group_id(&state, &conversation_id).await?;
 
-    let msg = state
-        .orchestrator
+    let msg = orchestrator
         .send_message(&group_id, &content)
         .await
         .map_err(|e| {
@@ -1348,6 +1523,7 @@ pub async fn send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<Message, String> {
+    let orchestrator = state.get_orchestrator().await?;
     state
         .api_client
         .require_signing_capability()
@@ -1395,8 +1571,7 @@ pub async fn send_image(
 
     let group_id = resolve_group_id(&state, &conversation_id).await?;
 
-    let msg = state
-        .orchestrator
+    let msg = orchestrator
         .send_message_with_embed(&group_id, &content, embed)
         .await
         .map_err(|e| {
@@ -1408,7 +1583,6 @@ pub async fn send_image(
     ui.conversation_id = conversation_id;
     Ok(ui)
 }
-
 #[tauri::command]
 pub async fn get_image_attachment(
     state: State<'_, AppState>,
@@ -1444,10 +1618,10 @@ pub async fn get_messages(
     conversation_id: String,
     before: Option<String>,
 ) -> Result<Vec<Message>, String> {
+    let orchestrator = state.get_orchestrator().await?;
     // Try local storage first
     let before_seq = before.and_then(|b| b.parse::<u64>().ok());
-    let mut stored = state
-        .orchestrator
+    let mut stored = orchestrator
         .storage()
         .get_messages(&conversation_id, 50, before_seq)
         .await
@@ -1469,15 +1643,14 @@ pub async fn get_group_members(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<GroupMember>, String> {
-    let user_did = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let user_did = orchestrator
         .api_client()
         .current_did()
         .await
         .unwrap_or_default();
 
-    let convo = state
-        .orchestrator
+    let convo = orchestrator
         .storage()
         .get_conversation(&user_did, &conversation_id)
         .await
@@ -1504,6 +1677,7 @@ pub async fn subscribe_conversation(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<(), String> {
+    let orchestrator = state.get_orchestrator().await?;
     // Don't subscribe twice
     {
         let handles = state.ws_handles.lock().await;
@@ -1527,7 +1701,6 @@ pub async fn subscribe_conversation(
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
-    let orchestrator = state.orchestrator.clone();
 
     let handle = WsHandle {
         shutdown: shutdown_tx,
@@ -1607,8 +1780,7 @@ pub async fn subscribe_all_events(
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
-    let orchestrator = state.orchestrator.clone();
-
+    let orchestrator = state.get_orchestrator().await?;
     state.ws_handles.lock().await.insert(
         GLOBAL_KEY.to_string(),
         WsHandle {
@@ -1651,8 +1823,8 @@ pub async fn fetch_new_messages(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<Message>, String> {
-    let (msgs, _cursor) = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let (msgs, _cursor) = orchestrator
         .fetch_messages(&conversation_id, None, 50, Some("app"), None, None)
         .await
         .map_err(|e| format!("{:?}", e))?;
@@ -1721,6 +1893,7 @@ pub async fn send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), String> {
+    let orchestrator = state.get_orchestrator().await?;
     state
         .api_client
         .require_signing_capability()
@@ -1746,8 +1919,7 @@ pub async fn send_reaction(
     // before the reaction enters the Rust orchestrator.
     let group_id = resolve_group_id(&state, &conversation_id).await?;
 
-    state
-        .orchestrator
+    orchestrator
         .send_reaction(&group_id, &message_id, &emoji, reaction_action)
         .await
         .map_err(|e| {
@@ -1898,7 +2070,10 @@ pub async fn check_opt_in_status(
         "blue.catbird.chat.getDevices",
     );
     let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
-    let query_params: Vec<(&str, &str)> = parsed_dids.iter().map(|d| ("userDids", d.as_str())).collect();
+    let query_params: Vec<(&str, &str)> = parsed_dids
+        .iter()
+        .map(|d| ("userDids", d.as_str()))
+        .collect();
 
     let client = reqwest::Client::new();
     let resp = crate::mls_proxy::with_mls_proxy_header(client.get(&url).query(&query_params))
@@ -1912,23 +2087,18 @@ pub async fn check_opt_in_status(
     }
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let output =
-        parse_lexicon_json::<catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>>(body.as_ref())?;
+    let output = parse_lexicon_json::<
+        catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>,
+    >(body.as_ref())?;
 
-    let active_dids: std::collections::HashSet<&str> = output
-        .devices
-        .iter()
-        .map(|d| d.user_did.as_str())
-        .collect();
+    let active_dids: std::collections::HashSet<&str> =
+        output.devices.iter().map(|d| d.user_did.as_str()).collect();
 
     Ok(dids
         .into_iter()
         .map(|did| {
             let opted_in = active_dids.contains(did.as_str());
-            OptInStatusResult {
-                did,
-                opted_in,
-            }
+            OptInStatusResult { did, opted_in }
         })
         .collect())
 }
@@ -1973,8 +2143,8 @@ pub async fn remove_group_member(
         target_did
     );
 
-    state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    orchestrator
         .remove_members(&conversation_id, &[target_did])
         .await
         .map_err(|e| format!("{:?}", e))?;
@@ -1990,13 +2160,14 @@ pub async fn get_group_metadata(
     // Post-cutover, group titles / descriptions live in the encrypted blob
     // path persisted by `bootstrap_group_metadata`. The plaintext 0xff00
     // extension is gone; serve everything from local SQLite.
-    let snapshot = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let snapshot = orchestrator
         .storage()
         .get_metadata_snapshot(&conversation_id);
     Ok(snapshot
-        .and_then(|s| s.metadata_json)
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok()))
+        .as_ref()
+        .and_then(|s| s.metadata_json.as_deref())
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok()))
 }
 
 /// Fetch + decrypt the encrypted group metadata blob for a group at its
@@ -2018,13 +2189,8 @@ async fn bootstrap_group_metadata(
     group_id_hex: &str,
     convo_id: &str,
 ) -> std::result::Result<(), String> {
-    bootstrap_group_metadata_for_ws(
-        &state.orchestrator,
-        &state.api_client,
-        group_id_hex,
-        convo_id,
-    )
-    .await
+    let orchestrator = state.get_orchestrator().await?;
+    bootstrap_group_metadata_for_ws(&orchestrator, &state.api_client, group_id_hex, convo_id).await
 }
 
 /// `bootstrap_group_metadata` variant that takes the orchestrator + API
@@ -2365,11 +2531,11 @@ async fn republish_group_metadata_after_reset(
     avatar_bytes: Option<Vec<u8>>,
     avatar_content_type: Option<String>,
 ) -> std::result::Result<(), String> {
+    let orchestrator = state.get_orchestrator().await?;
     let group_id_bytes =
         hex::decode(new_group_id_hex).map_err(|e| format!("Invalid new_group_id hex: {e}"))?;
 
-    let info = state
-        .orchestrator
+    let info = orchestrator
         .mls_context()
         .get_current_metadata(group_id_bytes.clone())
         .map_err(|e| format!("get_current_metadata failed: {e:?}"))?
@@ -2460,16 +2626,9 @@ async fn republish_group_metadata_after_reset(
         }
     }
 
-    // Cache locally so the UI reflects the new title without waiting for the
-    // first incoming commit to trigger another bootstrap. Note: the actual
-    // commit that installs `MetadataReference { metadata_version, locator }`
-    // into AppDataDictionary 0x8001 is the responsibility of the
-    // post-reset MLS update_group_metadata flow (separate from this helper);
-    // here we only persist what the user already sees.
     let payload_json = serde_json::to_string(&payload)
         .map_err(|e| format!("metadata payload serialize failed: {e}"))?;
-    state
-        .orchestrator
+    orchestrator
         .storage()
         .update_metadata_json(
             convo_id,
@@ -2482,7 +2641,7 @@ async fn republish_group_metadata_after_reset(
         .map_err(|e| format!("update_metadata_json (post-reset) failed: {e:?}"))?;
 
     if let Some(bytes) = avatar_bytes.as_deref() {
-        if let Err(e) = state.orchestrator.storage().update_avatar_bytes(
+        if let Err(e) = orchestrator.storage().update_avatar_bytes(
             convo_id,
             bytes,
             avatar_content_type.as_deref(),
@@ -2514,8 +2673,8 @@ pub async fn update_group_metadata(
         description
     );
 
-    state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    orchestrator
         .update_group_metadata_encrypted(
             &conversation_id,
             name.as_deref(),
@@ -2542,8 +2701,8 @@ pub async fn add_group_members(
         member_dids
     );
 
-    state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    orchestrator
         .add_members(&conversation_id, &member_dids)
         .await
         .map_err(|e| e.to_string())?;
@@ -2558,8 +2717,8 @@ pub async fn leave_conversation(
 ) -> Result<(), String> {
     log_catmos!("leave_conversation: convo={}", conversation_id);
 
-    state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    orchestrator
         .leave_group(&conversation_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -2589,16 +2748,15 @@ pub async fn search_messages(
         return Ok(vec![]);
     }
 
-    let user_did = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let user_did = orchestrator
         .api_client()
         .current_did()
         .await
         .unwrap_or_default();
 
     // Get all conversations for name lookup
-    let conversations = state
-        .orchestrator
+    let conversations = orchestrator
         .storage()
         .list_conversations(&user_did)
         .await
@@ -2611,8 +2769,7 @@ pub async fn search_messages(
     let convo_names: std::collections::HashMap<String, String> = conversations
         .iter()
         .map(|c| {
-            let title = state
-                .orchestrator
+            let title = orchestrator
                 .storage()
                 .get_metadata_snapshot(&c.conversation_id)
                 .and_then(|s| s.metadata_json)
@@ -2633,8 +2790,7 @@ pub async fn search_messages(
     for convo in &conversations {
         // Use stable conversation_id for message lookups
         let convo_id = &convo.conversation_id;
-        if let Ok(all_msgs) = state
-            .orchestrator
+        if let Ok(all_msgs) = orchestrator
             .storage()
             .get_messages(convo_id, 500, None)
             .await
@@ -2751,19 +2907,17 @@ pub async fn republish_group_metadata(
         new_group_id,
         new_reset_generation
     );
-
-    let snapshot = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let snapshot = orchestrator
         .storage()
         .get_metadata_snapshot(&conversation_id);
     let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
         .as_ref()
         .and_then(|s| s.metadata_json.as_deref())
         .and_then(|j| serde_json::from_str(j).ok());
-    let avatar_pair = state.orchestrator.storage().get_avatar(&conversation_id);
+    let avatar_pair = orchestrator.storage().get_avatar(&conversation_id);
     let avatar_bytes = avatar_pair.as_ref().map(|(b, _)| b.clone());
     let avatar_content_type = avatar_pair.and_then(|(_, ct)| ct);
-
     let title = payload
         .as_ref()
         .map(|p| p.title.clone())
@@ -2963,8 +3117,8 @@ pub async fn get_quarantine_state(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Option<QuarantineStateView>, String> {
-    let snapshot = state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    let snapshot = orchestrator
         .get_conversation_quarantine_state(&conversation_id)
         .await;
     Ok(snapshot.map(|q| QuarantineStateView {
@@ -2974,32 +3128,23 @@ pub async fn get_quarantine_state(
     }))
 }
 
-/// User-confirmed manual reset for a quarantined conversation (Layer 3
-/// banner's `[Reset conversation]` action). Distinct from `reset_group`,
-/// which is the bootstrap-reset (External Commit) path: this one routes
-/// through `MLSOrchestrator::user_confirmed_manual_reset`, which reports the
-/// deliberate user vote to the server's A7 reset pyramid AND clears local
-/// quarantine state (`exit_quarantine` → `Active`). The server emits a
-/// follow-up `groupResetEvent` if quorum is reached; the existing
-/// `mls:group-reset` listener picks that up.
 #[tauri::command]
 pub async fn confirm_manual_reset(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<(), String> {
     log_catmos!("confirm_manual_reset: convo={}", conversation_id);
-    state
-        .orchestrator
+    let orchestrator = state.get_orchestrator().await?;
+    orchestrator
         .user_confirmed_manual_reset(&conversation_id)
         .await
         .map_err(|e| format!("{:?}", e))
 }
-
 #[cfg(test)]
 mod tests {
     use super::{
         cleanup_ws_handle, resolve_current_group_id, restore_registered_signer,
-        validate_current_group_id,
+        validate_current_group_id, SESSION_CREDENTIAL_KEYS, SESSION_KEYRING_SERVICE,
     };
     use crate::credentials::KeyringCredentialStore;
     use crate::storage::SqliteStorage;
@@ -3010,7 +3155,6 @@ mod tests {
     use catbird_mls::{KeychainAccess, MLSContext, MLSError};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-
     struct TestKeychain {
         values: Mutex<HashMap<String, Vec<u8>>>,
     }
@@ -3073,8 +3217,8 @@ mod tests {
     async fn reaction_mapping_must_be_the_storage_current_group_for_conversation() {
         let temp = tempfile::tempdir().expect("temporary storage directory");
         let db_path = temp.path().join("commands-reaction.sqlite");
-        let storage =
-            SqliteStorage::new(db_path.to_str().unwrap(), "test-key").expect("storage should open");
+        let storage = SqliteStorage::create_new(db_path.to_str().unwrap(), "test-key")
+            .expect("storage should open");
         let did = "did:plc:reaction-owner";
         let conversation_id = "00000000-0000-4000-8000-000000000001";
         let stale_group_id = "deadbeefcafe1234";
@@ -3136,7 +3280,7 @@ mod tests {
         let storage_db = temp.path().join("commands-orchestrator.sqlite");
         let mls_db = temp.path().join("commands-orchestrator-mls.sqlite");
         let storage = Arc::new(
-            SqliteStorage::new(storage_db.to_str().unwrap(), "test-key")
+            SqliteStorage::create_new(storage_db.to_str().unwrap(), "test-key")
                 .expect("storage should open"),
         );
         let did = "did:plc:reaction-owner";
@@ -3271,7 +3415,6 @@ mod tests {
 
     #[test]
     fn session_credential_keys_order_has_user_did_last() {
-        let keys = ["session_id", "chat_dpop_jkt", "user_did"];
-        assert_eq!(keys.last(), Some(&"user_did"));
+        assert_eq!(SESSION_CREDENTIAL_KEYS.last(), Some(&"user_did"));
     }
 }

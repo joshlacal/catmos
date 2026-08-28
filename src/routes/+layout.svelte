@@ -5,7 +5,7 @@
 	import TabBlockedMessage from '$lib/components/TabBlockedMessage.svelte';
 	import { auth } from '$lib/stores/auth';
 	import { selectedConversation } from '$lib/stores/conversations';
-	import { isTauri, initWasm, resetCleanStorage } from '$lib/wasm';
+	import { isTauri, resetCleanStorage } from '$lib/wasm';
 	import { acquireTabLock, type TabLockStatus } from '$lib/stores/tab-lock';
 
 	let { children } = $props();
@@ -77,22 +77,30 @@
 
 		// Single-tab enforcement (web only — Tauri handles this natively)
 		if (!isTauri) {
-			const { steal } = acquireTabLock((status) => {
+			let restoreInitiated = false;
+			const { steal } = acquireTabLock(async (status) => {
 				tabLockStatus = status;
+				if (status === 'granted' && !restoreInitiated) {
+					restoreInitiated = true;
+					try {
+						await auth.tryRestore();
+					} catch (err) {
+						console.error('[catmos] tryRestore error:', err);
+						initError = err instanceof Error ? err.message : String(err);
+					}
+				}
 			});
 			stealLock = steal;
-
-			try {
-				await initWasm();
-			} catch (err) {
-				console.error('[catmos] initWasm error:', err);
-				initError = err instanceof Error ? err.message : String(err);
-			}
 		} else {
 			tabLockStatus = 'granted';
+			try {
+				await auth.tryRestore();
+			} catch (err) {
+				console.error('[catmos] tryRestore error:', err);
+				initError = err instanceof Error ? err.message : String(err);
+			}
 		}
 
-		auth.tryRestore();
 	});
 
 	onDestroy(() => {
