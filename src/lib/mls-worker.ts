@@ -37,17 +37,18 @@ const api = {
 		subscriptions.clear();
 		(wasm as unknown as { catbird_mls_close?: () => void }).catbird_mls_close?.();
 	},
-	resetCleanStorage: async (config?: object) => {
+	resetCleanStorage: async (config?: { storagePrefix?: string; dbPrefix?: string }) => {
 		for (const sub of subscriptions.values()) {
 			sub.close();
 		}
 		subscriptions.clear();
 		await wasmReady;
-		await (
-			wasm as unknown as {
-				catbird_mls_reset_clean_storage?: (c?: unknown) => Promise<void>;
-			}
-		).catbird_mls_reset_clean_storage?.(config);
+		await wasm.catbird_mls_init({
+			baseUrl: 'https://api.catbird.blue',
+			storagePrefix: config?.storagePrefix,
+			dbPrefix: config?.dbPrefix,
+			reset: true
+		});
 	},
 	// Browser signer bridge. The CryptoKey remains owned by the worker's
 	// WebCrypto implementation; only its public key and a callback cross into

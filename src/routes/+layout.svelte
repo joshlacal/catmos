@@ -118,6 +118,7 @@
 	</div>
 {:else if tabLockStatus === 'blocked' && stealLock}
 	<TabBlockedMessage onSteal={stealLock} />
+{:else}
 <div
 	class="app-shell"
 	class:sidebar-collapsed={sidebarCollapsed}

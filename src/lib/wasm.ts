@@ -595,6 +595,7 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 	}
 
 	// 2. Await worker resetCleanStorage before terminating worker
+	let workerError: unknown = null;
 	if (_worker) {
 		try {
 			await (
@@ -614,7 +615,7 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 				dbPrefix: DB_PREFIX
 			});
 		} catch (err) {
-			console.error('[catmos] worker resetCleanStorage error:', err);
+			workerError = err;
 		}
 	}
 
@@ -624,6 +625,10 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 	}
 	_worker = null;
 
+	if (workerError) {
+		console.error('[catmos] worker resetCleanStorage error:', workerError);
+		throw workerError;
+	}
 	// 3. Determine target DID
 	const activeDid =
 		did ?? (typeof window !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
