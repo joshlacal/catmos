@@ -187,8 +187,19 @@ pub fn write_marker_complete(
     }
     let content = format!("complete\n{}\n{}\n", MLS_STORAGE_GENERATION, db_file_name);
     let tmp_path = format!("{}.tmp.{}", marker_path.display(), uuid::Uuid::new_v4());
-    std::fs::write(&tmp_path, content.as_bytes())?;
-    std::fs::rename(&tmp_path, marker_path)?;
+    let write_res = (|| -> Result<(), std::io::Error> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, marker_path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DatabaseInitError::Io(e));
+    }
     Ok(())
 }
 
@@ -475,7 +486,24 @@ pub async fn reset_clean_storage_with_store(
     // 2. Close and drop SqliteStorage handle before unlinking files
     drop(storage);
 
-    // 3. Delete Clean Application Database and sidecars
+    // 3. Delete per-DID credentials and content-root key if user_did is provided
+    if let Some(did) = user_did {
+        let cred_store = crate::credentials::KeyringCredentialStore::try_new()
+            .map_err(|e| format!("failed to open credential store for reset: {e}"))?;
+        use catbird_mls::orchestrator::credentials::CredentialStore;
+        cred_store
+            .clear_all(did)
+            .await
+            .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
+        crate::keys::delete_content_root_key(data_dir, did)
+            .map_err(|e| format!("failed to delete content-root key: {e}"))?;
+    }
+
+    // 4. Delete all indexed MLS signer slots from keychain before deleting MLS DB
+    crate::keychain::KeyringKeychainAccess::clear_all()
+        .map_err(|e| format!("failed to clear indexed MLS signer slots: {e}"))?;
+
+    // 5. Delete Clean Application Database and sidecars
     let app_db_path = data_dir.join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
     let app_db_wal = data_dir.join(format!("catmos-{}.db-wal", MLS_KEY_SUFFIX));
     let app_db_shm = data_dir.join(format!("catmos-{}.db-shm", MLS_KEY_SUFFIX));
@@ -487,12 +515,12 @@ pub async fn reset_clean_storage_with_store(
         }
     }
 
-    // 4. Delete App DB keyring key from store
+    // 6. Delete App DB keyring key from store
     store
         .delete_password(service, CONVERSATION_DB_KEY_LABEL)
         .map_err(|e| format!("failed to delete conversation DB key: {e}"))?;
 
-    // 5. Delete Clean MLS Database and sidecars
+    // 7. Delete Clean MLS Database and sidecars
     let mls_state_dir = data_dir.join(MLS_STORAGE_GENERATION);
     let mls_db_path = mls_state_dir.join("mls.db");
     let mls_db_wal = mls_state_dir.join("mls.db-wal");
@@ -505,26 +533,12 @@ pub async fn reset_clean_storage_with_store(
         }
     }
 
-    // 6. Delete MLS DB keyring key from store
+    // 8. Delete MLS DB keyring key from store
     store
         .delete_password(service, MLS_DB_KEY_LABEL)
         .map_err(|e| format!("failed to delete MLS DB key: {e}"))?;
 
-    // 7. Delete optional credentials and content-root key for user_did AFTER DBs and keys are deleted
-    if let Some(did) = user_did {
-        if let Ok(cred_store) = crate::credentials::KeyringCredentialStore::try_new() {
-            use catbird_mls::orchestrator::credentials::CredentialStore;
-            cred_store
-                .clear_all(did)
-                .await
-                .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
-        }
-        if let Err(e) = crate::keys::delete_content_root_key(data_dir, did) {
-            return Err(format!("failed to delete content-root key: {e}"));
-        }
-    }
-
-    // 8. Delete marker files LAST
+    // 9. Delete marker files LAST
     let app_marker = marker_path(&app_db_path);
     if app_marker.exists() {
         std::fs::remove_file(&app_marker)

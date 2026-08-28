@@ -204,14 +204,7 @@ impl CredentialStore for KeyringCredentialStore {
 
     async fn clear_all(&self, user_did: &str) -> Result<()> {
         self.delete_signing_key(user_did).await?;
-        // Delete MLS DID
-        if let Ok(entry) = Self::entry(&Self::key_mls_did(user_did)) {
-            match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => {}
-                Err(e) => return Err(OrchestratorError::Credential(e.to_string())),
-            }
-        }
-        // Delete both the server ID slot and the client UUID slot.
+        Self::delete_key(Self::key_mls_did(user_did))?;
         Self::delete_key(Self::key_device_uuid(user_did))?;
         Self::delete_key(Self::key_server_device_id(user_did))?;
         Self::delete_key(Self::key_local_device_uuid(user_did))?;

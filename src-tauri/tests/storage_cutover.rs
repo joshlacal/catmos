@@ -179,7 +179,8 @@ fn clean_mls_context_mixed_states_fail_closed() {
         Box::new(TestKeychain::new()),
         &store1,
     )
-    .unwrap_err();
+    .err()
+    .expect("absent DB with present key should fail closed");
     assert!(matches!(err, DatabaseInitError::MixedStateAbsentDbPresentKey));
 
     // Case 2: present DB, absent key
@@ -191,7 +192,8 @@ fn clean_mls_context_mixed_states_fail_closed() {
         Box::new(TestKeychain::new()),
         &store2,
     )
-    .unwrap_err();
+    .err()
+    .expect("present DB with absent key should fail closed");
     assert!(matches!(err, DatabaseInitError::MixedStatePresentDbAbsentKey));
     let _ = fs::remove_file(&mls_db_path);
 
@@ -206,7 +208,8 @@ fn clean_mls_context_mixed_states_fail_closed() {
         Box::new(TestKeychain::new()),
         &store3,
     )
-    .unwrap_err();
+    .err()
+    .expect("creating marker should fail closed as incomplete initialization");
     assert!(matches!(err, DatabaseInitError::InitializationIncomplete));
     let _ = fs::remove_file(&mls_db_path);
     let _ = fs::remove_file(&marker_file);
@@ -220,7 +223,27 @@ fn clean_mls_context_mixed_states_fail_closed() {
         Box::new(TestKeychain::new()),
         &store4,
     )
-    .unwrap_err();
+    .err()
+    .expect("orphan complete marker should fail closed as invalid marker");
     assert!(matches!(err, DatabaseInitError::InvalidMarker(_)));
     let _ = fs::remove_file(&marker_file);
+}
+
+#[test]
+fn write_marker_complete_produces_valid_durable_marker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("test.db");
+    let marker = marker_path(&db_path);
+
+    write_marker_complete(&marker, "test.db").expect("write complete marker should succeed");
+    assert!(marker.exists());
+
+    let parsed = read_marker(&marker, "test.db").expect("read marker should parse");
+    assert_eq!(parsed, Some(MarkerStatus::Complete));
+
+    let content = fs::read_to_string(&marker).expect("read content");
+    assert_eq!(
+        content,
+        format!("complete\n{}\ntest.db\n", MLS_STORAGE_GENERATION)
+    );
 }

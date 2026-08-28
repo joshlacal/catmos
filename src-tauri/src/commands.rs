@@ -213,16 +213,42 @@ struct SessionInfo {
 
 pub(crate) const SESSION_KEYRING_SERVICE: &str = "catmos-clean-v2-openmls-v09";
 
+pub(crate) fn get_saved_session_did() -> Result<Option<String>, String> {
+    get_saved_session_did_for_service(SESSION_KEYRING_SERVICE)
+}
+
+pub(crate) fn get_saved_session_did_for_service(service: &str) -> Result<Option<String>, String> {
+    let entry = keyring::Entry::new(service, "user_did")
+        .map_err(|e| format!("failed to access keyring entry for user_did: {e}"))?;
+    match entry.get_password() {
+        Ok(did) if !did.trim().is_empty() => Ok(Some(did)),
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("failed to read user_did from keyring: {e}")),
+    }
+}
+
+pub(crate) fn delete_saved_session_credentials() -> Result<(), String> {
+    delete_saved_session_credentials_for_service(SESSION_KEYRING_SERVICE)
+}
+
+pub(crate) fn delete_saved_session_credentials_for_service(service: &str) -> Result<(), String> {
+    for key in ["session_id", "user_did", "chat_dpop_jkt"] {
+        let entry = keyring::Entry::new(service, key)
+            .map_err(|e| format!("failed to create keyring entry for {key}: {e}"))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("failed to delete session credential {key}: {e}")),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn clear_saved_session_credentials() {
-    clear_saved_session_credentials_for_service(SESSION_KEYRING_SERVICE);
+    let _ = delete_saved_session_credentials();
 }
 
 pub(crate) fn clear_saved_session_credentials_for_service(service: &str) {
-    for key in ["session_id", "user_did", "chat_dpop_jkt"] {
-        if let Ok(entry) = keyring::Entry::new(service, key) {
-            let _ = entry.delete_credential();
-        }
-    }
+    let _ = delete_saved_session_credentials_for_service(service);
 }
 
 /// Install only opaque runtime capabilities after login/device enrollment.
@@ -3226,5 +3252,10 @@ mod tests {
             .clear_all(did)
             .await
             .expect("clear signer fixture after test");
+    }
+
+    #[test]
+    fn session_keyring_service_matches_clean_generation() {
+        assert_eq!(SESSION_KEYRING_SERVICE, "catmos-clean-v2-openmls-v09");
     }
 }
