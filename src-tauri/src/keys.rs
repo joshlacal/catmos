@@ -76,6 +76,16 @@ pub fn delete_content_root_key(app_data_dir: &Path, user_did: &str) -> Result<()
     Ok(())
 }
 
+/// Remove the entire generation-scoped content-root directory and all keys within it.
+/// Used during global storage reset.
+pub fn delete_all_content_root_keys(app_data_dir: &Path) -> Result<()> {
+    let dir = app_data_dir.join(MLS_CONTENT_ROOT_DIR);
+    if dir.exists() {
+        fs::remove_dir_all(&dir).context("remove mls-content-root directory")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +154,34 @@ mod tests {
         delete_content_root_key(tmp.path(), did).unwrap();
         assert!(legacy_file.exists());
         assert!(!tmp.path().join(MLS_CONTENT_ROOT_DIR).join(did_filename(did)).exists());
+    }
+
+    #[test]
+    fn delete_all_content_root_keys_removes_clean_dir_and_leaves_legacy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let did1 = "did:plc:user1";
+        let did2 = "did:plc:user2";
+        let _ = load_or_create_content_root_key(tmp.path(), did1).unwrap();
+        let _ = load_or_create_content_root_key(tmp.path(), did2).unwrap();
+
+        let clean_dir = tmp.path().join(MLS_CONTENT_ROOT_DIR);
+        assert!(clean_dir.exists());
+
+        let legacy_dir = tmp.path().join("mls-content-root");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join(did_filename(did1));
+        fs::write(&legacy_file, b"legacy-sentinel-bytes-32bytes!!").unwrap();
+
+        // Global delete should remove clean dir completely
+        delete_all_content_root_keys(tmp.path()).unwrap();
+        assert!(!clean_dir.exists());
+
+        // Calling again should be idempotent
+        delete_all_content_root_keys(tmp.path()).unwrap();
+        assert!(!clean_dir.exists());
+
+        // Legacy directory must remain untouched
+        assert!(legacy_file.exists());
+        assert_eq!(fs::read(&legacy_file).unwrap(), b"legacy-sentinel-bytes-32bytes!!");
     }
 }

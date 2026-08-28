@@ -1,12 +1,16 @@
+use std::collections::BTreeSet;
+use std::sync::Mutex;
 use async_trait::async_trait;
 use keyring::Entry;
 
 use catbird_mls::orchestrator::credentials::CredentialStore;
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 
-const SERVICE_NAME: &str = "blue.catbird.catmos.clean-v2-openmls-v09";
-const KEY_SUFFIX: &str = "clean-v2-openmls-v09";
+pub const SERVICE_NAME: &str = "blue.catbird.catmos.clean-v2-openmls-v09";
+pub const KEY_SUFFIX: &str = "clean-v2-openmls-v09";
+pub const DID_INDEX_KEY: &str = "credential_dids_index";
 
+static DID_INDEX_LOCK: Mutex<()> = Mutex::new(());
 /// OS keychain-backed credential store using the `keyring` crate.
 pub struct KeyringCredentialStore;
 
@@ -33,8 +37,67 @@ impl KeyringCredentialStore {
         }
     }
 
+    pub(crate) fn scoped_key(key: &str) -> String {
+        format!("{}:{}", key, KEY_SUFFIX)
+    }
+
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
         Entry::new(SERVICE_NAME, key)
+    }
+
+    fn index_entry() -> std::result::Result<Entry, keyring::Error> {
+        Entry::new(SERVICE_NAME, &Self::scoped_key(DID_INDEX_KEY))
+    }
+
+    fn load_index_locked() -> Result<BTreeSet<String>> {
+        let entry = Self::index_entry().map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        match entry.get_password() {
+            Ok(json_str) => {
+                let trimmed = json_str.trim();
+                if trimmed.is_empty() {
+                    return Err(OrchestratorError::Credential(
+                        "credential DIDs index is empty or corrupt in keyring".into(),
+                    ));
+                }
+                let set: BTreeSet<String> = serde_json::from_str(trimmed)
+                    .map_err(|e| OrchestratorError::Credential(format!("corrupt credential DIDs index: {e}")))?;
+                Ok(set)
+            }
+            Err(keyring::Error::NoEntry) => Ok(BTreeSet::new()),
+            Err(e) => Err(OrchestratorError::Credential(e.to_string())),
+        }
+    }
+
+    fn save_index_locked(index: &BTreeSet<String>) -> Result<()> {
+        let entry = Self::index_entry().map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        if index.is_empty() {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(OrchestratorError::Credential(e.to_string())),
+            }
+        } else {
+            let json_str = serde_json::to_string(index)
+                .map_err(|e| OrchestratorError::Credential(format!("failed to serialize credential DIDs index: {e}")))?;
+            entry
+                .set_password(&json_str)
+                .map_err(|e| OrchestratorError::Credential(e.to_string()))
+        }
+    }
+
+    fn index_did_locked(user_did: &str) -> Result<()> {
+        let trimmed = user_did.trim();
+        if trimmed.is_empty() {
+            return Err(OrchestratorError::Credential(
+                "cannot index an empty user DID".to_string(),
+            ));
+        }
+        let _guard = DID_INDEX_LOCK.lock().unwrap();
+        let mut index = Self::load_index_locked()?;
+        if !index.contains(trimmed) {
+            index.insert(trimmed.to_string());
+            Self::save_index_locked(&index)?;
+        }
+        Ok(())
     }
 
     fn key_signing(user_did: &str) -> String {
@@ -66,8 +129,17 @@ impl KeyringCredentialStore {
     async fn get_string(key: String) -> Result<Option<String>> {
         match Self::entry(&key) {
             Ok(entry) => match entry.get_password() {
-                Ok(value) if !value.trim().is_empty() => Ok(Some(value)),
-                Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+                Ok(value) => {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        Err(OrchestratorError::Credential(format!(
+                            "keychain slot {key} is empty or corrupt"
+                        )))
+                    } else {
+                        Ok(Some(value))
+                    }
+                }
+                Err(keyring::Error::NoEntry) => Ok(None),
                 Err(error) => Err(OrchestratorError::Credential(error.to_string())),
             },
             Err(error) => Err(OrchestratorError::Credential(error.to_string())),
@@ -99,6 +171,7 @@ impl KeyringCredentialStore {
 
     /// Store the client-generated UUID independently from the server ID.
     pub async fn store_local_device_uuid(&self, user_did: &str, uuid: &str) -> Result<()> {
+        Self::index_did_locked(user_did)?;
         Self::store_string(Self::key_local_device_uuid(user_did), uuid).await
     }
 
@@ -109,6 +182,7 @@ impl KeyringCredentialStore {
 
     /// Store the server-minted device ID separately from the local UUID.
     pub async fn store_server_device_id(&self, user_did: &str, device_id: &str) -> Result<()> {
+        Self::index_did_locked(user_did)?;
         Self::store_string(Self::key_server_device_id(user_did), device_id).await
     }
 
@@ -126,11 +200,56 @@ impl KeyringCredentialStore {
         Self::delete_key(Self::key_device_uuid(user_did))?;
         Ok(())
     }
+
+    pub fn clear_all_credentials(saved_did_hint: Option<&str>) -> Result<()> {
+        #[cfg(target_os = "android")]
+        {
+            Err(OrchestratorError::Credential(
+                "Android secure credential storage is not implemented; refusing to clear via keyring".to_string(),
+            ))
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _guard = DID_INDEX_LOCK.lock().unwrap();
+            let mut index = Self::load_index_locked()?;
+            let mut dids_to_clean = index.clone();
+            if let Some(hint) = saved_did_hint {
+                let trimmed = hint.trim();
+                if !trimmed.is_empty() {
+                    dids_to_clean.insert(trimmed.to_string());
+                }
+            }
+            for did in dids_to_clean {
+                Self::delete_key(Self::key_signing(&did))?;
+                Self::delete_key(Self::key_mls_did(&did))?;
+                Self::delete_key(Self::key_device_uuid(&did))?;
+                Self::delete_key(Self::key_server_device_id(&did))?;
+                Self::delete_key(Self::key_local_device_uuid(&did))?;
+                if index.remove(&did) {
+                    Self::save_index_locked(&index)?;
+                }
+            }
+            let idx_entry = Self::index_entry()
+                .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+            match idx_entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => {}
+                Err(e) => return Err(OrchestratorError::Credential(e.to_string())),
+            }
+            Ok(())
+        }
+    }
 }
 
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
+        if key_data.is_empty() {
+            return Err(OrchestratorError::Credential(
+                "cannot persist an empty signing key".to_string(),
+            ));
+        }
+        Self::index_did_locked(user_did)?;
         use base64::Engine;
         let encoded = base64::engine::general_purpose::STANDARD.encode(key_data);
         Self::entry(&Self::key_signing(user_did))
@@ -144,9 +263,20 @@ impl CredentialStore for KeyringCredentialStore {
         match Self::entry(&Self::key_signing(user_did)) {
             Ok(entry) => match entry.get_password() {
                 Ok(encoded) => {
+                    let trimmed = encoded.trim();
+                    if trimmed.is_empty() {
+                        return Err(OrchestratorError::Credential(
+                            "keychain signing key is empty or corrupt".to_string(),
+                        ));
+                    }
                     let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(&encoded)
+                        .decode(trimmed)
                         .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+                    if bytes.is_empty() {
+                        return Err(OrchestratorError::Credential(
+                            "keychain signing key payload is empty or corrupt".to_string(),
+                        ));
+                    }
                     Ok(Some(bytes))
                 }
                 Err(keyring::Error::NoEntry) => Ok(None),
@@ -167,6 +297,13 @@ impl CredentialStore for KeyringCredentialStore {
     }
 
     async fn store_mls_did(&self, user_did: &str, mls_did: &str) -> Result<()> {
+        let mls_did = mls_did.trim();
+        if mls_did.is_empty() {
+            return Err(OrchestratorError::Credential(
+                "cannot persist an empty mls_did".to_string(),
+            ));
+        }
+        Self::index_did_locked(user_did)?;
         Self::entry(&Self::key_mls_did(user_did))
             .map_err(|e| OrchestratorError::Credential(e.to_string()))?
             .set_password(mls_did)
@@ -176,7 +313,16 @@ impl CredentialStore for KeyringCredentialStore {
     async fn get_mls_did(&self, user_did: &str) -> Result<Option<String>> {
         match Self::entry(&Self::key_mls_did(user_did)) {
             Ok(entry) => match entry.get_password() {
-                Ok(val) => Ok(Some(val)),
+                Ok(val) => {
+                    let trimmed = val.trim();
+                    if trimmed.is_empty() {
+                        Err(OrchestratorError::Credential(
+                            "keychain mls_did is empty or corrupt".to_string(),
+                        ))
+                    } else {
+                        Ok(Some(val))
+                    }
+                }
                 Err(keyring::Error::NoEntry) => Ok(None),
                 Err(e) => Err(OrchestratorError::Credential(e.to_string())),
             },
@@ -203,12 +349,29 @@ impl CredentialStore for KeyringCredentialStore {
     }
 
     async fn clear_all(&self, user_did: &str) -> Result<()> {
-        self.delete_signing_key(user_did).await?;
-        Self::delete_key(Self::key_mls_did(user_did))?;
-        Self::delete_key(Self::key_device_uuid(user_did))?;
-        Self::delete_key(Self::key_server_device_id(user_did))?;
-        Self::delete_key(Self::key_local_device_uuid(user_did))?;
-        Ok(())
+        #[cfg(target_os = "android")]
+        {
+            let _ = user_did;
+            Err(OrchestratorError::Credential(
+                "Android secure credential storage is not implemented; refusing to clear via keyring".to_string(),
+            ))
+        }
+
+        #[cfg(not(target_os = "android"))]
+        {
+            let _guard = DID_INDEX_LOCK.lock().unwrap();
+            Self::delete_key(Self::key_signing(user_did))?;
+            Self::delete_key(Self::key_mls_did(user_did))?;
+            Self::delete_key(Self::key_device_uuid(user_did))?;
+            Self::delete_key(Self::key_server_device_id(user_did))?;
+            Self::delete_key(Self::key_local_device_uuid(user_did))?;
+
+            let mut index = Self::load_index_locked()?;
+            if index.remove(user_did) {
+                Self::save_index_locked(&index)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -251,5 +414,29 @@ mod tests {
     fn non_android_credential_store_constructor_succeeds() {
         let _ =
             KeyringCredentialStore::try_new().expect("desktop credential constructor should work");
+    }
+
+    #[test]
+    fn did_index_key_scoped_correctly() {
+        assert_eq!(
+            KeyringCredentialStore::scoped_key(DID_INDEX_KEY),
+            "credential_dids_index:clean-v2-openmls-v09"
+        );
+    }
+
+    #[test]
+    fn did_index_serialization_round_trip() {
+        let mut set = BTreeSet::new();
+        set.insert("did:plc:user1".to_string());
+        set.insert("did:plc:user2".to_string());
+        let serialized = serde_json::to_string(&set).unwrap();
+        let deserialized: BTreeSet<String> = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(set, deserialized);
+    }
+
+    #[test]
+    fn did_index_deserialization_fails_on_corrupt_data() {
+        let corrupt = "{not-json";
+        assert!(serde_json::from_str::<BTreeSet<String>>(corrupt).is_err());
     }
 }

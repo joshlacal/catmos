@@ -486,24 +486,19 @@ pub async fn reset_clean_storage_with_store(
     // 2. Close and drop SqliteStorage handle before unlinking files
     drop(storage);
 
-    // 3. Delete per-DID credentials and content-root key if user_did is provided
-    if let Some(did) = user_did {
-        let cred_store = crate::credentials::KeyringCredentialStore::try_new()
-            .map_err(|e| format!("failed to open credential store for reset: {e}"))?;
-        use catbird_mls::orchestrator::credentials::CredentialStore;
-        cred_store
-            .clear_all(did)
-            .await
-            .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
-        crate::keys::delete_content_root_key(data_dir, did)
-            .map_err(|e| format!("failed to delete content-root key: {e}"))?;
-    }
+    // 3. Clear all clean credentials from keyring (DID index unioned with saved user_did hint)
+    crate::credentials::KeyringCredentialStore::clear_all_credentials(user_did)
+        .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
 
-    // 4. Delete all indexed MLS signer slots from keychain before deleting MLS DB
+    // 4. Delete the exact generation-scoped content-root directory idempotently
+    crate::keys::delete_all_content_root_keys(data_dir)
+        .map_err(|e| format!("failed to delete content-root directory: {e}"))?;
+
+    // 5. Delete all indexed MLS signer slots from keychain before deleting MLS DB
     crate::keychain::KeyringKeychainAccess::clear_all()
         .map_err(|e| format!("failed to clear indexed MLS signer slots: {e}"))?;
 
-    // 5. Delete Clean Application Database and sidecars
+    // 6. Delete Clean Application Database and sidecars
     let app_db_path = data_dir.join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
     let app_db_wal = data_dir.join(format!("catmos-{}.db-wal", MLS_KEY_SUFFIX));
     let app_db_shm = data_dir.join(format!("catmos-{}.db-shm", MLS_KEY_SUFFIX));
@@ -515,12 +510,12 @@ pub async fn reset_clean_storage_with_store(
         }
     }
 
-    // 6. Delete App DB keyring key from store
+    // 7. Delete App DB keyring key from store
     store
         .delete_password(service, CONVERSATION_DB_KEY_LABEL)
         .map_err(|e| format!("failed to delete conversation DB key: {e}"))?;
 
-    // 7. Delete Clean MLS Database and sidecars
+    // 8. Delete Clean MLS Database and sidecars
     let mls_state_dir = data_dir.join(MLS_STORAGE_GENERATION);
     let mls_db_path = mls_state_dir.join("mls.db");
     let mls_db_wal = mls_state_dir.join("mls.db-wal");
@@ -533,12 +528,12 @@ pub async fn reset_clean_storage_with_store(
         }
     }
 
-    // 8. Delete MLS DB keyring key from store
+    // 9. Delete MLS DB keyring key from store
     store
         .delete_password(service, MLS_DB_KEY_LABEL)
         .map_err(|e| format!("failed to delete MLS DB key: {e}"))?;
 
-    // 9. Delete marker files LAST
+    // 10. Delete marker files LAST
     let app_marker = marker_path(&app_db_path);
     if app_marker.exists() {
         std::fs::remove_file(&app_marker)
@@ -2479,11 +2474,14 @@ mod storage_cutover_tests {
         let legacy_mls_db = legacy_mls_dir.join("mls.db");
         fs::write(&legacy_mls_db, b"legacy-mls-db-sentinel").unwrap();
 
-        // Set up clean database
+        // Set up clean database and content root
         let clean_db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
         let storage = open_clean_sqlite_storage_with_store(&clean_db_path, test_service, &store).unwrap();
+        let _ = crate::keys::load_or_create_content_root_key(tmp.path(), "did:plc:reset-test").unwrap();
+        let clean_content_dir = tmp.path().join(crate::keys::MLS_CONTENT_ROOT_DIR);
         assert!(clean_db_path.exists());
         assert!(marker_path(&clean_db_path).exists());
+        assert!(clean_content_dir.exists());
 
         // Perform explicit reset
         reset_clean_storage_with_store(
@@ -2497,10 +2495,10 @@ mod storage_cutover_tests {
         .await
         .expect("reset should succeed");
 
-        // Clean DB and marker should be gone
+        // Clean DB, content-root dir, and marker should be gone
         assert!(!clean_db_path.exists());
         assert!(!marker_path(&clean_db_path).exists());
-
+        assert!(!clean_content_dir.exists());
         // Legacy files MUST remain untouched
         assert!(legacy_db.exists());
         assert_eq!(fs::read(&legacy_db).unwrap(), b"legacy-catmos-db-sentinel");

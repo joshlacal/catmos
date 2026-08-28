@@ -221,8 +221,15 @@ pub(crate) fn get_saved_session_did_for_service(service: &str) -> Result<Option<
     let entry = keyring::Entry::new(service, "user_did")
         .map_err(|e| format!("failed to access keyring entry for user_did: {e}"))?;
     match entry.get_password() {
-        Ok(did) if !did.trim().is_empty() => Ok(Some(did)),
-        Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
+        Ok(did) => {
+            let trimmed = did.trim();
+            if trimmed.is_empty() {
+                Err("saved user_did in keyring is empty or corrupt".to_string())
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
         Err(e) => Err(format!("failed to read user_did from keyring: {e}")),
     }
 }
@@ -232,7 +239,9 @@ pub(crate) fn delete_saved_session_credentials() -> Result<(), String> {
 }
 
 pub(crate) fn delete_saved_session_credentials_for_service(service: &str) -> Result<(), String> {
-    for key in ["session_id", "user_did", "chat_dpop_jkt"] {
+    // Delete non-DID session tokens first; delete user_did last so it remains
+    // a retry hint for storage cleanup if an earlier deletion fails.
+    for key in ["session_id", "chat_dpop_jkt", "user_did"] {
         let entry = keyring::Entry::new(service, key)
             .map_err(|e| format!("failed to create keyring entry for {key}: {e}"))?;
         match entry.delete_credential() {
@@ -241,14 +250,6 @@ pub(crate) fn delete_saved_session_credentials_for_service(service: &str) -> Res
         }
     }
     Ok(())
-}
-
-pub(crate) fn clear_saved_session_credentials() {
-    let _ = delete_saved_session_credentials();
-}
-
-pub(crate) fn clear_saved_session_credentials_for_service(service: &str) {
-    let _ = delete_saved_session_credentials_for_service(service);
 }
 
 /// Install only opaque runtime capabilities after login/device enrollment.
@@ -884,21 +885,30 @@ pub async fn complete_login(
 pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
-    let session_id = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id")
-        .and_then(|e| e.get_password())
-        .ok();
-    let did = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did")
-        .and_then(|e| e.get_password())
-        .ok();
+    let session_entry = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id")
+        .map_err(|e| format!("failed to access session_id keyring entry: {e}"))?;
+    let session_id = match session_entry.get_password() {
+        Ok(sid) => {
+            let trimmed = sid.trim();
+            if trimmed.is_empty() {
+                return Err("saved session_id in keyring is empty or corrupt".to_string());
+            }
+            Some(trimmed.to_string())
+        }
+        Err(keyring::Error::NoEntry) => None,
+        Err(e) => return Err(format!("failed to read session_id from keyring: {e}")),
+    };
 
-    match (session_id, did) {
+    let stored_did = get_saved_session_did()?;
+
+    match (session_id, stored_did) {
         (Some(sid), stored_did) => {
             let session = match fetch_session_info(&sid).await {
                 Ok(session) => session,
                 Err(e) => {
                     if crate::session_restore::session_error_invalidates_credentials(&e) {
                         log_catmos!("Stored session was rejected; clearing saved login: {}", e);
-                        clear_saved_session_credentials();
+                        delete_saved_session_credentials()?;
                         state.api_client.clear_auth();
                         return Ok(None);
                     }
@@ -1014,7 +1024,7 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     // Logout revokes only runtime authority and saved session credentials.
     // The local UUID and server device ID remain durable so the next login
     // can reconcile listDevices before considering registration.
-    clear_saved_session_credentials();
+    delete_saved_session_credentials()?;
 
     Ok(())
 }
@@ -3257,5 +3267,11 @@ mod tests {
     #[test]
     fn session_keyring_service_matches_clean_generation() {
         assert_eq!(SESSION_KEYRING_SERVICE, "catmos-clean-v2-openmls-v09");
+    }
+
+    #[test]
+    fn session_credential_keys_order_has_user_did_last() {
+        let keys = ["session_id", "chat_dpop_jkt", "user_did"];
+        assert_eq!(keys.last(), Some(&"user_did"));
     }
 }

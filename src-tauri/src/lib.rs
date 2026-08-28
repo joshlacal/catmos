@@ -96,6 +96,9 @@ pub fn run() {
         tracing::info!("[catmos] Explicit --reset-mls-storage requested; resetting clean storage generation");
         let reset_did = commands::get_saved_session_did()
             .unwrap_or_else(|e| panic!("Failed to resolve saved session DID for reset: {e}"));
+        if let Err(e) = commands::delete_saved_session_credentials() {
+            panic!("Failed to clear saved session credentials before reset: {e}");
+        }
         if let Err(e) = tauri::async_runtime::block_on(storage::reset_clean_storage(
             &data_dir,
             reset_did.as_deref(),
@@ -104,9 +107,6 @@ pub fn run() {
             storage::DB_KEYRING_SERVICE,
         )) {
             panic!("Failed to reset clean storage via --reset-mls-storage: {e}");
-        }
-        if let Err(e) = commands::delete_saved_session_credentials() {
-            panic!("Failed to clear saved session credentials after reset: {e}");
         }
     }
 

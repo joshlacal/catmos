@@ -53,7 +53,13 @@ impl KeyringKeychainAccess {
         let entry = Self::index_entry().map_err(|e| MLSError::Internal(e.to_string()))?;
         match entry.get_password() {
             Ok(json_str) => {
-                let set: BTreeSet<String> = serde_json::from_str(&json_str)
+                let trimmed = json_str.trim();
+                if trimmed.is_empty() {
+                    return Err(MLSError::Internal(
+                        "signer slots index is empty or corrupt in keychain".into(),
+                    ));
+                }
+                let set: BTreeSet<String> = serde_json::from_str(trimmed)
                     .map_err(|e| MLSError::Internal(format!("corrupt signer slots index: {e}")))?;
                 Ok(set)
             }
@@ -111,7 +117,15 @@ impl KeychainAccess for KeyringKeychainAccess {
     async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
         match Self::entry(&key) {
             Ok(entry) => match entry.get_password() {
-                Ok(val) => Ok(Some(val.into_bytes())),
+                Ok(val) => {
+                    let trimmed = val.trim();
+                    if trimmed.is_empty() {
+                        return Err(MLSError::Internal(format!(
+                            "signer slot {key} is empty or corrupt in keychain"
+                        )));
+                    }
+                    Ok(Some(val.into_bytes()))
+                }
                 Err(keyring::Error::NoEntry) => Ok(None),
                 Err(e) => Err(MLSError::Internal(e.to_string())),
             },
@@ -120,6 +134,11 @@ impl KeychainAccess for KeyringKeychainAccess {
     }
 
     async fn write(&self, key: String, value: Vec<u8>) -> Result<(), MLSError> {
+        if value.is_empty() {
+            return Err(MLSError::Internal(
+                "cannot persist empty signer slot value".into(),
+            ));
+        }
         let val_str = String::from_utf8(value).map_err(|e| MLSError::Internal(e.to_string()))?;
         let entry =
             Self::entry(&key).map_err(|e: keyring::Error| MLSError::Internal(e.to_string()))?;
