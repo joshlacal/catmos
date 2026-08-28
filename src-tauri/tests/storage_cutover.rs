@@ -1,12 +1,13 @@
-use std::fs;
-use std::sync::Mutex;
-use std::collections::HashMap;
 use async_trait::async_trait;
 use catbird_mls::{KeychainAccess, MLSError};
-use catmos_lib::catbird;
-
-const GENERATION_TOKEN: &str = "mls-state-clean-v2-openmls-v09";
-const KEY_SUFFIX: &str = "clean-v2-openmls-v09";
+use catmos_lib::storage::{
+    marker_path, open_clean_mls_context, read_marker, write_marker_complete,
+    write_marker_creating, DatabaseInitError, MarkerStatus, CONVERSATION_DB_KEY_LABEL,
+    DB_KEYRING_SERVICE, MLS_DB_KEY_LABEL, MLS_KEY_SUFFIX, MLS_STORAGE_GENERATION,
+};
+use std::collections::HashMap;
+use std::fs;
+use std::sync::Mutex;
 
 struct TestKeychain {
     values: Mutex<HashMap<String, Vec<u8>>>,
@@ -39,10 +40,31 @@ impl KeychainAccess for TestKeychain {
 
 #[test]
 fn generation_constants_match_specification() {
-    assert_eq!(GENERATION_TOKEN, "mls-state-clean-v2-openmls-v09");
-    assert_eq!(KEY_SUFFIX, "clean-v2-openmls-v09");
+    assert_eq!(
+        catmos_lib::storage::MLS_STORAGE_GENERATION,
+        "mls-state-clean-v2-openmls-v09"
+    );
+    assert_eq!(
+        catmos_lib::storage::MLS_KEY_SUFFIX,
+        "clean-v2-openmls-v09"
+    );
+    assert_eq!(
+        catmos_lib::storage::CONVERSATION_DB_KEY_LABEL,
+        "conversation-db-clean-v2-openmls-v09"
+    );
+    assert_eq!(
+        catmos_lib::storage::MLS_DB_KEY_LABEL,
+        "mls-db-clean-v2-openmls-v09"
+    );
+    assert_eq!(
+        catmos_lib::storage::DB_KEYRING_SERVICE,
+        "blue.catbird.catmos.clean-v2-openmls-v09"
+    );
+    assert_eq!(
+        catmos_lib::keys::MLS_CONTENT_ROOT_DIR,
+        "mls-content-root-clean-v2-openmls-v09"
+    );
 }
-
 #[test]
 fn content_root_key_lifecycle_and_legacy_isolation() {
     let tmp = tempfile::tempdir().unwrap();
@@ -97,4 +119,100 @@ fn content_root_key_rejects_corrupt_file() {
     assert!(err.to_string().contains("wrong length"));
     // Corrupt file must NOT have been overwritten
     assert_eq!(fs::read(&key_file).unwrap(), b"corrupted-short-key");
+}
+
+#[test]
+fn clean_mls_context_fresh_creation_and_reopen() {
+    let test_service = format!("catmos-test-mls-{}", uuid::Uuid::new_v4());
+    let tmp = tempfile::tempdir().unwrap();
+    let mls_state_dir = tmp.path().join(MLS_STORAGE_GENERATION);
+    fs::create_dir_all(&mls_state_dir).unwrap();
+    let mls_db_path = mls_state_dir.join("mls.db");
+    let marker_file = marker_path(&mls_db_path);
+    let db_file_name = mls_db_path.file_name().unwrap().to_str().unwrap();
+
+    assert!(!mls_db_path.exists());
+    assert!(!marker_file.exists());
+
+    // First open: creates key, DB, and marker
+    let ctx = open_clean_mls_context(
+        &mls_db_path,
+        &test_service,
+        Box::new(TestKeychain::new()),
+    )
+    .expect("first open of MLSContext should succeed");
+    assert!(mls_db_path.exists());
+    assert!(marker_file.exists());
+    let marker = read_marker(&marker_file, db_file_name).unwrap();
+    assert_eq!(marker, Some(MarkerStatus::Complete));
+    drop(ctx);
+
+    // Second open: reopens existing valid MLS database
+    let ctx2 = open_clean_mls_context(
+        &mls_db_path,
+        &test_service,
+        Box::new(TestKeychain::new()),
+    )
+    .expect("reopen of MLSContext should succeed");
+    drop(ctx2);
+}
+
+#[test]
+fn clean_mls_context_mixed_states_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mls_state_dir = tmp.path().join(MLS_STORAGE_GENERATION);
+    fs::create_dir_all(&mls_state_dir).unwrap();
+    let mls_db_path = mls_state_dir.join("mls.db");
+    let marker_file = marker_path(&mls_db_path);
+    let db_file_name = mls_db_path.file_name().unwrap().to_str().unwrap();
+
+    // Case 1: absent DB, present key
+    let service1 = format!("catmos-test-mls-{}", uuid::Uuid::new_v4());
+    let _ = catmos_lib::storage::create_db_key_in_keyring(&service1, MLS_DB_KEY_LABEL).unwrap();
+    let err = open_clean_mls_context(
+        &mls_db_path,
+        &service1,
+        Box::new(TestKeychain::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, DatabaseInitError::MixedStateAbsentDbPresentKey));
+
+    // Case 2: present DB, absent key
+    let service2 = format!("catmos-test-mls-{}", uuid::Uuid::new_v4());
+    fs::write(&mls_db_path, b"fake-mls-db-bytes").unwrap();
+    let err = open_clean_mls_context(
+        &mls_db_path,
+        &service2,
+        Box::new(TestKeychain::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, DatabaseInitError::MixedStatePresentDbAbsentKey));
+    let _ = fs::remove_file(&mls_db_path);
+
+    // Case 3: creating marker with present DB and present key (InitializationIncomplete)
+    let service3 = format!("catmos-test-mls-{}", uuid::Uuid::new_v4());
+    let _ = catmos_lib::storage::create_db_key_in_keyring(&service3, MLS_DB_KEY_LABEL).unwrap();
+    fs::write(&mls_db_path, b"fake-mls-db-bytes").unwrap();
+    write_marker_creating(&marker_file, db_file_name).unwrap();
+    let err = open_clean_mls_context(
+        &mls_db_path,
+        &service3,
+        Box::new(TestKeychain::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, DatabaseInitError::InitializationIncomplete));
+    let _ = fs::remove_file(&mls_db_path);
+    let _ = fs::remove_file(&marker_file);
+
+    // Case 4: orphan complete marker (DB and key absent) -> InvalidMarker
+    let service4 = format!("catmos-test-mls-{}", uuid::Uuid::new_v4());
+    write_marker_complete(&marker_file, db_file_name).unwrap();
+    let err = open_clean_mls_context(
+        &mls_db_path,
+        &service4,
+        Box::new(TestKeychain::new()),
+    )
+    .unwrap_err();
+    assert!(matches!(err, DatabaseInitError::InvalidMarker(_)));
+    let _ = fs::remove_file(&marker_file);
 }

@@ -96,7 +96,7 @@ pub fn run() {
 
     // Create platform implementations
     let storage = Arc::new(
-        storage::open_clean_sqlite_storage(&db_path)
+        storage::open_clean_sqlite_storage(&db_path, storage::DB_KEYRING_SERVICE)
             .expect("Failed to initialize clean SQLite storage"),
     );
     let api_client = Arc::new(ReqwestApiClient::new(mls_ds_url));
@@ -108,7 +108,7 @@ pub fn run() {
 
     let mls_db_path = mls_state_dir.join("mls.db");
     let keychain = Box::new(KeyringKeychainAccess::new());
-    let mls_context = storage::open_clean_mls_context(&mls_db_path, keychain)
+    let mls_context = storage::open_clean_mls_context(&mls_db_path, storage::DB_KEYRING_SERVICE, keychain)
         .expect("Failed to initialize clean MLS context");
     // Clear leftover WAL from previous session — ensures all committed data is
     // checkpointed into the main database file before we start reading.

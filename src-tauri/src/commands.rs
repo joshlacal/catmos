@@ -214,8 +214,12 @@ struct SessionInfo {
 pub(crate) const SESSION_KEYRING_SERVICE: &str = "catmos-clean-v2-openmls-v09";
 
 pub(crate) fn clear_saved_session_credentials() {
+    clear_saved_session_credentials_for_service(SESSION_KEYRING_SERVICE);
+}
+
+pub(crate) fn clear_saved_session_credentials_for_service(service: &str) {
     for key in ["session_id", "user_did", "chat_dpop_jkt"] {
-        if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, key) {
+        if let Ok(entry) = keyring::Entry::new(service, key) {
             let _ = entry.delete_credential();
         }
     }
@@ -966,7 +970,11 @@ pub async fn try_restore_session(
 }
 
 #[tauri::command]
-pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn logout(
+    state: State<'_, AppState>,
+    wipe_clean_storage: Option<bool>,
+) -> Result<(), String> {
+    let did = state.api_client.current_did().await;
     // Stop key package monitor
     if let Some(handle) = state.kp_monitor.lock().await.take() {
         handle.abort();
@@ -985,6 +993,17 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     // The local UUID and server device ID remain durable so the next login
     // can reconcile listDevices before considering registration.
     clear_saved_session_credentials();
+
+    if wipe_clean_storage == Some(true) {
+        crate::storage::reset_clean_storage(
+            &state.data_dir,
+            did.as_deref(),
+            None,
+            Some(state.orchestrator.mls_context().as_ref()),
+            crate::storage::DB_KEYRING_SERVICE,
+        )
+        .await?;
+    }
     Ok(())
 }
 
