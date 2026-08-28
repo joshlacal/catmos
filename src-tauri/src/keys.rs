@@ -4,7 +4,7 @@
 //! to derive per-conversation AES-GCM content keys and HMAC chain keys. It is
 //! held in process memory inside `MLSContext` and must be available on every
 //! cold start, so we persist it as a binary file under
-//! `{app_data_dir}/mls-content-root/{sha256(did)}.key`.
+//! `{app_data_dir}/mls-content-root-clean-v2-openmls-v09/{sha256(did)}.key`.
 //!
 //! The file is protected by OS-level filesystem permissions (`0o600` on Unix).
 //! It is **not** the SQLCipher database key — the two are stored separately so
@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
 
+pub const MLS_CONTENT_ROOT_DIR: &str = "mls-content-root-clean-v2-openmls-v09";
 const KEY_LEN: usize = 32;
-
 fn did_filename(user_did: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(user_did.as_bytes());
@@ -26,11 +26,11 @@ fn did_filename(user_did: &str) -> String {
     format!("{}.key", did_hash)
 }
 
-/// Load the content-root key for `user_did` from `{app_data_dir}/mls-content-root/`,
+/// Load the content-root key for `user_did` from `{app_data_dir}/mls-content-root-clean-v2-openmls-v09/`,
 /// creating a fresh random 32-byte key on first use. Permissions are tightened to
 /// `0o600` on Unix-likes; on other platforms the OS default applies.
 pub fn load_or_create_content_root_key(app_data_dir: &Path, user_did: &str) -> Result<Vec<u8>> {
-    let dir = app_data_dir.join("mls-content-root");
+    let dir = app_data_dir.join(MLS_CONTENT_ROOT_DIR);
     fs::create_dir_all(&dir).context("create mls-content-root dir")?;
     let path = dir.join(did_filename(user_did));
 
@@ -68,7 +68,7 @@ pub fn load_or_create_content_root_key(app_data_dir: &Path, user_did: &str) -> R
 #[allow(dead_code)]
 pub fn delete_content_root_key(app_data_dir: &Path, user_did: &str) -> Result<()> {
     let path = app_data_dir
-        .join("mls-content-root")
+        .join(MLS_CONTENT_ROOT_DIR)
         .join(did_filename(user_did));
     if path.exists() {
         fs::remove_file(&path).context("remove content root key file")?;
@@ -116,10 +116,33 @@ mod tests {
     fn rejects_wrong_length_file() {
         let tmp = tempfile::tempdir().unwrap();
         let did = "did:plc:bad";
-        let dir = tmp.path().join("mls-content-root");
+        let dir = tmp.path().join(MLS_CONTENT_ROOT_DIR);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(did_filename(did)), b"too-short").unwrap();
         let err = load_or_create_content_root_key(tmp.path(), did).unwrap_err();
         assert!(err.to_string().contains("wrong length"));
+    }
+
+    #[test]
+    fn clean_paths_ignore_and_never_access_legacy_content_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let did = "did:plc:legacy-isolation";
+        let legacy_dir = tmp.path().join("mls-content-root");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_file = legacy_dir.join(did_filename(did));
+        fs::write(&legacy_file, b"legacy-sentinel-bytes-32bytes!!").unwrap();
+
+        // Clean load must create fresh clean key, not read legacy
+        let clean_key = load_or_create_content_root_key(tmp.path(), did).unwrap();
+        assert_ne!(clean_key, b"legacy-sentinel-bytes-32bytes!!");
+
+        // Legacy file must remain untouched
+        let legacy_bytes = fs::read(&legacy_file).unwrap();
+        assert_eq!(legacy_bytes, b"legacy-sentinel-bytes-32bytes!!");
+
+        // Clean delete must delete clean file only, leaving legacy untouched
+        delete_content_root_key(tmp.path(), did).unwrap();
+        assert!(legacy_file.exists());
+        assert!(!tmp.path().join(MLS_CONTENT_ROOT_DIR).join(did_filename(did)).exists());
     }
 }

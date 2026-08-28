@@ -3,7 +3,8 @@ use catbird_mls::KeychainAccess;
 use catbird_mls::MLSError;
 use keyring::Entry;
 
-const SERVICE_NAME: &str = "blue.catbird.catmos.mls";
+const SERVICE_NAME: &str = "blue.catbird.catmos.mls.clean-v2-openmls-v09";
+const KEY_SUFFIX: &str = "clean-v2-openmls-v09";
 
 /// OS keychain-backed implementation of `KeychainAccess` for MLS FFI.
 pub struct KeyringKeychainAccess;
@@ -31,11 +32,14 @@ impl KeyringKeychainAccess {
         }
     }
 
+    fn scoped_key(key: &str) -> String {
+        format!("{}:{}", key, KEY_SUFFIX)
+    }
+
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(SERVICE_NAME, key)
+        Entry::new(SERVICE_NAME, &Self::scoped_key(key))
     }
 }
-
 #[async_trait]
 impl KeychainAccess for KeyringKeychainAccess {
     async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {

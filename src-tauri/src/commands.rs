@@ -211,9 +211,11 @@ struct SessionInfo {
     handle: String,
 }
 
-fn clear_saved_session_credentials() {
+pub(crate) const SESSION_KEYRING_SERVICE: &str = "catmos-clean-v2-openmls-v09";
+
+pub(crate) fn clear_saved_session_credentials() {
     for key in ["session_id", "user_did", "chat_dpop_jkt"] {
-        if let Ok(entry) = keyring::Entry::new("catmos", key) {
+        if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, key) {
             let _ = entry.delete_credential();
         }
     }
@@ -833,10 +835,10 @@ pub async fn complete_login(
     start_sync_loop(&state).await;
 
     // Persist session to keyring
-    if let Ok(entry) = keyring::Entry::new("catmos", "session_id") {
+    if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id") {
         let _ = entry.set_password(&session_id);
     }
-    if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
+    if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did") {
         let _ = entry.set_password(&session.did);
     }
 
@@ -852,10 +854,10 @@ pub async fn complete_login(
 pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
-    let session_id = keyring::Entry::new("catmos", "session_id")
+    let session_id = keyring::Entry::new(SESSION_KEYRING_SERVICE, "session_id")
         .and_then(|e| e.get_password())
         .ok();
-    let did = keyring::Entry::new("catmos", "user_did")
+    let did = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did")
         .and_then(|e| e.get_password())
         .ok();
 
@@ -947,7 +949,7 @@ pub async fn try_restore_session(
             // Start periodic sync loop (spec §6.1)
             start_sync_loop(&state).await;
 
-            if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
+            if let Ok(entry) = keyring::Entry::new(SESSION_KEYRING_SERVICE, "user_did") {
                 let _ = entry.set_password(&session.did);
             }
             log_catmos!("Session restored: handle={}", session.handle);

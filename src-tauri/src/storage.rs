@@ -1,5 +1,7 @@
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
@@ -7,6 +9,381 @@ use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::orchestrator::types::*;
 use catbird_mls::MLSContext;
 
+pub const MLS_STORAGE_GENERATION: &str = "mls-state-clean-v2-openmls-v09";
+pub const MLS_KEY_SUFFIX: &str = "clean-v2-openmls-v09";
+pub const CONVERSATION_DB_KEY_LABEL: &str = "conversation-db-clean-v2-openmls-v09";
+pub const MLS_DB_KEY_LABEL: &str = "mls-db-clean-v2-openmls-v09";
+pub const DB_KEYRING_SERVICE: &str = "blue.catbird.catmos.clean-v2-openmls-v09";
+
+#[derive(Debug)]
+pub enum DatabaseInitError {
+    MixedStateAbsentDbPresentKey,
+    MixedStatePresentDbAbsentKey,
+    MixedStateMissingMarker,
+    InitializationIncomplete,
+    InvalidMarker(String),
+    KeyringError(String),
+    InvalidKeyFormat,
+    ValidationFailed(String),
+    Io(std::io::Error),
+    Sqlite(rusqlite::Error),
+}
+
+impl fmt::Display for DatabaseInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MixedStateAbsentDbPresentKey => {
+                write!(
+                    f,
+                    "mixed storage state: database file is absent but key exists in secure store"
+                )
+            }
+            Self::MixedStatePresentDbAbsentKey => {
+                write!(
+                    f,
+                    "mixed storage state: database file is present but key is absent from secure store"
+                )
+            }
+            Self::MixedStateMissingMarker => {
+                write!(
+                    f,
+                    "mixed storage state: database or key exists without complete initialization marker"
+                )
+            }
+            Self::InitializationIncomplete => {
+                write!(
+                    f,
+                    "storage initialization was interrupted in creating state; explicit reset required"
+                )
+            }
+            Self::InvalidMarker(msg) => {
+                write!(f, "storage initialization record is corrupt or invalid: {msg}")
+            }
+            Self::KeyringError(msg) => {
+                write!(f, "secure store access failed: {msg}")
+            }
+            Self::InvalidKeyFormat => {
+                write!(
+                    f,
+                    "invalid key format in secure store: expected 64 hex characters (32 bytes)"
+                )
+            }
+            Self::ValidationFailed(msg) => {
+                write!(f, "database validation failed: {msg}")
+            }
+            Self::Io(err) => write!(f, "database I/O error: {err}"),
+            Self::Sqlite(err) => write!(f, "database SQLite error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Sqlite(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for DatabaseInitError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<rusqlite::Error> for DatabaseInitError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MarkerStatus {
+    Creating,
+    Complete,
+}
+
+pub fn marker_path(db_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.marker", db_path.display()))
+}
+
+pub fn read_marker(marker_path: &Path) -> std::result::Result<Option<MarkerStatus>, DatabaseInitError> {
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(marker_path)?;
+    let trimmed = content.trim();
+    if trimmed == "creating" {
+        Ok(Some(MarkerStatus::Creating))
+    } else if trimmed == "complete" {
+        Ok(Some(MarkerStatus::Complete))
+    } else {
+        Err(DatabaseInitError::InvalidMarker(format!(
+            "unknown marker content: {trimmed}"
+        )))
+    }
+}
+
+pub fn write_marker_creating(marker_path: &Path) -> std::result::Result<(), DatabaseInitError> {
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker_path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                DatabaseInitError::InvalidMarker("marker already exists during create".into())
+            } else {
+                DatabaseInitError::Io(e)
+            }
+        })?;
+    file.write_all(b"creating\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub fn write_marker_complete(marker_path: &Path) -> std::result::Result<(), DatabaseInitError> {
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp_path = format!("{}.tmp.{}", marker_path.display(), uuid::Uuid::new_v4());
+    std::fs::write(&tmp_path, b"complete\n")?;
+    std::fs::rename(&tmp_path, marker_path)?;
+    Ok(())
+}
+
+pub fn load_db_key_from_keyring(
+    service: &str,
+    label: &str,
+) -> std::result::Result<Option<String>, DatabaseInitError> {
+    let entry = keyring::Entry::new(service, label)
+        .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+    match entry.get_password() {
+        Ok(pwd) => {
+            let trimmed = pwd.trim();
+            if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
+                Ok(Some(trimmed.to_string()))
+            } else {
+                Err(DatabaseInitError::InvalidKeyFormat)
+            }
+        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+    }
+}
+
+pub fn create_db_key_in_keyring(
+    service: &str,
+    label: &str,
+) -> std::result::Result<String, DatabaseInitError> {
+    let entry = keyring::Entry::new(service, label)
+        .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+    match entry.get_password() {
+        Ok(existing) => {
+            let trimmed = existing.trim();
+            if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
+                Ok(trimmed.to_string())
+            } else {
+                Err(DatabaseInitError::InvalidKeyFormat)
+            }
+        }
+        Err(keyring::Error::NoEntry) => {
+            let mut key_bytes = [0u8; 32];
+            getrandom::getrandom(&mut key_bytes)
+                .map_err(|e| DatabaseInitError::ValidationFailed(format!("RNG failure: {e}")))?;
+            let hex_key = hex::encode(key_bytes);
+            entry
+                .set_password(&hex_key)
+                .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+            Ok(hex_key)
+        }
+        Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+    }
+}
+
+pub fn open_clean_sqlite_storage(db_path: &Path) -> std::result::Result<SqliteStorage, DatabaseInitError> {
+    let marker_file = marker_path(db_path);
+    let db_exists = db_path.exists();
+    let key_opt = load_db_key_from_keyring(DB_KEYRING_SERVICE, CONVERSATION_DB_KEY_LABEL)?;
+    let marker_opt = read_marker(&marker_file)?;
+
+    match (db_exists, key_opt.is_some(), marker_opt) {
+        (false, false, None) => {
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_marker_creating(&marker_file)?;
+            let key = create_db_key_in_keyring(DB_KEYRING_SERVICE, CONVERSATION_DB_KEY_LABEL)?;
+            let storage = SqliteStorage::new(&db_path.to_string_lossy(), &key)?;
+            storage.validate()?;
+            write_marker_complete(&marker_file)?;
+            Ok(storage)
+        }
+        (true, true, Some(MarkerStatus::Complete)) => {
+            let key = key_opt.unwrap();
+            let storage = SqliteStorage::new(&db_path.to_string_lossy(), &key)?;
+            storage.validate()?;
+            Ok(storage)
+        }
+        (false, true, _) => Err(DatabaseInitError::MixedStateAbsentDbPresentKey),
+        (true, false, _) => Err(DatabaseInitError::MixedStatePresentDbAbsentKey),
+        (true, true, None) => Err(DatabaseInitError::MixedStateMissingMarker),
+        (true, true, Some(MarkerStatus::Creating)) => {
+            Err(DatabaseInitError::InitializationIncomplete)
+        }
+        (false, false, Some(MarkerStatus::Creating)) => {
+            Err(DatabaseInitError::InitializationIncomplete)
+        }
+        (false, false, Some(MarkerStatus::Complete)) => {
+            Err(DatabaseInitError::MixedStateAbsentDbPresentKey)
+        }
+    }
+}
+
+pub fn open_clean_mls_context(
+    mls_db_path: &Path,
+    keychain: Box<dyn catbird_mls::KeychainAccess>,
+) -> std::result::Result<Arc<catbird_mls::MLSContext>, DatabaseInitError> {
+    let marker_file = marker_path(mls_db_path);
+    let db_exists = mls_db_path.exists();
+    let key_opt = load_db_key_from_keyring(DB_KEYRING_SERVICE, MLS_DB_KEY_LABEL)?;
+    let marker_opt = read_marker(&marker_file)?;
+
+    match (db_exists, key_opt.is_some(), marker_opt) {
+        (false, false, None) => {
+            if let Some(parent) = mls_db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_marker_creating(&marker_file)?;
+            let key = create_db_key_in_keyring(DB_KEYRING_SERVICE, MLS_DB_KEY_LABEL)?;
+            let mls_context = catbird_mls::MLSContext::new(
+                mls_db_path.to_string_lossy().to_string(),
+                key,
+                keychain,
+            )
+            .map_err(|e| DatabaseInitError::ValidationFailed(format!("MLSContext init failed: {e}")))?;
+            if let Err(e) = mls_context.launch_checkpoint() {
+                tracing::warn!("[catmos] launch checkpoint note: {:?}", e);
+            }
+            write_marker_complete(&marker_file)?;
+            Ok(mls_context)
+        }
+        (true, true, Some(MarkerStatus::Complete)) => {
+            let key = key_opt.unwrap();
+            let mls_context = catbird_mls::MLSContext::new(
+                mls_db_path.to_string_lossy().to_string(),
+                key,
+                keychain,
+            )
+            .map_err(|e| DatabaseInitError::ValidationFailed(format!("MLSContext init failed: {e}")))?;
+            if let Err(e) = mls_context.launch_checkpoint() {
+                tracing::warn!("[catmos] launch checkpoint note: {:?}", e);
+            }
+            Ok(mls_context)
+        }
+        (false, true, _) => Err(DatabaseInitError::MixedStateAbsentDbPresentKey),
+        (true, false, _) => Err(DatabaseInitError::MixedStatePresentDbAbsentKey),
+        (true, true, None) => Err(DatabaseInitError::MixedStateMissingMarker),
+        (true, true, Some(MarkerStatus::Creating)) => {
+            Err(DatabaseInitError::InitializationIncomplete)
+        }
+        (false, false, Some(MarkerStatus::Creating)) => {
+            Err(DatabaseInitError::InitializationIncomplete)
+        }
+        (false, false, Some(MarkerStatus::Complete)) => {
+            Err(DatabaseInitError::MixedStateAbsentDbPresentKey)
+        }
+    }
+}
+
+pub async fn reset_clean_storage(
+    data_dir: &Path,
+    user_did: Option<&str>,
+    storage: Option<&SqliteStorage>,
+    mls_context: Option<&catbird_mls::MLSContext>,
+) -> std::result::Result<(), String> {
+    // 1. Close MLSContext if provided
+    if let Some(ctx) = mls_context {
+        ctx.clear_content_root_key();
+        if let Err(e) = ctx.close_database() {
+            tracing::warn!("warning: MLSContext close_database returned {e:?}");
+        }
+    }
+
+    // 2. Clear credentials and content-root key for user_did if provided
+    if let Some(did) = user_did {
+        if let Err(e) = crate::keys::delete_content_root_key(data_dir, did) {
+            return Err(format!("failed to delete content-root key: {e}"));
+        }
+        if let Ok(store) = crate::credentials::KeyringCredentialStore::try_new() {
+            use catbird_mls::orchestrator::credentials::CredentialStore;
+            if let Err(e) = store.clear_all(did).await {
+                return Err(format!("failed to clear keyring credentials: {e}"));
+            }
+        }
+    }
+
+    // 3. Clear session credentials
+    crate::commands::clear_saved_session_credentials();
+
+    // 4. Delete Clean Application Database and sidecars
+    let app_db_path = data_dir.join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
+    let app_db_wal = data_dir.join(format!("catmos-{}.db-wal", MLS_KEY_SUFFIX));
+    let app_db_shm = data_dir.join(format!("catmos-{}.db-shm", MLS_KEY_SUFFIX));
+    let app_db_journal = data_dir.join(format!("catmos-{}.db-journal", MLS_KEY_SUFFIX));
+    for path in [&app_db_path, &app_db_wal, &app_db_shm, &app_db_journal] {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+        }
+    }
+
+    // 5. Delete App DB keyring key
+    if let Ok(entry) = keyring::Entry::new(DB_KEYRING_SERVICE, CONVERSATION_DB_KEY_LABEL) {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("failed to delete conversation DB key: {e}")),
+        }
+    }
+
+    // 6. Delete App DB marker file LAST
+    let app_marker = marker_path(&app_db_path);
+    if app_marker.exists() {
+        std::fs::remove_file(&app_marker).map_err(|e| format!("failed to remove marker {}: {e}", app_marker.display()))?;
+    }
+
+    // 7. Delete Clean MLS Database and sidecars
+    let mls_state_dir = data_dir.join(MLS_STORAGE_GENERATION);
+    let mls_db_path = mls_state_dir.join("mls.db");
+    let mls_db_wal = mls_state_dir.join("mls.db-wal");
+    let mls_db_shm = mls_state_dir.join("mls.db-shm");
+    let mls_db_journal = mls_state_dir.join("mls.db-journal");
+    for path in [&mls_db_path, &mls_db_wal, &mls_db_shm, &mls_db_journal] {
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+        }
+    }
+
+    // 8. Delete MLS DB keyring key
+    if let Ok(entry) = keyring::Entry::new(DB_KEYRING_SERVICE, MLS_DB_KEY_LABEL) {
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => {}
+            Err(e) => return Err(format!("failed to delete MLS DB key: {e}")),
+        }
+    }
+
+    // 9. Delete MLS DB marker file LAST
+    let mls_marker = marker_path(&mls_db_path);
+    if mls_marker.exists() {
+        std::fs::remove_file(&mls_marker).map_err(|e| format!("failed to remove marker {}: {e}", mls_marker.display()))?;
+    }
+
+    Ok(())
+}
 /// Locally cached encrypted-metadata snapshot for a conversation. Mirrors
 /// what `bootstrap_group_metadata` writes after a successful blob fetch +
 /// decrypt: the JSON-serialized `GroupMetadataV1` payload, the bound
@@ -73,7 +450,51 @@ impl SqliteStorage {
             mls_context: RwLock::new(None),
         };
         storage.create_tables()?;
+        storage.validate().map_err(|e| match e {
+            DatabaseInitError::Sqlite(err) => err,
+            other => rusqlite::Error::InvalidParameterName(other.to_string()),
+        })?;
         Ok(storage)
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), DatabaseInitError> {
+        let conn = self.conn.lock().unwrap();
+        #[cfg(target_os = "android")]
+        {
+            let version: String = conn
+                .pragma_query_value(None, "cipher_version", |row| row.get(0))
+                .map_err(|e| DatabaseInitError::ValidationFailed(format!("cipher_version query failed: {e}")))?;
+            if version.is_empty() {
+                return Err(DatabaseInitError::ValidationFailed(
+                    "Android SQLCipher probe returned empty cipher_version".into(),
+                ));
+            }
+        }
+        let _count: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "sqlite_master query failed (wrong key or corrupt db): {e}"
+                ))
+            })?;
+        let quick_check: String = conn
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!("quick_check query failed: {e}"))
+            })?;
+        if quick_check != "ok" {
+            return Err(DatabaseInitError::ValidationFailed(format!(
+                "quick_check returned: {quick_check}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn close(&self) {
+        // Release database locks
+        if let Ok(mut guard) = self.mls_context.write() {
+            *guard = None;
+        }
     }
 
     /// Bind the per-process MLS context for the field-level encryption layer.
@@ -1787,5 +2208,110 @@ mod field_encryption_tests {
         let got = storage.get_messages("conv-x", 10, None).await.unwrap();
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["msg-a", "msg-c"]);
+    }
+}
+
+#[cfg(test)]
+mod storage_cutover_tests {
+    use super::*;
+    use std::fs;
+
+    fn clean_test_keyring() {
+        if let Ok(entry) = keyring::Entry::new(DB_KEYRING_SERVICE, CONVERSATION_DB_KEY_LABEL) {
+            let _ = entry.delete_credential();
+        }
+        if let Ok(entry) = keyring::Entry::new(DB_KEYRING_SERVICE, MLS_DB_KEY_LABEL) {
+            let _ = entry.delete_credential();
+        }
+    }
+
+    #[test]
+    fn clean_storage_fresh_creation_and_reopen() {
+        clean_test_keyring();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
+        let marker_file = marker_path(&db_path);
+
+        assert!(!db_path.exists());
+        assert!(!marker_file.exists());
+
+        // First open: creates key, DB, and marker
+        let storage = open_clean_sqlite_storage(&db_path).expect("first open should succeed");
+        assert!(db_path.exists());
+        assert!(marker_file.exists());
+        let marker = read_marker(&marker_file).unwrap();
+        assert_eq!(marker, Some(MarkerStatus::Complete));
+
+        // Second open: reopens existing valid DB
+        let storage2 = open_clean_sqlite_storage(&db_path).expect("reopen should succeed");
+        storage2.validate().expect("reopened DB must be valid");
+        drop(storage);
+        drop(storage2);
+
+        clean_test_keyring();
+    }
+
+    #[test]
+    fn clean_storage_mixed_states_fail_closed() {
+        clean_test_keyring();
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
+        let marker_file = marker_path(&db_path);
+
+        // Case 1: absent DB, present key
+        let _ = create_db_key_in_keyring(DB_KEYRING_SERVICE, CONVERSATION_DB_KEY_LABEL).unwrap();
+        let err = open_clean_sqlite_storage(&db_path).unwrap_err();
+        assert!(matches!(err, DatabaseInitError::MixedStateAbsentDbPresentKey));
+
+        clean_test_keyring();
+
+        // Case 2: present DB, absent key
+        fs::write(&db_path, b"fake-db-bytes").unwrap();
+        let err = open_clean_sqlite_storage(&db_path).unwrap_err();
+        assert!(matches!(err, DatabaseInitError::MixedStatePresentDbAbsentKey));
+
+        // Case 3: creating marker
+        write_marker_creating(&marker_file).unwrap();
+        let err = open_clean_sqlite_storage(&db_path).unwrap_err();
+        assert!(matches!(err, DatabaseInitError::InitializationIncomplete | DatabaseInitError::MixedStatePresentDbAbsentKey));
+
+        clean_test_keyring();
+    }
+
+    #[tokio::test]
+    async fn clean_storage_reset_and_legacy_isolation() {
+        clean_test_keyring();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Set up legacy sentinels
+        let legacy_db = tmp.path().join("catmos.db");
+        fs::write(&legacy_db, b"legacy-catmos-db-sentinel").unwrap();
+        let legacy_mls_dir = tmp.path().join("mls-state");
+        fs::create_dir_all(&legacy_mls_dir).unwrap();
+        let legacy_mls_db = legacy_mls_dir.join("mls.db");
+        fs::write(&legacy_mls_db, b"legacy-mls-db-sentinel").unwrap();
+
+        // Set up clean database
+        let clean_db_path = tmp.path().join(format!("catmos-{}.db", MLS_KEY_SUFFIX));
+        let storage = open_clean_sqlite_storage(&clean_db_path).unwrap();
+        assert!(clean_db_path.exists());
+        assert!(marker_path(&clean_db_path).exists());
+
+        // Perform explicit reset
+        reset_clean_storage(tmp.path(), Some("did:plc:test-reset"), Some(&storage), None)
+            .await
+            .expect("reset should succeed");
+
+        // Clean DB and marker should be gone
+        assert!(!clean_db_path.exists());
+        assert!(!marker_path(&clean_db_path).exists());
+
+        // Legacy files MUST remain untouched
+        assert!(legacy_db.exists());
+        assert_eq!(fs::read(&legacy_db).unwrap(), b"legacy-catmos-db-sentinel");
+        assert!(legacy_mls_db.exists());
+        assert_eq!(fs::read(&legacy_mls_db).unwrap(), b"legacy-mls-db-sentinel");
+
+        clean_test_keyring();
     }
 }

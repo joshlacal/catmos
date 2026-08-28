@@ -1,16 +1,16 @@
 mod api_client;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
-mod commands;
-mod credentials;
-mod keychain;
-mod keys;
-mod mls_proxy;
-mod quarantine_observer;
-mod recovery;
-mod session_restore;
-mod storage;
-mod websocket;
+pub mod commands;
+pub mod credentials;
+pub mod keychain;
+pub mod keys;
+pub mod mls_proxy;
+pub mod quarantine_observer;
+pub mod recovery;
+pub mod session_restore;
+pub mod storage;
+pub mod websocket;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,29 +24,6 @@ use storage::SqliteStorage;
 use tauri::Manager;
 use tokio::sync::Mutex;
 
-/// Retrieve or generate a random 32-byte hex key stored in the OS keychain.
-/// `label` distinguishes between multiple databases (e.g. "conversation-db", "mls-db").
-fn get_or_create_db_key(label: &str) -> String {
-    let service = "blue.catbird.catmos";
-    let entry =
-        keyring::Entry::new(service, label).expect("Failed to create keyring entry for DB key");
-
-    // Try to load an existing key
-    match entry.get_password() {
-        Ok(existing) => existing,
-        Err(keyring::Error::NoEntry) => {
-            // Generate a random 32-byte key and hex-encode it
-            let mut key_bytes = [0u8; 32];
-            getrandom::getrandom(&mut key_bytes).expect("Failed to generate random DB key");
-            let hex_key: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
-            entry
-                .set_password(&hex_key)
-                .expect("Failed to store DB key in keychain");
-            hex_key
-        }
-        Err(e) => panic!("Failed to read DB key from keychain: {e}"),
-    }
-}
 
 pub type CatmosOrchestrator = MLSOrchestrator<
     SqliteStorage,
@@ -111,36 +88,28 @@ pub fn run() {
         )
     });
 
-    let db_path = data_dir.join("catmos.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
+    let db_path = data_dir.join(format!("catmos-{}.db", storage::MLS_KEY_SUFFIX));
 
     // Route XRPC calls through nest BFF (handles DPoP auth, session management)
     let mls_ds_url =
         std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string());
 
     // Create platform implementations
-    let conversation_encryption_key = get_or_create_db_key("conversation-db");
     let storage = Arc::new(
-        SqliteStorage::new(&db_path_str, &conversation_encryption_key)
-            .expect("Failed to initialize SQLite storage"),
+        storage::open_clean_sqlite_storage(&db_path)
+            .expect("Failed to initialize clean SQLite storage"),
     );
     let api_client = Arc::new(ReqwestApiClient::new(mls_ds_url));
     let cred_store = Arc::new(KeyringCredentialStore::new());
 
     // Create MLS FFI context — create parent directory first
-    let mls_state_dir = data_dir.join("mls-state");
+    let mls_state_dir = data_dir.join(storage::MLS_STORAGE_GENERATION);
     std::fs::create_dir_all(&mls_state_dir).expect("Failed to create mls-state directory");
 
     let mls_db_path = mls_state_dir.join("mls.db");
-    let encryption_key = get_or_create_db_key("mls-db");
     let keychain = Box::new(KeyringKeychainAccess::new());
-    let mls_context = catbird_mls::MLSContext::new(
-        mls_db_path.to_string_lossy().to_string(),
-        encryption_key,
-        keychain,
-    )
-    .expect("Failed to initialize MLS context");
-
+    let mls_context = storage::open_clean_mls_context(&mls_db_path, keychain)
+        .expect("Failed to initialize clean MLS context");
     // Clear leftover WAL from previous session — ensures all committed data is
     // checkpointed into the main database file before we start reading.
     if let Err(e) = mls_context.launch_checkpoint() {
