@@ -8,7 +8,7 @@
  * Keys are namespaced by DID + convoId to prevent data leakage across accounts.
  */
 
-const CURSOR_PREFIX = 'catbird_ws_cursor';
+const CURSOR_PREFIX = 'catbird_ws_cursor-clean-v2-openmls-v09';
 
 /** True when running inside Tauri desktop shell. */
 const isTauri: boolean =
@@ -24,7 +24,7 @@ function storageKey(did: string, convoId: string): string {
 
 /** Read the current DID from localStorage (set by wasm.ts on login). */
 function getCurrentDid(): string | null {
-  return localStorage.getItem('catbird_mls_user_did');
+  return localStorage.getItem('catbird_mls-clean-v2-openmls-v09_user_did');
 }
 
 /**

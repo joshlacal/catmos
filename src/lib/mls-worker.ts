@@ -30,6 +30,24 @@ const api = {
 		wasm.catbird_mls_clear_auth();
 		(wasm as unknown as { catbird_mls_clear_signer_bridge: () => void }).catbird_mls_clear_signer_bridge();
 	},
+	close: () => {
+		for (const sub of subscriptions.values()) {
+			sub.close();
+		}
+		subscriptions.clear();
+		(wasm as unknown as { catbird_mls_close?: () => void }).catbird_mls_close?.();
+	},
+	resetCleanStorage: (config?: object) => {
+		for (const sub of subscriptions.values()) {
+			sub.close();
+		}
+		subscriptions.clear();
+		(
+			wasm as unknown as {
+				catbird_mls_reset_clean_storage?: (c?: unknown) => void;
+			}
+		).catbird_mls_reset_clean_storage?.(config);
+	},
 	// Browser signer bridge. The CryptoKey remains owned by the worker's
 	// WebCrypto implementation; only its public key and a callback cross into
 	// WASM. No private key bytes, access token, DPoP proof, or JKT is exported.

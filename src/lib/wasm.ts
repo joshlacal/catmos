@@ -102,23 +102,72 @@ function getWorker(): Remote<WorkerApi> {
 // TODO: Migrate to WebCrypto non-extractable key for proper key protection
 // ---------------------------------------------------------------------------
 
+const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+const SS_ACTIVE_DID = `catbird_mls_active_did${CLEAN_STORAGE_SUFFIX}`;
+const MLS_DB_KEY_PREFIX = `catbird_mls_mls_db_key${CLEAN_STORAGE_SUFFIX}`;
+const INIT_RECORD_PREFIX = `catbird_mls_init_record${CLEAN_STORAGE_SUFFIX}`;
+const STORAGE_PREFIX = `catbird_mls${CLEAN_STORAGE_SUFFIX}`;
+const DB_PREFIX = `catbird-mls${CLEAN_STORAGE_SUFFIX}`;
+
+/** Return a per-DID namespaced key for browser storage. */
+function didKey(did: string, suffix: string): string {
+	return `catbird_mls:${did}:${suffix}${CLEAN_STORAGE_SUFFIX}`;
+}
+
 /**
- * Get or create the MLS DB encryption key, namespaced per-DID in sessionStorage.
- * Falls back to an unnamespaced key when no DID is known yet (pre-login init).
+ * Get or create the MLS DB encryption key, enforcing browser initialization authority.
+ * Namespaced per-DID when available.
  */
 function getOrCreateMlsDbKey(): string {
-	const did = sessionStorage.getItem(SS_ACTIVE_DID);
-	const storageKey = did ? didKey(did, 'mls_db_key') : 'catbird_mls_mls_db_key';
+	const did = typeof window !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null;
+	const markerKey = did ? didKey(did, 'init_record') : INIT_RECORD_PREFIX;
+	const storageKey = did ? didKey(did, 'mls_db_key') : MLS_DB_KEY_PREFIX;
 
-	let key = sessionStorage.getItem(storageKey);
-	if (key) return key;
+	const marker = typeof window !== 'undefined' ? localStorage.getItem(markerKey) : null;
+	if (marker === 'creating') {
+		throw new Error(
+			'Clean storage initialization incomplete (creating marker present); explicit reset required'
+		);
+	}
+
+	if (marker === 'complete') {
+		const key =
+			(typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null) ??
+			(typeof window !== 'undefined' ? sessionStorage.getItem(storageKey) : null);
+		if (!key || key.length !== 64) {
+			throw new Error(
+				'Clean storage mixed state: complete record but missing or invalid key material; explicit reset required'
+			);
+		}
+		sessionStorage.setItem(storageKey, key);
+		return key;
+	}
+
+	// Marker is absent: state table requires absent key or fail closed
+	const existingKey =
+		(typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null) ??
+		(typeof window !== 'undefined' ? sessionStorage.getItem(storageKey) : null);
+	if (existingKey) {
+		throw new Error(
+			'Clean storage mixed state: key material exists without initialization record; explicit reset required'
+		);
+	}
+
+	// Atomically write "creating" marker
+	if (typeof window !== 'undefined') {
+		localStorage.setItem(markerKey, 'creating');
+	}
 
 	const bytes = new Uint8Array(32);
 	crypto.getRandomValues(bytes);
-	key = Array.from(bytes)
+	const key = Array.from(bytes)
 		.map((b) => b.toString(16).padStart(2, '0'))
 		.join('');
-	sessionStorage.setItem(storageKey, key);
+
+	if (typeof window !== 'undefined') {
+		localStorage.setItem(storageKey, key);
+		sessionStorage.setItem(storageKey, key);
+	}
 	return key;
 }
 
@@ -128,16 +177,6 @@ function getOrCreateMlsDbKey(): string {
 // The 32-byte content root key feeds catbird-mls's field_encryption layer:
 //   - per-conversation AES-GCM content keys (envelope around `text`)
 //   - per-conversation HMAC chain keys (tamper-evident transcript)
-//
-// Persisted in localStorage so cold-starts on the same browser profile
-// can decrypt the existing transcript. Namespaced by sha256(did) so that
-// (a) DID strings don't end up readable in DevTools and (b) multi-account
-// scenarios stay isolated. Browser localStorage is per-origin so the key
-// never leaks across catmos / Bluesky / unrelated sites.
-//
-// This is intentionally separate from the SQLCipher DB key (sessionStorage)
-// so that compromise of the DB-at-rest key alone (where sealed rows live)
-// doesn't directly expose decrypted message bodies.
 // ---------------------------------------------------------------------------
 
 const CONTENT_ROOT_PREFIX = 'mls.content.root.';
@@ -151,54 +190,43 @@ async function sha256Hex(input: string): Promise<string> {
 }
 
 async function contentRootStorageKey(userDid: string): Promise<string> {
-	return CONTENT_ROOT_PREFIX + (await sha256Hex(userDid));
+	return `${CONTENT_ROOT_PREFIX}${await sha256Hex(userDid)}${CLEAN_STORAGE_SUFFIX}`;
 }
 
 /**
  * Load the per-DID content root key from localStorage, creating a fresh
- * random 32-byte key on first use. Returns the raw bytes so they can be
- * pushed into the Worker via comlink (Uint8Array is structured-cloneable).
+ * random 32-byte key on first use. Returns raw bytes.
  */
 async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> {
 	const storageKey = await contentRootStorageKey(userDid);
-	const existing = localStorage.getItem(storageKey);
+	const existing = typeof window !== 'undefined' ? localStorage.getItem(storageKey) : null;
 	if (existing) {
 		try {
 			const bytes = Uint8Array.from(atob(existing), (c) => c.charCodeAt(0));
 			if (bytes.length === 32) return bytes;
-			console.warn(
-				'[catmos] content root key has wrong length, regenerating:',
-				bytes.length
-			);
+			throw new Error(`Invalid content root key length: ${bytes.length}`);
 		} catch (e) {
-			console.warn('[catmos] content root key base64 decode failed, regenerating:', e);
+			throw new Error(`Clean storage corrupted content root key: fail closed without mutation (${e})`);
 		}
 	}
 	const fresh = new Uint8Array(32);
 	crypto.getRandomValues(fresh);
 	const b64 = btoa(String.fromCharCode(...fresh));
-	localStorage.setItem(storageKey, b64);
+	if (typeof window !== 'undefined') {
+		localStorage.setItem(storageKey, b64);
+	}
 	return fresh;
 }
 
 /**
- * Push the per-DID content root key into the WASM module. Called once per
- * session after `setAuth` resolves so that subsequent `setup()` and any
- * message encrypt/decrypt has the key bound.
+ * Push the per-DID content root key into the WASM module.
  */
 async function installContentRootKey(did: string): Promise<void> {
 	const key = await loadOrCreateContentRootKey(did);
 	const w = getWorker();
-	try {
-		await (
-			w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
-		).setContentRootKey(key);
-	} catch (e) {
-		console.warn(
-			'[catmos] setContentRootKey failed; messages will fall back to legacy plaintext storage:',
-			e
-		);
-	}
+	await (
+		w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
+	).setContentRootKey(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -219,17 +247,26 @@ const NEST_URL = (() => {
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize the WASM Worker with MLS config.
- * Generates/retrieves the MLS DB key from sessionStorage and passes it to the
- * Worker (which has no sessionStorage access).
+ * Initialize the WASM Worker with MLS config and verify clean storage.
  */
 export async function initWasm(): Promise<void> {
 	if (isTauri) return;
 	const w = getWorker();
 	const mlsDbKey = getOrCreateMlsDbKey();
-	await w.init({ baseUrl: NEST_URL, mlsDbKey });
-}
+	const did = typeof window !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null;
+	const markerKey = did ? didKey(did, 'init_record') : INIT_RECORD_PREFIX;
 
+	await w.init({
+		baseUrl: NEST_URL,
+		storagePrefix: STORAGE_PREFIX,
+		dbPrefix: DB_PREFIX,
+		mlsDbKey
+	});
+
+	if (typeof window !== 'undefined') {
+		localStorage.setItem(markerKey, 'complete');
+	}
+}
 // ---------------------------------------------------------------------------
 // Event listeners (Tauri IPC events on desktop, no-op in browser)
 // ---------------------------------------------------------------------------
@@ -252,14 +289,6 @@ export async function listenForEvent<T>(
 // ---------------------------------------------------------------------------
 // Browser session storage helpers (per-DID namespace isolation)
 // ---------------------------------------------------------------------------
-
-/** Base keys -- the DID key is unnamespaced (bootstrap). */
-const SS_ACTIVE_DID = 'catbird_mls_active_did';
-
-/** Return a per-DID namespaced key for browser sessionStorage. */
-function didKey(did: string, suffix: string): string {
-	return `catbird_mls:${did}:${suffix}`;
-}
 
 /** Persist auth credentials in sessionStorage, namespaced by DID. */
 function persistBrowserAuth(did: string, sessionId: string): void {
@@ -549,6 +578,86 @@ export async function logout(): Promise<void> {
 			_rawWorker = null;
 		}
 		_worker = null;
+	}
+}
+
+/**
+ * Explicit reset of Clean Chat / OpenMLS 0.9 browser storage.
+ * Terminates the worker, closes handles, clears exact clean keys,
+ * and deletes the initialization record marker last.
+ */
+export async function resetCleanStorage(did?: string): Promise<void> {
+	if (isTauri) return;
+
+	// 1. Terminate worker and clear intervals first
+	if (_replenishInterval) {
+		clearInterval(_replenishInterval);
+		_replenishInterval = null;
+	}
+
+	if (_worker) {
+		try {
+			await (
+				_worker as unknown as { clearContentRootKey: () => Promise<void> }
+			).clearContentRootKey();
+		} catch {
+			// ignore
+		}
+		try {
+			await _worker.clearAuth();
+		} catch {
+			// ignore
+		}
+	}
+
+	if (_rawWorker) {
+		_rawWorker.terminate();
+		_rawWorker = null;
+	}
+	_worker = null;
+
+	// 2. Determine target DID
+	const activeDid =
+		did ?? (typeof window !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
+
+	// 3. Clear exact clean storage keys
+	try {
+		if (typeof window !== 'undefined') {
+			if (activeDid) {
+				const crKey = await contentRootStorageKey(activeDid);
+				localStorage.removeItem(crKey);
+				localStorage.removeItem(didKey(activeDid, 'mls_db_key'));
+				localStorage.removeItem(didKey(activeDid, 'session_id'));
+				sessionStorage.removeItem(didKey(activeDid, 'session_id'));
+				sessionStorage.removeItem(didKey(activeDid, 'mls_db_key'));
+				localStorage.removeItem(didKey(activeDid, 'init_record'));
+
+				// Remove clean cursors for this DID
+				const cursorPrefix = `catbird_ws_cursor${CLEAN_STORAGE_SUFFIX}:${activeDid}:`;
+				const keysToRemove: string[] = [];
+				for (let i = 0; i < localStorage.length; i++) {
+					const k = localStorage.key(i);
+					if (k?.startsWith(cursorPrefix)) keysToRemove.push(k);
+				}
+				for (const k of keysToRemove) localStorage.removeItem(k);
+			}
+			sessionStorage.removeItem(SS_ACTIVE_DID);
+			sessionStorage.removeItem(MLS_DB_KEY_PREFIX);
+			localStorage.removeItem(MLS_DB_KEY_PREFIX);
+			localStorage.removeItem(`catbird_mls${CLEAN_STORAGE_SUFFIX}_user_did`);
+			localStorage.removeItem(`catbird_mls${CLEAN_STORAGE_SUFFIX}_session_id`);
+			localStorage.removeItem(`catbird_mls${CLEAN_STORAGE_SUFFIX}_mls_db_key`);
+
+			// Remove initialization record marker LAST
+			if (activeDid) {
+				localStorage.removeItem(didKey(activeDid, 'init_record'));
+			}
+			localStorage.removeItem(INIT_RECORD_PREFIX);
+			localStorage.removeItem(`catbird_mls${CLEAN_STORAGE_SUFFIX}_init_record`);
+		}
+	} catch (err) {
+		console.error('[catmos] resetCleanStorage error:', err);
+		throw err;
 	}
 }
 
