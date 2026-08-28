@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
