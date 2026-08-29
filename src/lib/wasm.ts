@@ -6,8 +6,10 @@
  * - Browser: routes calls through a Web Worker (comlink) so that WASM gets
  *   OPFS Synchronous Access Handle for MLS SQLite crypto.
  *
- * Session credentials (did, token) and MLS DB key all live in sessionStorage
+ * Session credentials (did, token) live in sessionStorage
  * on the main thread (cleared on tab close to limit XSS exposure).
+ * MLS DB encryption key and content root key live exclusively in durable localStorage
+ * and are bound to the DID-scoped CleanStorageRecord.
  * Credential keys are namespaced by DID to prevent data leakage when multiple
  * users log in on the same browser. The Worker receives them via explicit
  * setAuth / init calls.
@@ -54,7 +56,11 @@ import type {
 
 import { wrap, proxy, type Remote } from 'comlink';
 import type { WorkerApi } from './mls-worker';
-
+import {
+	clearAllCursorsForDid,
+	setAuthoritativeActiveDid,
+	clearAuthoritativeActiveDid
+} from './stores/cursors';
 // ---------------------------------------------------------------------------
 // Environment detection
 // ---------------------------------------------------------------------------
@@ -97,52 +103,49 @@ function getWorker(): Remote<WorkerApi> {
 	return _worker;
 }
 
-// ---------------------------------------------------------------------------
-// MLS DB key management (main thread sessionStorage)
-// TODO: Migrate to WebCrypto non-extractable key for proper key protection
-// ---------------------------------------------------------------------------
-
-/**
- * Get or create the MLS DB encryption key, namespaced per-DID in sessionStorage.
- * Falls back to an unnamespaced key when no DID is known yet (pre-login init).
- */
-function getOrCreateMlsDbKey(): string {
-	const did = sessionStorage.getItem(SS_ACTIVE_DID);
-	const storageKey = did ? didKey(did, 'mls_db_key') : 'catbird_mls_mls_db_key';
-
-	let key = sessionStorage.getItem(storageKey);
-	if (key) return key;
-
-	const bytes = new Uint8Array(32);
-	crypto.getRandomValues(bytes);
-	key = Array.from(bytes)
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
-	sessionStorage.setItem(storageKey, key);
-	return key;
+/** Terminate the MLS worker and drop both handles. */
+function terminateWorker(): void {
+	_rawWorker?.terminate();
+	_rawWorker = null;
+	_worker = null;
 }
 
 // ---------------------------------------------------------------------------
-// MLS field-level encryption: per-DID content root key (localStorage)
-//
-// The 32-byte content root key feeds catbird-mls's field_encryption layer:
-//   - per-conversation AES-GCM content keys (envelope around `text`)
-//   - per-conversation HMAC chain keys (tamper-evident transcript)
-//
-// Persisted in localStorage so cold-starts on the same browser profile
-// can decrypt the existing transcript. Namespaced by sha256(did) so that
-// (a) DID strings don't end up readable in DevTools and (b) multi-account
-// scenarios stay isolated. Browser localStorage is per-origin so the key
-// never leaks across catmos / Bluesky / unrelated sites.
-//
-// This is intentionally separate from the SQLCipher DB key (sessionStorage)
-// so that compromise of the DB-at-rest key alone (where sealed rows live)
-// doesn't directly expose decrypted message bodies.
+// Clean storage constants & generation derivation
 // ---------------------------------------------------------------------------
 
-const CONTENT_ROOT_PREFIX = 'mls.content.root.';
+export const CLEAN_STORAGE_GENERATION_TOKEN = 'mls-state-clean-v2-openmls-v09';
+export const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+export const STORAGE_PREFIX = `catbird_mls${CLEAN_STORAGE_SUFFIX}`;
+export const DB_PREFIX = `catbird-mls${CLEAN_STORAGE_SUFFIX}`;
+export const MLS_DB_KEY_PREFIX = `${STORAGE_PREFIX}_mls_db_key`;
+export const INIT_RECORD_PREFIX = `${STORAGE_PREFIX}_init_record`;
+export const SS_ACTIVE_DID = `catbird_mls_active_did${CLEAN_STORAGE_SUFFIX}`;
+export const CONTENT_ROOT_PREFIX = 'mls.content.root.';
 
-async function sha256Hex(input: string): Promise<string> {
+export interface CleanStorageRecord {
+	generation: string;
+	normalizedDid: string;
+	didDigest: string;
+	storagePrefix: string;
+	dbPrefix: string;
+	dbIdentity: string;
+	mlsDbKeyLabel: string;
+	mlsDbKeyVerifier: string;
+	contentRootKeyLabel: string;
+	contentRootKeyVerifier: string;
+	creatorToken: string;
+	state: 'creating' | 'complete';
+	createdAt: number;
+	completedAt?: number;
+}
+
+/** Return a per-DID namespaced key for browser storage. */
+export function didKey(did: string, suffix: string): string {
+	return `catbird_mls:${did}:${suffix}${CLEAN_STORAGE_SUFFIX}`;
+}
+
+export async function sha256Hex(input: string): Promise<string> {
 	const bytes = new TextEncoder().encode(input);
 	const digest = await crypto.subtle.digest('SHA-256', bytes);
 	return Array.from(new Uint8Array(digest))
@@ -150,55 +153,274 @@ async function sha256Hex(input: string): Promise<string> {
 		.join('');
 }
 
-async function contentRootStorageKey(userDid: string): Promise<string> {
-	return CONTENT_ROOT_PREFIX + (await sha256Hex(userDid));
+export async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
+	const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
+	return Array.from(new Uint8Array(digest))
+		.map((b) => b.toString(16).padStart(2, '0'))
+		.join('');
 }
 
-/**
- * Load the per-DID content root key from localStorage, creating a fresh
- * random 32-byte key on first use. Returns the raw bytes so they can be
- * pushed into the Worker via comlink (Uint8Array is structured-cloneable).
- */
-async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> {
-	const storageKey = await contentRootStorageKey(userDid);
-	const existing = localStorage.getItem(storageKey);
-	if (existing) {
-		try {
-			const bytes = Uint8Array.from(atob(existing), (c) => c.charCodeAt(0));
-			if (bytes.length === 32) return bytes;
-			console.warn(
-				'[catmos] content root key has wrong length, regenerating:',
-				bytes.length
-			);
-		} catch (e) {
-			console.warn('[catmos] content root key base64 decode failed, regenerating:', e);
-		}
-	}
-	const fresh = new Uint8Array(32);
-	crypto.getRandomValues(fresh);
-	const b64 = btoa(String.fromCharCode(...fresh));
-	localStorage.setItem(storageKey, b64);
-	return fresh;
+export async function contentRootStorageKey(userDid: string): Promise<string> {
+	const normalizedDid = userDid.trim();
+	return `${CONTENT_ROOT_PREFIX}${await sha256Hex(normalizedDid)}${CLEAN_STORAGE_SUFFIX}`;
 }
 
-/**
- * Push the per-DID content root key into the WASM module. Called once per
- * session after `setAuth` resolves so that subsequent `setup()` and any
- * message encrypt/decrypt has the key bound.
- */
-async function installContentRootKey(did: string): Promise<void> {
-	const key = await loadOrCreateContentRootKey(did);
-	const w = getWorker();
-	try {
-		await (
-			w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
-		).setContentRootKey(key);
-	} catch (e) {
-		console.warn(
-			'[catmos] setContentRootKey failed; messages will fall back to legacy plaintext storage:',
-			e
+export async function deriveDidStorageCoordinates(did: string): Promise<{
+	normalizedDid: string;
+	didDigest: string;
+	storagePrefix: string;
+	dbPrefix: string;
+	dbIdentity: string;
+	recordKey: string;
+	mlsDbKeyLabel: string;
+	contentRootKeyLabel: string;
+	cursorRegistryKey: string;
+}> {
+	const normalizedDid = did.trim();
+	const didDigest = await sha256Hex(normalizedDid);
+	const storagePrefix = `catbird_mls_${didDigest}${CLEAN_STORAGE_SUFFIX}`;
+	const dbPrefix = `catbird-mls-${didDigest}${CLEAN_STORAGE_SUFFIX}`;
+	const dbIdentity = `${dbPrefix}-app.db`;
+	const recordKey = didKey(normalizedDid, 'init_record');
+	const mlsDbKeyLabel = didKey(normalizedDid, 'mls_db_key');
+	const contentRootKeyLabel = `${CONTENT_ROOT_PREFIX}${didDigest}${CLEAN_STORAGE_SUFFIX}`;
+	const cursorRegistryKey = didKey(normalizedDid, 'cursor_registry');
+
+	return {
+		normalizedDid,
+		didDigest,
+		storagePrefix,
+		dbPrefix,
+		dbIdentity,
+		recordKey,
+		mlsDbKeyLabel,
+		contentRootKeyLabel,
+		cursorRegistryKey
+	};
+}
+
+async function withDidLock<T>(normalizedDid: string, fn: () => Promise<T>): Promise<T> {
+	if (typeof navigator === 'undefined' || !navigator.locks) {
+		throw new Error(
+			'Web Locks API is required for browser MLS storage coordination; fail closed without mutation'
 		);
 	}
+	const didDigest = await sha256Hex(normalizedDid);
+	const lockName = `catbird_mls_init_lock_${didDigest}${CLEAN_STORAGE_SUFFIX}`;
+	return new Promise<T>((resolve, reject) => {
+		navigator.locks.request(lockName, { mode: 'exclusive' }, async () => {
+			try {
+				const res = await fn();
+				resolve(res);
+			} catch (err) {
+				reject(err);
+			}
+		});
+	});
+}
+
+let _activeDid: string | null = null;
+let _lastAttemptedDid: string | null = null;
+let _initializedDid: string | null = null;
+
+export async function ensureMlsInitialized(did: string): Promise<void> {
+	if (isTauri) return;
+	const coords = await deriveDidStorageCoordinates(did);
+	const {
+		normalizedDid,
+		recordKey,
+		mlsDbKeyLabel,
+		contentRootKeyLabel,
+		storagePrefix,
+		dbPrefix,
+		dbIdentity,
+		didDigest
+	} = coords;
+
+	_lastAttemptedDid = normalizedDid;
+
+	await withDidLock(normalizedDid, async () => {
+		const rawRecord = typeof window !== 'undefined' ? localStorage.getItem(recordKey) : null;
+		let record: CleanStorageRecord | null = null;
+		if (rawRecord !== null) {
+			try {
+				record = JSON.parse(rawRecord) as CleanStorageRecord;
+			} catch {
+				throw new Error(
+					'Clean storage invalid initialization record format; explicit reset required'
+				);
+			}
+		}
+
+		if (record) {
+			if (record.state === 'creating') {
+				throw new Error(
+					'Clean storage initialization incomplete (creating marker present); explicit reset required'
+				);
+			}
+			if (record.state === 'complete') {
+				if (
+					record.generation !== CLEAN_STORAGE_GENERATION_TOKEN ||
+					record.normalizedDid !== normalizedDid ||
+					record.didDigest !== didDigest ||
+					record.storagePrefix !== storagePrefix ||
+					record.dbPrefix !== dbPrefix ||
+					record.dbIdentity !== dbIdentity ||
+					record.mlsDbKeyLabel !== mlsDbKeyLabel ||
+					record.contentRootKeyLabel !== contentRootKeyLabel ||
+					!record.mlsDbKeyVerifier ||
+					typeof record.mlsDbKeyVerifier !== 'string' ||
+					!record.contentRootKeyVerifier ||
+					typeof record.contentRootKeyVerifier !== 'string' ||
+					!record.creatorToken ||
+					typeof record.creatorToken !== 'string' ||
+					typeof record.createdAt !== 'number' ||
+					record.state !== 'complete'
+				) {
+					throw new Error('Clean storage record binding mismatch; explicit reset required');
+				}
+				const dbKey =
+					typeof window !== 'undefined' ? localStorage.getItem(record.mlsDbKeyLabel) : null;
+				if (!dbKey || dbKey.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(dbKey)) {
+					throw new Error(
+						'Clean storage mixed state: complete record but missing or invalid key material; explicit reset required'
+					);
+				}
+				const computedDbKeyVerifier = await sha256Hex(dbKey);
+				if (computedDbKeyVerifier !== record.mlsDbKeyVerifier) {
+					throw new Error(
+						'Clean storage mixed state: database key verifier mismatch; explicit reset required'
+					);
+				}
+
+				const contentRootB64 =
+					typeof window !== 'undefined'
+						? localStorage.getItem(record.contentRootKeyLabel)
+						: null;
+				if (!contentRootB64) {
+					throw new Error(
+						'Clean storage mixed state: complete record but missing content root key; explicit reset required'
+					);
+				}
+				let contentRootBytes: Uint8Array;
+				try {
+					contentRootBytes = Uint8Array.from(atob(contentRootB64), (c) => c.charCodeAt(0));
+				} catch {
+					throw new Error(
+						'Clean storage corrupted content root key: fail closed without mutation'
+					);
+				}
+				if (contentRootBytes.length !== 32) {
+					throw new Error(`Invalid content root key length: ${contentRootBytes.length}`);
+				}
+				const computedCrVerifier = await sha256HexBytes(contentRootBytes);
+				if (computedCrVerifier !== record.contentRootKeyVerifier) {
+					throw new Error(
+						'Clean storage mixed state: content root key verifier mismatch; explicit reset required'
+					);
+				}
+
+				const w = getWorker();
+				await w.init({
+					baseUrl: NEST_URL,
+					storagePrefix: record.storagePrefix,
+					dbPrefix: record.dbPrefix,
+					mlsDbKey: dbKey,
+					initRecord: 'complete',
+					actorDid: normalizedDid,
+					boundDid: normalizedDid,
+					record
+				});
+
+				await w.setContentRootKey(contentRootBytes);
+				_initializedDid = normalizedDid;
+				_activeDid = normalizedDid;
+				return;
+			}
+			throw new Error(`Clean storage invalid initialization record state: ${(record as CleanStorageRecord).state}`);
+		}
+
+		// Record absent: verify no orphaned keys exist
+		const existingDbKey =
+			typeof window !== 'undefined' ? localStorage.getItem(mlsDbKeyLabel) : null;
+		if (existingDbKey !== null) {
+			throw new Error(
+				'Clean storage mixed state: key material exists without initialization record; explicit reset required'
+			);
+		}
+		const existingCrKey =
+			typeof window !== 'undefined' ? localStorage.getItem(contentRootKeyLabel) : null;
+		if (existingCrKey !== null) {
+			throw new Error(
+				'Clean storage mixed state: content root key exists without initialization record; explicit reset required'
+			);
+		}
+
+		// Read-only preflight probe in worker BEFORE any localStorage/key mutation
+		const w = getWorker();
+		await w.probeFreshCreation(storagePrefix, dbPrefix);
+
+		// Fresh first creation
+		const creatorToken = crypto.randomUUID();
+
+		const dbKeyBytes = new Uint8Array(32);
+		crypto.getRandomValues(dbKeyBytes);
+		const dbKey = Array.from(dbKeyBytes)
+			.map((b) => b.toString(16).padStart(2, '0'))
+			.join('');
+
+		const contentRootBytes = new Uint8Array(32);
+		crypto.getRandomValues(contentRootBytes);
+		const contentRootB64 = btoa(String.fromCharCode(...contentRootBytes));
+
+		const mlsDbKeyVerifier = await sha256Hex(dbKey);
+		const contentRootKeyVerifier = await sha256HexBytes(contentRootBytes);
+
+		const newRecord: CleanStorageRecord = {
+			generation: CLEAN_STORAGE_GENERATION_TOKEN,
+			normalizedDid,
+			didDigest,
+			storagePrefix,
+			dbPrefix,
+			dbIdentity,
+			mlsDbKeyLabel,
+			mlsDbKeyVerifier,
+			contentRootKeyLabel,
+			contentRootKeyVerifier,
+			creatorToken,
+			state: 'creating',
+			createdAt: Date.now()
+		};
+
+		if (typeof window !== 'undefined') {
+			localStorage.setItem(recordKey, JSON.stringify(newRecord));
+			localStorage.setItem(mlsDbKeyLabel, dbKey);
+			localStorage.setItem(contentRootKeyLabel, contentRootB64);
+		}
+
+		await w.init({
+			baseUrl: NEST_URL,
+			storagePrefix,
+			dbPrefix,
+			mlsDbKey: dbKey,
+			initRecord: 'creating',
+			creatorToken,
+			actorDid: normalizedDid,
+			boundDid: normalizedDid,
+			record: newRecord
+		});
+
+		await w.setContentRootKey(contentRootBytes);
+
+		newRecord.state = 'complete';
+		newRecord.completedAt = Date.now();
+		if (typeof window !== 'undefined') {
+			localStorage.setItem(recordKey, JSON.stringify(newRecord));
+		}
+
+		_initializedDid = normalizedDid;
+		_activeDid = normalizedDid;
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -219,17 +441,21 @@ const NEST_URL = (() => {
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize the WASM Worker with MLS config.
- * Generates/retrieves the MLS DB key from sessionStorage and passes it to the
- * Worker (which has no sessionStorage access).
+ * Initialize the WASM Worker with MLS config and verify clean storage.
  */
-export async function initWasm(): Promise<void> {
+export async function initWasm(did?: string): Promise<void> {
 	if (isTauri) return;
-	const w = getWorker();
-	const mlsDbKey = getOrCreateMlsDbKey();
-	await w.init({ baseUrl: NEST_URL, mlsDbKey });
+	if (did) {
+		await ensureMlsInitialized(did);
+		return;
+	}
+	const saved = readBrowserAuth();
+	if (saved?.did) {
+		await ensureMlsInitialized(saved.did);
+		return;
+	}
+	getWorker();
 }
-
 // ---------------------------------------------------------------------------
 // Event listeners (Tauri IPC events on desktop, no-op in browser)
 // ---------------------------------------------------------------------------
@@ -252,14 +478,6 @@ export async function listenForEvent<T>(
 // ---------------------------------------------------------------------------
 // Browser session storage helpers (per-DID namespace isolation)
 // ---------------------------------------------------------------------------
-
-/** Base keys -- the DID key is unnamespaced (bootstrap). */
-const SS_ACTIVE_DID = 'catbird_mls_active_did';
-
-/** Return a per-DID namespaced key for browser sessionStorage. */
-function didKey(did: string, suffix: string): string {
-	return `catbird_mls:${did}:${suffix}`;
-}
 
 /** Persist auth credentials in sessionStorage, namespaced by DID. */
 function persistBrowserAuth(did: string, sessionId: string): void {
@@ -307,7 +525,9 @@ export async function startLogin(identifier: string): Promise<void> {
 
 export async function completeLogin(sessionId: string): Promise<AuthState> {
 	if (isTauri) {
-		return tauriInvoke('complete_login', { sessionId });
+		const state = await tauriInvoke<AuthState>('complete_login', { sessionId });
+		setAuthoritativeActiveDid(state.did);
+		return state;
 	}
 	const resp = await fetch(`${NEST_URL}/auth/session`, {
 		headers: { Authorization: `Bearer ${sessionId}` }
@@ -317,19 +537,16 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 	const did: string = info.did;
 	const handle: string = info.handle ?? did;
 
-	// Persist session on main thread (sessionStorage, per-DID namespaced)
-	persistBrowserAuth(did, sessionId);
+	// Ensure MLS DB is initialized under Web Lock for this DID
+	await ensureMlsInitialized(did);
 
 	// Push credentials to Worker and run MLS setup
 	const w = getWorker();
 	await w.setAuth(did, sessionId);
-	// Install the per-DID content root key BEFORE setup() so the field-
-	// level encryption layer is ready for the very first message that
-	// setup() may decrypt during initial sync.
-	await installContentRootKey(did);
 	await w.setup();
 
-	// Ensure key packages are available for other clients to send us Welcomes
+	// Persist session on main thread only after clean init & setup succeed
+	persistBrowserAuth(did, sessionId);
 	replenishKeyPackages();
 	startKeyPackageReplenishment();
 
@@ -342,14 +559,11 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
  */
 export async function setAuth(did: string, token: string): Promise<void> {
 	if (isTauri) return;
-	persistBrowserAuth(did, token);
+	await ensureMlsInitialized(did);
 	const w = getWorker();
 	await w.setAuth(did, token);
-	// Install the per-DID content root key after auth so the field-level
-	// encryption layer is bound before any subsequent message flow.
-	await installContentRootKey(did);
+	persistBrowserAuth(did, token);
 }
-
 /**
  * Install a browser-owned non-exporting Ed25519 signer for canonical chat
  * preparation. The CryptoKey is passed to the worker as a structured-clone
@@ -464,24 +678,19 @@ export async function submitPreparedRequest(
  */
 export async function clearAuth(): Promise<void> {
 	if (isTauri) return;
+	await getWorker().clearAuth();
 	clearBrowserAuth();
-	const w = getWorker();
-	// Drop the in-memory content root key from the WASM layer first; the
-	// localStorage entry is intentionally preserved so re-login from the
-	// same browser profile resumes the same HMAC chain seed.
-	try {
-		await (
-			w as unknown as { clearContentRootKey: () => Promise<void> }
-		).clearContentRootKey();
-	} catch (e) {
-		console.warn('[catmos] clearContentRootKey failed:', e);
-	}
-	await w.clearAuth();
 }
 
 export async function tryRestoreSession(): Promise<AuthState | null> {
 	if (isTauri) {
-		return tauriInvoke('try_restore_session');
+		const state = await tauriInvoke<AuthState | null>('try_restore_session');
+		if (state?.did) {
+			setAuthoritativeActiveDid(state.did);
+		} else {
+			clearAuthoritativeActiveDid();
+		}
+		return state;
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return null;
@@ -500,13 +709,12 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		}
 		const info = await resp.json();
 
+		// Ensure MLS DB is initialized under Web Lock for this DID
+		await ensureMlsInitialized(info.did);
+
 		// Push restored credentials to Worker
 		const w = getWorker();
 		await w.setAuth(info.did, sessionId);
-		// Restore the per-DID content root key from localStorage (or
-		// generate one if first restore on this profile) so the field-
-		// level encryption layer can read pre-existing sealed rows.
-		await installContentRootKey(info.did);
 		await w.setup();
 
 		// Replenish key packages (setup skips upload on returning sessions)
@@ -521,37 +729,105 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 
 export async function logout(): Promise<void> {
 	if (isTauri) {
+		clearAuthoritativeActiveDid();
 		return tauriInvoke('logout');
 	}
-	clearBrowserAuth();
 
-	// Clear key package replenishment interval
-	if (_replenishInterval) {
-		clearInterval(_replenishInterval);
-		_replenishInterval = null;
-	}
+	const restartReplenishmentOnFailure = stopKeyPackageReplenishment();
 
-	// Clear auth in worker, then terminate it
 	try {
-		if (_worker) {
-			try {
-				await (
-					_worker as unknown as { clearContentRootKey: () => Promise<void> }
-				).clearContentRootKey();
-			} catch (e) {
-				console.warn('[catmos] clearContentRootKey failed during logout:', e);
-			}
-			await _worker.clearAuth();
-		}
-	} finally {
-		if (_rawWorker) {
-			_rawWorker.terminate();
-			_rawWorker = null;
-		}
-		_worker = null;
+		if (_worker) await _worker.clearAuth();
+	} catch (error) {
+		if (restartReplenishmentOnFailure) startKeyPackageReplenishment();
+		throw error;
 	}
+
+	clearAuthoritativeActiveDid();
+	clearBrowserAuth();
+	terminateWorker();
+	_activeDid = null;
+	_initializedDid = null;
 }
 
+/**
+ * Explicit reset of Clean Chat / OpenMLS 0.9 browser storage.
+ * Awaits worker reset & OPFS database unlink, terminates the worker,
+ * clears exact clean keys for the bound DID, and deletes the initialization record marker last.
+ */
+export async function resetCleanStorage(did?: string): Promise<void> {
+	if (isTauri) return;
+
+	const restartReplenishmentOnFailure = stopKeyPackageReplenishment();
+
+	const targetDid =
+		did ??
+		_lastAttemptedDid ??
+		_activeDid ??
+		readBrowserAuth()?.did ??
+		(typeof window !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
+	if (!targetDid) {
+		terminateWorker();
+		_activeDid = null;
+		_initializedDid = null;
+		return;
+	}
+
+	const {
+		normalizedDid,
+		recordKey,
+		mlsDbKeyLabel,
+		contentRootKeyLabel,
+		storagePrefix,
+		dbPrefix
+	} = await deriveDidStorageCoordinates(targetDid);
+
+	await withDidLock(normalizedDid, async () => {
+		// Reset is the gate: a busy Rust database lease rejects before auth,
+		// content-key, signer, or OPFS state is changed.
+		const w = getWorker();
+		try {
+			await w.resetCleanStorage({
+				storagePrefix,
+				dbPrefix,
+				boundDid: normalizedDid
+			});
+		} catch (error) {
+			if (restartReplenishmentOnFailure) startKeyPackageReplenishment();
+			throw error;
+		}
+
+		terminateWorker();
+
+		// Delete exact keys for this DID ONLY
+		if (typeof window !== 'undefined') {
+			localStorage.removeItem(contentRootKeyLabel);
+			localStorage.removeItem(mlsDbKeyLabel);
+			localStorage.removeItem(didKey(normalizedDid, 'session_id'));
+			sessionStorage.removeItem(didKey(normalizedDid, 'session_id'));
+			sessionStorage.removeItem(didKey(normalizedDid, 'mls_db_key'));
+
+			// Exact cursor cleanup via cursor registry (no Storage enumeration)
+			clearAllCursorsForDid(normalizedDid);
+
+			if (sessionStorage.getItem(SS_ACTIVE_DID) === normalizedDid) {
+				sessionStorage.removeItem(SS_ACTIVE_DID);
+			}
+
+			// Remove initialization record marker LAST
+			localStorage.removeItem(recordKey);
+		}
+
+		if (_lastAttemptedDid === normalizedDid) {
+			_lastAttemptedDid = null;
+		}
+		if (_activeDid === normalizedDid) {
+			_activeDid = null;
+		}
+		if (_initializedDid === normalizedDid) {
+			_initializedDid = null;
+		}
+	});
+}
 // ---------------------------------------------------------------------------
 // Key package replenishment (browser only)
 // ---------------------------------------------------------------------------
@@ -575,6 +851,14 @@ function startKeyPackageReplenishment(): void {
 	_replenishInterval = setInterval(() => {
 		replenishKeyPackages();
 	}, 5 * 60 * 1000);
+}
+
+/** Stop periodic replenishment; returns whether it had been running. */
+function stopKeyPackageReplenishment(): boolean {
+	if (!_replenishInterval) return false;
+	clearInterval(_replenishInterval);
+	_replenishInterval = null;
+	return true;
 }
 
 // ---------------------------------------------------------------------------

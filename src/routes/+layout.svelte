@@ -5,7 +5,7 @@
 	import TabBlockedMessage from '$lib/components/TabBlockedMessage.svelte';
 	import { auth } from '$lib/stores/auth';
 	import { selectedConversation } from '$lib/stores/conversations';
-	import { isTauri, initWasm } from '$lib/wasm';
+	import { isTauri, resetCleanStorage } from '$lib/wasm';
 	import { acquireTabLock, type TabLockStatus } from '$lib/stores/tab-lock';
 
 	let { children } = $props();
@@ -14,6 +14,7 @@
 	let tabLockStatus = $state<TabLockStatus>('acquiring');
 	let stealLock: (() => void) | undefined = $state(undefined);
 	let requestNewConversation = $state(false);
+	let initError = $state<string | null>(null);
 
 	function toggleTheme() {
 		theme = theme === 'dark' ? 'light' : 'dark';
@@ -76,17 +77,30 @@
 
 		// Single-tab enforcement (web only — Tauri handles this natively)
 		if (!isTauri) {
-			const { steal } = acquireTabLock((status) => {
+			let restoreInitiated = false;
+			const { steal } = acquireTabLock(async (status) => {
 				tabLockStatus = status;
+				if (status === 'granted' && !restoreInitiated) {
+					restoreInitiated = true;
+					try {
+						await auth.tryRestore();
+					} catch (err) {
+						console.error('[catmos] tryRestore error:', err);
+						initError = err instanceof Error ? err.message : String(err);
+					}
+				}
 			});
 			stealLock = steal;
-
-			await initWasm();
 		} else {
 			tabLockStatus = 'granted';
+			try {
+				await auth.tryRestore();
+			} catch (err) {
+				console.error('[catmos] tryRestore error:', err);
+				initError = err instanceof Error ? err.message : String(err);
+			}
 		}
 
-		auth.tryRestore();
 	});
 
 	onDestroy(() => {
@@ -94,7 +108,23 @@
 	});
 </script>
 
-{#if tabLockStatus === 'blocked' && stealLock}
+{#if initError}
+	<div class="init-error-container">
+		<div class="init-error-card">
+			<h2>Storage Initialization Failed</h2>
+			<p class="init-error-msg">{initError}</p>
+			<button
+				class="reset-btn"
+				onclick={async () => {
+					await resetCleanStorage();
+					window.location.reload();
+				}}
+			>
+				Reset Clean Storage &amp; Reload
+			</button>
+		</div>
+	</div>
+{:else if tabLockStatus === 'blocked' && stealLock}
 	<TabBlockedMessage onSteal={stealLock} />
 {:else}
 <div
@@ -203,5 +233,52 @@
 		.sidebar-expand-btn {
 			display: none !important;
 		}
+	}
+
+	.init-error-container {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		height: 100dvh;
+		width: 100vw;
+		background: var(--bg-app);
+		padding: 24px;
+	}
+
+	.init-error-card {
+		max-width: 480px;
+		padding: 32px;
+		background: var(--bg-surface, #1e1e1e);
+		border-radius: 12px;
+		border: 1px solid var(--border, #333);
+		text-align: center;
+	}
+
+	.init-error-card h2 {
+		margin: 0 0 12px 0;
+		color: var(--text-primary, #fff);
+	}
+
+	.init-error-msg {
+		color: var(--text-secondary, #aaa);
+		margin: 0 0 24px 0;
+		font-size: 14px;
+		line-height: 1.5;
+		word-break: break-word;
+	}
+
+	.reset-btn {
+		background: #e53e3e;
+		color: white;
+		border: none;
+		padding: 10px 20px;
+		border-radius: 8px;
+		font-size: 14px;
+		font-weight: 600;
+		cursor: pointer;
+	}
+
+	.reset-btn:hover {
+		background: #c53030;
 	}
 </style>

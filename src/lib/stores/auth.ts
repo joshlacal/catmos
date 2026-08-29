@@ -3,7 +3,7 @@ import * as api from '$lib/wasm';
 import { listenForEvent, isTauri } from '$lib/wasm';
 import type { AuthState } from '$lib/tauri';
 import { profiles } from './profiles';
-
+import { setAuthoritativeActiveDid, clearAuthoritativeActiveDid } from './cursors';
 interface AuthStore {
 	user: AuthState | null;
 	loading: boolean;
@@ -64,6 +64,7 @@ function createAuthStore() {
 		},
 		async logout() {
 			try {
+				clearAuthoritativeActiveDid();
 				await api.logout();
 			} finally {
 				set(initialState);
@@ -84,6 +85,7 @@ function createAuthStore() {
 				// desktop backend intentionally keeps the keychained session so a
 				// retry can resume the existing encrypted transcript.
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
+				throw e;
 			}
 		},
 		/** Called from /auth/callback route after browser OAuth completes. */
@@ -98,6 +100,7 @@ function createAuthStore() {
 			}
 		},
 		setUser(user: AuthState) {
+			setAuthoritativeActiveDid(user.did);
 			set({ user, loading: false, error: null, waitingForOAuth: false });
 		}
 	};

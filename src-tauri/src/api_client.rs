@@ -187,7 +187,7 @@ fn parse_sequencer_receipt_data<S: catbird_atproto::jacquard_common::BosStr>(
 
 /// Errors returned when a canonical clean-chat request cannot be authorized.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ChatAuthError {
+pub enum ChatAuthError {
     MissingSession,
     SessionChanged,
     MissingLocalDeviceUuid,
@@ -324,10 +324,10 @@ impl Default for ChatAuthSnapshot {
 /// value through every await and revalidate it before a durable or runtime
 /// mutation so a late response cannot cross an account switch.
 #[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ChatSessionSnapshot {
-    pub(crate) actor_did: String,
-    pub(crate) token: String,
-    pub(crate) revision: u64,
+pub struct ChatSessionSnapshot {
+    pub actor_did: String,
+    pub token: String,
+    pub revision: u64,
 }
 
 impl std::fmt::Debug for ChatSessionSnapshot {
@@ -891,9 +891,29 @@ impl ReqwestApiClient {
         }
     }
 
-    /// Set the MLS context so the API client can derive confirmation tags.
+    /// Create a clone of this API client sharing the same HTTP client, base_url, and chat_auth provider,
+    /// but with its own independent local `mls_context` (allowing provisional isolation).
+    pub fn clone_with_local_mls_context(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            base_url: self.base_url.clone(),
+            mls_context: RwLock::new(None),
+            chat_auth: self.chat_auth.clone(),
+            #[cfg(test)]
+            publish_device_id_override: RwLock::new(None),
+        }
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
     pub fn set_mls_context(&self, ctx: std::sync::Arc<catbird_mls::MLSContext>) {
         *self.mls_context.write().unwrap() = Some(ctx);
+    }
+
+    /// Clear the MLS context when the account runtime drops.
+    pub fn clear_mls_context(&self) {
+        *self.mls_context.write().unwrap() = None;
     }
 
     /// Get the base64-encoded confirmation tag for a conversation, or None if unavailable.
@@ -925,9 +945,7 @@ impl ReqwestApiClient {
         self.chat_auth.set_session(did, token);
     }
 
-    pub(crate) fn current_session(
-        &self,
-    ) -> std::result::Result<ChatSessionSnapshot, ChatAuthError> {
+    pub fn current_session(&self) -> std::result::Result<ChatSessionSnapshot, ChatAuthError> {
         self.chat_auth.session_snapshot()
     }
 
@@ -1035,6 +1053,14 @@ impl ReqwestApiClient {
             .await
     }
 
+    pub(crate) async fn list_devices_readonly(
+        &self,
+        session: &ChatSessionSnapshot,
+    ) -> Result<Vec<DeviceInfo>> {
+        self.ensure_session_current(session)?;
+        self.list_devices_for_session(session).await
+    }
+
     pub(crate) async fn resolve_server_device_id_for_local_uuid_with_session(
         &self,
         session: &ChatSessionSnapshot,
@@ -1094,9 +1120,9 @@ impl ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::chat::get_devices::GetDevicesOutput<String>,
-        >(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::chat::get_devices::GetDevicesOutput<String>>(
+            body.as_ref(),
+        )?;
 
         Ok(output
             .devices
@@ -1232,14 +1258,14 @@ impl ReqwestApiClient {
             .map(|d| DeviceInfo {
                 device_id: d.device.device_id.to_string(),
                 mls_did: session.actor_did.clone(),
-                device_uuid: d.device.key_id.to_string(),
-                created_at: None,
+                device_uuid: d.device.device_id.to_string(),
+                created_at: d.device.created_at.as_str().parse().ok(),
                 key_id: Some(d.device.key_id.to_string()),
-                signature_public_key: None,
-                auth_generation: Some(i64::try_from(d.device.auth_generation).unwrap_or(i64::MAX)),
+                signature_public_key: Some(d.device.signature_public_key.to_vec()),
+                auth_generation: Some(d.device.auth_generation),
                 status: Some(d.device.status.to_string()),
-                available_package_count: d.device.available_package_count.try_into().ok(),
-                reserved_package_count: d.device.reserved_package_count.try_into().ok(),
+                available_package_count: u32::try_from(d.device.available_package_count).ok(),
+                reserved_package_count: u32::try_from(d.device.reserved_package_count).ok(),
             })
             .collect())
     }
@@ -1713,11 +1739,13 @@ impl MLSAPIClient for ReqwestApiClient {
 
         self.ensure_session_current(&session)?;
 
-        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-            status,
-            content_type,
-            body,
-        })
+        Ok(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type,
+                body,
+            },
+        )
     }
 
     async fn get_conversations(
@@ -1789,9 +1817,9 @@ impl MLSAPIClient for ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         self.ensure_session_current(&session)?;
-        let output = parse_lexicon_json::<
-            blue_catbird::chat::get_devices::GetDevicesOutput<String>,
-        >(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::chat::get_devices::GetDevicesOutput<String>>(
+            body.as_ref(),
+        )?;
 
         Ok(output
             .devices
@@ -2124,10 +2152,9 @@ mod tests {
         }
     }
 
-    fn list_devices_body(did: &str, device_id: &str, device_uuid: &str) -> String {
-        let _ = did;
+    fn list_devices_body(device_id: &str) -> String {
         format!(
-            r#"{{"hasMore":false,"items":[{{"device":{{"authGeneration":1,"availablePackageCount":1,"createdAt":"2026-08-17T00:00:00.000Z","deviceId":"{device_id}","dpopJkt":"jkt-test","keyId":"{device_uuid}","reservedPackageCount":0,"signaturePublicKey":{{"$bytes":"AAECAwQ="}},"status":"active","updatedAt":"2026-08-17T00:00:00.000Z"}}}}],"snapshotExpiresAt":"2026-08-17T00:00:00.000Z"}}"#
+            r#"{{"hasMore":false,"items":[{{"device":{{"authGeneration":1,"availablePackageCount":1,"createdAt":"2026-08-17T00:00:00.000Z","deviceId":"{device_id}","dpopJkt":"jkt-test","keyId":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","reservedPackageCount":0,"signaturePublicKey":{{"$bytes":"AAECAwQ="}},"status":"active","updatedAt":"2026-08-17T00:00:00.000Z"}}}}],"snapshotExpiresAt":"2026-08-17T00:00:00.000Z"}}"#
         )
     }
 
@@ -2148,7 +2175,7 @@ mod tests {
 
         let (base_url, requests) = spawn_scripted_json_server(vec![(
             200,
-            list_devices_body(did_a, "server-device-a", "local-device-a"),
+            list_devices_body("11111111-1111-4111-8111-111111111111"),
             std::time::Duration::from_millis(150),
         )]);
         let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
@@ -2156,7 +2183,7 @@ mod tests {
         let task_client = client.clone();
         let task = tokio::spawn(async move {
             task_client
-                .resolve_server_device_id_for_local_uuid("local-device-a")
+                .resolve_server_device_id_for_local_uuid("11111111-1111-4111-8111-111111111111")
                 .await
         });
 
@@ -2212,7 +2239,7 @@ mod tests {
         store.clear_all(did).await.expect("clear success fixture");
         let (base_url, requests) = spawn_scripted_json_server(vec![(
             200,
-            list_devices_body(did, "server-device-success", "local-device-success"),
+            list_devices_body("22222222-2222-4222-8222-222222222222"),
             std::time::Duration::from_millis(100),
         )]);
         let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
@@ -2220,7 +2247,7 @@ mod tests {
         let task_client = client.clone();
         let task = tokio::spawn(async move {
             task_client
-                .resolve_server_device_id_for_local_uuid("local-device-success")
+                .resolve_server_device_id_for_local_uuid("22222222-2222-4222-8222-222222222222")
                 .await
         });
         let request = requests
@@ -2235,7 +2262,7 @@ mod tests {
             task.await
                 .expect("reconciliation task should join")
                 .expect("captured actor should reconcile successfully"),
-            "server-device-success"
+            "22222222-2222-4222-8222-222222222222"
         );
         assert_eq!(
             store
@@ -2243,7 +2270,7 @@ mod tests {
                 .await
                 .expect("read reconciled server ID")
                 .as_deref(),
-            Some("server-device-success")
+            Some("22222222-2222-4222-8222-222222222222")
         );
         store.clear_all(did).await.expect("clear success fixture");
     }
@@ -2285,178 +2312,6 @@ mod tests {
         assert!(
             client.chat_auth.canonical_read_context().is_ok(),
             "account B authority must survive account A's delayed 401"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(unreachable_code)]
-    async fn delayed_registration_does_not_write_under_switched_account() {
-        let (base_url, requests) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth(
-            "did:plc:delayed-register-a".to_string(),
-            "token-a".to_string(),
-        );
-        let error = <ReqwestApiClient as MLSAPIClient>::register_device(
-            &client,
-            "local-device-a",
-            "test-device",
-            "did:plc:delayed-register-a",
-            &[],
-            &[],
-        )
-        .await
-        .expect_err("legacy registration must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(requests
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-        return;
-        let did_a = "did:plc:delayed-register-a";
-        let did_b = "did:plc:delayed-register-b";
-        let store = crate::credentials::KeyringCredentialStore::try_new()
-            .expect("credential store should initialize");
-        store
-            .clear_all(did_a)
-            .await
-            .expect("clear account A fixture");
-        store
-            .clear_all(did_b)
-            .await
-            .expect("clear account B fixture");
-        let responses = vec![
-            (
-                200,
-                r#"{"deviceId":"server-device-a","mlsDid":"did:plc:delayed-register-a","autoJoinedConvos":[]}"#
-                    .to_string(),
-                std::time::Duration::from_millis(150),
-            ),
-        ];
-        let (base_url, requests) = spawn_scripted_json_server(responses);
-        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
-        client.set_auth(did_a.to_string(), "token-a".to_string());
-        let task_client = client.clone();
-        let task = tokio::spawn(async move {
-            <ReqwestApiClient as MLSAPIClient>::register_device(
-                &*task_client,
-                "local-device-a",
-                "test-device",
-                did_a,
-                &[],
-                &[],
-            )
-            .await
-        });
-
-        let first = requests
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("delayed registerDevice request");
-        assert!(first.path.contains("registerDevice"));
-        client.set_auth(did_b.to_string(), "token-b".to_string());
-
-        let error = task
-            .await
-            .expect("registration task should join")
-            .expect_err("registration must fail after account switch");
-        assert!(
-            error.to_string().contains("session changed"),
-            "unexpected error: {error}"
-        );
-        assert!(store
-            .get_local_device_uuid(did_a)
-            .await
-            .expect("read account A local UUID")
-            .is_none());
-        assert!(
-            store
-                .get_local_device_uuid(did_b)
-                .await
-                .expect("read account B local UUID")
-                .is_none(),
-            "account B must not receive account A registration identity"
-        );
-        assert!(
-            store
-                .get_server_device_id(did_b)
-                .await
-                .expect("read account B server ID")
-                .is_none(),
-            "account B must not receive account A server device ID"
-        );
-        store
-            .clear_all(did_a)
-            .await
-            .expect("clear account A fixture");
-        store
-            .clear_all(did_b)
-            .await
-            .expect("clear account B fixture");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(unreachable_code)]
-    async fn delayed_registration_error_does_not_invalidate_new_account() {
-        let (base_url, requests) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth(
-            "did:plc:delayed-registration-error-a".to_string(),
-            "token-a".to_string(),
-        );
-        let error = <ReqwestApiClient as MLSAPIClient>::register_device(
-            &client,
-            "local-a",
-            "test-device",
-            "did:plc:delayed-registration-error-a",
-            &[],
-            &[],
-        )
-        .await
-        .expect_err("legacy registration must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(requests
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-        return;
-        let did_a = "did:plc:delayed-registration-error-a";
-        let did_b = "did:plc:delayed-registration-error-b";
-        let (base_url, requests) = spawn_scripted_json_server(vec![(
-            401,
-            "{}".to_string(),
-            std::time::Duration::from_millis(150),
-        )]);
-        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
-        client.set_auth(did_a.to_string(), "token-a".to_string());
-        client.chat_auth.set_local_device_for_tests("local-a");
-        client.chat_auth.set_device_for_tests("server-a");
-        client.chat_auth.admit_for_tests(1);
-        let task_client = client.clone();
-        let task = tokio::spawn(async move {
-            <ReqwestApiClient as MLSAPIClient>::register_device(
-                &*task_client,
-                "local-a",
-                "test-device",
-                did_a,
-                &[],
-                &[],
-            )
-            .await
-        });
-        requests
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("delayed registerDevice request");
-        client.set_auth(did_b.to_string(), "token-b".to_string());
-        client.chat_auth.set_local_device_for_tests("local-b");
-        client.chat_auth.set_device_for_tests("server-b");
-        client.chat_auth.admit_for_tests(1);
-
-        let error = task
-            .await
-            .expect("registration task should join")
-            .expect_err("delayed registration 401 must fail");
-        assert!(error.to_string().contains("401"));
-        assert!(
-            client.chat_auth.canonical_read_context().is_ok(),
-            "account B authority must survive account A's delayed registration error"
         );
     }
 
@@ -2524,52 +2379,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_key_package_fails_closed_without_signed_adapter() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-        client.set_publish_device_id_for_tests("device-uuid-123");
-
-        let error = client
-            .publish_key_package(
-                b"test-key-package",
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                "2099-01-01T00:00:00Z",
-                None,
-            )
-            .await
-            .expect_err("legacy key-package publishing must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn generic_send_message_fails_closed_without_canonical_signed_adapter() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-
-        let error = <ReqwestApiClient as MLSAPIClient>::send_message(
-            &client,
-            "conversation-id",
-            b"cipher",
-            7,
-        )
-        .await
-        .expect_err("generic MLS sends must not use an unsigned legacy route");
-        assert!(error
-            .to_string()
-            .contains("legacy mlsChat sendMessage is disabled"));
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "fail-closed send must not reach the legacy HTTP endpoint"
-        );
-    }
-
-    #[tokio::test]
     async fn every_legacy_mutation_gate_stops_before_bearer_http() {
         let (base_url, rx) = spawn_capture_server();
         let client = ReqwestApiClient::new(base_url);
@@ -2618,43 +2427,6 @@ mod tests {
             .expect("canonical blob request must carry the server device ID");
         assert_eq!(device_header.1, "server-device-1");
     }
-
-    #[tokio::test]
-    async fn report_recovery_failure_fails_closed_without_signed_adapter() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-
-        let error = client
-            .report_recovery_failure(
-                "convo-x",
-                "external_commit_exhausted",
-                Some("deadbeefcafe1234"),
-                Some("local_state_loss"),
-            )
-            .await
-            .expect_err("legacy recovery report must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn report_recovery_failure_without_fields_fails_closed() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-
-        let error = client
-            .report_recovery_failure("convo-y", "remote_data_error", None, None)
-            .await
-            .expect_err("legacy recovery report must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-    }
 }
 
 #[test]
@@ -2698,10 +2470,10 @@ fn test_device_info(device_id: &str, device_uuid: &str) -> DeviceInfo {
         mls_did: "did:plc:catmos".to_string(),
         device_uuid: device_uuid.to_string(),
         created_at: None,
-        key_id: None,
+        key_id: Some(device_uuid.to_string()),
         signature_public_key: None,
         auth_generation: None,
-        status: None,
+        status: Some("active".to_string()),
         available_package_count: None,
         reserved_package_count: None,
     }

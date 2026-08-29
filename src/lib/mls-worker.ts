@@ -2,6 +2,15 @@
 import { expose } from 'comlink';
 import init, * as wasm from 'catbird-mls-web';
 
+type WasmLifecycleExports = {
+	setContentRootKey: (key: Uint8Array) => void;
+	clearContentRootKey: () => void;
+	catbird_mls_clear_signer_bridge: () => void;
+};
+
+// wasm-bindgen's generated declarations omit these configured export names.
+const lifecycleExports = wasm as unknown as WasmLifecycleExports;
+
 // Initialize the WASM binary when the worker starts.
 // Stored as a module-level promise — each exposed method awaits it before calling WASM.
 // NOT exposed as a property (Promises can't be structured-cloned across the Worker boundary).
@@ -11,6 +20,11 @@ const wasmReady = init().then(() => undefined);
 // Active WebSocket subscriptions keyed by conversation ID.
 // WsSubscription structs can't cross the Worker boundary, so we track them here.
 const subscriptions = new Map<string, { close(): void }>();
+
+const closeSubscriptions = () => {
+	for (const sub of subscriptions.values()) sub.close();
+	subscriptions.clear();
+};
 
 // WASM return values may contain non-cloneable JsValue handles.
 // Strip them to plain JSON-safe objects for structured clone across Worker boundary.
@@ -22,13 +36,42 @@ const api = {
 	init: async (config: object) => {
 		await wasmReady;
 		await wasm.catbird_mls_init(config);
+		closeSubscriptions();
+	},
+	probeFreshCreation: async (storagePrefix: string, dbPrefix: string) => {
+		await wasmReady;
+		await wasm.catbird_mls_init({
+			baseUrl: 'https://api.catbird.blue',
+			storagePrefix,
+			dbPrefix,
+			probeOnly: true
+		});
 	},
 	setAuth: (did: string, token: string) => {
 		wasm.catbird_mls_set_auth(did, token);
 	},
 	clearAuth: () => {
 		wasm.catbird_mls_clear_auth();
-		(wasm as unknown as { catbird_mls_clear_signer_bridge: () => void }).catbird_mls_clear_signer_bridge();
+		lifecycleExports.clearContentRootKey();
+		lifecycleExports.catbird_mls_clear_signer_bridge();
+		closeSubscriptions();
+	},
+	close: closeSubscriptions,
+	resetCleanStorage: async (config?: {
+		storagePrefix?: string;
+		dbPrefix?: string;
+		boundDid?: string;
+	}) => {
+		await wasmReady;
+		await wasm.catbird_mls_init({
+			baseUrl: 'https://api.catbird.blue',
+			storagePrefix: config?.storagePrefix,
+			dbPrefix: config?.dbPrefix,
+			actorDid: config?.boundDid,
+			boundDid: config?.boundDid,
+			reset: true
+		});
+		closeSubscriptions();
 	},
 	// Browser signer bridge. The CryptoKey remains owned by the worker's
 	// WebCrypto implementation; only its public key and a callback cross into
@@ -88,15 +131,14 @@ const api = {
 	// the bytes from localStorage. wasm-bindgen exports the function as
 	// `setContentRootKey`/`clearContentRootKey` (see catbird-mls-web/src/lib.rs).
 	setContentRootKey: (key: Uint8Array) => {
-		(wasm as unknown as { setContentRootKey: (k: Uint8Array) => void }).setContentRootKey(
-			key
-		);
+		lifecycleExports.setContentRootKey(key);
 	},
 	clearContentRootKey: () => {
-		(wasm as unknown as { clearContentRootKey: () => void }).clearContentRootKey();
+		lifecycleExports.clearContentRootKey();
 	},
 	setup: async () => {
 		await wasm.catbird_mls_setup();
+		wasm.catbird_mls_start_background_tasks(30_000);
 	},
 	replenishKeyPackages: async () => {
 		await wasm.catbird_mls_replenish_key_packages();

@@ -1,5 +1,8 @@
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use catbird_mls::orchestrator::error::{OrchestratorError, Result};
@@ -7,6 +10,2358 @@ use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::orchestrator::types::*;
 use catbird_mls::MLSContext;
 
+pub const MLS_STORAGE_GENERATION: &str = "mls-state-clean-v2-openmls-v09";
+pub const MLS_KEY_SUFFIX: &str = "clean-v2-openmls-v09";
+pub const DB_KEYRING_SERVICE: &str = "blue.catbird.catmos.clean-v2-openmls-v09";
+
+pub fn app_db_file_name(account_id: &str) -> String {
+    format!("catmos-{}-{}.db", account_id, MLS_KEY_SUFFIX)
+}
+
+pub fn mls_db_file_name(account_id: &str) -> String {
+    format!("mls-{}-{}.db", account_id, MLS_KEY_SUFFIX)
+}
+
+pub fn app_db_key_label(account_id: &str) -> String {
+    format!("conversation-db:{}:{}", account_id, MLS_KEY_SUFFIX)
+}
+
+pub fn mls_db_key_label(account_id: &str) -> String {
+    format!("mls-db:{}:{}", account_id, MLS_KEY_SUFFIX)
+}
+
+pub fn account_marker_path(data_dir: &Path, account_id: &str) -> PathBuf {
+    data_dir.join(format!("catmos-{}-{}.marker", account_id, MLS_KEY_SUFFIX))
+}
+
+pub struct AccountLock {
+    _file: std::fs::File,
+}
+
+pub(crate) fn acquire_account_lock(
+    data_dir: &Path,
+    account_id: &str,
+) -> std::result::Result<AccountLock, DatabaseInitError> {
+    let lock_path = data_dir.join(format!("{}-{}.lock", account_id, MLS_KEY_SUFFIX));
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    use fs2::FileExt;
+    file.lock_exclusive()?;
+    Ok(AccountLock { _file: file })
+}
+
+#[derive(Debug)]
+pub enum DatabaseInitError {
+    MixedStateAbsentDbPresentKey,
+    MixedStatePresentDbAbsentKey,
+    MixedStateMissingMarker,
+    InitializationIncomplete,
+    InvalidMarker(String),
+    KeyringError(String),
+    InvalidKeyFormat,
+    ValidationFailed(String),
+    Io(std::io::Error),
+    Sqlite(rusqlite::Error),
+}
+
+impl fmt::Display for DatabaseInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MixedStateAbsentDbPresentKey => {
+                write!(
+                    f,
+                    "mixed storage state: database file is absent but key exists in secure store"
+                )
+            }
+            Self::MixedStatePresentDbAbsentKey => {
+                write!(
+                    f,
+                    "mixed storage state: database file is present but key is absent from secure store"
+                )
+            }
+            Self::MixedStateMissingMarker => {
+                write!(
+                    f,
+                    "mixed storage state: database or key exists without complete initialization marker"
+                )
+            }
+            Self::InitializationIncomplete => {
+                write!(
+                    f,
+                    "storage initialization was interrupted in creating state; explicit reset required"
+                )
+            }
+            Self::InvalidMarker(msg) => {
+                write!(
+                    f,
+                    "storage initialization record is corrupt or invalid: {msg}"
+                )
+            }
+            Self::KeyringError(msg) => {
+                write!(f, "secure store access failed: {msg}")
+            }
+            Self::InvalidKeyFormat => {
+                write!(
+                    f,
+                    "invalid key format in secure store: expected 64 hex characters (32 bytes)"
+                )
+            }
+            Self::ValidationFailed(msg) => {
+                write!(f, "database validation failed: {msg}")
+            }
+            Self::Io(err) => write!(f, "database I/O error: {err}"),
+            Self::Sqlite(err) => write!(f, "database SQLite error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for DatabaseInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Sqlite(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for DatabaseInitError {
+    fn from(err: std::io::Error) -> Self {
+        Self::Io(err)
+    }
+}
+
+impl From<rusqlite::Error> for DatabaseInitError {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Sqlite(err)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MarkerStatus {
+    Creating,
+    Complete,
+}
+
+pub fn read_account_marker(
+    marker_path: &Path,
+    expected_normalized_did: &str,
+    expected_account_id: &str,
+    expected_app_db_name: &str,
+    expected_mls_db_name: &str,
+) -> std::result::Result<Option<MarkerStatus>, DatabaseInitError> {
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(marker_path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() {
+        return Err(DatabaseInitError::InvalidMarker("empty marker file".into()));
+    }
+    let status_str = lines[0].trim();
+    let status = match status_str {
+        "creating" => MarkerStatus::Creating,
+        "complete" => MarkerStatus::Complete,
+        other => {
+            return Err(DatabaseInitError::InvalidMarker(format!(
+                "unknown marker content: {other}"
+            )));
+        }
+    };
+    if lines.len() != 6 {
+        return Err(DatabaseInitError::InvalidMarker(format!(
+            "invalid marker line count: expected exactly 6 lines, got {}",
+            lines.len()
+        )));
+    }
+    let normalized_did = lines[1].trim();
+    let account_id = lines[2].trim();
+    let generation = lines[3].trim();
+    let app_db_name = lines[4].trim();
+    let mls_db_name = lines[5].trim();
+
+    if normalized_did != expected_normalized_did {
+        return Err(DatabaseInitError::InvalidMarker(format!(
+            "marker normalized DID mismatch: expected {expected_normalized_did}, got {normalized_did}"
+        )));
+    }
+    if account_id != expected_account_id {
+        return Err(DatabaseInitError::InvalidMarker(format!(
+            "marker account ID mismatch: expected {expected_account_id}, got {account_id}"
+        )));
+    }
+    if generation != MLS_STORAGE_GENERATION {
+        return Err(DatabaseInitError::InvalidMarker(format!(
+            "marker generation mismatch: expected {MLS_STORAGE_GENERATION}, got {generation}"
+        )));
+    }
+    if app_db_name != expected_app_db_name {
+        return Err(DatabaseInitError::InvalidMarker(format!(
+            "marker app db name mismatch: expected {expected_app_db_name}, got {app_db_name}"
+        )));
+    }
+    if mls_db_name != expected_mls_db_name {
+        return Err(DatabaseInitError::InvalidMarker(format!(
+            "marker mls db name mismatch: expected {expected_mls_db_name}, got {mls_db_name}"
+        )));
+    }
+    Ok(Some(status))
+}
+
+pub fn write_account_marker_creating(
+    marker_path: &Path,
+    normalized_did: &str,
+    account_id: &str,
+    app_db_name: &str,
+    mls_db_name: &str,
+) -> std::result::Result<(), DatabaseInitError> {
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker_path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                DatabaseInitError::InvalidMarker("marker already exists during create".into())
+            } else {
+                DatabaseInitError::Io(e)
+            }
+        })?;
+    let content = format!(
+        "creating\n{}\n{}\n{}\n{}\n{}\n",
+        normalized_did, account_id, MLS_STORAGE_GENERATION, app_db_name, mls_db_name
+    );
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub fn write_account_marker_complete(
+    marker_path: &Path,
+    normalized_did: &str,
+    account_id: &str,
+    app_db_name: &str,
+    mls_db_name: &str,
+) -> std::result::Result<(), DatabaseInitError> {
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = format!(
+        "complete\n{}\n{}\n{}\n{}\n{}\n",
+        normalized_did, account_id, MLS_STORAGE_GENERATION, app_db_name, mls_db_name
+    );
+    let tmp_path = format!("{}.tmp.{}", marker_path.display(), uuid::Uuid::new_v4());
+    let write_res = (|| -> std::result::Result<(), std::io::Error> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp_path, marker_path)?;
+        Ok(())
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(DatabaseInitError::Io(e));
+    }
+    Ok(())
+}
+
+pub trait DbKeyStore: Send + Sync {
+    fn get_password(
+        &self,
+        service: &str,
+        label: &str,
+    ) -> std::result::Result<Option<String>, DatabaseInitError>;
+    fn set_password(
+        &self,
+        service: &str,
+        label: &str,
+        password: &str,
+    ) -> std::result::Result<(), DatabaseInitError>;
+    fn delete_password(
+        &self,
+        service: &str,
+        label: &str,
+    ) -> std::result::Result<(), DatabaseInitError>;
+}
+
+pub struct KeyringDbKeyStore;
+
+impl DbKeyStore for KeyringDbKeyStore {
+    fn get_password(
+        &self,
+        service: &str,
+        label: &str,
+    ) -> std::result::Result<Option<String>, DatabaseInitError> {
+        let entry = keyring::Entry::new(service, label)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+        match entry.get_password() {
+            Ok(val) => Ok(Some(val)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+        }
+    }
+
+    fn set_password(
+        &self,
+        service: &str,
+        label: &str,
+        password: &str,
+    ) -> std::result::Result<(), DatabaseInitError> {
+        let entry = keyring::Entry::new(service, label)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+        entry
+            .set_password(password)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))
+    }
+
+    fn delete_password(
+        &self,
+        service: &str,
+        label: &str,
+    ) -> std::result::Result<(), DatabaseInitError> {
+        let entry = keyring::Entry::new(service, label)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(DatabaseInitError::KeyringError(e.to_string())),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct MemoryDbKeyStore {
+    entries: Mutex<HashMap<(String, String), String>>,
+}
+
+impl MemoryDbKeyStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl DbKeyStore for MemoryDbKeyStore {
+    fn get_password(
+        &self,
+        service: &str,
+        label: &str,
+    ) -> std::result::Result<Option<String>, DatabaseInitError> {
+        let guard = self.entries.lock().unwrap();
+        Ok(guard
+            .get(&(service.to_string(), label.to_string()))
+            .cloned())
+    }
+
+    fn set_password(
+        &self,
+        service: &str,
+        label: &str,
+        password: &str,
+    ) -> std::result::Result<(), DatabaseInitError> {
+        let mut guard = self.entries.lock().unwrap();
+        guard.insert(
+            (service.to_string(), label.to_string()),
+            password.to_string(),
+        );
+        Ok(())
+    }
+
+    fn delete_password(
+        &self,
+        service: &str,
+        label: &str,
+    ) -> std::result::Result<(), DatabaseInitError> {
+        let mut guard = self.entries.lock().unwrap();
+        guard.remove(&(service.to_string(), label.to_string()));
+        Ok(())
+    }
+}
+
+/// Accept only a 64-character lowercase-or-uppercase hex SQLCipher key.
+fn checked_db_key(raw: &str) -> std::result::Result<String, DatabaseInitError> {
+    let trimmed = raw.trim();
+    if trimmed.len() == 64 && hex::decode(trimmed).is_ok() {
+        Ok(trimmed.to_string())
+    } else {
+        Err(DatabaseInitError::InvalidKeyFormat)
+    }
+}
+
+/// Map a SQLite declared column type onto the storage class the schema
+/// descriptors are written in, following SQLite's own affinity substring rules.
+fn column_storage_class(declared: &str) -> Option<&'static str> {
+    let upper = declared.to_uppercase();
+    if upper.contains("INT") {
+        Some("INTEGER")
+    } else if upper.contains("TEXT") || upper.contains("CHAR") {
+        Some("TEXT")
+    } else if upper.contains("BLOB") {
+        Some("BLOB")
+    } else {
+        None
+    }
+}
+
+pub fn load_db_key_from_store(
+    store: &dyn DbKeyStore,
+    service: &str,
+    label: &str,
+) -> std::result::Result<Option<String>, DatabaseInitError> {
+    store
+        .get_password(service, label)?
+        .map(|pwd| checked_db_key(&pwd))
+        .transpose()
+}
+
+pub fn create_db_key_in_store(
+    store: &dyn DbKeyStore,
+    service: &str,
+    label: &str,
+) -> std::result::Result<String, DatabaseInitError> {
+    if let Some(existing) = store.get_password(service, label)? {
+        return checked_db_key(&existing);
+    }
+
+    let mut key_bytes = [0u8; 32];
+    getrandom::getrandom(&mut key_bytes)
+        .map_err(|e| DatabaseInitError::ValidationFailed(format!("RNG failure: {e}")))?;
+    let hex_key = hex::encode(key_bytes);
+    store.set_password(service, label, &hex_key)?;
+
+    // Re-read so a concurrent writer's value, not ours, becomes the key in use.
+    let winner = store
+        .get_password(service, label)?
+        .ok_or_else(|| DatabaseInitError::KeyringError("key missing after set".into()))?;
+    checked_db_key(&winner)
+}
+
+pub fn derive_cipher_salt_hex(encryption_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(encryption_key.as_bytes());
+    let digest = hasher.finalize();
+    hex::encode(&digest[..16])
+}
+
+/// Open the MLS SQLCipher database read-only with the exact cipher parameters
+/// `MLSContext` writes with. Every read-only inspection of the MLS DB must go
+/// through here so the parameters can never drift between call sites.
+fn open_mls_db_readonly(
+    path: &Path,
+    encryption_key: &str,
+) -> std::result::Result<Connection, DatabaseInitError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.pragma_update(None, "cipher_memory_security", "OFF")?;
+    conn.pragma_update(None, "key", encryption_key)?;
+    conn.pragma_update(None, "cipher_plaintext_header_size", 32)?;
+    let salt_hex = derive_cipher_salt_hex(encryption_key);
+    conn.pragma_update(None, "cipher_salt", format!("x'{}'", salt_hex))?;
+    conn.pragma_update(None, "cipher_page_size", 4096)?;
+    conn.pragma_update(None, "kdf_iter", 256000)?;
+    conn.pragma_update(None, "cipher_hmac_algorithm", "HMAC_SHA512")?;
+    conn.pragma_update(None, "cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512")?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    Ok(conn)
+}
+
+pub fn validate_mls_db_readonly(
+    path: &Path,
+    encryption_key: &str,
+) -> std::result::Result<(), DatabaseInitError> {
+    let conn = open_mls_db_readonly(path, encryption_key)?;
+
+    // 1. Validate openmls_sqlite_storage_migrations has EXACTLY versions 1..=6
+    let mut stmt = conn
+        .prepare("SELECT version FROM openmls_sqlite_storage_migrations ORDER BY version ASC")
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!(
+                "openmls_sqlite_storage_migrations missing or invalid: {e}"
+            ))
+        })?;
+    let versions: Vec<i32> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("Failed to query migration versions: {e}"))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    if versions != vec![1, 2, 3, 4, 5, 6] {
+        return Err(DatabaseInitError::ValidationFailed(format!(
+            "Refinery schema versions mismatch: expected [1, 2, 3, 4, 5, 6], found {versions:?}"
+        )));
+    }
+
+    // 2. Validate all expected OpenMLS and Catbird tables and exact column descriptors exist
+    #[derive(Debug, PartialEq, Eq)]
+    struct ColumnDescriptor {
+        name: &'static str,
+        col_type: &'static str,
+        notnull: bool,
+        pk: i32,
+    }
+
+    struct TableDescriptor {
+        name: &'static str,
+        columns: &'static [ColumnDescriptor],
+    }
+
+    const REQUIRED_TABLE_DESCRIPTORS: &[TableDescriptor] = &[
+        TableDescriptor {
+            name: "openmls_sqlite_storage_migrations",
+            columns: &[
+                ColumnDescriptor {
+                    name: "version",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "name",
+                    col_type: "TEXT",
+                    notnull: false,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "applied_on",
+                    col_type: "TEXT",
+                    notnull: false,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "checksum",
+                    col_type: "TEXT",
+                    notnull: false,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_encryption_keys",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "public_key",
+                    col_type: "BLOB",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "key_pair",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_epoch_keys_pairs",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "epoch_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 2,
+                },
+                ColumnDescriptor {
+                    name: "leaf_index",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 3,
+                },
+                ColumnDescriptor {
+                    name: "key_pairs",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_group_data",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "data_type",
+                    col_type: "TEXT",
+                    notnull: true,
+                    pk: 2,
+                },
+                ColumnDescriptor {
+                    name: "group_data",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_key_packages",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "key_package_ref",
+                    col_type: "BLOB",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "key_package",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_own_leaf_nodes",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "id",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "leaf_node",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_proposals",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "proposal_ref",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 2,
+                },
+                ColumnDescriptor {
+                    name: "proposal",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_psks",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "psk_id",
+                    col_type: "BLOB",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "psk_bundle",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "openmls_signature_keys",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "public_key",
+                    col_type: "BLOB",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "signature_key",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "vc_emulation_group_secrets",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "epoch_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "secret_type",
+                    col_type: "TEXT",
+                    notnull: true,
+                    pk: 2,
+                },
+                ColumnDescriptor {
+                    name: "vc_secret",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "vc_emulation_bindings",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "bindings",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "vc_operation_trees",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "epoch_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "operation_tree",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "vc_retained_key_package_material",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "key_package_ref",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "epoch_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "record",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "registered_vc_emulation_epochs",
+            columns: &[
+                ColumnDescriptor {
+                    name: "provider_version",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "registration",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "mls_manifests",
+            columns: &[
+                ColumnDescriptor {
+                    name: "key",
+                    col_type: "TEXT",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "value",
+                    col_type: "TEXT",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "mls_key_package_bundles",
+            columns: &[
+                ColumnDescriptor {
+                    name: "hash_ref",
+                    col_type: "TEXT",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "bundle_b64",
+                    col_type: "TEXT",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "created_at",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "mls_own_echo_proofs",
+            columns: &[
+                ColumnDescriptor {
+                    name: "canonical_entry_sha256",
+                    col_type: "BLOB",
+                    notnull: false,
+                    pk: 1,
+                },
+                ColumnDescriptor {
+                    name: "accepted_request_sha256",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "group_id",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "server_entry_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "mls_epoch",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "aad_sha256",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+                ColumnDescriptor {
+                    name: "ciphertext_sha256",
+                    col_type: "BLOB",
+                    notnull: true,
+                    pk: 0,
+                },
+            ],
+        },
+    ];
+
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("MLS DB prepare sqlite_master failed: {e}"))
+        })?;
+    let existing_tables: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!(
+                "MLS DB query_map sqlite_master failed: {e}"
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    for desc in REQUIRED_TABLE_DESCRIPTORS {
+        if !existing_tables.contains(desc.name) {
+            return Err(DatabaseInitError::ValidationFailed(format!(
+                "MLS DB missing required clean-v09 table: {}",
+                desc.name
+            )));
+        }
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", desc.name))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to query table_info for {}: {e}",
+                    desc.name
+                ))
+            })?;
+        let actual_cols: Vec<ColumnDescriptor> = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let col_type: String = row.get(2)?;
+                let notnull: bool = row.get::<_, i32>(3)? != 0;
+                let pk: i32 = row.get(5)?;
+                Ok((name, col_type, notnull, pk))
+            })
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to map column info for {}: {e}",
+                    desc.name
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(name, col_type, notnull, pk)| {
+                let static_name = desc
+                    .columns
+                    .iter()
+                    .find(|c| c.name == name)
+                    .map(|c| c.name)
+                    .unwrap_or("");
+                let static_type = column_storage_class(&col_type).unwrap_or("");
+                ColumnDescriptor {
+                    name: static_name,
+                    col_type: static_type,
+                    notnull,
+                    pk,
+                }
+            })
+            .collect();
+        if actual_cols != desc.columns {
+            return Err(DatabaseInitError::ValidationFailed(format!(
+                "MLS DB table `{}` schema mismatch (expected {:?}, found {:?})",
+                desc.name, desc.columns, actual_cols
+            )));
+        }
+    }
+
+    // 3. Validate index vc_retained_key_package_material_epoch_id
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'vc_retained_key_package_material'")
+        .map_err(|e| DatabaseInitError::ValidationFailed(format!("Failed to query index list: {e}")))?;
+    let indices: std::collections::HashSet<String> = stmt
+        .query_map([], |row| row.get(0))
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("Failed to read index names: {e}"))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+    if !indices.contains("vc_retained_key_package_material_epoch_id") {
+        return Err(DatabaseInitError::ValidationFailed(
+            "MLS DB missing required index vc_retained_key_package_material_epoch_id".into(),
+        ));
+    }
+
+    let quick_check: String = conn
+        .pragma_query_value(None, "quick_check", |row| row.get(0))
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("MLS DB quick_check query failed: {e}"))
+        })?;
+    if quick_check != "ok" {
+        return Err(DatabaseInitError::ValidationFailed(format!(
+            "MLS DB quick_check returned: {quick_check}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_app_db_readonly(
+    path: &Path,
+    encryption_key: &str,
+) -> std::result::Result<(), DatabaseInitError> {
+    let conn = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.execute_batch(&format!("PRAGMA key = '{}';", encryption_key))?;
+    conn.pragma_update(None, "query_only", "ON")?;
+    #[cfg(target_os = "android")]
+    {
+        let version: String = conn
+            .pragma_query_value(None, "cipher_version", |row| row.get(0))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!("cipher_version query failed: {e}"))
+            })?;
+        if version.is_empty() {
+            return Err(DatabaseInitError::ValidationFailed(
+                "Android SQLCipher probe returned empty cipher_version".into(),
+            ));
+        }
+    }
+
+    // 1. Check for extra objects (tables, views, triggers) and inspect table DDL SQL in sqlite_master
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+        )
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("App DB prepare sqlite_master failed: {e}"))
+        })?;
+
+    let mut existing_tables = std::collections::BTreeSet::new();
+    let rows = stmt
+        .query_map([], |row| {
+            let obj_type: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let tbl_name: String = row.get(2)?;
+            let sql: Option<String> = row.get(3)?;
+            Ok((obj_type, name, tbl_name, sql))
+        })
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!(
+                "App DB query_map sqlite_master failed: {e}"
+            ))
+        })?;
+
+    for row_res in rows {
+        let (obj_type, name, _tbl_name, sql_opt) = row_res.map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("Failed to read sqlite_master row: {e}"))
+        })?;
+        match obj_type.as_str() {
+            "table" => {
+                if let Some(ref sql) = sql_opt {
+                    let sql_upper = sql.to_uppercase();
+                    const FORBIDDEN_DDL: &[(&[&str], &str)] = &[
+                        (&[" CHECK", "CHECK(", "CHECK ("], "CHECK constraint"),
+                        (&["STRICT"], "STRICT option"),
+                        (&["WITHOUT ROWID"], "WITHOUT ROWID option"),
+                        (&["GENERATED", " AS (", " AS("], "GENERATED column"),
+                        (&["COLLATE"], "COLLATE clause"),
+                        (&["REFERENCES"], "FOREIGN KEY constraint"),
+                    ];
+                    for (needles, what) in FORBIDDEN_DDL {
+                        if needles.iter().any(|needle| sql_upper.contains(*needle)) {
+                            return Err(DatabaseInitError::ValidationFailed(format!(
+                                "App DB table `{name}` has unexpected {what} in DDL"
+                            )));
+                        }
+                    }
+                }
+                existing_tables.insert(name);
+            }
+            "view" => {
+                return Err(DatabaseInitError::ValidationFailed(format!(
+                    "App DB has unexpected view object: {name}"
+                )));
+            }
+            "trigger" => {
+                return Err(DatabaseInitError::ValidationFailed(format!(
+                    "App DB has unexpected trigger object: {name}"
+                )));
+            }
+            "index" => {
+                // Index validation is performed per-table below
+            }
+            other => {
+                return Err(DatabaseInitError::ValidationFailed(format!(
+                    "App DB has unexpected sqlite_master object of type {other}: {name}"
+                )));
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExpectedColumnDescriptor {
+        name: &'static str,
+        col_type: &'static str,
+        notnull: bool,
+        dflt_value: Option<&'static str>,
+        pk: i32,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ActualColumnDescriptor {
+        name: String,
+        col_type: String,
+        notnull: bool,
+        dflt_value: Option<String>,
+        pk: i32,
+    }
+
+    struct TableDescriptor {
+        name: &'static str,
+        columns: &'static [ExpectedColumnDescriptor],
+    }
+
+    const REQUIRED_TABLE_DESCRIPTORS: &[TableDescriptor] = &[
+        TableDescriptor {
+            name: "conversations",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "user_did",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 2,
+                },
+                ExpectedColumnDescriptor {
+                    name: "group_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "epoch",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: Some("0"),
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "state",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: Some("'Active'"),
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "join_method",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "join_epoch",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "needs_rejoin",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: Some("0"),
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "members_json",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: Some("'[]'"),
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "metadata_json",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "metadata_version",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "metadata_blob_locator",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "avatar_blob_locator",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "avatar_bytes",
+                    col_type: "BLOB",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "avatar_content_type",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "created_at",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "updated_at",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "sequencer_did",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "reset_new_group_id",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "reset_generation",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "reset_notified_at_ms",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "quarantine_reason_tag",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "quarantine_since_ms",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "messages",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "id",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "sender_did",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "text",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "timestamp",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "epoch",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "sequence_number",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "is_own",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: Some("0"),
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "delivery_status_json",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "payload_json",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "payload_encrypted",
+                    col_type: "BLOB",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "entry_hmac",
+                    col_type: "BLOB",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "payload_key_version",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "is_tombstone",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: Some("0"),
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "deleted_at",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "sync_cursors",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "user_did",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "conversations_cursor",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "messages_cursor",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "group_states",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "group_id",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "epoch",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "members_json",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: Some("'[]'"),
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "ws_cursors",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "cursor",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "pending_messages",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "message_id",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "created_at",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "recovery_backoffs",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "conversation_id",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "failed_rejoin_count",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "last_attempt_at_ms",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+                ExpectedColumnDescriptor {
+                    name: "quarantined_until_ms",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "recovery_globals",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "key",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "val_int",
+                    col_type: "INTEGER",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+        TableDescriptor {
+            name: "migration_status",
+            columns: &[
+                ExpectedColumnDescriptor {
+                    name: "name",
+                    col_type: "TEXT",
+                    notnull: false,
+                    dflt_value: None,
+                    pk: 1,
+                },
+                ExpectedColumnDescriptor {
+                    name: "applied_at",
+                    col_type: "INTEGER",
+                    notnull: true,
+                    dflt_value: None,
+                    pk: 0,
+                },
+            ],
+        },
+    ];
+
+    let expected_tables: std::collections::BTreeSet<String> = REQUIRED_TABLE_DESCRIPTORS
+        .iter()
+        .map(|d| d.name.to_string())
+        .collect();
+
+    if existing_tables != expected_tables {
+        return Err(DatabaseInitError::ValidationFailed(format!(
+            "App DB table set mismatch: expected {expected_tables:?}, found {existing_tables:?}"
+        )));
+    }
+
+    for desc in REQUIRED_TABLE_DESCRIPTORS {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({})", desc.name))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to query table_info for {}: {e}",
+                    desc.name
+                ))
+            })?;
+        let actual_cols: Vec<ActualColumnDescriptor> = stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let col_type_raw: String = row.get(2)?;
+                let notnull: bool = row.get::<_, i32>(3)? != 0;
+                let dflt_value: Option<String> = row.get(4)?;
+                let pk: i32 = row.get(5)?;
+                let col_type = match column_storage_class(&col_type_raw) {
+                    Some(class) => class.to_string(),
+                    None => col_type_raw,
+                };
+                Ok(ActualColumnDescriptor {
+                    name,
+                    col_type,
+                    notnull,
+                    dflt_value,
+                    pk,
+                })
+            })
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to map column info for {}: {e}",
+                    desc.name
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let mismatch = actual_cols.len() != desc.columns.len()
+            || actual_cols
+                .iter()
+                .zip(desc.columns.iter())
+                .any(|(actual, expected)| {
+                    actual.name != expected.name
+                        || actual.col_type != expected.col_type
+                        || actual.notnull != expected.notnull
+                        || actual.dflt_value.as_deref() != expected.dflt_value
+                        || actual.pk != expected.pk
+                });
+        if mismatch {
+            return Err(DatabaseInitError::ValidationFailed(format!(
+                "App DB table `{}` schema mismatch (expected {:?}, found {:?})",
+                desc.name, desc.columns, actual_cols
+            )));
+        }
+
+        // Validate foreign keys: expect exactly zero foreign keys for every table
+        let mut fk_stmt = conn
+            .prepare(&format!("PRAGMA foreign_key_list({})", desc.name))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to query foreign_key_list for {}: {e}",
+                    desc.name
+                ))
+            })?;
+        let fk_count: usize = fk_stmt
+            .query_map([], |_r| Ok(()))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!("Failed to read FK list: {e}"))
+            })?
+            .count();
+        if fk_count > 0 {
+            return Err(DatabaseInitError::ValidationFailed(format!(
+                "App DB table `{}` has unexpected foreign keys (count: {fk_count})",
+                desc.name
+            )));
+        }
+
+        // Validate indices for this table
+        let mut idx_stmt = conn
+            .prepare(&format!("PRAGMA index_list({})", desc.name))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to query index_list for {}: {e}",
+                    desc.name
+                ))
+            })?;
+        let table_indices: Vec<(String, bool, String, bool)> = idx_stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let unique: bool = row.get::<_, i32>(2)? != 0;
+                let origin: String = row.get(3)?;
+                let partial: bool = row.get::<_, i32>(4)? != 0;
+                Ok((name, unique, origin, partial))
+            })
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "Failed to map index list for {}: {e}",
+                    desc.name
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        if desc.name == "messages" {
+            // messages must have exactly: 1 pk autoindex, and idx_messages_convo_seq (non-unique, non-partial)
+            let mut has_expected_user_idx = false;
+            for (idx_name, unique, origin, partial) in &table_indices {
+                if idx_name == "idx_messages_convo_seq" {
+                    if *unique || *partial || origin != "c" {
+                        return Err(DatabaseInitError::ValidationFailed(format!(
+                            "idx_messages_convo_seq has invalid index properties: unique={unique}, partial={partial}, origin={origin}"
+                        )));
+                    }
+                    // Validate exact column sequence
+                    let mut info_stmt = conn
+                        .prepare("PRAGMA index_info(idx_messages_convo_seq)")
+                        .map_err(|e| {
+                        DatabaseInitError::ValidationFailed(format!(
+                            "Failed to query index_info: {e}"
+                        ))
+                    })?;
+                    let indexed_cols: Vec<(i32, String)> = info_stmt
+                        .query_map([], |row| {
+                            let seqno: i32 = row.get(0)?;
+                            let col_name: String = row.get(2)?;
+                            Ok((seqno, col_name))
+                        })
+                        .map_err(|e| {
+                            DatabaseInitError::ValidationFailed(format!(
+                                "Failed to map index_info: {e}"
+                            ))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    let expected_cols = vec![
+                        (0, "conversation_id".to_string()),
+                        (1, "sequence_number".to_string()),
+                    ];
+                    if indexed_cols != expected_cols {
+                        return Err(DatabaseInitError::ValidationFailed(format!(
+                            "idx_messages_convo_seq column mismatch: expected {expected_cols:?}, found {indexed_cols:?}"
+                        )));
+                    }
+                    has_expected_user_idx = true;
+                } else if origin == "pk" {
+                    // Expected primary key autoindex
+                } else {
+                    return Err(DatabaseInitError::ValidationFailed(format!(
+                        "App DB table messages has unexpected extra index: {idx_name}"
+                    )));
+                }
+            }
+            if !has_expected_user_idx {
+                return Err(DatabaseInitError::ValidationFailed(
+                    "App DB missing required index idx_messages_convo_seq".into(),
+                ));
+            }
+        } else {
+            // All other tables must ONLY have the PK autoindex and NO extra index / UNIQUE constraint
+            for (idx_name, _unique, origin, _partial) in &table_indices {
+                if origin != "pk" {
+                    return Err(DatabaseInitError::ValidationFailed(format!(
+                        "App DB table `{}` has unexpected extra index / constraint: {idx_name}",
+                        desc.name
+                    )));
+                }
+            }
+        }
+    }
+
+    // 2. Validate MLSMessageFieldMigrationV1 status row exists
+    let migration_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM migration_status WHERE name = 'MLSMessageFieldMigrationV1'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!(
+                "App DB migration_status check failed: {e}"
+            ))
+        })?;
+    if migration_count == 0 {
+        return Err(DatabaseInitError::ValidationFailed(
+            "App DB missing MLSMessageFieldMigrationV1 status row".into(),
+        ));
+    }
+
+    let quick_check: String = conn
+        .pragma_query_value(None, "quick_check", |row| row.get(0))
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("App DB quick_check query failed: {e}"))
+        })?;
+    if quick_check != "ok" {
+        return Err(DatabaseInitError::ValidationFailed(format!(
+            "App DB quick_check returned: {quick_check}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn open_clean_account_storage(
+    data_dir: &Path,
+    user_did: &str,
+    service: &str,
+) -> std::result::Result<
+    (
+        Arc<SqliteStorage>,
+        Arc<catbird_mls::MLSContext>,
+        Vec<u8>,
+        AccountLock,
+    ),
+    DatabaseInitError,
+> {
+    open_clean_account_storage_with_store(data_dir, user_did, service, &KeyringDbKeyStore)
+}
+
+pub fn open_clean_account_storage_with_store(
+    data_dir: &Path,
+    user_did: &str,
+    service: &str,
+    store: &dyn DbKeyStore,
+) -> std::result::Result<
+    (
+        Arc<SqliteStorage>,
+        Arc<catbird_mls::MLSContext>,
+        Vec<u8>,
+        AccountLock,
+    ),
+    DatabaseInitError,
+> {
+    let normalized_did = crate::keys::normalize_did(user_did);
+    let account_id = crate::keys::derive_account_id(&normalized_did);
+
+    let lock = acquire_account_lock(data_dir, &account_id)?;
+
+    let app_db_name = app_db_file_name(&account_id);
+    let mls_db_name = mls_db_file_name(&account_id);
+    let app_db_path = data_dir.join(&app_db_name);
+    let mls_state_dir = data_dir.join(MLS_STORAGE_GENERATION);
+    let mls_db_path = mls_state_dir.join(&mls_db_name);
+    let marker_file = account_marker_path(data_dir, &account_id);
+    let content_root_path = crate::keys::content_root_key_path(data_dir, &account_id);
+
+    let app_key_label = app_db_key_label(&account_id);
+    let mls_key_label = mls_db_key_label(&account_id);
+
+    let app_db_exists = app_db_path.exists();
+    let app_sidecars_exist = app_db_path.with_extension("db-wal").exists()
+        || app_db_path.with_extension("db-shm").exists()
+        || app_db_path.with_extension("db-journal").exists();
+
+    let mls_db_exists = mls_db_path.exists();
+    let mls_sidecars_exist = mls_db_path.with_extension("db-wal").exists()
+        || mls_db_path.with_extension("db-shm").exists()
+        || mls_db_path.with_extension("db-journal").exists();
+
+    let app_key_opt = load_db_key_from_store(store, service, &app_key_label)?;
+    let mls_key_opt = load_db_key_from_store(store, service, &mls_key_label)?;
+    let content_root_exists = content_root_path.exists();
+    let marker_opt = read_account_marker(
+        &marker_file,
+        &normalized_did,
+        &account_id,
+        &app_db_name,
+        &mls_db_name,
+    )?;
+
+    let credential_state =
+        crate::credentials::KeyringCredentialStore::check_credential_state(&normalized_did)
+            .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+    let signer_slots_exist =
+        crate::keychain::KeyringKeychainAccess::has_signer_slots_unlocked(&account_id)
+            .map_err(DatabaseInitError::KeyringError)?;
+
+    let credentials_absent =
+        credential_state == crate::credentials::CredentialEnrollmentState::Unenrolled;
+    let all_absent = !app_db_exists
+        && !app_sidecars_exist
+        && !mls_db_exists
+        && !mls_sidecars_exist
+        && app_key_opt.is_none()
+        && mls_key_opt.is_none()
+        && !content_root_exists
+        && marker_opt.is_none()
+        && credentials_absent
+        && !signer_slots_exist;
+
+    let all_present = app_db_exists
+        && mls_db_exists
+        && app_key_opt.is_some()
+        && mls_key_opt.is_some()
+        && content_root_exists
+        && marker_opt == Some(MarkerStatus::Complete);
+    if all_absent {
+        if let Some(parent) = app_db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::create_dir_all(&mls_state_dir)?;
+
+        write_account_marker_creating(
+            &marker_file,
+            &normalized_did,
+            &account_id,
+            &app_db_name,
+            &mls_db_name,
+        )?;
+
+        let content_root_key = crate::keys::create_new_content_root_key(data_dir, &normalized_did)
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "content root key creation failed: {e}"
+                ))
+            })?;
+        if content_root_key.len() != crate::keys::KEY_LEN {
+            return Err(DatabaseInitError::ValidationFailed(
+                "invalid content root key length".into(),
+            ));
+        }
+
+        let app_key = create_db_key_in_store(store, service, &app_key_label)?;
+        let mls_key = create_db_key_in_store(store, service, &mls_key_label)?;
+
+        let storage = Arc::new(SqliteStorage::create_new(
+            &app_db_path.to_string_lossy(),
+            &app_key,
+        )?);
+
+        let keychain = Box::new(crate::keychain::KeyringKeychainAccess::new(
+            account_id.clone(),
+        ));
+        let mls_context = catbird_mls::MLSContext::new(
+            mls_db_path.to_string_lossy().to_string(),
+            mls_key,
+            keychain,
+        )
+        .map_err(|e| DatabaseInitError::ValidationFailed(format!("MLSContext init failed: {e}")))?;
+
+        if let Err(e) = mls_context.launch_checkpoint() {
+            tracing::warn!("MLSContext launch_checkpoint warning: {:?}", e);
+        }
+
+        // Creation marker stays `creating` until credential tuple enrollment succeeds
+        Ok((storage, mls_context, content_root_key, lock))
+    } else if all_present {
+        match credential_state {
+            crate::credentials::CredentialEnrollmentState::Partial(msg) => {
+                return Err(DatabaseInitError::ValidationFailed(format!(
+                    "partial credential state: {msg}"
+                )));
+            }
+            crate::credentials::CredentialEnrollmentState::FullyEnrolled => {
+                if !signer_slots_exist {
+                    return Err(DatabaseInitError::ValidationFailed(
+                        "fully enrolled credentials present without signer slots".into(),
+                    ));
+                }
+                crate::keychain::KeyringKeychainAccess::validate_signer_slots_unlocked(&account_id)
+                    .map_err(DatabaseInitError::KeyringError)?;
+            }
+            crate::credentials::CredentialEnrollmentState::Unenrolled => {
+                return Err(DatabaseInitError::ValidationFailed(
+                    "complete marker present but credentials are unenrolled".into(),
+                ));
+            }
+        }
+
+        let content_root_key = crate::keys::load_existing_content_root_key(
+            data_dir,
+            &normalized_did,
+        )
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("content root key read failed: {e}"))
+        })?;
+
+        let app_key = app_key_opt.unwrap();
+        let mls_key = mls_key_opt.unwrap();
+
+        // Read-only SQLCipher validation before opening writable constructors
+        validate_app_db_readonly(&app_db_path, &app_key)?;
+        validate_mls_db_readonly(&mls_db_path, &mls_key)?;
+
+        // Verify that the exact manifest signer binds to persisted mls_did and signing_key public key
+        {
+            let mls_conn = open_mls_db_readonly(&mls_db_path, &mls_key)?;
+
+            let signers_json: String = mls_conn
+                .query_row(
+                    "SELECT value FROM mls_manifests WHERE key = 'signers'",
+                    [],
+                    |r| r.get(0),
+                )
+                .map_err(|e| {
+                    DatabaseInitError::ValidationFailed(format!(
+                        "MLS DB missing `signers` manifest: {e}"
+                    ))
+                })?;
+            let signers_map: std::collections::HashMap<String, String> =
+                serde_json::from_str(&signers_json).map_err(|e| {
+                    DatabaseInitError::ValidationFailed(format!("Corrupt signers manifest: {e}"))
+                })?;
+            if signers_map.is_empty() {
+                return Err(DatabaseInitError::ValidationFailed(
+                    "MLS DB signers manifest is empty".into(),
+                ));
+            }
+
+            let mls_did_key =
+                crate::credentials::KeyringCredentialStore::key_mls_did(&normalized_did);
+            let mls_did_entry = keyring::Entry::new(crate::credentials::SERVICE_NAME, &mls_did_key)
+                .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+            let persisted_mls_did = mls_did_entry.get_password().map_err(|e| {
+                DatabaseInitError::KeyringError(format!("missing persisted mls_did: {e}"))
+            })?;
+
+            let hex_identity = hex::encode(persisted_mls_did.trim().as_bytes());
+            let hex_pk = signers_map.get(&hex_identity).ok_or_else(|| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "signers manifest does not contain persisted identity `{persisted_mls_did}`"
+                ))
+            })?;
+            let manifest_pk = hex::decode(hex_pk).map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "invalid hex in signers manifest pk: {e}"
+                ))
+            })?;
+
+            // Verify public key matches the signing_key credential
+            let signing_key_name =
+                crate::credentials::KeyringCredentialStore::key_signing(&normalized_did);
+            let signing_key_entry =
+                keyring::Entry::new(crate::credentials::SERVICE_NAME, &signing_key_name)
+                    .map_err(|e| DatabaseInitError::KeyringError(e.to_string()))?;
+            let signing_key_b64 = signing_key_entry.get_password().map_err(|e| {
+                DatabaseInitError::KeyringError(format!("missing persisted signing_key: {e}"))
+            })?;
+            use base64::engine::general_purpose::STANDARD as B64;
+            use base64::Engine;
+            let signing_key_bytes = B64.decode(signing_key_b64.trim()).map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!("invalid base64 in signing_key: {e}"))
+            })?;
+            let val: serde_json::Value =
+                serde_json::from_slice(&signing_key_bytes).map_err(|e| {
+                    DatabaseInitError::ValidationFailed(format!("invalid JSON in signing_key: {e}"))
+                })?;
+            let pk_val = val
+                .get("public")
+                .and_then(|p| p.as_array())
+                .ok_or_else(|| {
+                    DatabaseInitError::ValidationFailed(
+                        "missing public field in signing_key".into(),
+                    )
+                })?;
+            let signing_key_pk: Vec<u8> = pk_val
+                .iter()
+                .filter_map(|v| v.as_u64().and_then(|n| u8::try_from(n).ok()))
+                .collect();
+            if signing_key_pk != manifest_pk {
+                return Err(DatabaseInitError::ValidationFailed(
+                    "public key mismatch between signers manifest and signing_key credential"
+                        .into(),
+                ));
+            }
+        }
+        let storage = Arc::new(SqliteStorage::open_existing(
+            &app_db_path.to_string_lossy(),
+            &app_key,
+        )?);
+        let keychain = Box::new(crate::keychain::KeyringKeychainAccess::new(
+            account_id.clone(),
+        ));
+        let mls_context = catbird_mls::MLSContext::new(
+            mls_db_path.to_string_lossy().to_string(),
+            mls_key,
+            keychain,
+        )
+        .map_err(|e| {
+            DatabaseInitError::ValidationFailed(format!("MLSContext reopen failed: {e}"))
+        })?;
+
+        Ok((storage, mls_context, content_root_key, lock))
+    } else {
+        if marker_opt == Some(MarkerStatus::Creating) {
+            return Err(DatabaseInitError::InitializationIncomplete);
+        }
+        if app_sidecars_exist && !app_db_exists || mls_sidecars_exist && !mls_db_exists {
+            return Err(DatabaseInitError::MixedStatePresentDbAbsentKey);
+        }
+        if !app_db_exists && app_key_opt.is_some() || !mls_db_exists && mls_key_opt.is_some() {
+            return Err(DatabaseInitError::MixedStateAbsentDbPresentKey);
+        }
+        if app_db_exists && app_key_opt.is_none() || mls_db_exists && mls_key_opt.is_none() {
+            return Err(DatabaseInitError::MixedStatePresentDbAbsentKey);
+        }
+        if marker_opt.is_none()
+            && (app_db_exists
+                || mls_db_exists
+                || app_key_opt.is_some()
+                || mls_key_opt.is_some()
+                || content_root_exists
+                || !credentials_absent
+                || signer_slots_exist)
+        {
+            return Err(DatabaseInitError::MixedStateMissingMarker);
+        }
+        if marker_opt == Some(MarkerStatus::Complete)
+            && (!app_db_exists
+                || !mls_db_exists
+                || app_key_opt.is_none()
+                || mls_key_opt.is_none()
+                || !content_root_exists)
+        {
+            return Err(DatabaseInitError::InvalidMarker(
+                "complete marker present but resource set is incomplete or mixed".into(),
+            ));
+        }
+        Err(DatabaseInitError::MixedStateMissingMarker)
+    }
+}
+
+/// Remove a SQLite database file together with its WAL/SHM/journal sidecars.
+fn remove_db_with_sidecars(db_path: &Path) -> std::result::Result<(), String> {
+    for path in [
+        db_path.to_path_buf(),
+        db_path.with_extension("db-wal"),
+        db_path.with_extension("db-shm"),
+        db_path.with_extension("db-journal"),
+    ] {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("failed to remove {}: {e}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove temp files matching `matches` in `dir`, tolerating a missing directory.
+/// `what` prefixes the error messages ("" for the data dir, "content-root " for the key dir).
+fn remove_temp_files(
+    dir: &Path,
+    what: &str,
+    matches: impl Fn(&str) -> bool,
+) -> std::result::Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "failed to read {what}directory {}: {e}",
+                dir.display()
+            ))
+        }
+    };
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| {
+            format!(
+                "failed to read {what}directory entry in {}: {e}",
+                dir.display()
+            )
+        })?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !matches(&file_name) {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(format!(
+                    "failed to remove {what}temp file {}: {e}",
+                    path.display()
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn reset_account_storage(
+    data_dir: &Path,
+    user_did: &str,
+    storage: Option<Arc<SqliteStorage>>,
+    mls_context: Option<&catbird_mls::MLSContext>,
+    service: &str,
+) -> std::result::Result<(), String> {
+    reset_account_storage_with_store(
+        data_dir,
+        user_did,
+        storage,
+        mls_context,
+        service,
+        &KeyringDbKeyStore,
+    )
+    .await
+}
+
+pub async fn reset_account_storage_with_store(
+    data_dir: &Path,
+    user_did: &str,
+    storage: Option<Arc<SqliteStorage>>,
+    mls_context: Option<&catbird_mls::MLSContext>,
+    service: &str,
+    store: &dyn DbKeyStore,
+) -> std::result::Result<(), String> {
+    let normalized_did = crate::keys::normalize_did(user_did);
+    let account_id = crate::keys::derive_account_id(&normalized_did);
+
+    let _lock = acquire_account_lock(data_dir, &account_id)
+        .map_err(|e| format!("failed to acquire account lock for reset: {e}"))?;
+
+    // --- PHASE 1: PREFLIGHT (ZERO MUTATION) ---
+    // Validate that signer index is readable and parseable before deleting ANY secret
+    let signer_slots_to_delete =
+        crate::keychain::KeyringKeychainAccess::preflight_account_signer_slots_reset(&account_id)
+            .map_err(|e| format!("preflight signer index failed: {e}"))?;
+
+    // --- PHASE 2: EXECUTION ---
+    // 1. Close MLSContext if provided
+    if let Some(ctx) = mls_context {
+        ctx.clear_content_root_key();
+        ctx.interrupt();
+        ctx.flush_and_prepare_close()
+            .map_err(|e| format!("MLSContext flush_and_prepare_close failed: {e:?}"))?;
+    }
+
+    // 2. Drop SqliteStorage handle
+    drop(storage);
+
+    // 3. Clear exact-DID credentials from keyring
+    crate::credentials::KeyringCredentialStore::delete_exact_account_credentials(&normalized_did)
+        .map_err(|e| format!("failed to clear keyring credentials: {e}"))?;
+
+    // 4. Delete exact account content-root key file and .tmp.<uuid> files
+    crate::keys::delete_content_root_key(data_dir, &normalized_did)
+        .map_err(|e| format!("failed to delete content-root key: {e}"))?;
+
+    // 5. Delete preflight-verified MLS signer slots and index entry
+    crate::keychain::KeyringKeychainAccess::execute_account_signer_slots_reset(
+        &account_id,
+        signer_slots_to_delete,
+    )
+    .map_err(|e| format!("failed to clear indexed MLS signer slots: {e}"))?;
+
+    // 6. Delete App DB and sidecars
+    remove_db_with_sidecars(&data_dir.join(app_db_file_name(&account_id)))?;
+
+    // 7. Delete App DB key from store
+    let app_key_label = app_db_key_label(&account_id);
+    store
+        .delete_password(service, &app_key_label)
+        .map_err(|e| format!("failed to delete conversation DB key: {e}"))?;
+
+    // 8. Delete MLS DB and sidecars
+    let mls_db_path = data_dir
+        .join(MLS_STORAGE_GENERATION)
+        .join(mls_db_file_name(&account_id));
+    remove_db_with_sidecars(&mls_db_path)?;
+
+    // 9. Delete MLS DB key from store
+    let mls_key_label = mls_db_key_label(&account_id);
+    store
+        .delete_password(service, &mls_key_label)
+        .map_err(|e| format!("failed to delete MLS DB key: {e}"))?;
+
+    // 10. Delete all account-scoped temp files in data_dir (.tmp.*) and content-root dir ({account_id}.tmp.*)
+    let account_file_prefix = format!("catmos-{}-{}.", account_id, MLS_KEY_SUFFIX);
+    remove_temp_files(data_dir, "", |file_name| {
+        file_name.starts_with(&account_file_prefix) && file_name.contains(".tmp")
+    })?;
+
+    let cr_dir = data_dir.join(crate::keys::MLS_CONTENT_ROOT_DIR);
+    let cr_temp_prefix = format!("{}.tmp.", account_id);
+    remove_temp_files(&cr_dir, "content-root ", |file_name| {
+        file_name.starts_with(&cr_temp_prefix)
+    })?;
+
+    // 11. Delete marker file explicitly LAST and propagate failure
+    let marker_file = account_marker_path(data_dir, &account_id);
+    match std::fs::remove_file(&marker_file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "failed to remove marker file {}: {e}",
+                marker_file.display()
+            ))
+        }
+    }
+
+    Ok(())
+}
 /// Locally cached encrypted-metadata snapshot for a conversation. Mirrors
 /// what `bootstrap_group_metadata` writes after a successful blob fetch +
 /// decrypt: the JSON-serialized `GroupMetadataV1` payload, the bound
@@ -53,7 +2408,11 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
-    pub fn new(db_path: &str, encryption_key: &str) -> std::result::Result<Self, rusqlite::Error> {
+    /// Open a keyed SQLCipher connection and wrap it, without touching schema.
+    pub fn open_existing(
+        db_path: &str,
+        encryption_key: &str,
+    ) -> std::result::Result<Self, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
         // Set SQLCipher key (required even for unencrypted use with bundled-sqlcipher)
         conn.execute_batch(&format!("PRAGMA key = '{}';", encryption_key))?;
@@ -68,12 +2427,64 @@ impl SqliteStorage {
             tracing::info!("Android SQLCipher enabled (cipher_version={version})");
         }
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;")?;
-        let storage = Self {
+        Ok(Self {
             conn: Mutex::new(conn),
             mls_context: RwLock::new(None),
-        };
+        })
+    }
+
+    pub fn create_new(
+        db_path: &str,
+        encryption_key: &str,
+    ) -> std::result::Result<Self, rusqlite::Error> {
+        let storage = Self::open_existing(db_path, encryption_key)?;
         storage.create_tables()?;
+        storage.validate().map_err(|e| match e {
+            DatabaseInitError::Sqlite(err) => err,
+            other => rusqlite::Error::InvalidParameterName(other.to_string()),
+        })?;
         Ok(storage)
+    }
+
+    pub fn validate(&self) -> std::result::Result<(), DatabaseInitError> {
+        let conn = self.conn.lock().unwrap();
+        #[cfg(target_os = "android")]
+        {
+            let version: String = conn
+                .pragma_query_value(None, "cipher_version", |row| row.get(0))
+                .map_err(|e| {
+                    DatabaseInitError::ValidationFailed(format!("cipher_version query failed: {e}"))
+                })?;
+            if version.is_empty() {
+                return Err(DatabaseInitError::ValidationFailed(
+                    "Android SQLCipher probe returned empty cipher_version".into(),
+                ));
+            }
+        }
+        let _count: i64 = conn
+            .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!(
+                    "sqlite_master query failed (wrong key or corrupt db): {e}"
+                ))
+            })?;
+        let quick_check: String = conn
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .map_err(|e| {
+                DatabaseInitError::ValidationFailed(format!("quick_check query failed: {e}"))
+            })?;
+        if quick_check != "ok" {
+            return Err(DatabaseInitError::ValidationFailed(format!(
+                "quick_check returned: {quick_check}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn clear_mls_context(&self) {
+        if let Ok(mut guard) = self.mls_context.write() {
+            *guard = None;
+        }
     }
 
     /// Bind the per-process MLS context for the field-level encryption layer.
@@ -1018,63 +3429,56 @@ impl MLSStorageBackend for SqliteStorage {
             .transpose()
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
-        // Attempt field-level encryption. Falls back to legacy plaintext when
-        // the context isn't bound yet OR when the content root key hasn't
-        // been installed (initial sync may run before login completes).
-        let sealed = self.try_encrypt_message_body(message);
+        let ctx = self.mls_context_snapshot().ok_or_else(|| {
+            OrchestratorError::Storage(
+                "store_message: missing MLS context for message encryption".to_string(),
+            )
+        })?;
+        let body = CanonicalMessageBody {
+            text: &message.text,
+            payload_json: message.payload_json.as_deref(),
+        };
+        let plaintext = serde_json::to_vec(&body).map_err(|e| {
+            OrchestratorError::Storage(format!("canonical body serialization failed: {e}"))
+        })?;
+        let encrypted = ctx
+            .encrypt_message_payload(message.conversation_id.clone(), plaintext)
+            .map_err(|e| {
+                OrchestratorError::Storage(format!("encrypt_message_payload failed: {e:?}"))
+            })?;
+        let prev_hmac = self.last_entry_hmac(&message.conversation_id);
+        let entry_hmac = ctx
+            .compute_message_hmac(
+                message.conversation_id.clone(),
+                prev_hmac,
+                message.id.clone(),
+                encrypted.clone(),
+            )
+            .map_err(|e| {
+                OrchestratorError::Storage(format!("compute_message_hmac failed: {e:?}"))
+            })?;
 
         let conn = self.conn.lock().unwrap();
-        match sealed {
-            Some((encrypted, entry_hmac)) => {
-                conn.execute(
-                    "INSERT OR REPLACE INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted, entry_hmac, payload_key_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    rusqlite::params![
-                        message.id,
-                        message.conversation_id,
-                        message.sender_did,
-                        // text/payload_json kept blank when the sealed payload
-                        // is the source of truth — `text NOT NULL` schema
-                        // constraint forces an empty string here, not NULL.
-                        "",
-                        message.timestamp.to_rfc3339(),
-                        message.epoch,
-                        message.sequence_number,
-                        message.is_own as i32,
-                        delivery_status_json,
-                        Option::<String>::None,
-                        encrypted,
-                        entry_hmac,
-                        PAYLOAD_KEY_VERSION_V1,
-                    ],
-                )
-                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-            }
-            None => {
-                tracing::warn!(
-                    message_id = %message.id,
-                    conversation_id = %message.conversation_id,
-                    "store_message: field-encryption unavailable; falling back to legacy plaintext columns"
-                );
-                conn.execute(
-                    "INSERT OR REPLACE INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted, entry_hmac, payload_key_version)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, NULL, NULL)",
-                    rusqlite::params![
-                        message.id,
-                        message.conversation_id,
-                        message.sender_did,
-                        message.text,
-                        message.timestamp.to_rfc3339(),
-                        message.epoch,
-                        message.sequence_number,
-                        message.is_own as i32,
-                        delivery_status_json,
-                        message.payload_json,
-                    ],
-                )
-                .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-            }
-        }
+        conn.execute(
+            "INSERT OR REPLACE INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted, entry_hmac, payload_key_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                message.id,
+                message.conversation_id,
+                message.sender_did,
+                "",
+                message.timestamp.to_rfc3339(),
+                message.epoch,
+                message.sequence_number,
+                message.is_own as i32,
+                delivery_status_json,
+                Option::<String>::None,
+                encrypted,
+                entry_hmac,
+                PAYLOAD_KEY_VERSION_V1,
+            ],
+        )
+        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
     }
 
@@ -1351,13 +3755,13 @@ fn row_to_message(row: &rusqlite::Row, mls_ctx: Option<&MLSContext>) -> rusqlite
     let id: String = row.get(0)?;
     let conversation_id: String = row.get(1)?;
     let sender_did: String = row.get(2)?;
-    let legacy_text: String = row.get(3)?;
+    let _legacy_text: String = row.get(3)?;
     let timestamp_str: String = row.get(4)?;
     let epoch: u64 = row.get(5)?;
     let sequence_number: u64 = row.get(6)?;
     let is_own: i32 = row.get(7)?;
     let delivery_status_json: Option<String> = row.get(8)?;
-    let legacy_payload_json: Option<String> = row.get(9)?;
+    let _legacy_payload_json: Option<String> = row.get(9)?;
     let payload_encrypted: Option<Vec<u8>> = row.get(10)?;
 
     let timestamp = timestamp_str
@@ -1376,63 +3780,56 @@ fn row_to_message(row: &rusqlite::Row, mls_ctx: Option<&MLSContext>) -> rusqlite
             }
         });
 
-    // Prefer the encrypted column when present and the MLS context is bound;
-    // fall back to the legacy plaintext columns for rows written during a
-    // bootstrap-race window or before the field-encryption migration ran.
-    let (text, payload_json) = match (payload_encrypted, mls_ctx) {
-        (Some(ref wire), Some(ctx)) if !wire.is_empty() => {
-            match ctx.decrypt_message_payload(conversation_id.clone(), wire.clone()) {
-                Ok(plaintext) => {
-                    match serde_json::from_slice::<CanonicalMessageBodyOwned>(&plaintext) {
-                        Ok(body) => (body.text, body.payload_json),
-                        Err(err) => {
-                            tracing::warn!(
-                                message_id = %id,
-                                error = %err,
-                                "row_to_message: canonical body deserialize failed; row will surface empty text"
-                            );
-                            (legacy_text, legacy_payload_json)
-                        }
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        message_id = %id,
-                        error = ?err,
-                        "row_to_message: decrypt_message_payload failed; falling back to legacy columns"
-                    );
-                    (legacy_text, legacy_payload_json)
-                }
-            }
-        }
-        // Sealed row read without an MLS context: log loudly. In production
-        // the orchestrator owns the context for its lifetime, so this branch
-        // should only fire during the bootstrap window before login installs
-        // the context. The legacy `text` column will be an empty string here
-        // (because the write path put the real payload in `payload_encrypted`),
-        // so the UI will surface a blank body — preferable to a panic.
-        (Some(_), None) => {
-            tracing::error!(
-                message_id = %id,
-                "row_to_message: sealed row read with no MLS context bound; \
-                 payload will surface empty until the context is installed"
-            );
-            (legacy_text, legacy_payload_json)
-        }
-        _ => (legacy_text, legacy_payload_json),
-    };
+    let ctx = mls_ctx.ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "missing MLS context for encrypted message read",
+            )),
+        )
+    })?;
+
+    let wire = payload_encrypted.filter(|b| !b.is_empty()).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            10,
+            rusqlite::types::Type::Blob,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing or empty encrypted message payload",
+            )),
+        )
+    })?;
+
+    let plaintext = ctx
+        .decrypt_message_payload(conversation_id.clone(), wire)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Blob,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("decrypt_message_payload failed: {e:?}"),
+                )),
+            )
+        })?;
+
+    let body = serde_json::from_slice::<CanonicalMessageBodyOwned>(&plaintext).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Blob, Box::new(e))
+    })?;
 
     Ok(Message {
         id,
         conversation_id,
         sender_did,
-        text,
+        text: body.text,
         timestamp,
         epoch,
         sequence_number,
         is_own: is_own != 0,
         delivery_status,
-        payload_json,
+        payload_json: body.payload_json,
     })
 }
 
@@ -1445,9 +3842,6 @@ mod field_encryption_tests {
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
-    /// Minimal in-memory `KeychainAccess` impl used in tests so we don't have
-    /// to depend on the OS keychain (which would taint the developer's real
-    /// `keyring` store and break parallel test runs).
     struct InMemoryKeychain {
         inner: StdMutex<HashMap<String, Vec<u8>>>,
     }
@@ -1475,21 +3869,16 @@ mod field_encryption_tests {
         }
     }
 
-    /// 32-byte hex key suitable for SQLCipher's `PRAGMA key`.
     const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
     fn new_temp_storage() -> (tempfile::TempDir, SqliteStorage) {
         let tmp = tempfile::tempdir().expect("temp dir");
         let db_path = tmp.path().join("catmos-test.db");
-        let storage =
-            SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("open SqliteStorage");
+        let storage = SqliteStorage::create_new(db_path.to_str().unwrap(), TEST_DB_KEY)
+            .expect("open SqliteStorage");
         (tmp, storage)
     }
 
-    /// Smoke-test the schema migration: after `SqliteStorage::new` the new
-    /// columns must exist on `messages` and the `MLSMessageFieldMigrationV1`
-    /// migration row must be present. This is the catmos-desktop equivalent
-    /// of the iOS `MLSPlaintextHeaderMigration` migration-status check.
     #[test]
     fn message_field_columns_and_migration_row_exist() {
         let (_tmp, storage) = new_temp_storage();
@@ -1525,11 +3914,8 @@ mod field_encryption_tests {
         assert_eq!(count, 1, "MLSMessageFieldMigrationV1 row should be present");
     }
 
-    /// Without an MLS context bound, `store_message` must fall back to legacy
-    /// plaintext columns rather than panicking — this is the bootstrap-race
-    /// path (initial sync may run before login installs the content root key).
     #[tokio::test]
-    async fn store_message_falls_back_to_plaintext_without_mls_context() {
+    async fn store_message_fails_closed_without_mls_context() {
         let (_tmp, storage) = new_temp_storage();
         let now = Utc::now();
         let msg = Message {
@@ -1544,27 +3930,8 @@ mod field_encryption_tests {
             delivery_status: None,
             payload_json: None,
         };
-        storage.store_message(&msg).await.expect("store");
-
-        let got = storage
-            .get_messages("conv-1", 10, None)
-            .await
-            .expect("read");
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].text, "hello bootstrap");
-        // Encrypted column should be NULL on the legacy fallback row.
-        let conn = storage.conn.lock().unwrap();
-        let payload_encrypted: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT payload_encrypted FROM messages WHERE id = 'msg-1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(
-            payload_encrypted.is_none(),
-            "fallback row must leave payload_encrypted NULL"
-        );
+        // Without MLS context bound, store_message MUST fail closed
+        assert!(storage.store_message(&msg).await.is_err());
     }
 
     #[tokio::test]
@@ -1608,18 +3975,13 @@ mod field_encryption_tests {
         assert_eq!(listed.sequencer_did.as_deref(), Some(sequencer_did));
     }
 
-    /// Full roundtrip: install a content-root key on an ephemeral
-    /// `MLSContext`, write a message via `store_message` (encrypts + chains
-    /// HMAC), read it back via `get_messages` (decrypts), and verify the
-    /// payload survives. Also verifies that the encrypted column and the
-    /// HMAC tag are persisted (not just the legacy plaintext fallback).
     #[tokio::test]
     async fn message_round_trip_with_field_encryption() {
         let tmp = tempfile::tempdir().expect("temp dir");
         let storage_db = tmp.path().join("catmos-test.db");
         let mls_db = tmp.path().join("mls-test.db");
 
-        let storage = SqliteStorage::new(storage_db.to_str().unwrap(), TEST_DB_KEY)
+        let storage = SqliteStorage::create_new(storage_db.to_str().unwrap(), TEST_DB_KEY)
             .expect("open SqliteStorage");
 
         let keychain: Box<dyn KeychainAccess> = Box::new(InMemoryKeychain::new());
@@ -1698,94 +4060,151 @@ mod field_encryption_tests {
             Some(r#"{"version":1,"messageType":"text","text":"round-trip body"}"#)
         );
     }
+}
 
-    /// HMAC chain: two messages on the same conversation should chain — the
-    /// second row's HMAC must be a function of the first row's HMAC, so
-    /// rewriting the second row's prev-hmac input (via tampering or replay)
-    /// is detectable. We just assert the tags are different and non-empty
-    /// here; full chain verification is the Rust core's responsibility.
-    #[tokio::test]
-    async fn hmac_chain_advances_per_row() {
+#[cfg(test)]
+mod storage_cutover_tests {
+    use super::*;
+    use std::fs;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clean_account_storage_fresh_creation_and_reopen() {
+        use catbird_mls::orchestrator::credentials::CredentialStore;
+        let store = MemoryDbKeyStore::new();
+        let test_service = "catmos-test";
         let tmp = tempfile::tempdir().unwrap();
-        let storage_db = tmp.path().join("catmos-test.db");
-        let mls_db = tmp.path().join("mls-test.db");
-        let storage = SqliteStorage::new(storage_db.to_str().unwrap(), TEST_DB_KEY).unwrap();
-        let keychain: Box<dyn KeychainAccess> = Box::new(InMemoryKeychain::new());
-        let mls_ctx = catbird_mls::MLSContext::new(
-            mls_db.to_string_lossy().to_string(),
-            TEST_DB_KEY.to_string(),
-            keychain,
+        let did = "did:plc:account-test-user";
+        let account_id = crate::keys::derive_account_id(did);
+
+        let _ = crate::credentials::KeyringCredentialStore::delete_exact_account_credentials(did);
+        let _ = crate::keychain::KeyringKeychainAccess::reset_account_signer_slots(
+            &account_id,
+            tmp.path(),
+        );
+
+        let app_db_path = tmp.path().join(app_db_file_name(&account_id));
+        let marker_file = account_marker_path(tmp.path(), &account_id);
+
+        assert!(!app_db_path.exists());
+        assert!(!marker_file.exists());
+
+        // First open: creates keys, DBs, content root, and marker
+        let (storage, mls_ctx, _key, lock) =
+            open_clean_account_storage_with_store(tmp.path(), did, test_service, &store)
+                .expect("first open should succeed");
+        assert!(app_db_path.exists());
+        assert!(marker_file.exists());
+        let marker = read_account_marker(
+            &marker_file,
+            did,
+            &account_id,
+            &app_db_file_name(&account_id),
+            &mls_db_file_name(&account_id),
         )
         .unwrap();
-        mls_ctx.set_content_root_key(vec![0x11u8; 32]).unwrap();
-        storage.set_mls_context(mls_ctx);
+        assert_eq!(marker, Some(MarkerStatus::Creating));
 
-        let now = Utc::now();
-        for (id, seq) in [("m1", 1u64), ("m2", 2u64)] {
-            let msg = Message {
-                id: id.into(),
-                conversation_id: "conv-chain".into(),
-                sender_did: "did:plc:s".into(),
-                text: format!("body-{}", id),
-                timestamp: now,
-                epoch: 0,
-                sequence_number: seq,
-                is_own: false,
-                delivery_status: None,
-                payload_json: None,
-            };
-            storage.store_message(&msg).await.unwrap();
-        }
-        let conn = storage.conn.lock().unwrap();
-        let h1: Vec<u8> = conn
-            .query_row("SELECT entry_hmac FROM messages WHERE id = 'm1'", [], |r| {
-                r.get(0)
-            })
+        let cred_store = crate::credentials::KeyringCredentialStore::try_new().unwrap();
+        let local_uuid = "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d";
+        let server_dev_id = local_uuid;
+        let identity = format!("{did}#{local_uuid}");
+        let _kp = mls_ctx
+            .create_key_package(identity.as_bytes().to_vec())
             .unwrap();
-        let h2: Vec<u8> = conn
-            .query_row("SELECT entry_hmac FROM messages WHERE id = 'm2'", [], |r| {
-                r.get(0)
-            })
+        let exported_key = mls_ctx.export_identity_key(identity.clone()).unwrap();
+
+        cred_store
+            .store_signing_key(did, &exported_key)
+            .await
             .unwrap();
-        assert_eq!(h1.len(), 32);
-        assert_eq!(h2.len(), 32);
-        assert_ne!(h1, h2, "chained HMACs should differ");
+        cred_store.store_mls_did(did, &identity).await.unwrap();
+        cred_store
+            .store_server_device_id(did, server_dev_id)
+            .await
+            .unwrap();
+        cred_store
+            .store_local_device_uuid(did, local_uuid)
+            .await
+            .unwrap();
+
+        write_account_marker_complete(
+            &marker_file,
+            did,
+            &account_id,
+            &app_db_file_name(&account_id),
+            &mls_db_file_name(&account_id),
+        )
+        .unwrap();
+        let _ = mls_ctx.flush_and_prepare_close();
+        drop(storage);
+        drop(mls_ctx);
+        drop(lock);
+
+        // Second open: reopens existing valid account storage
+        let (storage2, mls_ctx2, _key2, lock2) =
+            open_clean_account_storage_with_store(tmp.path(), did, test_service, &store)
+                .expect("reopen should succeed");
+        storage2.validate().expect("reopened DB must be valid");
+        let _ = mls_ctx2.flush_and_prepare_close();
+        drop(storage2);
+        drop(mls_ctx2);
+        drop(lock2);
+
+        let _ = crate::credentials::KeyringCredentialStore::delete_exact_account_credentials(did);
+        let _ = crate::keychain::KeyringKeychainAccess::reset_account_signer_slots(
+            &account_id,
+            tmp.path(),
+        );
     }
 
-    /// Tombstone visibility filter: rows flagged `is_tombstone = 1` must be
-    /// excluded from `get_messages`. catmos desktop doesn't currently expose
-    /// user-initiated delete, but the schema parity contract requires the
-    /// read path to honor the flag for when iOS/Android replicate a delete.
     #[tokio::test]
-    async fn tombstoned_rows_are_excluded_from_get_messages() {
-        let (_tmp, storage) = new_temp_storage();
-        let now = Utc::now();
-        for (id, seq) in [("msg-a", 1u64), ("msg-b", 2u64), ("msg-c", 3u64)] {
-            let msg = Message {
-                id: id.into(),
-                conversation_id: "conv-x".into(),
-                sender_did: "did:plc:sender".into(),
-                text: format!("body-{}", id),
-                timestamp: now,
-                epoch: 0,
-                sequence_number: seq,
-                is_own: false,
-                delivery_status: None,
-                payload_json: None,
-            };
-            storage.store_message(&msg).await.unwrap();
-        }
-        // Tombstone msg-b out of band.
-        {
-            let conn = storage.conn.lock().unwrap();
-            conn.execute(
-                "UPDATE messages SET is_tombstone = 1, deleted_at = strftime('%s','now') WHERE id = 'msg-b'",
-                [],
-            )
-            .unwrap();
-        }
-        let got = storage.get_messages("conv-x", 10, None).await.unwrap();
-        let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(ids, vec!["msg-a", "msg-c"]);
+    async fn clean_account_storage_reset_and_legacy_isolation() {
+        let store = MemoryDbKeyStore::new();
+        let test_service = "catmos-test";
+        let tmp = tempfile::tempdir().unwrap();
+        let did = "did:plc:reset-test-user";
+        let account_id = crate::keys::derive_account_id(did);
+
+        // Set up legacy sentinels
+        let legacy_db = tmp.path().join("catmos.db");
+        fs::write(&legacy_db, b"legacy-catmos-db-sentinel").unwrap();
+        let legacy_mls_dir = tmp.path().join("mls-state");
+        fs::create_dir_all(&legacy_mls_dir).unwrap();
+        let legacy_mls_db = legacy_mls_dir.join("mls.db");
+        fs::write(&legacy_mls_db, b"legacy-mls-db-sentinel").unwrap();
+
+        // Create account storage
+        let (storage, mls_ctx, _key, lock) =
+            open_clean_account_storage_with_store(tmp.path(), did, test_service, &store).unwrap();
+        let app_db_path = tmp.path().join(app_db_file_name(&account_id));
+        let marker_file = account_marker_path(tmp.path(), &account_id);
+        let content_key_path = crate::keys::content_root_key_path(tmp.path(), &account_id);
+
+        assert!(app_db_path.exists());
+        assert!(marker_file.exists());
+        assert!(content_key_path.exists());
+        drop(lock);
+        // Perform explicit reset
+        reset_account_storage_with_store(
+            tmp.path(),
+            did,
+            Some(storage),
+            Some(&mls_ctx),
+            test_service,
+            &store,
+        )
+        .await
+        .expect("reset should succeed");
+
+        // Clean account DB, content root key, and marker should be gone
+        assert!(!app_db_path.exists());
+        assert!(!marker_file.exists());
+        assert!(!content_key_path.exists());
+
+        // Legacy files MUST remain untouched
+        assert!(legacy_db.exists());
+        assert_eq!(fs::read(&legacy_db).unwrap(), b"legacy-catmos-db-sentinel");
+        assert!(legacy_mls_db.exists());
+        assert_eq!(fs::read(&legacy_mls_db).unwrap(), b"legacy-mls-db-sentinel");
     }
 }
