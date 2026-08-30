@@ -8,8 +8,12 @@
  * Keys are namespaced by DID + convoId to prevent data leakage across accounts.
  */
 
-const CURSOR_PREFIX = 'catbird_ws_cursor-clean-v2-openmls-v09';
-export const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+/**
+ * Browser storage generation pin. Bumping this invalidates every browser-side
+ * MLS namespace at once (cursors, active DID, MLS storage coordinates, tab lock).
+ */
+export const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09-device-identity-v1';
+export const CURSOR_PREFIX = `catbird_ws_cursor${CLEAN_STORAGE_SUFFIX}`;
 export const SS_ACTIVE_DID = `catbird_mls_active_did${CLEAN_STORAGE_SUFFIX}`;
 
 /** True when running inside Tauri desktop shell. */
@@ -59,6 +63,7 @@ function getCurrentDid(): string | null {
   }
   return sessionStorage.getItem(SS_ACTIVE_DID);
 }
+
 function getRegisteredConvoIds(storage: Storage, did: string): string[] {
   const raw = storage.getItem(cursorRegistryKey(did));
   if (!raw) return [];
@@ -126,13 +131,28 @@ export function removeCursor(convoId: string): void {
 }
 
 /**
- * Clear all saved cursors for the given DID across both storages without key enumeration.
+ * Clear saved cursors for a DID, scanning storage keys only if its registry is corrupt.
  */
 export function clearAllCursorsForDid(did: string): void {
   if (typeof window === 'undefined') return;
-  const storages = [sessionStorage, localStorage];
-  for (const s of storages) {
-    const convoIds = getRegisteredConvoIds(s, did);
+  for (const s of [sessionStorage, localStorage]) {
+    let convoIds: string[] = [];
+    try {
+      convoIds = getRegisteredConvoIds(s, did);
+    } catch {
+      const owner = `${CURSOR_PREFIX}:${did}`;
+      // A cursor key is `${owner}:${convoId}` and a convoId never contains ':',
+      // so trimming the last segment must land exactly on this DID's owner prefix:
+      // clearing `did:web:x` must not touch the neighboring `did:web:x:user`.
+      // Reverse order: removing index i only shifts down the indices above it,
+      // which have already been visited. A forward loop would skip keys.
+      for (let index = s.length - 1; index >= 0; index -= 1) {
+        const key = s.key(index);
+        if (key && key.slice(0, key.lastIndexOf(':')) === owner) {
+          s.removeItem(key);
+        }
+      }
+    }
     for (const id of convoIds) {
       s.removeItem(storageKey(did, id));
     }

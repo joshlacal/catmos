@@ -75,24 +75,7 @@
 		window.addEventListener('keydown', handleGlobalKeydown);
 		cleanupKeydown = () => window.removeEventListener('keydown', handleGlobalKeydown);
 
-		// Single-tab enforcement (web only — Tauri handles this natively)
-		if (!isTauri) {
-			let restoreInitiated = false;
-			const { steal } = acquireTabLock(async (status) => {
-				tabLockStatus = status;
-				if (status === 'granted' && !restoreInitiated) {
-					restoreInitiated = true;
-					try {
-						await auth.tryRestore();
-					} catch (err) {
-						console.error('[catmos] tryRestore error:', err);
-						initError = err instanceof Error ? err.message : String(err);
-					}
-				}
-			});
-			stealLock = steal;
-		} else {
-			tabLockStatus = 'granted';
+		async function restoreSession() {
 			try {
 				await auth.tryRestore();
 			} catch (err) {
@@ -100,7 +83,25 @@
 				initError = err instanceof Error ? err.message : String(err);
 			}
 		}
+		// Captured at mount: the lock callback can run after the callback page
+		// has already navigated to `/`.
+		const mountedOnOAuthCallback = window.location.pathname === '/auth/callback/';
 
+		// Single-tab enforcement (web only — Tauri handles this natively)
+		if (!isTauri) {
+			let restoreInitiated = false;
+			const { steal } = acquireTabLock(async (status) => {
+				tabLockStatus = status;
+				if (status === 'granted' && !restoreInitiated && !mountedOnOAuthCallback) {
+					restoreInitiated = true;
+					await restoreSession();
+				}
+			});
+			stealLock = steal;
+		} else {
+			tabLockStatus = 'granted';
+			await restoreSession();
+		}
 	});
 
 	onDestroy(() => {
@@ -126,6 +127,8 @@
 	</div>
 {:else if tabLockStatus === 'blocked' && stealLock}
 	<TabBlockedMessage onSteal={stealLock} />
+{:else if tabLockStatus === 'acquiring'}
+	<div class="login-container" role="status">Preparing secure storage…</div>
 {:else}
 <div
 	class="app-shell"

@@ -1,7 +1,7 @@
 /**
  * Single-tab enforcement for Catmos Web.
  *
- * Uses the Web Locks API to acquire an exclusive lock named "catmos-mls-session-clean-v2-openmls-v09".
+ * Uses the Web Locks API to acquire an exclusive lock named `TAB_LOCK_NAME`.
  * If another tab already holds the lock, the caller is notified so it can show
  * a blocked UI instead of the app (preventing MLS epoch conflicts).
  *
@@ -9,7 +9,10 @@
  * Tauri desktop) — the lock is simply granted immediately.
  */
 
-const TAB_LOCK_NAME = 'catmos-mls-session-clean-v2-openmls-v09';
+import { CLEAN_STORAGE_SUFFIX } from './cursors';
+
+/** Generation-pinned lock name, so a tab on an older generation never blocks this one. */
+export const TAB_LOCK_NAME = `catmos-mls-session${CLEAN_STORAGE_SUFFIX}`;
 
 export type TabLockStatus = 'acquiring' | 'granted' | 'blocked';
 

@@ -57,10 +57,13 @@ import type {
 import { wrap, proxy, type Remote } from 'comlink';
 import type { WorkerApi } from './mls-worker';
 import {
+	CLEAN_STORAGE_SUFFIX,
+	SS_ACTIVE_DID,
 	clearAllCursorsForDid,
 	setAuthoritativeActiveDid,
 	clearAuthoritativeActiveDid
 } from './stores/cursors';
+
 // ---------------------------------------------------------------------------
 // Environment detection
 // ---------------------------------------------------------------------------
@@ -114,14 +117,42 @@ function terminateWorker(): void {
 // Clean storage constants & generation derivation
 // ---------------------------------------------------------------------------
 
-export const CLEAN_STORAGE_GENERATION_TOKEN = 'mls-state-clean-v2-openmls-v09';
-export const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
-export const STORAGE_PREFIX = `catbird_mls${CLEAN_STORAGE_SUFFIX}`;
-export const DB_PREFIX = `catbird-mls${CLEAN_STORAGE_SUFFIX}`;
-export const MLS_DB_KEY_PREFIX = `${STORAGE_PREFIX}_mls_db_key`;
-export const INIT_RECORD_PREFIX = `${STORAGE_PREFIX}_init_record`;
-export const SS_ACTIVE_DID = `catbird_mls_active_did${CLEAN_STORAGE_SUFFIX}`;
+// The generation pin itself lives in ./stores/cursors (a leaf module with no
+// imports) so cursor keys, the tab lock name, and MLS storage coordinates can
+// never drift onto different generations.
+export { CLEAN_STORAGE_SUFFIX, SS_ACTIVE_DID };
+export const CLEAN_STORAGE_GENERATION_TOKEN = `mls-state${CLEAN_STORAGE_SUFFIX}`;
 export const CONTENT_ROOT_PREFIX = 'mls.content.root.';
+const LEGACY_CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+
+/**
+ * One-shot removal of the previous storage generation's keys.
+ *
+ * Two guards keep this off the live generation, whose keys end in
+ * `-device-identity-v1`: the `endsWith` test for suffixed keys, and the trailing
+ * `:` on the cursor prefix, since a cursor key carries its suffix mid-key.
+ * Reverse order: removing index i only shifts down already-visited indices.
+ */
+function purgeLegacyCleanStorage(storage: Storage): void {
+	for (let index = storage.length - 1; index >= 0; index -= 1) {
+		const key = storage.key(index);
+		if (
+			key &&
+			((key.endsWith(LEGACY_CLEAN_STORAGE_SUFFIX) &&
+				(key.startsWith('catbird_mls:') ||
+					key.startsWith('catbird_mls_active_did') ||
+					key.startsWith(CONTENT_ROOT_PREFIX))) ||
+				key.startsWith(`catbird_ws_cursor${LEGACY_CLEAN_STORAGE_SUFFIX}:`))
+		) {
+			storage.removeItem(key);
+		}
+	}
+}
+
+if (!isTauri && typeof window !== 'undefined') {
+	purgeLegacyCleanStorage(localStorage);
+	purgeLegacyCleanStorage(sessionStorage);
+}
 
 export interface CleanStorageRecord {
 	generation: string;
@@ -143,6 +174,15 @@ export interface CleanStorageRecord {
 /** Return a per-DID namespaced key for browser storage. */
 export function didKey(did: string, suffix: string): string {
 	return `catbird_mls:${did}:${suffix}${CLEAN_STORAGE_SUFFIX}`;
+}
+
+/** localStorage read that yields null when there is no window (SSR). */
+function localGet(key: string): string | null {
+	return typeof window === 'undefined' ? null : localStorage.getItem(key);
+}
+
+function isNonEmptyString(value: unknown): boolean {
+	return typeof value === 'string' && value.length > 0;
 }
 
 export async function sha256Hex(input: string): Promise<string> {
@@ -199,33 +239,21 @@ export async function deriveDidStorageCoordinates(did: string): Promise<{
 	};
 }
 
-async function withDidLock<T>(normalizedDid: string, fn: () => Promise<T>): Promise<T> {
+async function withMlsLock<T>(fn: () => Promise<T>): Promise<T> {
 	if (typeof navigator === 'undefined' || !navigator.locks) {
 		throw new Error(
 			'Web Locks API is required for browser MLS storage coordination; fail closed without mutation'
 		);
 	}
-	const didDigest = await sha256Hex(normalizedDid);
-	const lockName = `catbird_mls_init_lock_${didDigest}${CLEAN_STORAGE_SUFFIX}`;
-	return new Promise<T>((resolve, reject) => {
-		navigator.locks.request(lockName, { mode: 'exclusive' }, async () => {
-			try {
-				const res = await fn();
-				resolve(res);
-			} catch (err) {
-				reject(err);
-			}
-		});
-	});
+	const lockName = `catbird_mls_lifecycle_lock${CLEAN_STORAGE_SUFFIX}`;
+	return navigator.locks.request(lockName, { mode: 'exclusive' }, fn) as Promise<T>;
 }
 
 let _activeDid: string | null = null;
 let _lastAttemptedDid: string | null = null;
-let _initializedDid: string | null = null;
 
 export async function ensureMlsInitialized(did: string): Promise<void> {
 	if (isTauri) return;
-	const coords = await deriveDidStorageCoordinates(did);
 	const {
 		normalizedDid,
 		recordKey,
@@ -235,12 +263,13 @@ export async function ensureMlsInitialized(did: string): Promise<void> {
 		dbPrefix,
 		dbIdentity,
 		didDigest
-	} = coords;
+	} = await deriveDidStorageCoordinates(did);
 
 	_lastAttemptedDid = normalizedDid;
 
-	await withDidLock(normalizedDid, async () => {
-		const rawRecord = typeof window !== 'undefined' ? localStorage.getItem(recordKey) : null;
+	await withMlsLock(async () => {
+		if (_activeDid === normalizedDid) return;
+		const rawRecord = localGet(recordKey);
 		let record: CleanStorageRecord | null = null;
 		if (rawRecord !== null) {
 			try {
@@ -268,20 +297,15 @@ export async function ensureMlsInitialized(did: string): Promise<void> {
 					record.dbIdentity !== dbIdentity ||
 					record.mlsDbKeyLabel !== mlsDbKeyLabel ||
 					record.contentRootKeyLabel !== contentRootKeyLabel ||
-					!record.mlsDbKeyVerifier ||
-					typeof record.mlsDbKeyVerifier !== 'string' ||
-					!record.contentRootKeyVerifier ||
-					typeof record.contentRootKeyVerifier !== 'string' ||
-					!record.creatorToken ||
-					typeof record.creatorToken !== 'string' ||
-					typeof record.createdAt !== 'number' ||
-					record.state !== 'complete'
+					!isNonEmptyString(record.mlsDbKeyVerifier) ||
+					!isNonEmptyString(record.contentRootKeyVerifier) ||
+					!isNonEmptyString(record.creatorToken) ||
+					typeof record.createdAt !== 'number'
 				) {
 					throw new Error('Clean storage record binding mismatch; explicit reset required');
 				}
-				const dbKey =
-					typeof window !== 'undefined' ? localStorage.getItem(record.mlsDbKeyLabel) : null;
-				if (!dbKey || dbKey.length !== 64 || !/^[0-9a-fA-F]{64}$/.test(dbKey)) {
+				const dbKey = localGet(record.mlsDbKeyLabel);
+				if (!dbKey || !/^[0-9a-fA-F]{64}$/.test(dbKey)) {
 					throw new Error(
 						'Clean storage mixed state: complete record but missing or invalid key material; explicit reset required'
 					);
@@ -293,10 +317,7 @@ export async function ensureMlsInitialized(did: string): Promise<void> {
 					);
 				}
 
-				const contentRootB64 =
-					typeof window !== 'undefined'
-						? localStorage.getItem(record.contentRootKeyLabel)
-						: null;
+				const contentRootB64 = localGet(record.contentRootKeyLabel);
 				if (!contentRootB64) {
 					throw new Error(
 						'Clean storage mixed state: complete record but missing content root key; explicit reset required'
@@ -333,23 +354,22 @@ export async function ensureMlsInitialized(did: string): Promise<void> {
 				});
 
 				await w.setContentRootKey(contentRootBytes);
-				_initializedDid = normalizedDid;
 				_activeDid = normalizedDid;
 				return;
 			}
-			throw new Error(`Clean storage invalid initialization record state: ${(record as CleanStorageRecord).state}`);
+			throw new Error(
+				`Clean storage invalid initialization record state: ${String(record.state)}`
+			);
 		}
 
 		// Record absent: verify no orphaned keys exist
-		const existingDbKey =
-			typeof window !== 'undefined' ? localStorage.getItem(mlsDbKeyLabel) : null;
+		const existingDbKey = localGet(mlsDbKeyLabel);
 		if (existingDbKey !== null) {
 			throw new Error(
 				'Clean storage mixed state: key material exists without initialization record; explicit reset required'
 			);
 		}
-		const existingCrKey =
-			typeof window !== 'undefined' ? localStorage.getItem(contentRootKeyLabel) : null;
+		const existingCrKey = localGet(contentRootKeyLabel);
 		if (existingCrKey !== null) {
 			throw new Error(
 				'Clean storage mixed state: content root key exists without initialization record; explicit reset required'
@@ -418,7 +438,6 @@ export async function ensureMlsInitialized(did: string): Promise<void> {
 			localStorage.setItem(recordKey, JSON.stringify(newRecord));
 		}
 
-		_initializedDid = normalizedDid;
 		_activeDid = normalizedDid;
 	});
 }
@@ -514,7 +533,7 @@ export async function startLogin(identifier: string): Promise<void> {
 	} else {
 		callbackBase = window.location.origin;
 	}
-	const redirectTo = `${callbackBase}/auth/callback`;
+	const redirectTo = `${callbackBase}/auth/callback/`;
 	const loginUrl =
 		`${NEST_URL}/auth/login` +
 		`?identifier=${encodeURIComponent(identifier)}` +
@@ -694,37 +713,33 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return null;
-	const { did, sessionId } = saved;
+	const { sessionId } = saved;
 
-	try {
-		const resp = await fetch(`${NEST_URL}/auth/session`, {
-			headers: { Authorization: `Bearer ${sessionId}` }
-		});
-		if (!resp.ok) {
-			if (resp.status === 401 || resp.status === 403) {
-				clearBrowserAuth();
-				return null;
-			}
-			throw new Error(`Failed to restore session: ${resp.status}`);
+	const resp = await fetch(`${NEST_URL}/auth/session`, {
+		headers: { Authorization: `Bearer ${sessionId}` }
+	});
+	if (!resp.ok) {
+		if (resp.status === 401 || resp.status === 403) {
+			clearBrowserAuth();
+			return null;
 		}
-		const info = await resp.json();
-
-		// Ensure MLS DB is initialized under Web Lock for this DID
-		await ensureMlsInitialized(info.did);
-
-		// Push restored credentials to Worker
-		const w = getWorker();
-		await w.setAuth(info.did, sessionId);
-		await w.setup();
-
-		// Replenish key packages (setup skips upload on returning sessions)
-		replenishKeyPackages();
-		startKeyPackageReplenishment();
-
-		return { did: info.did, handle: info.handle ?? info.did };
-	} catch (error) {
-		throw error;
+		throw new Error(`Failed to restore session: ${resp.status}`);
 	}
+	const info = await resp.json();
+
+	// Ensure MLS DB is initialized under Web Lock for this DID
+	await ensureMlsInitialized(info.did);
+
+	// Push restored credentials to Worker
+	const w = getWorker();
+	await w.setAuth(info.did, sessionId);
+	await w.setup();
+
+	// Replenish key packages (setup skips upload on returning sessions)
+	replenishKeyPackages();
+	startKeyPackageReplenishment();
+
+	return { did: info.did, handle: info.handle ?? info.did };
 }
 
 export async function logout(): Promise<void> {
@@ -733,20 +748,17 @@ export async function logout(): Promise<void> {
 		return tauriInvoke('logout');
 	}
 
-	const restartReplenishmentOnFailure = stopKeyPackageReplenishment();
-
+	stopKeyPackageReplenishment();
 	try {
 		if (_worker) await _worker.clearAuth();
-	} catch (error) {
-		if (restartReplenishmentOnFailure) startKeyPackageReplenishment();
-		throw error;
+	} finally {
+		// clearBrowserAuth() looks the credential key up via SS_ACTIVE_DID, so the
+		// credential must be cleared before the active DID is dropped.
+		clearBrowserAuth();
+		clearAuthoritativeActiveDid();
+		terminateWorker();
+		_activeDid = null;
 	}
-
-	clearAuthoritativeActiveDid();
-	clearBrowserAuth();
-	terminateWorker();
-	_activeDid = null;
-	_initializedDid = null;
 }
 
 /**
@@ -768,7 +780,7 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 	if (!targetDid) {
 		terminateWorker();
 		_activeDid = null;
-		_initializedDid = null;
+		_lastAttemptedDid = null;
 		return;
 	}
 
@@ -781,7 +793,7 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 		dbPrefix
 	} = await deriveDidStorageCoordinates(targetDid);
 
-	await withDidLock(normalizedDid, async () => {
+	await withMlsLock(async () => {
 		// Reset is the gate: a busy Rust database lease rejects before auth,
 		// content-key, signer, or OPFS state is changed.
 		const w = getWorker();
@@ -797,6 +809,8 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 		}
 
 		terminateWorker();
+		_activeDid = null;
+		_lastAttemptedDid = null;
 
 		// Delete exact keys for this DID ONLY
 		if (typeof window !== 'undefined') {
@@ -816,18 +830,9 @@ export async function resetCleanStorage(did?: string): Promise<void> {
 			// Remove initialization record marker LAST
 			localStorage.removeItem(recordKey);
 		}
-
-		if (_lastAttemptedDid === normalizedDid) {
-			_lastAttemptedDid = null;
-		}
-		if (_activeDid === normalizedDid) {
-			_activeDid = null;
-		}
-		if (_initializedDid === normalizedDid) {
-			_initializedDid = null;
-		}
 	});
 }
+
 // ---------------------------------------------------------------------------
 // Key package replenishment (browser only)
 // ---------------------------------------------------------------------------

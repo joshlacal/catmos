@@ -3,7 +3,8 @@ import * as api from '$lib/wasm';
 import { listenForEvent, isTauri } from '$lib/wasm';
 import type { AuthState } from '$lib/tauri';
 import { profiles } from './profiles';
-import { setAuthoritativeActiveDid, clearAuthoritativeActiveDid } from './cursors';
+import { setAuthoritativeActiveDid } from './cursors';
+
 interface AuthStore {
 	user: AuthState | null;
 	loading: boolean;
@@ -64,7 +65,6 @@ function createAuthStore() {
 		},
 		async logout() {
 			try {
-				clearAuthoritativeActiveDid();
 				await api.logout();
 			} finally {
 				set(initialState);

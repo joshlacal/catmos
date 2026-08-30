@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_WEB_REV="1731490b2be2dd94e69c889512d0cc9ba8fa5ee8"
-EXPECTED_WASM_SHA256="45cefe98834b47bacda1b54b051ed04698e90e1b753842d6de63442713448a0c"
+EXPECTED_WEB_REV="c078af99514f2ea5e11e3c865b0de8c1392e0a69"
+EXPECTED_WASM_SHA256="107ee1cc741a688e1978063d1ce78061cbbdfec12d232c93ee34ae6459f4e477"
 PAGES_BRANCH="${1:-main}"
 
 # Vite cannot handle special characters (+, #, etc.) in the project path.
@@ -11,27 +11,23 @@ PAGES_BRANCH="${1:-main}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SAFE_LINK="/tmp/catmos-build"
 SAFE_PARENT_LINK="/tmp/catbird-petrel-build"
 
 # Clean up on exit
 cleanup() {
-    rm -f "$SAFE_LINK"
     rm -f "$SAFE_PARENT_LINK"
 }
 trap cleanup EXIT
 
 # Create symlinks with paths that have no special characters
-rm -f "$SAFE_LINK"
 rm -f "$SAFE_PARENT_LINK"
-ln -s "$SCRIPT_DIR" "$SAFE_LINK"
 ln -s "$PARENT_DIR" "$SAFE_PARENT_LINK"
 
 echo "==> Building catbird-mls-web WASM..."
 cd "$SAFE_PARENT_LINK/catbird-mls-web"
 bash build.sh
 
-ACTUAL_WEB_REV="$(git rev-parse main^{commit})"
+ACTUAL_WEB_REV="$(jj log -r main --no-graph -T commit_id)"
 if [[ "$ACTUAL_WEB_REV" != "$EXPECTED_WEB_REV" ]]; then
     echo "catbird-mls-web revision mismatch: expected $EXPECTED_WEB_REV, got $ACTUAL_WEB_REV" >&2
     exit 1
@@ -44,11 +40,10 @@ if [[ "$ACTUAL_WASM_SHA256" != "$EXPECTED_WASM_SHA256" ]]; then
 fi
 
 echo "==> Building SvelteKit..."
-cd "$SAFE_LINK"
+cd "$SAFE_PARENT_LINK/catmos"
 npm run build
 
 echo "==> Deploying to Cloudflare Pages..."
-cd "$SAFE_LINK"
 npx wrangler pages deploy build/ --project-name=catmos --branch="$PAGES_BRANCH" --commit-dirty=true
 
 echo "==> Done!"
