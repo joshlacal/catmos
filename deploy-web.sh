@@ -2,7 +2,7 @@
 set -euo pipefail
 
 EXPECTED_WEB_REV="c078af99514f2ea5e11e3c865b0de8c1392e0a69"
-EXPECTED_WASM_SHA256="107ee1cc741a688e1978063d1ce78061cbbdfec12d232c93ee34ae6459f4e477"
+EXPECTED_WASM_SHA256="66be9ed66495d452aca8177e2be34b064627a7f688f31aebf0f1d3781a696014"
 PAGES_BRANCH="${1:-main}"
 
 # Vite cannot handle special characters (+, #, etc.) in the project path.
