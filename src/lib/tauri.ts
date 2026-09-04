@@ -3,10 +3,14 @@ import { invoke } from '@tauri-apps/api/core';
 export interface Conversation {
 	id: string;
 	/** Current MLS group identifier (hex). Changes on group reset. */
-	groupId?: string;
+	groupId: string;
 	displayName: string;
 	description?: string;
 	members: string[];
+	/** Immutable projection kind from the browser/WASM conversation API. */
+	conversationKind?: 'direct' | 'group' | string;
+	/** Server MemberView roster, including creator and role. */
+	memberViews?: ConversationMember[];
 	lastMessage?: string;
 	lastMessageAt?: string;
 	unreadCount: number;
@@ -21,6 +25,11 @@ export interface Conversation {
 	avatarDataUrl?: string;
 }
 
+export interface ConversationMember {
+	did: string;
+	role: 'admin' | 'member' | string;
+}
+
 export interface Message {
 	id: string;
 	conversationId: string;
@@ -28,6 +37,8 @@ export interface Message {
 	senderHandle: string;
 	content: string;
 	timestamp: string;
+	/** Canonical conversation sequence; absent or zero means not yet confirmed. */
+	sequenceNumber?: number;
 	status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 	messageType?: 'text' | 'image' | 'voice' | 'system' | 'event';
 	image?: ImageAttachment;

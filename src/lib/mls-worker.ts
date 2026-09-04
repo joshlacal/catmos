@@ -11,6 +11,27 @@ const wasmReady = init().then(() => undefined);
 // Active WebSocket subscriptions keyed by conversation ID.
 // WsSubscription structs can't cross the Worker boundary, so we track them here.
 const subscriptions = new Map<string, { close(): void }>();
+// Legacy group handles may resolve to the same stable subscription. Keep the
+// alias-to-stable index so unsubscribe works even after a reset changes the
+// current group coordinate.
+const subscriptionAliases = new Map<string, string>();
+
+// This is a required source ABI. The generated pkg is refreshed only at the
+// reviewed checkpoint; keeping the contract explicit here prevents an older
+// pkg from silently falling back to a caller-supplied group/stable alias.
+type BrowserIdentityAbi = typeof wasm & {
+	catbird_mls_resolve_conversation_id(identifier: string): string;
+	catbird_mls_start_background_tasks(intervalMs: number): void;
+	catbird_mls_stop_background_tasks(): void;
+	catbird_mls_run_deferred_recovery(): Promise<unknown>;
+};
+
+const browserAbi = wasm as BrowserIdentityAbi;
+
+async function canonicalConversationId(identifier: string): Promise<string> {
+	await wasmReady;
+	return browserAbi.catbird_mls_resolve_conversation_id(identifier);
+}
 
 // WASM return values may contain non-cloneable JsValue handles.
 // Strip them to plain JSON-safe objects for structured clone across Worker boundary.
@@ -27,8 +48,12 @@ const api = {
 		wasm.catbird_mls_set_auth(did, token);
 	},
 	clearAuth: () => {
+		browserAbi.catbird_mls_stop_background_tasks();
 		wasm.catbird_mls_clear_auth();
 		(wasm as unknown as { catbird_mls_clear_signer_bridge: () => void }).catbird_mls_clear_signer_bridge();
+		for (const subscription of subscriptions.values()) subscription.close();
+		subscriptionAliases.clear();
+		subscriptions.clear();
 	},
 	// Browser signer bridge. The CryptoKey remains owned by the worker's
 	// WebCrypto implementation; only its public key and a callback cross into
@@ -97,6 +122,19 @@ const api = {
 	},
 	setup: async () => {
 		await wasm.catbird_mls_setup();
+		browserAbi.catbird_mls_start_background_tasks(30_000);
+	},
+	startBackgroundTasks: async (intervalMs = 30_000) => {
+		await wasmReady;
+		browserAbi.catbird_mls_start_background_tasks(intervalMs);
+	},
+	stopBackgroundTasks: async () => {
+		await wasmReady;
+		browserAbi.catbird_mls_stop_background_tasks();
+	},
+	runDeferredRecovery: async () => {
+		await wasmReady;
+		return plain(await browserAbi.catbird_mls_run_deferred_recovery());
 	},
 	replenishKeyPackages: async () => {
 		await wasm.catbird_mls_replenish_key_packages();
@@ -163,12 +201,30 @@ const api = {
 		onStatus: (status: unknown) => void,
 		_cursor?: string
 	) => {
-		const sub = await wasm.catbird_mls_subscribe(convoId, onMessage, onEvent, onStatus);
-		if (sub) subscriptions.set(convoId, sub);
+		await wasmReady;
+		const stableConversationId = await canonicalConversationId(convoId);
+		const existing = subscriptions.get(stableConversationId);
+		if (existing) existing.close();
+		const sub = await wasm.catbird_mls_subscribe(
+			stableConversationId,
+			onMessage,
+			onEvent,
+			onStatus
+		);
+		if (sub) {
+			subscriptions.set(stableConversationId, sub);
+			subscriptionAliases.set(convoId, stableConversationId);
+			subscriptionAliases.set(stableConversationId, stableConversationId);
+		}
 	},
-	unsubscribe: (convoId: string) => {
-		subscriptions.get(convoId)?.close();
-		subscriptions.delete(convoId);
+	unsubscribe: async (convoId: string) => {
+		const stableConversationId =
+			subscriptionAliases.get(convoId) ?? (await canonicalConversationId(convoId));
+		subscriptions.get(stableConversationId)?.close();
+		subscriptions.delete(stableConversationId);
+		for (const [alias, stable] of subscriptionAliases) {
+			if (stable === stableConversationId) subscriptionAliases.delete(alias);
+		}
 	},
 
 	// Members

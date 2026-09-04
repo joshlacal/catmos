@@ -3,19 +3,39 @@
 	import { goto } from '$app/navigation';
 	import { page } from '$app/stores';
 	import { auth } from '$lib/stores/auth';
+	import { exchangeOAuthCode, clearPendingOAuthLogin } from '$lib/wasm';
 
 	let status = $state('Completing sign in…');
 
 	onMount(async () => {
-		const sessionId = $page.url.searchParams.get('session_id');
-		if (!sessionId) {
-			status = 'Error: missing session_id in callback URL.';
+		// Security: NEVER accept session_id directly in callback URL
+		if ($page.url.searchParams.has('session_id')) {
+			clearPendingOAuthLogin();
+			status = 'Error: direct session_id in callback URL is forbidden.';
 			return;
 		}
+
+		const error = $page.url.searchParams.get('error');
+		if (error) {
+			clearPendingOAuthLogin();
+			const errorDescription = $page.url.searchParams.get('error_description');
+			status = `Sign-in failed: ${error}${errorDescription ? ` (${errorDescription})` : ''}`;
+			return;
+		}
+
+		const code = $page.url.searchParams.get('code');
+		if (!code) {
+			clearPendingOAuthLogin();
+			status = 'Error: missing one-time code in callback URL.';
+			return;
+		}
+
 		try {
+			const sessionId = await exchangeOAuthCode(code);
 			await auth.completeOAuthCallback(sessionId);
 			goto('/');
 		} catch (e) {
+			clearPendingOAuthLogin();
 			status = `Sign-in failed: ${e}`;
 		}
 	});

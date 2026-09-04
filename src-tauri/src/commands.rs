@@ -453,6 +453,8 @@ pub struct Message {
     pub sender_handle: String,
     pub content: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub sequence_number: u64,
     pub status: String,
     #[serde(default = "default_message_type")]
     pub message_type: String,
@@ -530,6 +532,7 @@ pub(crate) fn ui_message_from_orchestrator(message: OrchestratorMessage) -> Mess
         sender_handle: String::new(),
         content,
         timestamp: message.timestamp.to_rfc3339(),
+        sequence_number: message.sequence_number,
         status: ui_status_for_delivery(message.is_own, message.delivery_status.as_ref()),
         message_type,
         image,
@@ -2971,6 +2974,29 @@ mod tests {
     use catbird_mls::{KeychainAccess, MLSContext, MLSError};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn message_ui_projection_preserves_canonical_sequence_in_json() {
+        let message = super::OrchestratorMessage {
+            id: "fixture-message".to_string(),
+            conversation_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            sender_did: "did:web:peer.example.com".to_string(),
+            text: "fixture".to_string(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-05T12:00:02Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            epoch: 3,
+            sequence_number: 100,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        let projected = super::ui_message_from_orchestrator(message);
+        let json = serde_json::to_value(projected).unwrap();
+        assert_eq!(json["sequenceNumber"], 100);
+        assert_eq!(json["timestamp"], "2026-09-05T12:00:02+00:00");
+        assert_eq!(json["id"], "fixture-message");
+    }
 
     struct TestKeychain {
         values: Mutex<HashMap<String, Vec<u8>>>,

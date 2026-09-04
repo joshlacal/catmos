@@ -23,7 +23,10 @@ function createConversationsStore() {
 		subscribe,
 		findDirectConversation(targetDid: string): string | null {
 			const match = currentState.items.find(
-				(c) => !c.isGroup && c.members.length === 2 && c.members.includes(targetDid)
+				(c) =>
+					(c.conversationKind === 'direct' || !c.isGroup) &&
+					c.members.length === 2 &&
+					c.members.includes(targetDid)
 			);
 			return match?.id ?? null;
 		},
