@@ -230,7 +230,12 @@ pub(crate) fn delete_saved_session_credentials() -> Result<(), String> {
 /// Install only opaque runtime capabilities after login/device enrollment.
 /// Persisted session/device identifiers never enter command logs; DPoP
 /// binding evidence is admitted only through the runtime authority provider.
-async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) -> Result<(), String> {
+async fn configure_chat_auth(
+    state: &AppState,
+    did: &str,
+    session_id: &str,
+    mls_context: &catbird_mls::MLSContext,
+) -> Result<(), String> {
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
@@ -279,6 +284,11 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) -> R
             format!("chat device authority server ID could not be installed for {did}: {error}")
         })?;
 
+    // Current getOwnDevices evidence restores only the in-memory capability.
+    // Complete reopen never rewrites the account's keychain or storage.
+    let evidence = verify_device_reconciliation_readonly(state, mls_context, did).await?;
+    state.chat_auth.admit_device_authority_for_session(&session, evidence)
+        .map_err(|error| format!("chat device reconciliation became stale: {error}"))?;
     Ok(())
 }
 
@@ -329,7 +339,11 @@ where
 /// listDevices row. Zero/duplicate/error results stop login and prevent
 /// accidental device churn. A missing local UUID is the only case that may
 /// proceed to first registration.
-async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Result<bool, String> {
+async fn reconcile_device_before_registration(
+    state: &AppState,
+    mls_context: &catbird_mls::MLSContext,
+    did: &str,
+) -> Result<bool, String> {
     let session = state
         .api_client
         .current_session()
@@ -354,9 +368,17 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
         .api_client
         .ensure_session_current(&session)
         .map_err(|error| error.to_string())?;
+    let identity = store.get_mls_did(did).await.map_err(|error| error.to_string())?
+        .ok_or_else(|| "registered device is missing its scoped MLS identity".to_string())?;
+    if identity != format!("{did}#{local_device_uuid}") {
+        return Err("registered MLS identity does not match the durable device".to_string());
+    }
+    let public_key = mls_context
+        .identity_public_key(identity)
+        .map_err(|error| error.to_string())?;
     state
         .api_client
-        .resolve_server_device_id_for_local_uuid_with_session(&session, &local_device_uuid)
+        .resolve_server_device_id_for_local_uuid_with_session(&session, &local_device_uuid, &public_key)
         .await
         .map(|_| true)
         .map_err(|error| {
@@ -375,7 +397,7 @@ async fn verify_device_reconciliation_readonly(
     state: &AppState,
     mls_context: &catbird_mls::MLSContext,
     did: &str,
-) -> Result<(), String> {
+) -> Result<crate::api_client::DeviceAuthorityEvidence, String> {
     let session = state
         .api_client
         .current_session()
@@ -412,7 +434,7 @@ async fn verify_device_reconciliation_readonly(
 
     let devices = state
         .api_client
-        .list_devices_readonly(&session)
+        .list_devices_readonly(&session, &local_device_uuid)
         .await
         .map_err(|error| format!("failed to list devices from server: {error}"))?;
 
@@ -487,7 +509,24 @@ async fn verify_device_reconciliation_readonly(
         }
     }
 
-    Ok(())
+    let public_key: [u8; 32] = local_pubkey.as_slice().try_into()
+        .map_err(|_| "local signer public key must be 32 bytes".to_string())?;
+    let key_id = matched_dev.key_id.as_deref()
+        .ok_or_else(|| "registered device omitted keyId".to_string())?;
+    let key_id = catbird_mls::chat_v2::ids::KeyId::parse(key_id)
+        .map_err(|error| error.to_string())?;
+    if !key_id.matches_public_key(&public_key) {
+        return Err("registered device keyId does not match local signer".to_string());
+    }
+    let auth_generation = matched_dev.auth_generation
+        .and_then(|value| u64::try_from(value).ok()).filter(|value| *value > 0)
+        .ok_or_else(|| "registered device has no positive authGeneration".to_string())?;
+    state.api_client.ensure_session_current(&session).map_err(|error| error.to_string())?;
+    Ok(crate::api_client::DeviceAuthorityEvidence {
+        local_device_uuid,
+        server_device_id: persisted_server_device_id,
+        auth_generation,
+    })
 }
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
@@ -552,6 +591,8 @@ pub struct Message {
     pub sender_handle: String,
     pub content: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub sequence_number: u64,
     pub status: String,
     #[serde(default = "default_message_type")]
     pub message_type: String,
@@ -629,6 +670,7 @@ pub(crate) fn ui_message_from_orchestrator(message: OrchestratorMessage) -> Mess
         sender_handle: String::new(),
         content,
         timestamp: message.timestamp.to_rfc3339(),
+        sequence_number: message.sequence_number,
         status: ui_status_for_delivery(message.is_own, message.delivery_status.as_ref()),
         message_type,
         image,
@@ -937,7 +979,7 @@ async fn enroll_and_publish_runtime(
             state
                 .api_client
                 .set_auth(normalized_did.clone(), session_id.to_string());
-            configure_chat_auth(state, &normalized_did, session_id).await?;
+            configure_chat_auth(state, &normalized_did, session_id, current.mls_context.as_ref()).await?;
             return Ok(current.orchestrator.clone());
         }
     }
@@ -985,7 +1027,7 @@ async fn enroll_and_publish_runtime(
         if is_creating {
             // Reconcile a durable identity before any registration attempt. Only a
             // first-login device without a local UUID may create a new registration.
-            if reconcile_device_before_registration(state, &normalized_did).await? {
+            if reconcile_device_before_registration(state, provisional.mls_context.as_ref(), &normalized_did).await? {
                 let authority_session = state
                     .api_client
                     .current_session()
@@ -1062,16 +1104,11 @@ async fn enroll_and_publish_runtime(
                 ));
             }
 
-            // Strictly read-only reconciliation: verifies exact 1 clientUuid match, resolved ID == persisted server ID, and pubkey binding with zero writes
-            verify_device_reconciliation_readonly(
-                state,
-                provisional.mls_context.as_ref(),
-                &normalized_did,
-            )
-            .await?;
+            // configure_chat_auth performs the same read-only device/signer
+            // verification immediately before runtime publication.
         }
 
-        configure_chat_auth(state, &normalized_did, session_id).await?;
+        configure_chat_auth(state, &normalized_did, session_id, provisional.mls_context.as_ref()).await?;
         Ok(())
     }
     .await;
@@ -1485,7 +1522,7 @@ pub async fn send_message(
     let orchestrator = state.get_orchestrator().await?;
     state
         .api_client
-        .require_signing_capability()
+        .require_canonical_admission()
         .map_err(|error| {
             actionable_error(format!("Signed clean-chat send unavailable: {error}"))
         })?;
@@ -1526,7 +1563,7 @@ pub async fn send_image(
     let orchestrator = state.get_orchestrator().await?;
     state
         .api_client
-        .require_signing_capability()
+        .require_canonical_admission()
         .map_err(|error| {
             actionable_error(format!("Signed clean-chat send unavailable: {error}"))
         })?;
@@ -1896,7 +1933,7 @@ pub async fn send_reaction(
     let orchestrator = state.get_orchestrator().await?;
     state
         .api_client
-        .require_signing_capability()
+        .require_canonical_admission()
         .map_err(|error| {
             actionable_error(format!("Signed clean-chat reaction unavailable: {error}"))
         })?;
@@ -2866,7 +2903,6 @@ pub async fn reset_group(
         path: "/xrpc/blue.catbird.chat.requestReset".to_string(),
         body: Some(serde_json::to_vec(&body).map_err(|e| format!("JSON error: {e}"))?),
     };
-
     let resp = state
         .api_client
         .submit_prepared_request(req)
@@ -3417,4 +3453,27 @@ mod tests {
     fn session_credential_keys_order_has_user_did_last() {
         assert_eq!(SESSION_CREDENTIAL_KEYS.last(), Some(&"user_did"));
     }
+    #[test]
+    fn message_ui_projection_preserves_canonical_sequence_in_json() {
+        let message = super::OrchestratorMessage {
+            id: "fixture-message".to_string(),
+            conversation_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            sender_did: "did:web:peer.example.com".to_string(),
+            text: "fixture".to_string(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-05T12:00:02Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            epoch: 3,
+            sequence_number: 100,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        let projected = super::ui_message_from_orchestrator(message);
+        let json = serde_json::to_value(projected).unwrap();
+        assert_eq!(json["sequenceNumber"], 100);
+        assert_eq!(json["timestamp"], "2026-09-05T12:00:02+00:00");
+        assert_eq!(json["id"], "fixture-message");
+    }
+
 }

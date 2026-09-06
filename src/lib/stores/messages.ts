@@ -14,8 +14,24 @@ interface MessagesStore {
 	loading: boolean;
 }
 
-function sortByTimestamp(msgs: Message[]): Message[] {
-	return msgs.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+function sortMessages(msgs: Message[]): Message[] {
+	return msgs.sort((a, b) => {
+		// Sequence belongs to the stable conversation. Local ACK timestamps can
+		// be later than the timestamp of a subsequent incoming message.
+		const aConfirmed = Number.isSafeInteger(a.sequenceNumber) && (a.sequenceNumber ?? 0) > 0;
+		const bConfirmed = Number.isSafeInteger(b.sequenceNumber) && (b.sequenceNumber ?? 0) > 0;
+		if (aConfirmed !== bConfirmed) return aConfirmed ? -1 : 1;
+		if (aConfirmed && bConfirmed && a.sequenceNumber !== b.sequenceNumber) {
+			return a.sequenceNumber! - b.sequenceNumber!;
+		}
+		// Unconfirmed/legacy rows stay at the tail. Treat invalid dates
+		// consistently so the comparator remains transitive even for old rows.
+		const aTime = Date.parse(a.timestamp);
+		const bTime = Date.parse(b.timestamp);
+		const timestampOrder = (Number.isFinite(aTime) ? aTime : 0) - (Number.isFinite(bTime) ? bTime : 0);
+		if (timestampOrder !== 0) return timestampOrder;
+		return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+	});
 }
 
 function createMessagesStore() {
@@ -40,7 +56,7 @@ function createMessagesStore() {
 				});
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
-					byConversation.set(conversationId, sortByTimestamp(deduped));
+					byConversation.set(conversationId, sortMessages(deduped));
 					return { ...s, byConversation, loading: false };
 				});
 			} catch {
@@ -61,7 +77,7 @@ function createMessagesStore() {
 						return true;
 					});
 					if (newMsgs.length > 0) {
-						byConversation.set(conversationId, sortByTimestamp([...existing, ...newMsgs]));
+						byConversation.set(conversationId, sortMessages([...existing, ...newMsgs]));
 					}
 					return { ...s, byConversation };
 				});
@@ -83,7 +99,7 @@ function createMessagesStore() {
 			update((s) => {
 				const byConversation = new Map(s.byConversation);
 				const existing = byConversation.get(conversationId) ?? [];
-				byConversation.set(conversationId, [...existing, optimistic]);
+				byConversation.set(conversationId, sortMessages([...existing, optimistic]));
 				return { ...s, byConversation };
 			});
 			try {
@@ -93,7 +109,7 @@ function createMessagesStore() {
 					const existing = byConversation.get(conversationId) ?? [];
 					byConversation.set(
 						conversationId,
-						existing.map((m) => (m.id === optimistic.id ? sent : m))
+						sortMessages(existing.map((m) => (m.id === optimistic.id ? sent : m)))
 					);
 					return { ...s, byConversation };
 				});
@@ -138,7 +154,7 @@ function createMessagesStore() {
 			update((s) => {
 				const byConversation = new Map(s.byConversation);
 				const existing = byConversation.get(conversationId) ?? [];
-				byConversation.set(conversationId, [...existing, optimistic]);
+				byConversation.set(conversationId, sortMessages([...existing, optimistic]));
 				return { ...s, byConversation };
 			});
 			try {
@@ -156,7 +172,7 @@ function createMessagesStore() {
 					const existing = byConversation.get(conversationId) ?? [];
 					byConversation.set(
 						conversationId,
-						existing.map((m) => (m.id === optimistic.id ? sent : m))
+						sortMessages(existing.map((m) => (m.id === optimistic.id ? sent : m)))
 					);
 					return { ...s, byConversation };
 				});
@@ -199,7 +215,7 @@ function createMessagesStore() {
 			update((s) => {
 				const byConversation = new Map(s.byConversation);
 				const existing = byConversation.get(conversationId) ?? [];
-				byConversation.set(conversationId, [...existing, optimistic]);
+				byConversation.set(conversationId, sortMessages([...existing, optimistic]));
 				return { ...s, byConversation };
 			});
 			try {
@@ -215,7 +231,7 @@ function createMessagesStore() {
 					const existing = byConversation.get(conversationId) ?? [];
 					byConversation.set(
 						conversationId,
-						existing.map((m) => (m.id === optimistic.id ? sent : m))
+						sortMessages(existing.map((m) => (m.id === optimistic.id ? sent : m)))
 					);
 					return { ...s, byConversation };
 				});
@@ -239,7 +255,7 @@ function createMessagesStore() {
 				const byConversation = new Map(s.byConversation);
 				const existing = byConversation.get(message.conversationId) ?? [];
 				if (!existing.find((m) => m.id === message.id)) {
-					byConversation.set(message.conversationId, sortByTimestamp([...existing, message]));
+					byConversation.set(message.conversationId, sortMessages([...existing, message]));
 				}
 				return { ...s, byConversation };
 			});
