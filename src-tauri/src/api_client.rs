@@ -34,10 +34,18 @@ fn canonical_conversation_view(
         group_id: hex::encode(state.coordinates.group_id.as_ref()),
         conversation_id: state.coordinates.conversation_id.to_string(),
         epoch: state.coordinates.epoch as u64,
-        members: state.participants.iter().map(|participant| MemberView {
-            did: participant.user_did.to_string(),
-            role: if participant.role == "admin" { MemberRole::Admin } else { MemberRole::Member },
-        }).collect(),
+        members: state
+            .participants
+            .iter()
+            .map(|participant| MemberView {
+                did: participant.user_did.to_string(),
+                role: if participant.role == "admin" {
+                    MemberRole::Admin
+                } else {
+                    MemberRole::Member
+                },
+            })
+            .collect(),
         metadata: None,
         created_at: None,
         updated_at: None,
@@ -1393,8 +1401,11 @@ impl ReqwestApiClient {
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
         self.ensure_session_current(&auth.session)?;
-        let output = catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
-            .map_err(|error| OrchestratorError::Api(format!("Canonical getConversations decode: {error}")))?;
+        let output =
+            catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
+                .map_err(|error| {
+                OrchestratorError::Api(format!("Canonical getConversations decode: {error}"))
+            })?;
 
         let conversations = output
             .items
@@ -1461,7 +1472,9 @@ impl ReqwestApiClient {
             .filter(|entry| canonical_entry_matches_type(entry, message_type))
             .map(|entry| map_canonical_entry(entry, convo_id))
             .collect::<Result<Vec<_>>>()?
-            .into_iter().flatten().collect();
+            .into_iter()
+            .flatten()
+            .collect();
         let next = if output.has_more {
             Some(output.next_after_seq.to_string())
         } else {
@@ -1526,7 +1539,8 @@ fn map_canonical_entry(
     entry: catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
     expected_conversation_id: &str,
 ) -> Result<Option<IncomingEnvelope>> {
-    let row = serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
+    let row =
+        serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
     IncomingEnvelope::from_canonical_entry(&row, expected_conversation_id)
 }
 
@@ -1842,6 +1856,7 @@ mod tests {
     //! `bytes::Bytes::from(Vec<u8>)`. These tests assert the wire output
     //! is singly-encoded (good) and explicitly check the old double-encoded
     //! output the buggy adapter would have produced (regression protection).
+    use super::canonical_admission_projection_tests::{test_device_key_id, TEST_DEVICE_PUBLIC_KEY};
     use super::*;
     use catbird_mls::orchestrator::credentials::CredentialStore;
 
@@ -1860,18 +1875,18 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    struct CapturedRequest {
-        method: String,
-        path: String,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
+    pub(super) struct CapturedRequest {
+        pub(super) method: String,
+        pub(super) path: String,
+        pub(super) headers: Vec<(String, String)>,
+        pub(super) body: Vec<u8>,
     }
 
     /// Spawn a single-shot loopback HTTP server. Returns (base_url, recv).
     /// The server accepts ONE connection, parses one request, replies 200,
     /// and forwards the captured request to the channel. Bind to port 0 so
     /// tests run in parallel without collisions.
-    fn spawn_capture_server() -> (String, mpsc::Receiver<CapturedRequest>) {
+    pub(super) fn spawn_capture_server() -> (String, mpsc::Receiver<CapturedRequest>) {
         spawn_capture_server_with_status(200)
     }
 
@@ -1941,7 +1956,7 @@ mod tests {
         (format!("http://127.0.0.1:{port}"), rx)
     }
 
-    fn spawn_scripted_json_server(
+    pub(super) fn spawn_scripted_json_server(
         responses: Vec<(u16, String, std::time::Duration)>,
     ) -> (String, mpsc::Receiver<CapturedRequest>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -2017,7 +2032,7 @@ mod tests {
         }
     }
 
-    fn list_devices_body(did: &str, device_id: &str) -> String {
+    pub(super) fn list_devices_body(did: &str, device_id: &str) -> String {
         let _ = did;
         let key_id = test_device_key_id();
         let public_key = base64::engine::general_purpose::STANDARD.encode(TEST_DEVICE_PUBLIC_KEY);
@@ -2695,8 +2710,11 @@ fn canonical_entries_preserve_commit_epochs() {
 
 #[cfg(test)]
 mod canonical_admission_projection_tests {
+    use super::tests::{list_devices_body, spawn_capture_server, spawn_scripted_json_server};
     use super::*;
-    use catbird_mls::orchestrator::canonical_transport::{decode_conversation_state, encode_conversation_state, decode_conversations_inventory};
+    use catbird_mls::orchestrator::canonical_transport::{
+        decode_conversation_state, decode_conversations_inventory, encode_conversation_state,
+    };
 
     fn inventory(wire: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -2706,10 +2724,12 @@ mod canonical_admission_projection_tests {
         })).unwrap()
     }
 
-
     #[test]
     fn canonical_pending_and_accepted_leafless_views_keep_exact_snapshot() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         for (status, version) in [("pending", 41), ("active", 42)] {
             let mut wire = fixture.clone();
             wire["participants"][1]["status"] = serde_json::json!(status);
@@ -2726,13 +2746,23 @@ mod canonical_admission_projection_tests {
             let view = canonical_conversation_view(&state);
             assert_eq!(view.canonical_state.as_ref(), Some(&state));
             assert_eq!(view.epoch, state.coordinates.epoch as u64);
-            assert_eq!(view.group_id, hex::encode(state.coordinates.group_id.as_ref()));
-            let persisted: ConversationView = serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
+            assert_eq!(
+                view.group_id,
+                hex::encode(state.coordinates.group_id.as_ref())
+            );
+            let persisted: ConversationView =
+                serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
             let retained = persisted.canonical_state.unwrap();
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(), state);
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
+                state
+            );
             assert_eq!(retained.participants[1].status, status);
             assert_eq!(retained.participants[1].leaf_count, 0);
-            assert_eq!(retained.participants[1].invitation_provenance, state.participants[1].invitation_provenance);
+            assert_eq!(
+                retained.participants[1].invitation_provenance,
+                state.participants[1].invitation_provenance
+            );
             assert!(view.created_at.is_none());
             assert!(view.metadata.is_none());
         }
@@ -2740,19 +2770,26 @@ mod canonical_admission_projection_tests {
 
     #[test]
     fn legacy_view_is_unknown_and_malformed_canonical_state_is_rejected() {
-        let mut wire: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         let state = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
         let view = canonical_conversation_view(&state);
         let mut old_view = serde_json::to_value(view).unwrap();
-        assert!(old_view.as_object_mut().unwrap().remove("canonicalState").is_some());
+        assert!(old_view
+            .as_object_mut()
+            .unwrap()
+            .remove("canonicalState")
+            .is_some());
         let legacy: ConversationView = serde_json::from_value(old_view).unwrap();
         assert!(legacy.canonical_state.is_none());
         wire["participants"][1]["status"] = serde_json::json!("unknown");
         assert!(decode_conversations_inventory(&inventory(wire)).is_err());
     }
-    const TEST_DEVICE_PUBLIC_KEY: [u8; 32] = [7; 32];
+    pub(super) const TEST_DEVICE_PUBLIC_KEY: [u8; 32] = [7; 32];
 
-    fn test_device_key_id() -> String {
+    pub(super) fn test_device_key_id() -> String {
         catbird_mls::chat_v2::ids::KeyId::from_public_key(&TEST_DEVICE_PUBLIC_KEY).to_string()
     }
 
@@ -2961,5 +2998,4 @@ mod canonical_admission_projection_tests {
             name.eq_ignore_ascii_case("x-catbird-chat-device-id") && value == TEST_AUTH_DEVICE_A
         }));
     }
-
 }

@@ -287,7 +287,9 @@ async fn configure_chat_auth(
     // Current getOwnDevices evidence restores only the in-memory capability.
     // Complete reopen never rewrites the account's keychain or storage.
     let evidence = verify_device_reconciliation_readonly(state, mls_context, did).await?;
-    state.chat_auth.admit_device_authority_for_session(&session, evidence)
+    state
+        .chat_auth
+        .admit_device_authority_for_session(&session, evidence)
         .map_err(|error| format!("chat device reconciliation became stale: {error}"))?;
     Ok(())
 }
@@ -368,7 +370,10 @@ async fn reconcile_device_before_registration(
         .api_client
         .ensure_session_current(&session)
         .map_err(|error| error.to_string())?;
-    let identity = store.get_mls_did(did).await.map_err(|error| error.to_string())?
+    let identity = store
+        .get_mls_did(did)
+        .await
+        .map_err(|error| error.to_string())?
         .ok_or_else(|| "registered device is missing its scoped MLS identity".to_string())?;
     if identity != format!("{did}#{local_device_uuid}") {
         return Err("registered MLS identity does not match the durable device".to_string());
@@ -509,19 +514,28 @@ async fn verify_device_reconciliation_readonly(
         }
     }
 
-    let public_key: [u8; 32] = local_pubkey.as_slice().try_into()
+    let public_key: [u8; 32] = local_pubkey
+        .as_slice()
+        .try_into()
         .map_err(|_| "local signer public key must be 32 bytes".to_string())?;
-    let key_id = matched_dev.key_id.as_deref()
+    let key_id = matched_dev
+        .key_id
+        .as_deref()
         .ok_or_else(|| "registered device omitted keyId".to_string())?;
-    let key_id = catbird_mls::chat_v2::ids::KeyId::parse(key_id)
-        .map_err(|error| error.to_string())?;
+    let key_id =
+        catbird_mls::chat_v2::ids::KeyId::parse(key_id).map_err(|error| error.to_string())?;
     if !key_id.matches_public_key(&public_key) {
         return Err("registered device keyId does not match local signer".to_string());
     }
-    let auth_generation = matched_dev.auth_generation
-        .and_then(|value| u64::try_from(value).ok()).filter(|value| *value > 0)
+    let auth_generation = matched_dev
+        .auth_generation
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
         .ok_or_else(|| "registered device has no positive authGeneration".to_string())?;
-    state.api_client.ensure_session_current(&session).map_err(|error| error.to_string())?;
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|error| error.to_string())?;
     Ok(crate::api_client::DeviceAuthorityEvidence {
         local_device_uuid,
         server_device_id: persisted_server_device_id,
@@ -979,7 +993,13 @@ async fn enroll_and_publish_runtime(
             state
                 .api_client
                 .set_auth(normalized_did.clone(), session_id.to_string());
-            configure_chat_auth(state, &normalized_did, session_id, current.mls_context.as_ref()).await?;
+            configure_chat_auth(
+                state,
+                &normalized_did,
+                session_id,
+                current.mls_context.as_ref(),
+            )
+            .await?;
             return Ok(current.orchestrator.clone());
         }
     }
@@ -1027,7 +1047,13 @@ async fn enroll_and_publish_runtime(
         if is_creating {
             // Reconcile a durable identity before any registration attempt. Only a
             // first-login device without a local UUID may create a new registration.
-            if reconcile_device_before_registration(state, provisional.mls_context.as_ref(), &normalized_did).await? {
+            if reconcile_device_before_registration(
+                state,
+                provisional.mls_context.as_ref(),
+                &normalized_did,
+            )
+            .await?
+            {
                 let authority_session = state
                     .api_client
                     .current_session()
@@ -1108,7 +1134,13 @@ async fn enroll_and_publish_runtime(
             // verification immediately before runtime publication.
         }
 
-        configure_chat_auth(state, &normalized_did, session_id, provisional.mls_context.as_ref()).await?;
+        configure_chat_auth(
+            state,
+            &normalized_did,
+            session_id,
+            provisional.mls_context.as_ref(),
+        )
+        .await?;
         Ok(())
     }
     .await;
@@ -3475,5 +3507,4 @@ mod tests {
         assert_eq!(json["timestamp"], "2026-09-05T12:00:02+00:00");
         assert_eq!(json["id"], "fixture-message");
     }
-
 }
