@@ -6,8 +6,8 @@
  * - Browser: routes calls through a Web Worker (comlink) so that WASM gets
  *   OPFS Synchronous Access Handle for MLS SQLite crypto.
  *
- * Session credentials (did, token) and MLS DB key all live in sessionStorage
- * on the main thread (cleared on tab close to limit XSS exposure).
+ * Session credentials remain in sessionStorage. The per-account database key
+ * is wrapped by a non-exportable CryptoKey retained in IndexedDB.
  * Credential keys are namespaced by DID to prevent data leakage when multiple
  * users log in on the same browser. The Worker receives them via explicit
  * setAuth / init calls.
@@ -99,27 +99,65 @@ function getWorker(): Remote<WorkerApi> {
 }
 
 // ---------------------------------------------------------------------------
-// MLS DB key management (main thread sessionStorage)
-// TODO: Migrate to WebCrypto non-extractable key for proper key protection
+// Protected per-account MLS database key custody
 // ---------------------------------------------------------------------------
 
 /**
- * Get or create the MLS DB encryption key, namespaced per-DID in sessionStorage.
- * Falls back to an unnamespaced key when no DID is known yet (pre-login init).
+ * Get the per-account database key through its persistent wrapping key.
+ * Legacy session keys are migrated without replacing existing database custody.
  */
-function getOrCreateMlsDbKey(targetDid?: string): string {
-	const did = targetDid || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
-	const storageKey = did ? didKey(did, 'mls_db_key') : 'catbird_mls_mls_db_key';
-	let key = sessionStorage.getItem(storageKey);
-	if (key) return key;
-
-	const bytes = new Uint8Array(32);
-	crypto.getRandomValues(bytes);
-	key = Array.from(bytes)
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
-	sessionStorage.setItem(storageKey, key);
-	return key;
+async function getOrCreateMlsDbKey(did: string): Promise<{ key: string; dbPrefix: string }> {
+	if (!did.startsWith('did:') || !navigator.locks || !globalThis.indexedDB) throw new Error('Protected persistent browser storage is unavailable.');
+	return navigator.locks.request('catbird-protected-database-keys-v1', async () => {
+		const db = await new Promise<IDBDatabase>((resolve, reject) => {
+			const request = indexedDB.open('catbird-protected-database-keys-v1', 1);
+			request.onupgradeneeded = () => request.result.createObjectStore('keys');
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(new Error('Protected key store could not be opened.'));
+			request.onblocked = () => reject(new Error('Protected key store is locked by another tab.'));
+		});
+		const read = (key: string) => new Promise<unknown>((resolve, reject) => {
+			const request = db.transaction('keys', 'readonly').objectStore('keys').get(key);
+			request.onsuccess = () => resolve(request.result);
+			request.onerror = () => reject(new Error('Protected key read failed.'));
+		});
+		const write = (key: string, value: unknown) => new Promise<void>((resolve, reject) => {
+			const transaction = db.transaction('keys', 'readwrite');
+			transaction.objectStore('keys').put(value, key);
+			transaction.oncomplete = () => resolve();
+			transaction.onerror = transaction.onabort = () => reject(new Error('Protected key commit failed.'));
+		});
+		try {
+			let wrapping = await read('wrapping-key') as CryptoKey | undefined;
+			if (!wrapping) {
+				wrapping = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+				await write('wrapping-key', wrapping);
+			}
+			if (wrapping.extractable || wrapping.algorithm.name !== 'AES-GCM') throw new Error('Invalid protected key custody.');
+			const id = await sha256Hex(did);
+			const aad = new TextEncoder().encode(`catbird.opfs.key.v1:${did}`);
+			const stored = await read(id) as { iv: Uint8Array; ciphertext: ArrayBuffer; dbPrefix: string } | undefined;
+			let bytes: Uint8Array;
+			let dbPrefix = `catbird_mls_${id}`;
+			if (stored) {
+				if (!stored.dbPrefix || !/^[a-zA-Z0-9_-]+$/.test(stored.dbPrefix)) throw new Error('Invalid protected database identity.');
+				dbPrefix = stored.dbPrefix;
+				bytes = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: stored.iv as BufferSource, additionalData: aad }, wrapping, stored.ciphertext));
+			} else {
+				const old = sessionStorage.getItem(didKey(did, 'mls_db_key')) || (sessionStorage.getItem(SS_ACTIVE_DID) === did ? sessionStorage.getItem('catbird_mls_mls_db_key') : null);
+				if (old && !/^[0-9a-f]{64}$/i.test(old)) throw new Error('Existing database key is invalid; custody was retained.');
+				bytes = old ? Uint8Array.from(old.match(/../g)!, byte => parseInt(byte, 16)) : crypto.getRandomValues(new Uint8Array(32));
+				const iv = crypto.getRandomValues(new Uint8Array(12));
+				const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad }, wrapping, bytes as BufferSource);
+				// Earlier clients always used the default DB because they sent db_prefix.
+				// Retain that database and its existing enrollment for explicit validation.
+				if (old) dbPrefix = 'catbird-mls';
+				await write(id, { iv, ciphertext, dbPrefix });
+			}
+			if (bytes.byteLength !== 32) throw new Error('Protected database key has invalid length.');
+			return { key: Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(''), dbPrefix };
+		} finally { db.close(); }
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -216,16 +254,31 @@ const NEST_URL = (() => {
 
 /**
  * Initialize the WASM Worker with MLS config.
- * Generates/retrieves the MLS DB key from sessionStorage and passes it to the
- * Worker (which has no sessionStorage access).
+ * Releases the account database key from protected persistent storage and
+ * passes it only to the worker that owns that account database.
  */
+let workerAccount: string | null = null;
+let workerInitTail: Promise<void> = Promise.resolve();
 export async function initWasm(did?: string): Promise<void> {
 	if (isTauri) return;
-	const w = getWorker();
 	const activeDid = did || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
-	const mlsDbKey = getOrCreateMlsDbKey(activeDid || undefined);
-	const db_prefix = activeDid ? `catbird_mls_${activeDid.replace(/[:.]/g, '_')}` : undefined;
-	await w.init({ baseUrl: NEST_URL, mlsDbKey, db_prefix });
+	if (!activeDid) return;
+	const initialization = workerInitTail.catch(() => {}).then(async () => {
+		if (workerAccount === activeDid && _worker) return;
+		const { key: mlsDbKey, dbPrefix } = await getOrCreateMlsDbKey(activeDid);
+		if (_rawWorker) _rawWorker.terminate();
+		_rawWorker = null; _worker = null; workerAccount = null;
+		const w = getWorker();
+		try {
+			await w.init({ baseUrl: NEST_URL, mlsDbKey, dbPrefix });
+			workerAccount = activeDid;
+		} catch (error) {
+			(_rawWorker as Worker | null)?.terminate(); _rawWorker = null; _worker = null;
+			throw error;
+		}
+	});
+	workerInitTail = initialization;
+	await initialization;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +422,8 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 	const did: string = info.did;
 	const handle: string = info.handle ?? did;
 
-	// Push credentials to Worker and complete MLS activation before persisting auth
+	// Open the account-specific protected database before activation.
+	await initWasm(did);
 	const w = getWorker();
 	try {
 		await w.setAuth(did, sessionId);
@@ -624,7 +678,9 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		}
 		const info = await resp.json();
 
-		// Push restored credentials to Worker
+		// Open only the restored account's protected database before installing credentials.
+		if (info.did !== did) throw new Error('Restored account does not match saved session');
+		await initWasm(did);
 		const w = getWorker();
 		await w.setAuth(info.did, sessionId);
 		// Restore the per-DID content root key from localStorage (or
@@ -1364,7 +1420,7 @@ import type { QuarantineState } from './tauri';
  *
  * Browser/WASM: returns `null` until catbird-mls-web exposes the same
  * surface — quarantine cascades cannot harm a browser tab today since the
- * WASM client doesn't run the orchestrator (catmos web uses a thinner facade).
+ * browser quarantine presentation adapter has not yet been connected.
  */
 export async function getQuarantineState(
 	conversationId: string
@@ -1392,8 +1448,8 @@ export async function confirmManualReset(conversationId: string): Promise<void> 
 // request to legacy browser create/send or persist its plaintext in web storage.
 export const requestBackendAvailable = isTauri;
 async function requestInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
-	if (!isTauri) throw new Error('Encrypted message requests are not available in this browser yet. Your draft stays on this screen.');
-	return tauriInvoke<T>(command, args);
+	if (isTauri) return tauriInvoke<T>(command, args);
+	return getWorker().requestCommand(command, args) as Promise<T>;
 }
 export async function getRequestWorkspace(ownerDid: string): Promise<import('./request-types').RequestWorkspace> {
 	return requestInvoke('get_request_workspace', { ownerDid });
@@ -1420,4 +1476,16 @@ export async function acceptDirectRequest(ownerDid: string, conversationId: stri
 export const setRequestDeliveryEnabled = (ownerDid: string, enabled: boolean) => requestInvoke<void>('set_request_delivery_enabled', { ownerDid, enabled });
 
 export const closeDirectRequest = (ownerDid: string, conversationId: string) => requestInvoke<import('./request-types').DirectRequestView>('close_direct_request', { ownerDid, conversationId });
-export const blockRequestSender = (ownerDid: string, conversationId: string) => requestInvoke<void>('block_request_sender', { ownerDid, conversationId });
+export async function blockRequestSender(ownerDid: string, conversationId: string): Promise<void> {
+	if (isTauri) return requestInvoke<void>('block_request_sender', { ownerDid, conversationId });
+	const sender = await requestInvoke<string>('request_sender', { ownerDid, conversationId });
+	if (readBrowserAuth()?.did !== ownerDid) throw new Error('Account changed');
+	await createBlock(sender);
+}
+
+export const getGroupInvitationReference = (ownerDid: string, conversationId: string, recipientDid: string) => requestInvoke<import('./request-types').GroupInvitationReference | null>('get_group_invitation_reference', { ownerDid, conversationId, recipientDid });
+
+export async function sendExistingInvitationNote(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
+	if (!isTauri) throw new Error('Invitation notes in accepted conversations are not yet available in this browser build.');
+	return requestInvoke('send_existing_invitation_note', { ownerDid, draftId });
+}

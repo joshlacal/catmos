@@ -73,6 +73,7 @@ const api = {
 		(wasm as unknown as {
 			catbird_mls_set_signer_bridge: (
 				callback: (transcript: Uint8Array) => Promise<Uint8Array>,
+				key: CryptoKey,
 				actorDid: string,
 				deviceId: string,
 				dpopJkt: string,
@@ -81,6 +82,7 @@ const api = {
 			) => void;
 		}).catbird_mls_set_signer_bridge(
 			sign,
+			key,
 			actorDid,
 			deviceId,
 			dpopJkt,
@@ -141,6 +143,10 @@ const api = {
 	},
 	ping: () => wasm.catbird_mls_ping(),
 
+	requestCommand: async (command: string, args: Record<string, unknown>) => {
+		await wasmReady;
+		return plain(await (wasm as typeof wasm & { catbird_mls_request_command(command: string, args: unknown): Promise<unknown> }).catbird_mls_request_command(command, args));
+	},
 	// Conversations — return plain-serializable data
 	listConversations: async () => plain(await wasm.catbird_mls_list_conversations()),
 	createConversation: async (name: string, memberDids: string[]) =>
