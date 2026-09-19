@@ -1813,9 +1813,10 @@ pub async fn get_profiles(
 
     // Use Bluesky public API to fetch profiles
     let client = crate::runtime_fixture::http_client();
-    let mut url =
-        reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
-            .map_err(|e| e.to_string())?;
+    let mut url = reqwest::Url::parse(&crate::runtime_fixture::appview_url(
+        "/xrpc/app.bsky.actor.getProfiles",
+    ))
+    .map_err(|e| e.to_string())?;
 
     for did in &dids {
         url.query_pairs_mut().append_pair("actors", did);
@@ -2004,7 +2005,7 @@ pub async fn search_users(
 
     let client = crate::runtime_fixture::http_client();
     let url = reqwest::Url::parse_with_params(
-        "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActorsTypeahead",
+        &crate::runtime_fixture::appview_url("/xrpc/app.bsky.actor.searchActorsTypeahead"),
         &[("q", query.as_str()), ("limit", "10")],
     )
     .map_err(|e| e.to_string())?;

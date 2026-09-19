@@ -27,6 +27,14 @@ pub(crate) fn origin() -> Option<String> {
     }
     None
 }
+pub(crate) fn appview_url(path: &str) -> String {
+    // Only callers with fixed AppView paths use this fixture routing seam.
+    format!(
+        "{}{}",
+        origin().unwrap_or_else(|| "https://public.api.bsky.app".into()),
+        path
+    )
+}
 pub(crate) fn http_builder() -> reqwest::ClientBuilder {
     let builder = reqwest::Client::builder();
     #[cfg(feature = "local-runtime-fixture")]
