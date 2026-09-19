@@ -842,10 +842,11 @@ export async function getMessages(conversationId: string, before?: string): Prom
 }
 
 export async function getImageAttachment(
-	image: import('./tauri').ImageAttachment
+	image: import('./tauri').ImageAttachment, conversationId: string
 ): Promise<string> {
 	if (isTauri) {
 		return tauriInvoke('get_image_attachment', {
+            conversationId,
 			blobId: image.blobId,
 			keyB64: image.keyB64,
 			ivB64: image.ivB64,
@@ -1386,3 +1387,37 @@ export async function confirmManualReset(conversationId: string): Promise<void> 
 	}
 	throw new Error('confirmManualReset is not yet implemented in browser builds');
 }
+
+// Request provider parity is a separate qualification gate. Never route a v2
+// request to legacy browser create/send or persist its plaintext in web storage.
+export const requestBackendAvailable = isTauri;
+async function requestInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
+	if (!isTauri) throw new Error('Encrypted message requests are not available in this browser yet. Your draft stays on this screen.');
+	return tauriInvoke<T>(command, args);
+}
+export async function getRequestWorkspace(ownerDid: string): Promise<import('./request-types').RequestWorkspace> {
+	return requestInvoke('get_request_workspace', { ownerDid });
+}
+export async function saveRequestDraft(ownerDid: string, input: import('./request-types').DirectRequestInput, recipientLabel: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('save_request_draft', { ownerDid, input, recipientLabel });
+}
+export async function submitRequestDraft(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('submit_request_draft', { ownerDid, draftId });
+}
+export async function resumeRequestDraft(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('resume_request_draft', { ownerDid, draftId });
+}
+export async function cancelRequestDraft(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('cancel_request_draft', { ownerDid, draftId });
+}
+export async function refreshDirectRequest(ownerDid: string, conversationId: string): Promise<import('./request-types').DirectRequestView> {
+	return requestInvoke('refresh_direct_request', { ownerDid, conversationId });
+}
+export async function acceptDirectRequest(ownerDid: string, conversationId: string): Promise<import('./request-types').DirectRequestView> {
+	return requestInvoke('accept_direct_request', { ownerDid, conversationId });
+}
+
+export const setRequestDeliveryEnabled = (ownerDid: string, enabled: boolean) => requestInvoke<void>('set_request_delivery_enabled', { ownerDid, enabled });
+
+export const closeDirectRequest = (ownerDid: string, conversationId: string) => requestInvoke<import('./request-types').DirectRequestView>('close_direct_request', { ownerDid, conversationId });
+export const blockRequestSender = (ownerDid: string, conversationId: string) => requestInvoke<void>('block_request_sender', { ownerDid, conversationId });
