@@ -257,6 +257,13 @@ const localRuntimeFixtureOrigin: string | null = (() => {
     return url.origin;
 })();
 
+/** Public run marker only in explicitly selected fixture builds. */
+export const localRuntimeFixtureBuild = localRuntimeFixtureOrigin === null ? null : (() => {
+    const runId = import.meta.env.VITE_LOCAL_REQUEST_FIXTURE_RUN_ID;
+    if (!runId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(runId)) throw new Error('Fixture build identity is required');
+    return { runId, origin: localRuntimeFixtureOrigin };
+})();
+
 /** Nest BFF gateway URL — resolve from current hostname. */
 const NEST_URL = (() => {
     if (localRuntimeFixtureOrigin) return localRuntimeFixtureOrigin;
