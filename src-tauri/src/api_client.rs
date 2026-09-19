@@ -261,11 +261,11 @@ impl std::fmt::Display for ChatAuthError {
 pub(crate) struct CanonicalReadContext {
     /// Actor DID captured with the immutable authority snapshot. This is used
     /// only to reject late responses after an account switch.
-    actor_did: String,
+    pub(crate) actor_did: String,
     pub(crate) authorization: String,
     pub(crate) device_id: String,
     pub(crate) auth_generation: u64,
-    session: ChatSessionSnapshot,
+    pub(crate) session: ChatSessionSnapshot,
 }
 
 impl std::fmt::Debug for CanonicalReadContext {
@@ -760,12 +760,12 @@ pub struct ReqwestApiClient {
 
 impl ReqwestApiClient {
     pub fn new(base_url: String) -> Self {
-        let client = Client::builder()
+        let client = crate::runtime_fixture::http_builder()
             .default_headers(crate::mls_proxy::mls_default_headers())
             .timeout(std::time::Duration::from_secs(30))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .expect("HTTP client configuration must be valid");
         Self {
             client,
             base_url,
@@ -998,6 +998,15 @@ impl ReqwestApiClient {
             let store = crate::credentials::KeyringCredentialStore::try_new()?;
             store
                 .store_server_device_id(&session.actor_did, &server_device_id)
+                .await?;
+            self.ensure_session_current(session)?;
+            store
+                .retain_verified_generation(
+                    &session.actor_did,
+                    &server_device_id,
+                    key_id,
+                    auth_generation,
+                )
                 .await?;
             self.ensure_session_current(session)?;
             Ok(server_device_id)

@@ -32,7 +32,7 @@ impl KeyringKeychainAccess {
     }
 
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(SERVICE_NAME, key)
+        Entry::new(&crate::runtime_fixture::keychain_service(SERVICE_NAME), key)
     }
 }
 

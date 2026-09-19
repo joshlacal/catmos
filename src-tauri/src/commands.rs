@@ -23,6 +23,9 @@ use crate::recovery::actionable_error;
 use crate::{AppState, CatmosOrchestrator, WsHandle};
 
 fn log_file_path() -> std::path::PathBuf {
+    if let Some(path) = crate::runtime_fixture::data_dir() {
+        return path.join("catmos.log");
+    }
     let base = dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(std::env::temp_dir);
@@ -219,7 +222,9 @@ struct SessionInfo {
 
 fn clear_saved_session_credentials() {
     for key in ["session_id", "user_did", "chat_dpop_jkt"] {
-        if let Ok(entry) = keyring::Entry::new("catmos", key) {
+        if let Ok(entry) =
+            keyring::Entry::new(&crate::runtime_fixture::keychain_service("catmos"), key)
+        {
             let _ = entry.delete_credential();
         }
     }
@@ -228,83 +233,23 @@ fn clear_saved_session_credentials() {
 /// Install only opaque runtime capabilities after login/device enrollment.
 /// Persisted session/device identifiers never enter command logs; DPoP
 /// binding evidence is admitted only through the runtime authority provider.
-async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
+async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) -> Result<(), String> {
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
-    let session = match state.api_client.current_session() {
-        Ok(session) => session,
-        Err(error) => {
-            log_catmos!(" chat device authority unavailable for {}: {}", did, error);
-            return;
-        }
-    };
-    let _ = state.chat_auth.clear_runtime_state_for_session(&session);
-
-    if let Ok(store) = KeyringCredentialStore::try_new() {
-        match store.get_local_device_uuid(did).await {
-            Ok(Some(local_device_uuid)) => {
-                if let Err(error) = state
-                    .chat_auth
-                    .set_local_device_uuid_for_session(&session, local_device_uuid.clone())
-                {
-                    log_catmos!(
-                        " chat device authority actor mismatch for {}: {}",
-                        did,
-                        error
-                    );
-                    return;
-                }
-                if let Err(error) = state.api_client.ensure_session_current(&session) {
-                    log_catmos!(
-                        " chat device authority actor changed during configuration for {}: {}",
-                        did,
-                        error
-                    );
-                    return;
-                }
-                match store.get_server_device_id(did).await {
-                    Ok(Some(server_device_id)) => {
-                        if let Err(error) = state
-                            .chat_auth
-                            .set_resolved_server_device_id_for_session(&session, server_device_id)
-                        {
-                            log_catmos!(
-                                " chat device authority server ID could not be installed for {}: {}",
-                                did,
-                                error
-                            );
-                        }
-                    }
-                    Ok(None) => {
-                        log_catmos!(
-                            " chat device authority unavailable for {}: server device ID is missing",
-                            did
-                        );
-                    }
-                    Err(error) => {
-                        log_catmos!(
-                            " chat device authority unavailable for {}: failed to load server device ID: {}",
-                            did,
-                            error
-                        );
-                    }
-                }
-            }
-            Ok(None) => {
-                log_catmos!(
-                    " chat device authority unavailable for {}: local device UUID is missing",
-                    did
-                );
-            }
-            Err(error) => {
-                log_catmos!(
-                    " chat device authority unavailable for {}: failed to load local UUID: {}",
-                    did,
-                    error
-                );
-            }
-        }
+    // Do not discard exact reconciliation evidence installed earlier in login.
+    // A persisted UUID alone never restores authority after a session change.
+    if state
+        .chat_auth
+        .canonical_read_context()
+        .is_ok_and(|context| context.actor_did == did)
+    {
+        return Ok(());
+    }
+    if reconcile_device_before_registration(state, did).await? {
+        Ok(())
+    } else {
+        Err("Current device authority could not be reconciled".into())
     }
 }
 
@@ -400,7 +345,7 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
     let nest_url = crate::nest_url();
 
-    let resp = reqwest::Client::new()
+    let resp = crate::runtime_fixture::http_client()
         .get(format!("{}/auth/session", nest_url))
         .bearer_auth(session_id)
         .send()
@@ -848,7 +793,9 @@ pub async fn complete_login(
             .await
             .map_err(|e| actionable_error(format!("{e:?}")))?;
     }
-    configure_chat_auth(&state, &session.did, &session_id).await;
+    configure_chat_auth(&state, &session.did, &session_id)
+        .await
+        .map_err(actionable_error)?;
 
     // Auto opt-in to MLS (non-blocking — failures are logged only)
     ensure_opted_in(&state).await;
@@ -860,10 +807,16 @@ pub async fn complete_login(
     start_sync_loop(&state).await;
 
     // Persist session to keyring
-    if let Ok(entry) = keyring::Entry::new("catmos", "session_id") {
+    if let Ok(entry) = keyring::Entry::new(
+        &crate::runtime_fixture::keychain_service("catmos"),
+        "session_id",
+    ) {
         let _ = entry.set_password(&session_id);
     }
-    if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
+    if let Ok(entry) = keyring::Entry::new(
+        &crate::runtime_fixture::keychain_service("catmos"),
+        "user_did",
+    ) {
         let _ = entry.set_password(&session.did);
     }
 
@@ -886,12 +839,18 @@ pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
     let _request_scope = state.request_scope.lock().await;
-    let session_id = keyring::Entry::new("catmos", "session_id")
-        .and_then(|e| e.get_password())
-        .ok();
-    let did = keyring::Entry::new("catmos", "user_did")
-        .and_then(|e| e.get_password())
-        .ok();
+    let session_id = keyring::Entry::new(
+        &crate::runtime_fixture::keychain_service("catmos"),
+        "session_id",
+    )
+    .and_then(|e| e.get_password())
+    .ok();
+    let did = keyring::Entry::new(
+        &crate::runtime_fixture::keychain_service("catmos"),
+        "user_did",
+    )
+    .and_then(|e| e.get_password())
+    .ok();
 
     match (session_id, did) {
         (Some(sid), stored_did) => {
@@ -970,7 +929,9 @@ pub async fn try_restore_session(
                     .await
                     .map_err(|e| actionable_error(format!("{e:?}")))?;
             }
-            configure_chat_auth(&state, &session.did, &sid).await;
+            configure_chat_auth(&state, &session.did, &sid)
+                .await
+                .map_err(actionable_error)?;
 
             // Auto opt-in to MLS (non-blocking — failures are logged only)
             ensure_opted_in(&state).await;
@@ -981,7 +942,10 @@ pub async fn try_restore_session(
             // Start periodic sync loop (spec §6.1)
             start_sync_loop(&state).await;
 
-            if let Ok(entry) = keyring::Entry::new("catmos", "user_did") {
+            if let Ok(entry) = keyring::Entry::new(
+                &crate::runtime_fixture::keychain_service("catmos"),
+                "user_did",
+            ) {
                 let _ = entry.set_password(&session.did);
             }
             log_catmos!("Session restored: handle={}", session.handle);
@@ -1848,7 +1812,7 @@ pub async fn get_profiles(
         .ok_or("Not authenticated")?;
 
     // Use Bluesky public API to fetch profiles
-    let client = reqwest::Client::new();
+    let client = crate::runtime_fixture::http_client();
     let mut url =
         reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
             .map_err(|e| e.to_string())?;
@@ -2038,7 +2002,7 @@ pub async fn search_users(
         .get_auth_token()
         .ok_or("Not authenticated")?;
 
-    let client = reqwest::Client::new();
+    let client = crate::runtime_fixture::http_client();
     let url = reqwest::Url::parse_with_params(
         "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActorsTypeahead",
         &[("q", query.as_str()), ("limit", "10")],
@@ -2106,7 +2070,7 @@ pub async fn check_opt_in_status(
         .map(|d| ("userDids", d.as_str()))
         .collect();
 
-    let client = reqwest::Client::new();
+    let client = crate::runtime_fixture::http_client();
     let resp = crate::mls_proxy::with_mls_proxy_header(client.get(&url).query(&query_params))
         .bearer_auth(&token)
         .send()
@@ -3143,7 +3107,7 @@ pub(crate) async fn create_block_for_captured_owner(
 
     // Build a fresh client without the atproto-proxy default header — this is a
     // standard PDS operation, not an MLS service call.
-    let client = reqwest::Client::new();
+    let client = crate::runtime_fixture::http_client();
     let resp = client
         .post(format!("{}/xrpc/com.atproto.repo.createRecord", nest_url))
         .bearer_auth(&token)
@@ -3195,7 +3159,7 @@ pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, 
 
     let nest_url = crate::nest_url();
 
-    let client = reqwest::Client::new();
+    let client = crate::runtime_fixture::http_client();
     let mut blocked: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
 

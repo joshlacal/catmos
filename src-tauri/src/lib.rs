@@ -9,12 +9,16 @@ mod mls_proxy;
 mod quarantine_observer;
 mod recovery;
 mod request_commands;
+mod runtime_fixture;
 mod session_restore;
 mod storage;
 mod websocket;
 
 use std::collections::HashMap;
 pub(crate) fn nest_url() -> String {
+    if let Some(origin) = runtime_fixture::origin() {
+        return origin;
+    }
     std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string())
 }
 use std::sync::Arc;
@@ -31,9 +35,9 @@ use tokio::sync::Mutex;
 /// Retrieve or generate a random 32-byte hex key stored in the OS keychain.
 /// `label` distinguishes between multiple databases (e.g. "conversation-db", "mls-db").
 fn get_or_create_db_key(label: &str) -> String {
-    let service = "blue.catbird.catmos";
+    let service = runtime_fixture::keychain_service("blue.catbird.catmos");
     let entry =
-        keyring::Entry::new(service, label).expect("Failed to create keyring entry for DB key");
+        keyring::Entry::new(&service, label).expect("Failed to create keyring entry for DB key");
 
     // Try to load an existing key
     match entry.get_password() {
@@ -60,6 +64,9 @@ pub type CatmosOrchestrator = MLSOrchestrator<
 >;
 
 fn resolve_data_dir() -> std::path::PathBuf {
+    if let Some(path) = runtime_fixture::data_dir() {
+        return path;
+    }
     #[cfg(target_os = "android")]
     {
         if let Some(home) = std::env::var_os("HOME") {
@@ -107,6 +114,7 @@ pub struct AppState {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Resolve paths
+    runtime_fixture::initialize();
     let data_dir = resolve_data_dir();
     std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
         panic!(
@@ -128,7 +136,6 @@ pub fn run() {
             .expect("Failed to initialize SQLite storage"),
     );
     let api_client = Arc::new(ReqwestApiClient::new(mls_ds_url));
-    let cred_store = Arc::new(KeyringCredentialStore::new());
 
     // Create MLS FFI context — create parent directory first
     let mls_state_dir = data_dir.join("mls-state");
@@ -143,6 +150,17 @@ pub fn run() {
         keychain,
     )
     .expect("Failed to initialize MLS context");
+
+    let cred_store = Arc::new(KeyringCredentialStore::with_chat_auth(
+        api_client.chat_auth_provider(),
+        mls_context.clone(),
+    ));
+    #[cfg(feature = "local-runtime-fixture")]
+    tauri::async_runtime::block_on(runtime_fixture::seed_native_authority(
+        mls_context.as_ref(),
+        cred_store.as_ref(),
+    ))
+    .expect("Native fixture authority preparation failed");
 
     // Clear leftover WAL from previous session — ensures all committed data is
     // checkpointed into the main database file before we start reading.

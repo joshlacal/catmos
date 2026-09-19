@@ -7,7 +7,17 @@ use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 const SERVICE_NAME: &str = "blue.catbird.catmos";
 
 /// OS keychain-backed credential store using the `keyring` crate.
-pub struct KeyringCredentialStore;
+pub struct KeyringCredentialStore {
+    chat_auth: Option<std::sync::Arc<crate::api_client::ChatAuthProvider>>,
+    context: Option<std::sync::Arc<catbird_mls::MLSContext>>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+struct VerifiedDeviceGeneration {
+    owner: String,
+    device_id: String,
+    key_id: String,
+    generation: u64,
+}
 
 impl KeyringCredentialStore {
     pub fn new() -> Self {
@@ -28,12 +38,47 @@ impl KeyringCredentialStore {
 
         #[cfg(not(target_os = "android"))]
         {
-            Ok(Self)
+            Ok(Self {
+                chat_auth: None,
+                context: None,
+            })
         }
     }
 
+    pub(crate) fn with_chat_auth(
+        authority: std::sync::Arc<crate::api_client::ChatAuthProvider>,
+        context: std::sync::Arc<catbird_mls::MLSContext>,
+    ) -> Self {
+        Self {
+            chat_auth: Some(authority),
+            context: Some(context),
+        }
+    }
+    pub(crate) async fn retain_verified_generation(
+        &self,
+        owner: &str,
+        device_id: &str,
+        key_id: &str,
+        generation: u64,
+    ) -> Result<()> {
+        if generation == 0 || generation > i64::MAX as u64 {
+            return Err(OrchestratorError::Credential(
+                "Invalid verified device generation".into(),
+            ));
+        }
+        let binding = VerifiedDeviceGeneration {
+            owner: owner.into(),
+            device_id: device_id.into(),
+            key_id: key_id.into(),
+            generation,
+        };
+        let value = serde_json::to_string(&binding)
+            .map_err(|e| OrchestratorError::Credential(e.to_string()))?;
+        Self::store_string(format!("verified_generation:{owner}"), &value).await
+    }
+
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(SERVICE_NAME, key)
+        Entry::new(&crate::runtime_fixture::keychain_service(SERVICE_NAME), key)
     }
 
     fn key_signing(user_did: &str) -> String {
@@ -118,6 +163,7 @@ impl KeyringCredentialStore {
     /// later exact `listDevices` reconciliation.
     pub async fn clear_server_device_authority(&self, user_did: &str) -> Result<()> {
         Self::delete_key(Self::key_server_device_id(user_did));
+        Self::delete_key(format!("verified_generation:{user_did}"));
         Self::delete_key(Self::key_device_uuid(user_did));
         Ok(())
     }
@@ -125,9 +171,48 @@ impl KeyringCredentialStore {
 
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
+    async fn get_auth_generation(&self, user_did: &str) -> Result<Option<i64>> {
+        let Some(authority) = self.chat_auth.as_ref() else {
+            return Ok(None);
+        };
+        let current = match authority.canonical_read_context() {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        if current.actor_did != user_did {
+            return Ok(None);
+        }
+        let Some(raw) = Self::get_string(format!("verified_generation:{user_did}")).await? else {
+            return Ok(None);
+        };
+        let binding: VerifiedDeviceGeneration = serde_json::from_str(&raw)
+            .map_err(|_| OrchestratorError::Credential("Invalid retained device binding".into()))?;
+        if binding.owner != user_did
+            || binding.device_id != current.device_id
+            || binding.generation != current.auth_generation
+            || !authority.session_is_current(&current.session)
+        {
+            return Ok(None);
+        }
+        let Some(context) = self.context.as_ref() else {
+            return Ok(None);
+        };
+        let public = context
+            .identity_public_key(format!("{}#{}", user_did, current.device_id))
+            .map_err(|_| {
+                OrchestratorError::Credential("Current scoped signer unavailable".into())
+            })?;
+        let key_id = catbird_mls::chat_v2::ids::KeyId::parse(&binding.key_id)
+            .map_err(|_| OrchestratorError::Credential("Invalid retained key binding".into()))?;
+        if !key_id.matches_public_key(&public) || !authority.session_is_current(&current.session) {
+            return Ok(None);
+        }
+        Ok(i64::try_from(binding.generation).ok())
+    }
+
     async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
         // Fixed did:web origin; never follow a receipt-supplied URL or redirect.
-        let client = reqwest::Client::builder()
+        let client = crate::runtime_fixture::http_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15))
             .build()
@@ -243,6 +328,7 @@ impl CredentialStore for KeyringCredentialStore {
         // Delete both the legacy/server ID slot and the client UUID slot.
         Self::delete_key(Self::key_device_uuid(user_did));
         Self::delete_key(Self::key_server_device_id(user_did));
+        Self::delete_key(format!("verified_generation:{user_did}"));
         Self::delete_key(Self::key_local_device_uuid(user_did));
         Ok(())
     }
