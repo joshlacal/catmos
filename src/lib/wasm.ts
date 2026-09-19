@@ -55,6 +55,7 @@ import type {
 
 import { wrap, proxy, type Remote } from 'comlink';
 import type { WorkerApi } from './mls-worker';
+import { captureNativeAuthority, recordNativeAuthority, clearNativeAuthority } from './native-authority';
 
 // ---------------------------------------------------------------------------
 // Environment detection
@@ -79,8 +80,9 @@ export const isTauri: boolean =
 
 /** Lazily import Tauri invoke — only pulled in when running in Tauri. */
 async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+	const capturedArgs = captureNativeAuthority(args);
 	const { invoke } = await import('@tauri-apps/api/core');
-	return invoke<T>(cmd, args);
+	return invoke<T>(cmd, capturedArgs);
 }
 
 // ---------------------------------------------------------------------------
@@ -436,7 +438,9 @@ export async function exchangeOAuthCode(code: string): Promise<string> {
 
 export async function completeLogin(sessionId: string): Promise<AuthState> {
 	if (isTauri) {
-		return tauriInvoke('complete_login', { sessionId });
+		const result = await tauriInvoke<AuthState>('complete_login', { sessionId });
+		recordNativeAuthority(result);
+		return result;
 	}
 	const resp = await fetch(`${NEST_URL}/auth/session`, {
 		headers: { Authorization: `Bearer ${sessionId}` }
@@ -685,7 +689,9 @@ export async function clearAuth(): Promise<void> {
 
 export async function tryRestoreSession(): Promise<AuthState | null> {
 	if (isTauri) {
-		return tauriInvoke('try_restore_session');
+		const result = await tauriInvoke<AuthState | null>('try_restore_session');
+		recordNativeAuthority(result);
+		return result;
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return null;
@@ -751,6 +757,7 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 
 export async function logout(): Promise<void> {
 	if (isTauri) {
+		clearNativeAuthority();
 		return tauriInvoke('logout');
 	}
 	clearBrowserAuth();
@@ -824,10 +831,10 @@ export async function createGroup(
 	name: string,
 	memberDids: string[],
 	description?: string
-, ownerDid?: string): Promise<Conversation> {
+, ownerDid?: string, ownerRevision?: string): Promise<Conversation> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('create_group', { name, memberDids, description , ownerDid: expectedOwner });
+		return tauriInvoke('create_group', { name, memberDids, description , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	// Ensure fresh key packages before group creation
@@ -844,10 +851,10 @@ export async function subscribeConversation(
 	onEvent?: (event: unknown) => void,
 	onStatus?: (status: unknown) => void,
 	cursor?: string,
-    ownerDid?: string
+    ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
 	if (isTauri) {
-		return tauriInvoke('subscribe_conversation', { conversationId, cursor, ownerDid: effectOwner(ownerDid) });
+		return tauriInvoke('subscribe_conversation', { conversationId, cursor, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
 	const w = getWorker();
     const owner = effectOwner(ownerDid);
@@ -892,9 +899,9 @@ export async function unsubscribeAllEvents(): Promise<void> {
 // Messages
 // ---------------------------------------------------------------------------
 
-export async function sendMessage(conversationId: string, content: string, ownerDid?: string): Promise<Message> {
+export async function sendMessage(conversationId: string, content: string, ownerDid?: string, ownerRevision?: string): Promise<Message> {
 	if (isTauri) {
-		return tauriInvoke('send_message', { conversationId, content, ownerDid: effectOwner(ownerDid) });
+		return tauriInvoke('send_message', { conversationId, content, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
     return browserEffect(ownerDid, w => w.sendMessage(conversationId, content) as Promise<Message>);
 }
@@ -907,7 +914,7 @@ export async function sendImage(
 	width: number,
 	height: number,
 	altText?: string,
-    ownerDid?: string
+    ownerDid?: string, ownerRevision?: string
 ): Promise<Message> {
 	if (isTauri) {
 		return tauriInvoke('send_image', {
@@ -918,21 +925,21 @@ export async function sendImage(
 			width,
 			height,
 			altText,
-            ownerDid: effectOwner(ownerDid)
+            ownerDid: effectOwner(ownerDid), ownerRevision
 		});
 	}
     return browserEffect(ownerDid, w => w.sendImage(conversationId, content, data, contentType, width, height, altText) as Promise<Message>);
 }
 
-export async function getMessages(conversationId: string, before?: string, ownerDid?: string): Promise<Message[]> {
+export async function getMessages(conversationId: string, before?: string, ownerDid?: string, ownerRevision?: string): Promise<Message[]> {
 	if (isTauri) {
-		return tauriInvoke('get_messages', { conversationId, before, ownerDid: effectOwner(ownerDid) });
+		return tauriInvoke('get_messages', { conversationId, before, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
     return browserEffect(ownerDid, w => w.getMessages(conversationId, before) as Promise<Message[]>);
 }
 
 export async function getImageAttachment(
-	image: import('./tauri').ImageAttachment, conversationId: string, ownerDid?: string
+	image: import('./tauri').ImageAttachment, conversationId: string, ownerDid?: string, ownerRevision?: string
 ): Promise<string> {
 	if (isTauri) {
 		return tauriInvoke('get_image_attachment', {
@@ -941,7 +948,7 @@ export async function getImageAttachment(
 			keyB64: image.keyB64,
 			ivB64: image.ivB64,
 			sha256: image.sha256,
-			contentType: image.contentType
+			contentType: image.contentType, ownerRevision
 		});
 	}
     return browserEffect(ownerDid, w => w.getImageAttachment(
@@ -954,9 +961,9 @@ export async function getImageAttachment(
 	) as Promise<string>);
 }
 
-export async function fetchNewMessages(conversationId: string, ownerDid?: string): Promise<Message[]> {
+export async function fetchNewMessages(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<Message[]> {
 	if (isTauri) {
-		return tauriInvoke('fetch_new_messages', { conversationId, ownerDid: effectOwner(ownerDid) });
+		return tauriInvoke('fetch_new_messages', { conversationId, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
     return browserEffect(ownerDid, w => w.fetchNewMessages(conversationId) as Promise<Message[]>);
 }
@@ -966,10 +973,10 @@ export async function sendReaction(
 	messageId: string,
 	emoji: string,
 	action: 'add' | 'remove',
-    ownerDid?: string
+    ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
 	if (isTauri) {
-		return tauriInvoke('send_reaction', { conversationId, messageId, emoji, action, ownerDid: effectOwner(ownerDid) });
+		return tauriInvoke('send_reaction', { conversationId, messageId, emoji, action, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
     return browserEffect(ownerDid, w => w.sendReaction(conversationId, messageId, emoji, action) as Promise<void>);
 }
@@ -982,9 +989,9 @@ export async function sendTyping(conversationId: string, isTyping: boolean): Pro
 	return w.sendTyping(conversationId, isTyping) as Promise<void>;
 }
 
-export async function updateCursor(conversationId: string, cursor: string, ownerDid?: string): Promise<void> {
+export async function updateCursor(conversationId: string, cursor: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
 	if (isTauri) {
-		return tauriInvoke('update_cursor', { conversationId, cursor, ownerDid: effectOwner(ownerDid) });
+		return tauriInvoke('update_cursor', { conversationId, cursor, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
     return browserEffect(ownerDid, w => w.updateCursor(conversationId, cursor) as Promise<void>);
 }
@@ -993,10 +1000,10 @@ export async function updateCursor(conversationId: string, cursor: string, owner
 // Members
 // ---------------------------------------------------------------------------
 
-export async function addGroupMembers(conversationId: string, memberDids: string[], ownerDid?: string): Promise<void> {
+export async function addGroupMembers(conversationId: string, memberDids: string[], ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('add_group_members', { conversationId, memberDids , ownerDid: expectedOwner });
+		return tauriInvoke('add_group_members', { conversationId, memberDids , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	const w = getWorker();
@@ -1032,10 +1039,10 @@ export async function demoteMember(conversationId: string, targetDid: string): P
 export async function removeGroupMember(
 	conversationId: string,
 	targetDid: string
-, ownerDid?: string): Promise<void> {
+, ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('remove_group_member', { conversationId, targetDid , ownerDid: expectedOwner });
+		return tauriInvoke('remove_group_member', { conversationId, targetDid , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	const w = getWorker();
@@ -1163,7 +1170,7 @@ export async function bootstrapGroupMetadata(
 export async function republishMetadataAfterReset(
 	newGroupIdHex: string,
 	resetGeneration?: number
-, ownerDid?: string): Promise<unknown> {
+, ownerDid?: string, ownerRevision?: string): Promise<unknown> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return null;
@@ -1177,10 +1184,10 @@ export async function republishMetadataAfterReset(
     });
 }
 
-export async function leaveConversation(conversationId: string, ownerDid?: string): Promise<void> {
+export async function leaveConversation(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('leave_conversation', { conversationId , ownerDid: expectedOwner });
+		return tauriInvoke('leave_conversation', { conversationId , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	const w = getWorker();
@@ -1196,7 +1203,7 @@ export async function updateGroupMetadata(
 	avatarHash?: string,
 	avatarBlobLocator?: string,
 	avatarContentType?: string
-, ownerDid?: string): Promise<void> {
+, ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		// Tauri now uses Phase A.2 encrypted update — accepts avatar
@@ -1210,7 +1217,7 @@ export async function updateGroupMetadata(
 			name,
 			description,
 			avatarBlobLocator: avatarBlobLocator ?? null,
-			avatarContentType: avatarContentType ?? null
+			avatarContentType: avatarContentType ?? null, ownerRevision
 		});
 	}
     return browserEffect(expectedOwner, async () => {
@@ -1251,10 +1258,10 @@ export async function updateGroupMetadata(
 export async function resetGroup(
 	conversationId: string,
 	reason?: string
-, ownerDid?: string): Promise<Record<string, unknown>> {
+, ownerDid?: string, ownerRevision?: string): Promise<Record<string, unknown>> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('reset_group', { conversationId, reason , ownerDid: expectedOwner });
+		return tauriInvoke('reset_group', { conversationId, reason , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	const saved = readBrowserAuth();
@@ -1284,10 +1291,10 @@ export async function reportSpam(
 	conversationId: string,
 	reportedDid: string,
 	reason?: string
-, ownerDid?: string): Promise<void> {
+, ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('report_spam', { conversationId, reportedDid, reason , ownerDid: expectedOwner });
+		return tauriInvoke('report_spam', { conversationId, reportedDid, reason , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	const saved = readBrowserAuth();
@@ -1324,10 +1331,10 @@ export async function reportSpam(
  * Publish an `app.bsky.graph.block` record for `targetDid`.
  * Uses `com.atproto.repo.createRecord` via the nest BFF. Returns the AT-URI.
  */
-export async function createBlock(targetDid: string, ownerDid?: string): Promise<void> {
+export async function createBlock(targetDid: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		await tauriInvoke<string>('create_block', { subjectDid: targetDid , ownerDid: expectedOwner });
+		await tauriInvoke<string>('create_block', { subjectDid: targetDid , ownerDid: expectedOwner, ownerRevision });
 		return;
 	}
     return browserEffect(expectedOwner, async () => {
@@ -1501,10 +1508,10 @@ export async function getQuarantineState(
  * server-pushed `groupResetEvent` is handled by the existing
  * `mls:group-reset` listener in `+page.svelte`.
  */
-export async function confirmManualReset(conversationId: string, ownerDid?: string): Promise<void> {
+export async function confirmManualReset(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
-		return tauriInvoke('confirm_manual_reset', { conversationId , ownerDid: expectedOwner });
+		return tauriInvoke('confirm_manual_reset', { conversationId , ownerDid: expectedOwner, ownerRevision });
 	}
     return browserEffect(expectedOwner, async () => {
 	throw new Error('confirmManualReset is not yet implemented in browser builds');
@@ -1517,42 +1524,44 @@ export async function confirmManualReset(conversationId: string, ownerDid?: stri
 export const requestBackendAvailable = isTauri;
 async function requestInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
 	if (isTauri) return tauriInvoke<T>(command, args);
-	return getWorker().requestCommand(command, args) as Promise<T>;
+	const { ownerRevision: _nativeRevision, ...browserArgs } = args;
+	return browserEffect(args.ownerDid as string, w => w.requestCommand(command, browserArgs) as Promise<T>);
 }
-export async function getRequestWorkspace(ownerDid: string): Promise<import('./request-types').RequestWorkspace> {
-	return requestInvoke('get_request_workspace', { ownerDid });
+export async function getRequestWorkspace(ownerDid: string, ownerRevision?: string): Promise<import('./request-types').RequestWorkspace> {
+	return requestInvoke('get_request_workspace', { ownerDid, ownerRevision });
 }
-export async function saveRequestDraft(ownerDid: string, input: import('./request-types').DirectRequestInput, recipientLabel: string): Promise<import('./request-types').RequestDraft> {
-	return requestInvoke('save_request_draft', { ownerDid, input, recipientLabel });
+export async function saveRequestDraft(ownerDid: string, input: import('./request-types').DirectRequestInput, recipientLabel: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('save_request_draft', { ownerDid, input, recipientLabel, ownerRevision });
 }
-export async function submitRequestDraft(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
-	return requestInvoke('submit_request_draft', { ownerDid, draftId });
+export async function submitRequestDraft(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('submit_request_draft', { ownerDid, draftId, ownerRevision });
 }
-export async function resumeRequestDraft(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
-	return requestInvoke('resume_request_draft', { ownerDid, draftId });
+export async function resumeRequestDraft(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('resume_request_draft', { ownerDid, draftId, ownerRevision });
 }
-export async function cancelRequestDraft(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
-	return requestInvoke('cancel_request_draft', { ownerDid, draftId });
+export async function cancelRequestDraft(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('cancel_request_draft', { ownerDid, draftId, ownerRevision });
 }
-export async function refreshDirectRequest(ownerDid: string, conversationId: string): Promise<import('./request-types').DirectRequestView> {
-	return requestInvoke('refresh_direct_request', { ownerDid, conversationId });
+export async function refreshDirectRequest(ownerDid: string, conversationId: string, ownerRevision?: string): Promise<import('./request-types').DirectRequestView> {
+	return requestInvoke('refresh_direct_request', { ownerDid, conversationId, ownerRevision });
 }
-export async function acceptDirectRequest(ownerDid: string, conversationId: string): Promise<import('./request-types').DirectRequestView> {
-	return requestInvoke('accept_direct_request', { ownerDid, conversationId });
-}
-
-export const setRequestDeliveryEnabled = (ownerDid: string, enabled: boolean) => requestInvoke<void>('set_request_delivery_enabled', { ownerDid, enabled });
-
-export const closeDirectRequest = (ownerDid: string, conversationId: string) => requestInvoke<import('./request-types').DirectRequestView>('close_direct_request', { ownerDid, conversationId });
-export async function blockRequestSender(ownerDid: string, conversationId: string): Promise<void> {
-	if (isTauri) return requestInvoke<void>('block_request_sender', { ownerDid, conversationId });
-	const sender = await requestInvoke<string>('request_sender', { ownerDid, conversationId });
-	if (readBrowserAuth()?.did !== ownerDid) throw new Error('Account changed');
-	await createBlock(sender);
+export async function acceptDirectRequest(ownerDid: string, conversationId: string, ownerRevision?: string): Promise<import('./request-types').DirectRequestView> {
+	return requestInvoke('accept_direct_request', { ownerDid, conversationId, ownerRevision });
 }
 
-export const getGroupInvitationReference = (ownerDid: string, conversationId: string, recipientDid: string) => requestInvoke<import('./request-types').GroupInvitationReference | null>('get_group_invitation_reference', { ownerDid, conversationId, recipientDid });
+export const setRequestDeliveryEnabled = (ownerDid: string, enabled: boolean, ownerRevision?: string) => requestInvoke<void>('set_request_delivery_enabled', { ownerDid, enabled, ownerRevision });
 
-export async function sendExistingInvitationNote(ownerDid: string, draftId: string): Promise<import('./request-types').RequestDraft> {
-	return requestInvoke('send_existing_invitation_note', { ownerDid, draftId });
+export const closeDirectRequest = (ownerDid: string, conversationId: string, ownerRevision?: string) => requestInvoke<import('./request-types').DirectRequestView>('close_direct_request', { ownerDid, conversationId, ownerRevision });
+export async function blockRequestSender(ownerDid: string, conversationId: string, ownerRevision?: string): Promise<void> {
+	if (isTauri) return requestInvoke<void>('block_request_sender', { ownerDid, conversationId, ownerRevision });
+	await browserEffect(ownerDid, async () => {
+		const sender = await requestInvoke<string>('request_sender', { ownerDid, conversationId, ownerRevision });
+		await createBlock(sender, ownerDid);
+	});
+}
+
+export const getGroupInvitationReference = (ownerDid: string, conversationId: string, recipientDid: string, ownerRevision?: string) => requestInvoke<import('./request-types').GroupInvitationReference | null>('get_group_invitation_reference', { ownerDid, conversationId, recipientDid, ownerRevision });
+
+export async function sendExistingInvitationNote(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+	return requestInvoke('send_existing_invitation_note', { ownerDid, draftId, ownerRevision });
 }
