@@ -27,6 +27,15 @@ type BrowserIdentityAbi = typeof wasm & {
 };
 
 const browserAbi = wasm as BrowserIdentityAbi;
+let workerSessionRevision = 0;
+function captureWorkerSession(): () => void {
+    const revision = workerSessionRevision;
+    return () => { if (revision !== workerSessionRevision) throw new Error('Worker session changed'); };
+}
+function closeSubscriptions(): void {
+    for (const subscription of subscriptions.values()) subscription.close();
+    subscriptionAliases.clear(); subscriptions.clear();
+}
 
 async function canonicalConversationId(identifier: string): Promise<string> {
 	await wasmReady;
@@ -41,19 +50,23 @@ const plain = (v: any) => (v === undefined || v === null ? v : JSON.parse(JSON.s
 const api = {
 	// Init & auth — void returns, discard WASM internals
 	init: async (config: object) => {
+        workerSessionRevision++;
+        const check = captureWorkerSession();
 		await wasmReady;
+        check();
 		await wasm.catbird_mls_init(config);
 	},
 	setAuth: (did: string, token: string) => {
+        workerSessionRevision++;
+        closeSubscriptions();
 		wasm.catbird_mls_set_auth(did, token);
 	},
 	clearAuth: () => {
+        workerSessionRevision++;
 		browserAbi.catbird_mls_stop_background_tasks();
 		wasm.catbird_mls_clear_auth();
 		(wasm as unknown as { catbird_mls_clear_signer_bridge: () => void }).catbird_mls_clear_signer_bridge();
-		for (const subscription of subscriptions.values()) subscription.close();
-		subscriptionAliases.clear();
-		subscriptions.clear();
+        closeSubscriptions();
 	},
 	// Browser signer bridge. The CryptoKey remains owned by the worker's
 	// WebCrypto implementation; only its public key and a callback cross into
@@ -123,19 +136,27 @@ const api = {
 		(wasm as unknown as { clearContentRootKey: () => void }).clearContentRootKey();
 	},
 	setup: async () => {
+        const check = captureWorkerSession();
 		await wasm.catbird_mls_setup();
+        check();
 		browserAbi.catbird_mls_start_background_tasks(30_000);
 	},
 	startBackgroundTasks: async (intervalMs = 30_000) => {
+        const check = captureWorkerSession();
 		await wasmReady;
+        check();
 		browserAbi.catbird_mls_start_background_tasks(intervalMs);
 	},
 	stopBackgroundTasks: async () => {
+        const check = captureWorkerSession();
 		await wasmReady;
+        check();
 		browserAbi.catbird_mls_stop_background_tasks();
 	},
 	runDeferredRecovery: async () => {
+        const check = captureWorkerSession();
 		await wasmReady;
+        check();
 		return plain(await browserAbi.catbird_mls_run_deferred_recovery());
 	},
 	replenishKeyPackages: async () => {
@@ -144,7 +165,9 @@ const api = {
 	ping: () => wasm.catbird_mls_ping(),
 
 	requestCommand: async (command: string, args: Record<string, unknown>) => {
+        const check = captureWorkerSession();
 		await wasmReady;
+        check();
 		return plain(await (wasm as typeof wasm & { catbird_mls_request_command(command: string, args: unknown): Promise<unknown> }).catbird_mls_request_command(command, args));
 	},
 	// Conversations — return plain-serializable data
@@ -208,8 +231,11 @@ const api = {
 		onStatus: (status: unknown) => void,
 		_cursor?: string
 	) => {
+        const check = captureWorkerSession();
 		await wasmReady;
+        check();
 		const stableConversationId = await canonicalConversationId(convoId);
+        check();
 		const existing = subscriptions.get(stableConversationId);
 		if (existing) existing.close();
 		const sub = await wasm.catbird_mls_subscribe(
@@ -218,6 +244,7 @@ const api = {
 			onEvent,
 			onStatus
 		);
+		try { check(); } catch (error) { sub?.close(); throw error; }
 		if (sub) {
 			subscriptions.set(stableConversationId, sub);
 			subscriptionAliases.set(convoId, stableConversationId);
@@ -225,8 +252,10 @@ const api = {
 		}
 	},
 	unsubscribe: async (convoId: string) => {
+        const check = captureWorkerSession();
 		const stableConversationId =
 			subscriptionAliases.get(convoId) ?? (await canonicalConversationId(convoId));
+        check();
 		subscriptions.get(stableConversationId)?.close();
 		subscriptions.delete(stableConversationId);
 		for (const [alias, stable] of subscriptionAliases) {

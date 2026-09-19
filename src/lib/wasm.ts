@@ -231,9 +231,9 @@ async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> 
  * Propagates errors on failure to enforce fail-closed security (no legacy
  * plaintext fallback).
  */
-async function installContentRootKey(did: string): Promise<void> {
+async function installContentRootKey(did: string, w: Remote<WorkerApi>, check: () => void): Promise<void> {
 	const key = await loadOrCreateContentRootKey(did);
-	const w = getWorker();
+    check();
 	await (
 		w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
 	).setContentRootKey(key);
@@ -264,18 +264,36 @@ const NEST_URL = (() => {
 let workerAccount: string | null = null;
 let browserSessionRevision = 0;
 function invalidateBrowserSession(): void { browserSessionRevision++; }
-async function bindWorkerAuth(w: Remote<WorkerApi>, did: string, token: string): Promise<void> {
-    invalidateBrowserSession();
-    await w.setAuth(did, token);
+function checkBrowserRevision(revision: number, w?: Remote<WorkerApi>): void {
+    if (browserSessionRevision !== revision || (w && _worker !== w)) throw new Error('Browser session changed');
 }
-function effectOwner(ownerDid?: string): string {
+async function bindWorkerAuth(w: Remote<WorkerApi>, did: string, token: string, revision: number): Promise<void> {
+    checkBrowserRevision(revision, w);
+    await w.setAuth(did, token);
+    checkBrowserRevision(revision, w);
+}
+function discardBrowserSession(revision: number): void {
+    if (revision !== browserSessionRevision) return;
+    invalidateBrowserSession();
+    clearBrowserAuth();
+    if (_replenishInterval) clearInterval(_replenishInterval);
+    _replenishInterval = null;
+    _rawWorker?.terminate();
+    _rawWorker = null; _worker = null; workerAccount = null;
+}
+function effectOwner(ownerDid?: string, ownerRevision?: string): string {
+    if (!isTauri && ownerRevision !== undefined && ownerRevision !== `browser:${browserSessionRevision}`) throw new Error('Chat effect session changed');
     if (!ownerDid || (!isTauri && workerAccount !== ownerDid)) throw new Error('Chat effect account changed');
     return ownerDid;
 }
-async function browserEffect<T>(ownerDid: string | undefined, operation: (w: Remote<WorkerApi>) => Promise<T>): Promise<T> {
+async function browserEffect<T>(ownerDid: string | undefined, operation: (w: Remote<WorkerApi>, check: () => void) => Promise<T>): Promise<T> {
     const owner = effectOwner(ownerDid), revision = browserSessionRevision, w = getWorker();
-    const result = await operation(w);
-    if (_worker !== w || workerAccount !== owner || browserSessionRevision !== revision) throw new Error('Chat effect session changed');
+    const check = () => {
+        if (_worker !== w || workerAccount !== owner || browserSessionRevision !== revision) throw new Error('Chat effect session changed');
+    };
+    check();
+    const result = await operation(w, check);
+    check();
     return result;
 }
 function sessionCallback<T>(w: Remote<WorkerApi>, owner: string, revision: number, callback?: (value: T) => void): (value: T) => void {
@@ -284,22 +302,27 @@ function sessionCallback<T>(w: Remote<WorkerApi>, owner: string, revision: numbe
     };
 }
 let workerInitTail: Promise<void> = Promise.resolve();
-export async function initWasm(did?: string): Promise<void> {
+export async function initWasm(did?: string, expectedRevision?: number): Promise<void> {
 	if (isTauri) return;
 	const activeDid = did || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
 	if (!activeDid) return;
-    if (workerAccount !== activeDid) invalidateBrowserSession();
+    if (expectedRevision === undefined && workerAccount !== activeDid) invalidateBrowserSession();
+    const revision = expectedRevision ?? browserSessionRevision;
+    checkBrowserRevision(revision);
 	const initialization = workerInitTail.catch(() => {}).then(async () => {
+        checkBrowserRevision(revision);
 		if (workerAccount === activeDid && _worker) return;
 		const { key: mlsDbKey, dbPrefix } = await getOrCreateMlsDbKey(activeDid);
+        checkBrowserRevision(revision);
 		if (_rawWorker) _rawWorker.terminate();
 		_rawWorker = null; _worker = null; workerAccount = null;
 		const w = getWorker();
 		try {
 			await w.init({ baseUrl: NEST_URL, mlsDbKey, dbPrefix });
+            checkBrowserRevision(revision, w);
 			workerAccount = activeDid;
 		} catch (error) {
-			(_rawWorker as Worker | null)?.terminate(); _rawWorker = null; _worker = null;
+			if (_worker === w && revision === browserSessionRevision) { (_rawWorker as Worker | null)?.terminate(); _rawWorker = null; _worker = null; }
 			throw error;
 		}
 	});
@@ -437,104 +460,43 @@ export async function exchangeOAuthCode(code: string): Promise<string> {
 }
 
 export async function completeLogin(sessionId: string): Promise<AuthState> {
-	if (isTauri) {
-		const result = await tauriInvoke<AuthState>('complete_login', { sessionId });
-		recordNativeAuthority(result);
-		return result;
-	}
-	const resp = await fetch(`${NEST_URL}/auth/session`, {
-		headers: { Authorization: `Bearer ${sessionId}` }
-	});
-	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
-	const info = await resp.json();
-	const did: string = info.did;
-	const handle: string = info.handle ?? did;
-
-	// Open the account-specific protected database before activation.
-	await initWasm(did);
-	const w = getWorker();
-	try {
-		await bindWorkerAuth(w, did, sessionId);
-		// Install the per-DID content root key BEFORE setup() so the field-
-		// level encryption layer is ready for the very first message that
-		// setup() may decrypt during initial sync.
-		await installContentRootKey(did);
-		await w.setup();
-
-		// Ensure key packages are available for other clients to send us Welcomes
-		replenishKeyPackages();
-		startKeyPackageReplenishment();
-
-		// Final commit: persist session on main thread only after successful activation
-		persistBrowserAuth(did, sessionId);
-
-		return { did, handle };
-	} catch (error) {
-		// On activation failure clear partial worker auth/key/setup state
-		// using existing reset/log-out seam and do not persist new bearer
-		if (_replenishInterval) {
-			clearInterval(_replenishInterval);
-			_replenishInterval = null;
-		}
-		clearBrowserAuth();
-		try {
-			if (_worker) {
-				try {
-					await (
-						_worker as unknown as { clearContentRootKey: () => Promise<void> }
-					).clearContentRootKey();
-				} catch (e) {
-					console.warn('[catmos] clearContentRootKey failed during activation rollback:', e);
-				}
-				invalidateBrowserSession();
-                await _worker.clearAuth();
-			}
-		} finally {
-			if (_rawWorker) {
-				_rawWorker.terminate();
-				_rawWorker = null;
-			}
-			_worker = null;
-		}
-		throw error;
-	}
+    if (isTauri) {
+        const result = await tauriInvoke<AuthState>('complete_login', { sessionId });
+        recordNativeAuthority(result); return result;
+    }
+    invalidateBrowserSession();
+    const revision = browserSessionRevision;
+    try {
+        await _worker?.clearAuth(); checkBrowserRevision(revision);
+        const resp = await fetch(`${NEST_URL}/auth/session`, { headers: { Authorization: `Bearer ${sessionId}` } });
+        checkBrowserRevision(revision);
+        if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
+        const info = await resp.json(); checkBrowserRevision(revision);
+        const did: string = info.did;
+        await initWasm(did, revision); checkBrowserRevision(revision);
+        const w = getWorker(), check = () => checkBrowserRevision(revision, w);
+        await bindWorkerAuth(w, did, sessionId, revision);
+        await installContentRootKey(did, w, check); check();
+        await w.setup(); check();
+        persistBrowserAuth(did, sessionId);
+        startKeyPackageReplenishment();
+        return { did, handle: info.handle ?? did, authRevision: `browser:${revision}` };
+    } catch (error) { discardBrowserSession(revision); throw error; }
 }
 /**
  * Set auth credentials for the WASM MLS module.
  * Called by catmos's auth store after completing OAuth.
  */
 export async function setAuth(did: string, token: string): Promise<void> {
-	if (isTauri) return;
-	const w = getWorker();
-	try {
-		await bindWorkerAuth(w, did, token);
-		// Install the per-DID content root key after auth so the field-level
-		// encryption layer is bound before any subsequent message flow.
-		await installContentRootKey(did);
-		persistBrowserAuth(did, token);
-	} catch (error) {
-		clearBrowserAuth();
-		try {
-			if (_worker) {
-				try {
-					await (
-						_worker as unknown as { clearContentRootKey: () => Promise<void> }
-					).clearContentRootKey();
-				} catch (e) {
-					console.warn('[catmos] clearContentRootKey failed during setAuth rollback:', e);
-				}
-				invalidateBrowserSession();
-                await _worker.clearAuth();
-			}
-		} finally {
-			if (_rawWorker) {
-				_rawWorker.terminate();
-				_rawWorker = null;
-			}
-			_worker = null;
-		}
-		throw error;
-	}
+    if (isTauri) return;
+    invalidateBrowserSession();
+    const revision = browserSessionRevision, w = getWorker();
+    const check = () => checkBrowserRevision(revision, w);
+    try {
+        await bindWorkerAuth(w, did, token, revision);
+        await installContentRootKey(did, w, check); check();
+        persistBrowserAuth(did, token);
+    } catch (error) { discardBrowserSession(revision); throw error; }
 }
 
 /** Run one deferred reset/history recovery pass in the browser worker. */
@@ -675,7 +637,9 @@ export async function clearAuth(): Promise<void> {
 	if (isTauri) return;
 	clearBrowserAuth();
 	const w = getWorker();
+    const revision = browserSessionRevision;
     await w.clearAuth();
+    checkBrowserRevision(revision, w);
 	// Cancel prior-session work before clearing the cached content key.
     // Protected persistent custody remains available for a later login.
 	try {
@@ -688,106 +652,38 @@ export async function clearAuth(): Promise<void> {
 }
 
 export async function tryRestoreSession(): Promise<AuthState | null> {
-	if (isTauri) {
-		const result = await tauriInvoke<AuthState | null>('try_restore_session');
-		recordNativeAuthority(result);
-		return result;
-	}
-	const saved = readBrowserAuth();
-	if (!saved) return null;
-	const { did, sessionId } = saved;
-
-	try {
-		const resp = await fetch(`${NEST_URL}/auth/session`, {
-			headers: { Authorization: `Bearer ${sessionId}` }
-		});
-		if (!resp.ok) {
-			if (resp.status === 401 || resp.status === 403) {
-				clearBrowserAuth();
-				return null;
-			}
-			throw new Error(`Failed to restore session: ${resp.status}`);
-		}
-		const info = await resp.json();
-
-		// Open only the restored account's protected database before installing credentials.
-		if (info.did !== did) throw new Error('Restored account does not match saved session');
-		await initWasm(did);
-		const w = getWorker();
-		await bindWorkerAuth(w, info.did, sessionId);
-		// Restore the per-DID content root key from localStorage (or
-		// generate one if first restore on this profile) so the field-
-		// level encryption layer can read pre-existing sealed rows.
-		await installContentRootKey(info.did);
-		await w.setup();
-
-		// Replenish key packages (setup skips upload on returning sessions)
-		replenishKeyPackages();
-		startKeyPackageReplenishment();
-
-		return { did: info.did, handle: info.handle ?? info.did };
-	} catch (error) {
-		if (_replenishInterval) {
-			clearInterval(_replenishInterval);
-			_replenishInterval = null;
-		}
-		clearBrowserAuth();
-		try {
-			if (_worker) {
-				try {
-					await (
-						_worker as unknown as { clearContentRootKey: () => Promise<void> }
-					).clearContentRootKey();
-				} catch (e) {
-					console.warn('[catmos] clearContentRootKey failed during restore rollback:', e);
-				}
-				invalidateBrowserSession();
-                await _worker.clearAuth();
-			}
-		} finally {
-			if (_rawWorker) {
-				_rawWorker.terminate();
-				_rawWorker = null;
-			}
-			_worker = null;
-		}
-		throw error;
-	}
+    if (isTauri) {
+        const result = await tauriInvoke<AuthState | null>('try_restore_session');
+        recordNativeAuthority(result); return result;
+    }
+    const saved = readBrowserAuth();
+    if (!saved) return null;
+    const { did, sessionId } = saved;
+    invalidateBrowserSession();
+    const revision = browserSessionRevision;
+    try {
+        await _worker?.clearAuth(); checkBrowserRevision(revision);
+        const resp = await fetch(`${NEST_URL}/auth/session`, { headers: { Authorization: `Bearer ${sessionId}` } });
+        checkBrowserRevision(revision);
+        if (!resp.ok) {
+            if (resp.status === 401 || resp.status === 403) { discardBrowserSession(revision); return null; }
+            throw new Error(`Failed to restore session: ${resp.status}`);
+        }
+        const info = await resp.json(); checkBrowserRevision(revision);
+        if (info.did !== did) throw new Error('Restored account does not match saved session');
+        await initWasm(did, revision); checkBrowserRevision(revision);
+        const w = getWorker(), check = () => checkBrowserRevision(revision, w);
+        await bindWorkerAuth(w, did, sessionId, revision);
+        await installContentRootKey(did, w, check); check();
+        await w.setup(); check();
+        startKeyPackageReplenishment();
+        return { did, handle: info.handle ?? did, authRevision: `browser:${revision}` };
+    } catch (error) { discardBrowserSession(revision); throw error; }
 }
 
 export async function logout(): Promise<void> {
-	if (isTauri) {
-		clearNativeAuthority();
-		return tauriInvoke('logout');
-	}
-	clearBrowserAuth();
-
-	// Clear key package replenishment interval
-	if (_replenishInterval) {
-		clearInterval(_replenishInterval);
-		_replenishInterval = null;
-	}
-
-	// Clear auth in worker, then terminate it
-	try {
-		if (_worker) {
-			try {
-				await (
-					_worker as unknown as { clearContentRootKey: () => Promise<void> }
-				).clearContentRootKey();
-			} catch (e) {
-				console.warn('[catmos] clearContentRootKey failed during logout:', e);
-			}
-			invalidateBrowserSession();
-                await _worker.clearAuth();
-		}
-	} finally {
-		if (_rawWorker) {
-			_rawWorker.terminate();
-			_rawWorker = null;
-		}
-		_worker = null;
-	}
+    if (isTauri) { clearNativeAuthority(); return tauriInvoke('logout'); }
+    discardBrowserSession(browserSessionRevision);
 }
 
 // ---------------------------------------------------------------------------
@@ -832,14 +728,15 @@ export async function createGroup(
 	memberDids: string[],
 	description?: string
 , ownerDid?: string, ownerRevision?: string): Promise<Conversation> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('create_group', { name, memberDids, description , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
+    return browserEffect(expectedOwner, async (w, check) => {
 	// Ensure fresh key packages before group creation
-	await replenishKeyPackages();
-	const w = getWorker();
+	await w.replenishKeyPackages();
+	check();
 	return w.createConversation(name, memberDids) as Promise<Conversation>;
 
     });
@@ -853,6 +750,7 @@ export async function subscribeConversation(
 	cursor?: string,
     ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('subscribe_conversation', { conversationId, cursor, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
@@ -900,6 +798,7 @@ export async function unsubscribeAllEvents(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function sendMessage(conversationId: string, content: string, ownerDid?: string, ownerRevision?: string): Promise<Message> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('send_message', { conversationId, content, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
@@ -916,6 +815,7 @@ export async function sendImage(
 	altText?: string,
     ownerDid?: string, ownerRevision?: string
 ): Promise<Message> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('send_image', {
 			conversationId,
@@ -932,6 +832,7 @@ export async function sendImage(
 }
 
 export async function getMessages(conversationId: string, before?: string, ownerDid?: string, ownerRevision?: string): Promise<Message[]> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('get_messages', { conversationId, before, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
@@ -941,6 +842,7 @@ export async function getMessages(conversationId: string, before?: string, owner
 export async function getImageAttachment(
 	image: import('./tauri').ImageAttachment, conversationId: string, ownerDid?: string, ownerRevision?: string
 ): Promise<string> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('get_image_attachment', {
             conversationId, ownerDid: effectOwner(ownerDid),
@@ -962,6 +864,7 @@ export async function getImageAttachment(
 }
 
 export async function fetchNewMessages(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<Message[]> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('fetch_new_messages', { conversationId, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
@@ -975,6 +878,7 @@ export async function sendReaction(
 	action: 'add' | 'remove',
     ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('send_reaction', { conversationId, messageId, emoji, action, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
@@ -990,6 +894,7 @@ export async function sendTyping(conversationId: string, isTyping: boolean): Pro
 }
 
 export async function updateCursor(conversationId: string, cursor: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) {
 		return tauriInvoke('update_cursor', { conversationId, cursor, ownerDid: effectOwner(ownerDid), ownerRevision });
 	}
@@ -1001,12 +906,12 @@ export async function updateCursor(conversationId: string, cursor: string, owner
 // ---------------------------------------------------------------------------
 
 export async function addGroupMembers(conversationId: string, memberDids: string[], ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('add_group_members', { conversationId, memberDids , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
-	const w = getWorker();
+    return browserEffect(expectedOwner, async (w, check) => {
 	return w.addGroupMembers(conversationId, memberDids) as Promise<void>;
 
     });
@@ -1040,12 +945,12 @@ export async function removeGroupMember(
 	conversationId: string,
 	targetDid: string
 , ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('remove_group_member', { conversationId, targetDid , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
-	const w = getWorker();
+    return browserEffect(expectedOwner, async (w, check) => {
 	return w.removeParticipants(conversationId, targetDid) as Promise<void>;
 
     });
@@ -1171,12 +1076,12 @@ export async function republishMetadataAfterReset(
 	newGroupIdHex: string,
 	resetGeneration?: number
 , ownerDid?: string, ownerRevision?: string): Promise<unknown> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return null;
 	}
-    return browserEffect(expectedOwner, async () => {
-	const w = getWorker();
+    return browserEffect(expectedOwner, async (w, check) => {
 	return (w as unknown as {
 		republishMetadataAfterReset: (g: string, r?: number) => Promise<unknown>;
 	}).republishMetadataAfterReset(newGroupIdHex, resetGeneration);
@@ -1185,12 +1090,12 @@ export async function republishMetadataAfterReset(
 }
 
 export async function leaveConversation(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('leave_conversation', { conversationId , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
-	const w = getWorker();
+    return browserEffect(expectedOwner, async (w, check) => {
 	return w.leaveConversation(conversationId) as Promise<void>;
 
     });
@@ -1204,6 +1109,7 @@ export async function updateGroupMetadata(
 	avatarBlobLocator?: string,
 	avatarContentType?: string
 , ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		// Tauri now uses Phase A.2 encrypted update — accepts avatar
@@ -1220,7 +1126,7 @@ export async function updateGroupMetadata(
 			avatarContentType: avatarContentType ?? null, ownerRevision
 		});
 	}
-    return browserEffect(expectedOwner, async () => {
+    return browserEffect(expectedOwner, async (w, check) => {
 	// MLS metadata cutover: WASM `update_group_metadata` takes the richer
 	// (title, description, avatarBlobLocator, avatarContentType, avatarBytes)
 	// shape. The legacy `avatarHash` arg was a content-addressed locator hint
@@ -1228,7 +1134,6 @@ export async function updateGroupMetadata(
 	// locators per upload. We pass it through as the locator so callers
 	// that still send a hash work, but new callers should pass the avatar
 	// bytes directly via the worker `updateGroupMetadata` method.
-	const w = getWorker();
 	void avatarHash;
 	await (w as unknown as {
 		updateGroupMetadata: (
@@ -1259,21 +1164,23 @@ export async function resetGroup(
 	conversationId: string,
 	reason?: string
 , ownerDid?: string, ownerRevision?: string): Promise<Record<string, unknown>> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('reset_group', { conversationId, reason , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
+    return browserEffect(expectedOwner, async (w, check) => {
 	const saved = readBrowserAuth();
 	if (!saved) throw new Error('Not authenticated');
 	const requestJson = JSON.stringify({
 		convoId: conversationId,
 		reason: reason ?? undefined
 	});
-	const prepared = (await prepareSignedRequest(
+	const prepared = (await w.prepareSignedRequest(
 		'requestReset',
 		requestJson
 	)) as PreparedGatewayRequest;
+	check();
 	const resp = await submitPreparedRequest(prepared, saved.did);
 	if (resp.status < 200 || resp.status >= 300) {
 		throw new Error(`Reset group failed: ${resp.status} ${resp.body}`);
@@ -1292,11 +1199,12 @@ export async function reportSpam(
 	reportedDid: string,
 	reason?: string
 , ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('report_spam', { conversationId, reportedDid, reason , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
+    return browserEffect(expectedOwner, async (w, check) => {
 	const saved = readBrowserAuth();
 	if (!saved) throw new Error('Not authenticated');
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
@@ -1332,12 +1240,13 @@ export async function reportSpam(
  * Uses `com.atproto.repo.createRecord` via the nest BFF. Returns the AT-URI.
  */
 export async function createBlock(targetDid: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		await tauriInvoke<string>('create_block', { subjectDid: targetDid , ownerDid: expectedOwner, ownerRevision });
 		return;
 	}
-    return browserEffect(expectedOwner, async () => {
+    return browserEffect(expectedOwner, async (w, check) => {
 	const saved = readBrowserAuth();
 	if (!saved) throw new Error('Not authenticated');
 	const body = {
@@ -1509,11 +1418,12 @@ export async function getQuarantineState(
  * `mls:group-reset` listener in `+page.svelte`.
  */
 export async function confirmManualReset(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
     const expectedOwner = effectOwner(ownerDid);
 	if (isTauri) {
 		return tauriInvoke('confirm_manual_reset', { conversationId , ownerDid: expectedOwner, ownerRevision });
 	}
-    return browserEffect(expectedOwner, async () => {
+    return browserEffect(expectedOwner, async (w, check) => {
 	throw new Error('confirmManualReset is not yet implemented in browser builds');
 
     });
@@ -1524,28 +1434,36 @@ export async function confirmManualReset(conversationId: string, ownerDid?: stri
 export const requestBackendAvailable = isTauri;
 async function requestInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
 	if (isTauri) return tauriInvoke<T>(command, args);
+	effectOwner(args.ownerDid as string, args.ownerRevision as string | undefined);
 	const { ownerRevision: _nativeRevision, ...browserArgs } = args;
 	return browserEffect(args.ownerDid as string, w => w.requestCommand(command, browserArgs) as Promise<T>);
 }
 export async function getRequestWorkspace(ownerDid: string, ownerRevision?: string): Promise<import('./request-types').RequestWorkspace> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('get_request_workspace', { ownerDid, ownerRevision });
 }
 export async function saveRequestDraft(ownerDid: string, input: import('./request-types').DirectRequestInput, recipientLabel: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('save_request_draft', { ownerDid, input, recipientLabel, ownerRevision });
 }
 export async function submitRequestDraft(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('submit_request_draft', { ownerDid, draftId, ownerRevision });
 }
 export async function resumeRequestDraft(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('resume_request_draft', { ownerDid, draftId, ownerRevision });
 }
 export async function cancelRequestDraft(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('cancel_request_draft', { ownerDid, draftId, ownerRevision });
 }
 export async function refreshDirectRequest(ownerDid: string, conversationId: string, ownerRevision?: string): Promise<import('./request-types').DirectRequestView> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('refresh_direct_request', { ownerDid, conversationId, ownerRevision });
 }
 export async function acceptDirectRequest(ownerDid: string, conversationId: string, ownerRevision?: string): Promise<import('./request-types').DirectRequestView> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('accept_direct_request', { ownerDid, conversationId, ownerRevision });
 }
 
@@ -1553,9 +1471,11 @@ export const setRequestDeliveryEnabled = (ownerDid: string, enabled: boolean, ow
 
 export const closeDirectRequest = (ownerDid: string, conversationId: string, ownerRevision?: string) => requestInvoke<import('./request-types').DirectRequestView>('close_direct_request', { ownerDid, conversationId, ownerRevision });
 export async function blockRequestSender(ownerDid: string, conversationId: string, ownerRevision?: string): Promise<void> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	if (isTauri) return requestInvoke<void>('block_request_sender', { ownerDid, conversationId, ownerRevision });
-	await browserEffect(ownerDid, async () => {
+	await browserEffect(ownerDid, async (w, check) => {
 		const sender = await requestInvoke<string>('request_sender', { ownerDid, conversationId, ownerRevision });
+		check();
 		await createBlock(sender, ownerDid);
 	});
 }
@@ -1563,5 +1483,6 @@ export async function blockRequestSender(ownerDid: string, conversationId: strin
 export const getGroupInvitationReference = (ownerDid: string, conversationId: string, recipientDid: string, ownerRevision?: string) => requestInvoke<import('./request-types').GroupInvitationReference | null>('get_group_invitation_reference', { ownerDid, conversationId, recipientDid, ownerRevision });
 
 export async function sendExistingInvitationNote(ownerDid: string, draftId: string, ownerRevision?: string): Promise<import('./request-types').RequestDraft> {
+    if (!isTauri) effectOwner(ownerDid, ownerRevision);
 	return requestInvoke('send_existing_invitation_note', { ownerDid, draftId, ownerRevision });
 }
