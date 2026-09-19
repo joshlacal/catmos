@@ -153,7 +153,7 @@ impl SqliteStorage {
             if c.conversation_id != id
                 || hex::encode(c.group_id.as_ref()) != *group
                 || c.epoch < 0
-                || c.epoch as u64 != view.epoch
+                || c.epoch as u64 > view.epoch
                 || !canonical
                     .participants
                     .iter()
@@ -196,7 +196,8 @@ impl SqliteStorage {
                 && request.canonical_lifecycle.reset_generation.is_some()
                 && request.canonical_lifecycle.reset_pending_target_group_id == row.reset
                 && row.reset.as_deref() == Some(group.as_str());
-            if (pending && !reset_authorized)
+            if (row.group == *group && row.epoch > view.epoch)
+                || (pending && !reset_authorized)
                 || (row.group != *group && !group_advance && !reset_authorized)
                 || ((row.state.contains("Closed") || row.state.contains("DeviceRemoved"))
                     && view
@@ -274,9 +275,9 @@ impl SqliteStorage {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });
             };
             let alias_view = self.read_projection_tx(&tx, owner, alias)?;
-            let native_epoch:Option<u64>=tx.query_row("SELECT epoch FROM conversation_projection_incarnations WHERE owner_did=?1 AND group_id=?2",params![owner,authority.alias_group_id],|r|r.get(0)).optional().map_err(|_|"Native incarnation lookup failed")?;
             if row.group != authority.alias_group_id
-                || native_epoch != Some(authority.alias_incarnation)
+                || row.epoch != authority.alias_incarnation
+                || authority.alias_incarnation > authority.canonical_incarnation
                 || !lifecycle_matches(&row, alias_view.as_ref(), &authority.alias_lifecycle)
             {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });

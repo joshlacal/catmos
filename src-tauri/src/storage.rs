@@ -815,14 +815,6 @@ impl MLSStorageBackend for SqliteStorage {
             })
             .ok();
 
-        if let Some(view) = &mut result {
-            if view.conversation_id == view.group_id {
-                let incarnation:Option<u64>=conn.query_row("SELECT epoch FROM conversation_projection_incarnations WHERE owner_did=?1 AND group_id=?2",rusqlite::params![user_did,view.group_id],|r|r.get(0)).optional().map_err(|e|OrchestratorError::Storage(e.to_string()))?;
-                if let Some(epoch) = incarnation {
-                    view.epoch = epoch;
-                }
-            }
-        }
         Ok(result)
     }
 
@@ -2014,6 +2006,104 @@ mod field_encryption_tests {
     }
 
     #[tokio::test]
+    async fn request_projection_keeps_native_epoch_overlay_without_changing_authority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage =
+            SqliteStorage::new(tmp.path().join("host.db").to_str().unwrap(), TEST_DB_KEY).unwrap();
+        let context = MLSContext::new(
+            tmp.path().join("mls.db").to_string_lossy().into_owned(),
+            TEST_DB_KEY.into(),
+            Box::new(InMemoryKeychain::new()),
+        )
+        .unwrap();
+        context.set_content_root_key(vec![0x63; 32]).unwrap();
+        storage.set_mls_context(context);
+        let canonical = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../tests/fixtures/canonical-conversation-state.json"
+            ))
+            .unwrap()
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let owner = canonical.participants[0].user_did.to_string();
+        storage.bind_request_owner(Some(&owner));
+        let view = ConversationView {
+            conversation_id: canonical.coordinates.conversation_id.to_string(),
+            group_id: hex::encode(canonical.coordinates.group_id.as_ref()),
+            epoch: canonical.coordinates.epoch as u64 + 3,
+            members: vec![],
+            metadata: None,
+            created_at: None,
+            updated_at: None,
+            sequencer_did: None,
+            canonical_state: Some(canonical.clone()),
+        };
+        storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                &owner,
+                view.clone(),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let stored = storage
+            .get_conversation(&owner, &view.conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.epoch, view.epoch);
+        assert_eq!(stored.canonical_state, Some(canonical.clone()));
+        let mut stale_overlay = view.clone();
+        stale_overlay.epoch -= 1;
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    stale_overlay,
+                    vec![]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        let mut inconsistent = view.clone();
+        inconsistent
+            .canonical_state
+            .as_mut()
+            .unwrap()
+            .coordinates
+            .epoch = view.epoch as i64 + 1;
+        assert!(storage
+            .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                &owner,
+                inconsistent,
+                vec![]
+            ))
+            .await
+            .is_err());
+        let mut changed_authority = view.clone();
+        changed_authority
+            .canonical_state
+            .as_mut()
+            .unwrap()
+            .participants[1]
+            .status = "active".into();
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    changed_authority,
+                    vec![]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+    }
+
+    #[tokio::test]
     async fn request_policy_distinguishes_pending_direct_from_existing_group_members() {
         let mut canonical =
             catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
@@ -2086,6 +2176,7 @@ mod field_encryption_tests {
         let mut alias = view.clone();
         alias.conversation_id = view.group_id.clone();
         alias.canonical_state = None;
+        alias.epoch = view.epoch - 1;
         storage
             .ensure_conversation_exists(&owner, &alias.conversation_id, &alias.group_id)
             .await
@@ -2122,6 +2213,42 @@ mod field_encryption_tests {
             .await
             .unwrap();
         let authority = AliasRetirementAuthority::from_views(&owner, &view, &alias).unwrap();
+        // First pass sees server epoch7 while native epoch6 has not caught up.
+        assert!(matches!(
+            storage
+                .commit_conversation_projection(&ConversationProjectionCommitRequest::live(
+                    &owner,
+                    view.clone(),
+                    vec![authority.clone()]
+                ))
+                .await
+                .unwrap(),
+            ConversationProjectionCommitOutcome::FenceMismatch { affected_rows: 0 }
+        ));
+        storage
+            .set_group_state(&GroupState {
+                group_id: alias.group_id.clone(),
+                conversation_id: alias.conversation_id.clone(),
+                epoch: view.epoch,
+                members: vec![owner.clone()],
+            })
+            .await
+            .unwrap();
+        // Native catch-up must not rewrite the observed durable alias row6.
+        assert_eq!(
+            storage
+                .get_conversation(&owner, &alias.conversation_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .epoch,
+            alias.epoch
+        );
+        assert_eq!(
+            storage.list_conversations(&owner).await.unwrap()[0].epoch,
+            alias.epoch
+        );
+
         let mut wrong = authority.clone();
         wrong.alias_incarnation += 1;
         assert!(matches!(
