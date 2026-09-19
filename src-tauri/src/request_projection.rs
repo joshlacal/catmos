@@ -88,6 +88,10 @@ impl SqliteStorage {
         owner: &str,
         id: &str,
     ) -> Result<Option<ConversationView>, String> {
+        let scope = self
+            .request_owner
+            .read()
+            .map_err(|_| "Account scope unavailable")?;
         let mut conn = self
             .conn
             .lock()
@@ -95,6 +99,11 @@ impl SqliteStorage {
         let tx = conn
             .transaction()
             .map_err(|_| "Projection transaction unavailable")?;
+        let key = format!("canonical:{id}");
+        let present: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM encrypted_request_projection WHERE owner_did=?1 AND record_kind='view' AND record_id=?2)", params![owner,key], |r|r.get(0)).map_err(|_| "Projection lookup failed")?;
+        if present && scope.as_deref() != Some(owner) {
+            return Err("Account changed".into());
+        }
         self.read_projection_tx(&tx, owner, id)
     }
     pub(super) fn commit_live_projection(
@@ -141,7 +150,7 @@ impl SqliteStorage {
         }
         if let Some(canonical) = &view.canonical_state {
             let c = &canonical.coordinates;
-            if c.conversation_id.to_string() != id
+            if c.conversation_id != id
                 || hex::encode(c.group_id.as_ref()) != *group
                 || c.epoch < 0
                 || c.epoch as u64 != view.epoch
@@ -227,6 +236,12 @@ impl SqliteStorage {
                 affected_rows: 0,
             });
         }
+        if request.mode == Mode::Replay || !request.aliases.is_empty() {
+            let incarnation:Option<u64>=tx.query_row("SELECT epoch FROM conversation_projection_incarnations WHERE owner_did=?1 AND group_id=?2",params![owner,group],|r|r.get(0)).optional().map_err(|_|"Canonical incarnation lookup failed")?;
+            if incarnation != Some(view.epoch) {
+                return Ok(Outcome::FenceMismatch { affected_rows: 0 });
+            }
+        }
         let context = self
             .mls_context_snapshot()
             .ok_or("Protected projection storage unavailable")?;
@@ -259,16 +274,16 @@ impl SqliteStorage {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });
             };
             let alias_view = self.read_projection_tx(&tx, owner, alias)?;
+            let native_epoch:Option<u64>=tx.query_row("SELECT epoch FROM conversation_projection_incarnations WHERE owner_did=?1 AND group_id=?2",params![owner,authority.alias_group_id],|r|r.get(0)).optional().map_err(|_|"Native incarnation lookup failed")?;
             if row.group != authority.alias_group_id
-                || row.epoch != authority.alias_incarnation
+                || native_epoch != Some(authority.alias_incarnation)
                 || !lifecycle_matches(&row, alias_view.as_ref(), &authority.alias_lifecycle)
             {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });
             }
             // Live claims bind the candidate coordinate; replay binds durable canonical state.
-            if authority.canonical_lifecycle.generation != request.canonical_lifecycle.generation
-                || authority.canonical_lifecycle.state_version
-                    != request.canonical_lifecycle.state_version
+            if fence_value(&authority.canonical_lifecycle)
+                != fence_value(&request.canonical_lifecycle)
             {
                 return Ok(Outcome::FenceMismatch { affected_rows: 0 });
             }
@@ -298,7 +313,7 @@ impl SqliteStorage {
                 "\"Active\""
             };
             let members = serde_json::to_string(&view.members).map_err(|_| "Invalid roster")?;
-            tx.execute("INSERT INTO conversations(conversation_id,user_did,group_id,epoch,state,members_json,sequencer_did) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(conversation_id,user_did) DO UPDATE SET group_id=excluded.group_id,epoch=excluded.epoch,state=excluded.state,members_json=excluded.members_json,sequencer_did=excluded.sequencer_did,reset_new_group_id=NULL,reset_generation=NULL,reset_notified_at_ms=NULL",params![id,owner,group,view.epoch,state,members,view.sequencer_did]).map_err(|_|"Canonical row write failed")?;
+            tx.execute("INSERT INTO conversations(conversation_id,user_did,group_id,epoch,state,members_json,sequencer_did) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(conversation_id,user_did) DO UPDATE SET group_id=excluded.group_id,epoch=excluded.epoch,state=excluded.state,members_json=excluded.members_json,sequencer_did=excluded.sequencer_did,reset_new_group_id=NULL,reset_notified_at_ms=NULL",params![id,owner,group,view.epoch,state,members,view.sequencer_did]).map_err(|_|"Canonical row write failed")?;
             tx.execute("INSERT INTO encrypted_request_projection(owner_did,record_kind,record_id,payload) VALUES(?1,'view',?2,?3) ON CONFLICT(owner_did,record_kind,record_id) DO UPDATE SET payload=excluded.payload",params![owner,key,bytes]).map_err(|_|"Protected projection write failed")?;
         }
         for (alias, bytes) in &retire {

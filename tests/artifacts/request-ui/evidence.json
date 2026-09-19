@@ -1,12 +1,13 @@
 {
   "kind": "local-ui-fixture-only",
   "base": "http://127.0.0.1:1420",
-  "screenshots": 5,
+  "screenshots": 6,
   "errors": [],
   "externalRequests": [
     "https://rsms.me/inter/inter.css",
     "https://rsms.me/inter/font-files/Inter-Bold.woff2?v=4.1",
-    "https://rsms.me/inter/font-files/Inter-Regular.woff2?v=4.1"
+    "https://rsms.me/inter/font-files/Inter-Regular.woff2?v=4.1",
+    "https://rsms.me/inter/font-files/Inter-SemiBold.woff2?v=4.1"
   ],
   "assertions": [
     "pending preview plain text only",
@@ -14,6 +15,7 @@
     "group navigation does not accept",
     "unavailable preview truthful",
     "browser producer unavailable",
-    "accepted first message single stable identity"
+    "accepted first message single stable identity",
+    "accepted note literal reference navigation only"
   ]
 }

@@ -2,13 +2,13 @@ mod api_client;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
 mod commands;
-mod request_commands;
 mod credentials;
 mod keychain;
 mod keys;
 mod mls_proxy;
 mod quarantine_observer;
 mod recovery;
+mod request_commands;
 mod session_restore;
 mod storage;
 mod websocket;
@@ -187,6 +187,8 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             request_commands::get_request_workspace,
+            request_commands::get_group_invitation_reference,
+            request_commands::send_existing_invitation_note,
             request_commands::set_request_delivery_enabled,
             request_commands::save_request_draft,
             request_commands::submit_request_draft,

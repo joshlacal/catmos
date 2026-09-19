@@ -30,12 +30,21 @@ export function createRequestsStore() {
     try { await work(owner); } catch(e) { if(active(owner,revision)) store.update(s=>({...s,error:e instanceof Error?e.message:String(e)})); }
     finally { if(active(owner,revision)) store.update(s=>({...s,busy:false})); }
   }
+  async function persistDraft(owner: string, revision: number, updated: RequestDraft) {
+    const id=updated.input.draftId;
+    const save=(saves.get(id) ?? Promise.resolve()).then(async()=>{
+      if(!active(owner,revision))return;
+      try { const saved=await api.saveRequestDraft(owner,updated.input,updated.recipientLabel); if(active(owner,revision) && JSON.stringify(get(store).drafts.find(d=>d.input.draftId===id)?.input)===JSON.stringify(updated.input))mergeDraft(saved); }
+      catch(e){if(active(owner,revision))store.update(s=>({...s,error:String(e)}));}
+    });
+    saves.set(id,save);await save;
+  }
   async function load() {
     const owner=get(store).ownerDid, revision=epoch; if(!owner || !api.requestBackendAvailable) return;
     store.update(s=>({...s,loading:true}));
     try {
       const value=await api.getRequestWorkspace(owner); if(!active(owner,revision) || value.ownerDid!==owner) return;
-      store.update(s=>({...s,deliveryEnabled:value.deliveryEnabled ?? null,drafts:[...s.drafts.filter(local=>!value.drafts.some(saved=>saved.input.draftId===local.input.draftId)),...value.drafts.map(saved=>{const local=s.drafts.find(d=>d.input.draftId===saved.input.draftId);return local?.phase==='draft'&&saved.phase==='draft'?local:saved;})],views:value.requests.reduce((all,v)=>{const previous=all.find(x=>x.conversationId===v.conversationId);return [...all.filter(x=>x.conversationId!==v.conversationId),newer(previous,v)];},s.views),loading:false}));
+      store.update(s=>({...s,notice:value.discoveryError ?? null,deliveryEnabled:value.deliveryEnabled ?? null,drafts:[...s.drafts.filter(local=>!value.drafts.some(saved=>saved.input.draftId===local.input.draftId)),...value.drafts.map(saved=>{const local=s.drafts.find(d=>d.input.draftId===saved.input.draftId);return local?.phase==='draft'&&saved.phase==='draft'?local:saved;})],views:value.requests.reduce((all,v)=>{const previous=all.find(x=>x.conversationId===v.conversationId);return [...all.filter(x=>x.conversationId!==v.conversationId),newer(previous,v)];},s.views),loading:false}));
     } catch(e) { if(active(owner,revision)) store.update(s=>({...s,loading:false,error:String(e)})); }
   }
   return {
@@ -48,21 +57,20 @@ export function createRequestsStore() {
     selectRequest(id: string) { store.update(s=>({...s,pane:'request',selectedId:id,error:null})); },
     begin(recipientDid: string, recipientLabel: string, text='', invitation?: GroupInvitationReference) {
       const s=get(store); if(!s.ownerDid || s.ownerDid===recipientDid)return;
-      const existing=s.drafts.find(d=>!d.archived && d.phase==='draft' && d.input.recipientDid===recipientDid);
+      let existing=s.drafts.find(d=>!d.archived && d.input.recipientDid===recipientDid && (d.phase==='draft'||d.phase==='attempted'||d.phase==='checking'||d.outcome?.type==='retryable'));
+      if(existing?.phase==='draft' && invitation && !existing.input.invitation){existing={...existing,input:{...existing.input,invitation,text:existing.input.text||text}};mergeDraft(existing);if(api.requestBackendAvailable)void persistDraft(s.ownerDid,epoch,existing);}
+      if(existing && invitation && JSON.stringify(existing.input.invitation)!==JSON.stringify(invitation)){store.update(s=>({...s,pane:'draft',selectedId:existing.input.draftId,error:'The group invitation is separate. This saved request already has its own content; no invitation note was sent.'}));return false;}
       const draft=existing ?? {input:{draftId:crypto.randomUUID(),recipientDid,text,invitation},recipientLabel,phase:'draft' as const,outcome:null,archived:false};
       mergeDraft(draft); store.update(s=>({...s,pane:'draft',selectedId:draft.input.draftId,error:null}));
+      if(!existing && api.requestBackendAvailable) void persistDraft(s.ownerDid,epoch,draft);
+      return true;
     },
     async saveText(id: string, text: string) {
       const s=get(store), owner=s.ownerDid, revision=epoch;
       const draft=s.drafts.find(d=>d.input.draftId===id); if(!owner || !draft || draft.phase!=='draft')return;
       const updated={...draft,input:{...draft.input,text}}; mergeDraft(updated);
       if(!api.requestBackendAvailable)return;
-      const save=(saves.get(id) ?? Promise.resolve()).then(async()=>{
-        if(!active(owner,revision))return;
-        try { const saved=await api.saveRequestDraft(owner,updated.input,updated.recipientLabel); if(active(owner,revision) && get(store).drafts.find(d=>d.input.draftId===id)?.input.text===text)mergeDraft(saved); }
-        catch(e){if(active(owner,revision))store.update(s=>({...s,error:String(e)}));}
-      });
-      saves.set(id,save); await save;
+      await persistDraft(owner,revision,updated);
     },
     async send(id: string) { await operation(async owner=>{
       const revision=epoch, draft=get(store).drafts.find(d=>d.input.draftId===id); if(!draft)return;
@@ -77,6 +85,7 @@ export function createRequestsStore() {
       if(draft.phase==='draft'&&!api.requestBackendAvailable){mergeDraft({...draft,archived:true});store.update(s=>({...s,pane:'inbox'}));return;}
       await api.saveRequestDraft(owner,draft.input,draft.recipientLabel);if(!active(owner,revision))return;const result=await api.cancelRequestDraft(owner,id);if(active(owner,revision)){mergeDraft(result);if(result.archived)store.update(s=>({...s,pane:'inbox'}));}
     }); },
+    async sendInvitationNote(id:string) { await operation(async owner=>{const revision=epoch;try {const draft=await api.sendExistingInvitationNote(owner,id);if(active(owner,revision))mergeDraft(draft);} finally {if(active(owner,revision))await load();}}); },
     async refresh(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.refreshDirectRequest(owner,id);if(active(owner,revision))mergeView(view);}); },
     async accept(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.acceptDirectRequest(owner,id);if(active(owner,revision))mergeView(view);}); },
     async close(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.closeDirectRequest(owner,id);if(active(owner,revision))mergeView(view);}); },

@@ -34,10 +34,18 @@ fn canonical_conversation_view(
         group_id: hex::encode(state.coordinates.group_id.as_ref()),
         conversation_id: state.coordinates.conversation_id.to_string(),
         epoch: state.coordinates.epoch as u64,
-        members: state.participants.iter().map(|participant| MemberView {
-            did: participant.user_did.to_string(),
-            role: if participant.role == "admin" { MemberRole::Admin } else { MemberRole::Member },
-        }).collect(),
+        members: state
+            .participants
+            .iter()
+            .map(|participant| MemberView {
+                did: participant.user_did.to_string(),
+                role: if participant.role == "admin" {
+                    MemberRole::Admin
+                } else {
+                    MemberRole::Member
+                },
+            })
+            .collect(),
         metadata: None,
         created_at: None,
         updated_at: None,
@@ -1328,16 +1336,48 @@ impl ReqwestApiClient {
 
     /// Read current policy with the admitted exact-device session. This is a
     /// restriction gate for host side effects; it never mints request consent.
-    pub(crate) async fn request_conversation_policy(&self, conversation_id: &str) -> Result<blue_catbird::chat::ConversationState> {
-        let auth = self.chat_auth.canonical_read_context().map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let route = catbird_mls::orchestrator::canonical_route(catbird_mls::orchestrator::CanonicalOperation::GetConversationState);
-        let path = format!("{}?actorDeviceId={}&conversationId={}", route.path, urlencoding::encode(&auth.device_id), urlencoding::encode(conversation_id));
-        let response = self.client.get(self.canonical_url(&path)).header(reqwest::header::AUTHORIZATION, &auth.authorization).header("x-catbird-chat-device-id", &auth.device_id).send().await.map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if !response.status().is_success() { return Err(self.handle_error_for_session(response, &auth.session).await); }
-        let body = response.bytes().await.map_err(|e| OrchestratorError::Api(e.to_string()))?;
+    pub(crate) async fn request_conversation_policy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<blue_catbird::chat::ConversationState> {
+        let auth = self
+            .chat_auth
+            .canonical_read_context()
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let route = catbird_mls::orchestrator::canonical_route(
+            catbird_mls::orchestrator::CanonicalOperation::GetConversationState,
+        );
+        let path = format!(
+            "{}?actorDeviceId={}&conversationId={}",
+            route.path,
+            urlencoding::encode(&auth.device_id),
+            urlencoding::encode(conversation_id)
+        );
+        let response = self
+            .client
+            .get(self.canonical_url(&path))
+            .header(reqwest::header::AUTHORIZATION, &auth.authorization)
+            .header("x-catbird-chat-device-id", &auth.device_id)
+            .send()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(self.handle_error_for_session(response, &auth.session).await);
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
         self.ensure_session_current(&auth.session)?;
-        let output = parse_lexicon_json::<blue_catbird::chat::get_conversation_state::GetConversationStateOutput>(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        if output.state.coordinates.conversation_id != conversation_id { return Err(OrchestratorError::Api("Conversation policy identity mismatch".into())); }
+        let output = parse_lexicon_json::<
+            blue_catbird::chat::get_conversation_state::GetConversationStateOutput,
+        >(&body)
+        .map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if output.state.coordinates.conversation_id != conversation_id {
+            return Err(OrchestratorError::Api(
+                "Conversation policy identity mismatch".into(),
+            ));
+        }
         Ok(output.state)
     }
 
@@ -1354,7 +1394,7 @@ impl ReqwestApiClient {
             catbird_mls::orchestrator::CanonicalOperation::GetConversations,
         );
         let mut path = format!(
-            "{}?actorDeviceId={}&limit={limit}",
+            "{}?actorDeviceId={}&limit={limit}&supportedProtocolVersions=1&supportedProtocolVersions=2",
             route.path,
             urlencoding::encode(&auth.device_id)
         );
@@ -1379,8 +1419,11 @@ impl ReqwestApiClient {
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
         self.ensure_session_current(&auth.session)?;
-        let output = catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
-            .map_err(|error| OrchestratorError::Api(format!("Canonical getConversations decode: {error}")))?;
+        let output =
+            catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
+                .map_err(|error| {
+                OrchestratorError::Api(format!("Canonical getConversations decode: {error}"))
+            })?;
 
         let conversations = output
             .items
@@ -1443,13 +1486,20 @@ impl ReqwestApiClient {
         >(body.as_ref())?;
         // Preserve original complete control rows. Typed round trips can change
         // byte wrappers; shared verification must receive the actual entry.
-        let raw:serde_json::Value=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
-        let raw_entries=raw["entries"].as_array().ok_or_else(||OrchestratorError::Api("Entry array missing".into()))?;
-        if raw_entries.len()!=output.entries.len(){return Err(OrchestratorError::Api("Entry count mismatch".into()));}
-        let mut entries=Vec::new();
-        for (typed,raw) in output.entries.iter().zip(raw_entries) {
-            if canonical_entry_matches_type(typed,message_type) {
-                if let Some(envelope)=IncomingEnvelope::from_canonical_entry(raw,convo_id)? {entries.push(envelope);}
+        let raw: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let raw_entries = raw["entries"]
+            .as_array()
+            .ok_or_else(|| OrchestratorError::Api("Entry array missing".into()))?;
+        if raw_entries.len() != output.entries.len() {
+            return Err(OrchestratorError::Api("Entry count mismatch".into()));
+        }
+        let mut entries = Vec::new();
+        for (typed, raw) in output.entries.iter().zip(raw_entries) {
+            if canonical_entry_matches_type(typed, message_type) {
+                if let Some(envelope) = IncomingEnvelope::from_canonical_entry(raw, convo_id)? {
+                    entries.push(envelope);
+                }
             }
         }
         let next = if output.has_more {
@@ -1492,7 +1542,16 @@ fn canonical_entry_matches_type(
 ) -> bool {
     // Request controls are authority, not optional content filtering. Dropping
     // one before returning the append cursor could permanently lose consent.
-    if matches!(entry, catbird_atproto::blue_catbird::chat::ConversationEntry::DirectRequestEntry(_) | catbird_atproto::blue_catbird::chat::ConversationEntry::DirectRequestAcceptanceEntry(_) | catbird_atproto::blue_catbird::chat::ConversationEntry::ConversationCloseEntry(_)) { return true; }
+    if matches!(
+        entry,
+        catbird_atproto::blue_catbird::chat::ConversationEntry::DirectRequestEntry(_)
+            | catbird_atproto::blue_catbird::chat::ConversationEntry::DirectRequestAcceptanceEntry(
+                _
+            )
+            | catbird_atproto::blue_catbird::chat::ConversationEntry::ConversationCloseEntry(_)
+    ) {
+        return true;
+    }
     match message_type {
         Some("commit") => matches!(
             entry,
@@ -1519,7 +1578,8 @@ fn map_canonical_entry(
     entry: catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
     expected_conversation_id: &str,
 ) -> Result<Option<IncomingEnvelope>> {
-    let row = serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
+    let row =
+        serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
     IncomingEnvelope::from_canonical_entry(&row, expected_conversation_id)
 }
 
@@ -1565,6 +1625,7 @@ impl MLSAPIClient for ReqwestApiClient {
             | CanonicalOperation::GetBlobUsage
             | CanonicalOperation::GetConversationState
             | CanonicalOperation::GetDevices
+            | CanonicalOperation::GetDeviceKey
             | CanonicalOperation::GetEntries
             | CanonicalOperation::GetLeafRecoveryInbox
             | CanonicalOperation::GetOwnDevices
@@ -2898,7 +2959,9 @@ fn canonical_entries_preserve_commit_epochs() {
 #[cfg(test)]
 mod canonical_admission_projection_tests {
     use super::*;
-    use catbird_mls::orchestrator::canonical_transport::{decode_conversation_state, encode_conversation_state, decode_conversations_inventory};
+    use catbird_mls::orchestrator::canonical_transport::{
+        decode_conversation_state, decode_conversations_inventory, encode_conversation_state,
+    };
 
     fn inventory(wire: serde_json::Value) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
@@ -2908,10 +2971,12 @@ mod canonical_admission_projection_tests {
         })).unwrap()
     }
 
-
     #[test]
     fn canonical_pending_and_accepted_leafless_views_keep_exact_snapshot() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         for (status, version) in [("pending", 41), ("active", 42)] {
             let mut wire = fixture.clone();
             wire["participants"][1]["status"] = serde_json::json!(status);
@@ -2928,13 +2993,23 @@ mod canonical_admission_projection_tests {
             let view = canonical_conversation_view(&state);
             assert_eq!(view.canonical_state.as_ref(), Some(&state));
             assert_eq!(view.epoch, state.coordinates.epoch as u64);
-            assert_eq!(view.group_id, hex::encode(state.coordinates.group_id.as_ref()));
-            let persisted: ConversationView = serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
+            assert_eq!(
+                view.group_id,
+                hex::encode(state.coordinates.group_id.as_ref())
+            );
+            let persisted: ConversationView =
+                serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
             let retained = persisted.canonical_state.unwrap();
-            assert_eq!(decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(), state);
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
+                state
+            );
             assert_eq!(retained.participants[1].status, status);
             assert_eq!(retained.participants[1].leaf_count, 0);
-            assert_eq!(retained.participants[1].invitation_provenance, state.participants[1].invitation_provenance);
+            assert_eq!(
+                retained.participants[1].invitation_provenance,
+                state.participants[1].invitation_provenance
+            );
             assert!(view.created_at.is_none());
             assert!(view.metadata.is_none());
         }
@@ -2942,11 +3017,18 @@ mod canonical_admission_projection_tests {
 
     #[test]
     fn legacy_view_is_unknown_and_malformed_canonical_state_is_rejected() {
-        let mut wire: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap();
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
         let state = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
         let view = canonical_conversation_view(&state);
         let mut old_view = serde_json::to_value(view).unwrap();
-        assert!(old_view.as_object_mut().unwrap().remove("canonicalState").is_some());
+        assert!(old_view
+            .as_object_mut()
+            .unwrap()
+            .remove("canonicalState")
+            .is_some());
         let legacy: ConversationView = serde_json::from_value(old_view).unwrap();
         assert!(legacy.canonical_state.is_none());
         wire["participants"][1]["status"] = serde_json::json!("unknown");

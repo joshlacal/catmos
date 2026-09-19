@@ -127,17 +127,36 @@ impl KeyringCredentialStore {
 impl CredentialStore for KeyringCredentialStore {
     async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
         // Fixed did:web origin; never follow a receipt-supplied URL or redirect.
-        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(15)).build()
-            .map_err(|_| OrchestratorError::Credential("Receipt authority resolver unavailable".into()))?;
-        let mut response = client.get("https://chat.catbird.blue/.well-known/did.json").send().await
-            .map_err(|_| OrchestratorError::Credential("Receipt authority could not be resolved".into()))?;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|_| {
+                OrchestratorError::Credential("Receipt authority resolver unavailable".into())
+            })?;
+        let mut response = client
+            .get("https://chat.catbird.blue/.well-known/did.json")
+            .send()
+            .await
+            .map_err(|_| {
+                OrchestratorError::Credential("Receipt authority could not be resolved".into())
+            })?;
         if !response.status().is_success() || response.content_length().is_some_and(|n| n > 65536) {
-            return Err(OrchestratorError::Credential("Invalid receipt authority response".into()));
+            return Err(OrchestratorError::Credential(
+                "Invalid receipt authority response".into(),
+            ));
         }
         let mut document = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| OrchestratorError::Credential("Receipt authority read failed".into()))? {
-            if document.len()+chunk.len()>65536 { return Err(OrchestratorError::Credential("Receipt authority document too large".into())); }
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| OrchestratorError::Credential("Receipt authority read failed".into()))?
+        {
+            if document.len() + chunk.len() > 65536 {
+                return Err(OrchestratorError::Credential(
+                    "Receipt authority document too large".into(),
+                ));
+            }
             document.extend_from_slice(&chunk);
         }
         Ok(Some(document))

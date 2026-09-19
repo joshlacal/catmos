@@ -2,6 +2,7 @@
 	import type { Message } from '$lib/tauri';
 	import { profiles } from '$lib/stores/profiles';
 	import { auth } from '$lib/stores/auth';
+	import { conversations } from '$lib/stores/conversations';
 	import Reactions from './Reactions.svelte';
 	import MessageImage from './MessageImage.svelte';
 	import BlueskyEmbed from './BlueskyEmbed.svelte';
@@ -73,7 +74,7 @@
 
 	// Detect Bluesky post URLs in message content
 	let blueskyUrl = $derived.by(() => {
-		if (!rawContent) return null;
+		if (!rawContent || message.groupInvitation) return null;
 		const bskyMatch = rawContent.match(
 			/https:\/\/bsky\.app\/profile\/[^\s/]+\/post\/[a-zA-Z0-9]+/
 		);
@@ -159,6 +160,9 @@
 				{#if textContent}
 					<div class="bubble-text">{textContent}</div>
 				{/if}
+                {#if message.groupInvitation}
+                    <button class="reply-quote" onclick={() => conversations.select(message.groupInvitation!.conversationId)}><span class="reply-quote-sender">View group invitation</span><span class="reply-quote-text">Review separately · opening does not accept</span></button>
+                {/if}
 				{#if blueskyUrl}
 					<BlueskyEmbed url={blueskyUrl} />
 				{/if}

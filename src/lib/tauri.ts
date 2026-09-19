@@ -43,6 +43,7 @@ export interface Message {
 	status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
 	messageType?: 'text' | 'image' | 'voice' | 'system' | 'event';
 	image?: ImageAttachment;
+	groupInvitation?: import("./request-types").GroupInvitationReference;
 	audioAttachment?: AudioAttachment;
 	reactions?: Record<string, string[]>;
 }
@@ -116,6 +117,7 @@ export interface GroupMember {
 	handle: string;
 	displayName?: string;
 	role: 'admin' | 'member';
+	pendingConsent?: boolean;
 }
 
 export interface ProfileView {

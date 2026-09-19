@@ -1,3 +1,5 @@
+// Mirrors the frozen request transcript UTF-8 limit; native core validates again.
+export const MAX_REQUEST_TEXT_UTF8_BYTES = 16384;
 /** Handwritten UI projections of the shared Rust request facade; never consent authority. */
 export interface GroupInvitationReference {
   authorityDid: string; conversationId: string; invitationTransitionId: string;
@@ -19,5 +21,5 @@ export interface DirectRequestView {
   capabilities: { canPreview: boolean; canAccept: boolean; canClose: boolean; canSend: boolean; canEmitReceipts: boolean; canAdminister: boolean };
   stateVersion: number; generation: number;
 }
-export interface RequestDraft { input: DirectRequestInput; recipientLabel: string; phase: 'draft' | 'attempted' | 'checking' | 'resolved'; outcome?: DirectRequestOutcome | null; archived: boolean }
-export interface RequestWorkspace { ownerDid: string; deliveryEnabled?: boolean | null; drafts: RequestDraft[]; requests: DirectRequestView[] }
+export interface RequestDraft { input: DirectRequestInput; recipientLabel: string; phase: 'draft' | 'attempted' | 'checking' | 'resolved'; outcome?: DirectRequestOutcome | null; noteDelivery?: { conversationId:string; messageId?:string|null } | null; archived: boolean }
+export interface RequestWorkspace { ownerDid: string; deliveryEnabled?: boolean | null; discoveryError?: string | null; drafts: RequestDraft[]; requests: DirectRequestView[] }

@@ -60,7 +60,10 @@ fn install_content_root_key(state: &AppState, user_did: &str) {
                     "install_content_root_key: set_content_root_key failed"
                 );
             } else {
-                state.orchestrator.storage().bind_request_owner(Some(user_did));
+                state
+                    .orchestrator
+                    .storage()
+                    .bind_request_owner(Some(user_did));
                 tracing::info!(
                     user_did = %user_did,
                     "install_content_root_key: field-level encryption key installed"
@@ -394,8 +397,7 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
 }
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     let resp = reqwest::Client::new()
         .get(format!("{}/auth/session", nest_url))
@@ -463,6 +465,8 @@ pub struct Message {
     pub message_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageAttachment>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_invitation: Option<catbird_mls::orchestrator::GroupInvitationReference>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -504,6 +508,15 @@ pub(crate) fn ui_message_from_orchestrator(message: OrchestratorMessage) -> Mess
     use catbird_mls::orchestrator::types::MLSMessageType;
 
     let image = image_attachment_from_message(&message);
+    let group_invitation = message
+        .payload()
+        .and_then(|p| p.checked_group_invitation().ok().flatten())
+        .filter(|reference| {
+            reference.invited_by_did
+                == catbird_mls::orchestrator::credential_binding::credential_root_did(
+                    &message.sender_did,
+                )
+        });
 
     // Detect system messages from payload
     let (message_type, content) = if let Some(payload) = message.payload() {
@@ -539,6 +552,7 @@ pub(crate) fn ui_message_from_orchestrator(message: OrchestratorMessage) -> Mess
         status: ui_status_for_delivery(message.is_own, message.delivery_status.as_ref()),
         message_type,
         image,
+        group_invitation,
     }
 }
 
@@ -642,12 +656,12 @@ pub struct GroupMember {
     pub handle: String,
     pub display_name: Option<String>,
     pub role: String,
+    pub pending_consent: bool,
 }
 
 #[tauri::command]
 pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     // Bind a temporary HTTP server on a random localhost port
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1004,7 +1018,11 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, String> {
     let _scope = state.request_scope.lock().await;
-    let owner = state.api_client.current_session().map_err(|_| "Sign in to view conversations")?.actor_did;
+    let owner = state
+        .api_client
+        .current_session()
+        .map_err(|_| "Sign in to view conversations")?
+        .actor_did;
     // Sync with server first — joins any groups we were added to
     if let Err(e) = state.orchestrator.sync_with_server(false).await {
         log_catmos!(" sync_with_server warning: {}", e);
@@ -1027,14 +1045,48 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
     // bootstrap inline so the very next render has a real title.
     let mut convos: Vec<Conversation> = Vec::with_capacity(page.conversations.len());
     for c in page.conversations.into_iter() {
-        let projection = catbird_mls::orchestrator::ConversationProjectionCommitRequest::live(&owner, c.clone(), vec![]);
-        let result = state.orchestrator.storage().commit_conversation_projection(&projection).await.map_err(|_| "Protected conversation projection is unavailable")?;
-        if matches!(result, catbird_mls::orchestrator::ConversationProjectionCommitOutcome::FenceMismatch { .. } | catbird_mls::orchestrator::ConversationProjectionCommitOutcome::Ambiguous { .. }) { return Err("Conversation projection changed; refresh after reconciliation".into()); }
+        let mut aliases = Vec::new();
+        if let Some(alias) = state
+            .orchestrator
+            .storage()
+            .get_conversation(&owner, &c.group_id)
+            .await
+            .map_err(|_| "Alias projection is unavailable")?
+        {
+            if alias.conversation_id != c.conversation_id {
+                aliases.push(
+                    catbird_mls::orchestrator::AliasRetirementAuthority::from_views(
+                        &owner, &c, &alias,
+                    )
+                    .map_err(|_| "Alias identity is ambiguous")?,
+                );
+            }
+        }
+        let projection = catbird_mls::orchestrator::ConversationProjectionCommitRequest::live(
+            &owner,
+            c.clone(),
+            aliases,
+        );
+        let result = state
+            .orchestrator
+            .storage()
+            .commit_conversation_projection(&projection)
+            .await
+            .map_err(|_| "Protected conversation projection is unavailable")?;
+        if matches!(
+            result,
+            catbird_mls::orchestrator::ConversationProjectionCommitOutcome::FenceMismatch { .. }
+                | catbird_mls::orchestrator::ConversationProjectionCommitOutcome::Ambiguous { .. }
+        ) {
+            return Err("Conversation projection changed; refresh after reconciliation".into());
+        }
 
         // Preserve canonical policy even when device preview import is unavailable.
-        let pending_consent = c.canonical_state.as_ref().map(|canonical| {
-            crate::request_commands::policy_blocks_activity(canonical, &owner)
-        }).unwrap_or(true);
+        let pending_consent = c
+            .canonical_state
+            .as_ref()
+            .map(|canonical| crate::request_commands::policy_blocks_activity(canonical, &owner))
+            .unwrap_or(true);
         let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
 
         // Lazy bootstrap on miss. Best-effort; failure leaves the snapshot
@@ -1111,6 +1163,11 @@ pub async fn create_group(
     member_dids: Vec<String>,
     description: Option<String>,
 ) -> Result<Conversation, String> {
+    let _scope = state.request_scope.lock().await;
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|_| "Sign in to create a group")?;
     log_catmos!(
         " create_group called: name={}, members={:?}, description={:?}",
         name,
@@ -1190,8 +1247,19 @@ pub async fn create_group(
             format!("data:{};base64,{}", mime, B64.encode(&bytes))
         });
 
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|_| "Account changed")?;
+    let pending_consent = convo
+        .canonical_state
+        .as_ref()
+        .map(|canonical| {
+            crate::request_commands::policy_blocks_activity(canonical, &session.actor_did)
+        })
+        .unwrap_or(true);
     Ok(Conversation {
-        pending_consent: true,
+        pending_consent,
         id: convo.conversation_id.clone(),
         group_id: convo.group_id,
         display_name,
@@ -1200,7 +1268,7 @@ pub async fn create_group(
         last_message: None,
         last_message_at: None,
         unread_count: 0,
-        is_group: member_list.len() > 2,
+        is_group: true,
         avatar_data_url,
     })
 }
@@ -1481,6 +1549,12 @@ pub async fn get_group_members(
                 handle: String::new(),
                 display_name: None,
                 role: format!("{:?}", m.role),
+                pending_consent: c.canonical_state.as_ref().is_some_and(|state| {
+                    state
+                        .participants
+                        .iter()
+                        .any(|p| p.user_did.as_str() == m.did && p.status == "pending")
+                }),
             })
             .collect()),
         None => Ok(vec![]),
@@ -1512,8 +1586,7 @@ pub async fn subscribe_conversation(
         .get_auth_token()
         .ok_or("Not authenticated")?;
 
-    let base_url =
-        crate::nest_url();
+    let base_url = crate::nest_url();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
@@ -1592,8 +1665,7 @@ pub async fn subscribe_all_events(
         .get_auth_token()
         .ok_or("Not authenticated")?;
 
-    let base_url =
-        crate::nest_url();
+    let base_url = crate::nest_url();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
@@ -1891,7 +1963,10 @@ pub async fn check_opt_in_status(
         "blue.catbird.chat.getDevices",
     );
     let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
-    let query_params: Vec<(&str, &str)> = parsed_dids.iter().map(|d| ("userDids", d.as_str())).collect();
+    let query_params: Vec<(&str, &str)> = parsed_dids
+        .iter()
+        .map(|d| ("userDids", d.as_str()))
+        .collect();
 
     let client = reqwest::Client::new();
     let resp = crate::mls_proxy::with_mls_proxy_header(client.get(&url).query(&query_params))
@@ -1905,23 +1980,18 @@ pub async fn check_opt_in_status(
     }
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let output =
-        parse_lexicon_json::<catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>>(body.as_ref())?;
+    let output = parse_lexicon_json::<
+        catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>,
+    >(body.as_ref())?;
 
-    let active_dids: std::collections::HashSet<&str> = output
-        .devices
-        .iter()
-        .map(|d| d.user_did.as_str())
-        .collect();
+    let active_dids: std::collections::HashSet<&str> =
+        output.devices.iter().map(|d| d.user_did.as_str()).collect();
 
     Ok(dids
         .into_iter()
         .map(|did| {
             let opted_in = active_dids.contains(did.as_str());
-            OptInStatusResult {
-                did,
-                opted_in,
-            }
+            OptInStatusResult { did, opted_in }
         })
         .collect())
 }
@@ -2797,8 +2867,7 @@ pub async fn create_block(
         .await
         .ok_or("Not authenticated")?;
 
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     let body = serde_json::json!({
         "repo": did,
@@ -2862,8 +2931,7 @@ pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, 
 
     log_catmos!("list_own_blocks: did={}", did);
 
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     let client = reqwest::Client::new();
     let mut blocked: Vec<String> = Vec::new();
@@ -3024,6 +3092,50 @@ mod tests {
         assert_eq!(json["sequenceNumber"], 100);
         assert_eq!(json["timestamp"], "2026-09-05T12:00:02+00:00");
         assert_eq!(json["id"], "fixture-message");
+    }
+
+    #[test]
+    fn invitation_note_projection_preserves_exact_reference_and_literal_text() {
+        use catbird_mls::orchestrator::{
+            GroupInvitationReference, MLSEmbedData, MLSMessagePayload,
+        };
+        let reference = GroupInvitationReference {
+            authority_did: "did:web:chat.catbird.blue".into(),
+            conversation_id: "11111111-1111-4111-9111-111111111111".into(),
+            invitation_transition_id: "22222222-2222-4222-9222-222222222222".into(),
+            invited_by_did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            invited_by_device_id: "33333333-3333-4333-9333-333333333333".into(),
+            recipient_did: "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb".into(),
+        };
+        let text = "Literal <b>note</b> https://example.invalid";
+        let payload = MLSMessagePayload::text_with_embed(
+            text,
+            MLSEmbedData::group_invitation(reference.clone()).unwrap(),
+        );
+        let mut message = super::OrchestratorMessage {
+            id: "note".into(),
+            conversation_id: "44444444-4444-4444-9444-444444444444".into(),
+            sender_did: reference.invited_by_did.clone(),
+            text: text.into(),
+            timestamp: chrono::Utc::now(),
+            epoch: 3,
+            sequence_number: 42,
+            is_own: false,
+            delivery_status: None,
+            payload_json: Some(String::from_utf8(payload.encode().unwrap()).unwrap()),
+        };
+        let projected = super::ui_message_from_orchestrator(message.clone());
+        assert_eq!(projected.group_invitation, Some(reference));
+        assert_eq!(projected.content, text);
+        assert!(projected.image.is_none());
+        message.sender_did.push_str("#device-1");
+        assert!(super::ui_message_from_orchestrator(message.clone())
+            .group_invitation
+            .is_some());
+        message.sender_did = "did:plc:cccccccccccccccccccccccc".into();
+        assert!(super::ui_message_from_orchestrator(message)
+            .group_invitation
+            .is_none());
     }
 
     struct TestKeychain {

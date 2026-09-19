@@ -1,6 +1,7 @@
 <script lang="ts">
 	import {
 		getGroupMembers,
+		getGroupInvitationReference,
 		promoteMember,
 		demoteMember,
 		removeGroupMember,
@@ -11,6 +12,7 @@
 		type QuarantineState
 	} from '$lib/wasm';
 	import { auth } from '$lib/stores/auth';
+	import { requests } from '$lib/stores/requests';
 	import { profiles } from '$lib/stores/profiles';
 	import {
 		conversations,
@@ -29,6 +31,7 @@
 		quarantine?: QuarantineState | null;
 	} = $props();
 	let members = $state<GroupMember[]>([]);
+	let invitationNotice = $state<string | null>(null);
 	let processing = $state<string | null>(null);
 	let confirmAction = $state<
 		{ type: string; did: string; name: string; affectedCount?: number } | null
@@ -98,6 +101,20 @@
 			addingMembers = false;
 		}
 	}
+
+	async function writeInvitationNote(member: GroupMember) {
+        const owner = currentUserDid(), group = conversationId;
+        processing = member.did;
+        invitationNotice = null;
+        try {
+            const reference = await getGroupInvitationReference(owner, group, member.did);
+            if (currentUserDid() !== owner || conversationId !== group) return;
+            if (!reference) { invitationNotice = 'No current invitation could be verified. No note was sent.'; return; }
+            requests.begin(member.did, memberDisplayName(member), '', reference);
+            conversations.select(null);
+        } catch { if (currentUserDid() === owner && conversationId === group) invitationNotice = 'The group invitation is separate. Its note could not be started; no note was sent.'; }
+        finally { processing = null; }
+    }
 
 	function requestAction(type: string, did: string, name: string) {
 		if (type === 'block') {
@@ -218,6 +235,7 @@
 			</dl>
 		</div>
 	{/if}
+	{#if invitationNotice}<p class="invitation-notice" role="status">{invitationNotice}</p>{/if}
 	<div class="member-items">
 		{#each members as member (member.did)}
 			{@const name = memberDisplayName(member)}
@@ -240,6 +258,7 @@
 				</div>
 				{#if !isSelf && processing !== member.did}
 					<div class="member-actions">
+                        {#if member.pendingConsent}<button class="action-btn" title="Write an optional invitation note" onclick={() => writeInvitationNote(member)}>Write note</button>{/if}
 						{#if isCurrentUserAdmin()}
 							{#if admin}
 								<button

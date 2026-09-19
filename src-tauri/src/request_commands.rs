@@ -1,7 +1,8 @@
 //! Desktop request adapter. The shared engine alone owns intent, crypto and consent.
 use crate::AppState;
 use catbird_mls::orchestrator::{
-    DirectRequestInput, DirectRequestOutcome, DirectRequestView, RequestConsent,
+    DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
+    RequestConsent,
 };
 use serde::{Deserialize, Serialize};
 use tauri::State;
@@ -14,6 +15,15 @@ pub struct RequestDraft {
     pub phase: String,
     pub outcome: Option<DirectRequestOutcome>,
     pub archived: bool,
+    #[serde(default)]
+    pub note_delivery: Option<NoteDelivery>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NoteDelivery {
+    pub conversation_id: String,
+    pub message_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -21,6 +31,7 @@ pub struct RequestDraft {
 pub struct RequestWorkspace {
     pub owner_did: String,
     pub delivery_enabled: Option<bool>,
+    pub discovery_error: Option<String>,
     pub drafts: Vec<RequestDraft>,
     pub requests: Vec<DirectRequestView>,
 }
@@ -38,6 +49,17 @@ pub async fn get_request_workspace(
     if session.actor_did != owner_did {
         return Err("Account changed".into());
     }
+    // Shared synchronization imports and verifies whole request/control entries;
+    // it alone changes consent. Retained views remain readable while offline.
+    let discovery_error = state
+        .orchestrator
+        .sync_with_server(false)
+        .await
+        .err()
+        .map(|_| {
+            "New requests could not be checked. Showing verified requests already on this device."
+                .to_string()
+        });
     let requests = state
         .orchestrator
         .list_direct_request_views()
@@ -62,8 +84,13 @@ pub async fn get_request_workspace(
         .get_direct_request_delivery_enabled()
         .await
         .map_err(|_| "Request delivery preference is unavailable")?;
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|_| "Account changed")?;
     Ok(RequestWorkspace {
         delivery_enabled,
+        discovery_error,
         owner_did: session.actor_did,
         drafts,
         requests,
@@ -88,7 +115,8 @@ pub async fn save_request_draft(
     if uuid::Uuid::parse_str(&input.draft_id).is_err()
         || input.recipient_did == session.actor_did
         || !input.recipient_did.starts_with("did:")
-        || input.text.len() > 4096
+        || input.text.len()
+            > catbird_mls::chat_v2::transcript::direct_request::MAX_REQUEST_TEXT_UTF8_BYTES
         || recipient_label.len() > 256
     {
         return Err("Invalid request draft".into());
@@ -108,6 +136,7 @@ pub async fn save_request_draft(
         phase: "draft".into(),
         outcome: None,
         archived: false,
+        note_delivery: None,
     };
     storage.save_request_draft(&session.actor_did, &draft)?;
     Ok(draft)
@@ -142,6 +171,9 @@ async fn operate(
             .storage()
             .save_request_draft(&session.actor_did, &draft)?;
         return Ok(draft);
+    }
+    if action == "send" && draft.input.text.trim().is_empty() {
+        return Err("Write a message before sending this request".into());
     }
     // Persist before the first network effect. Retry uses this exact input/id;
     // never mint another candidate in response to an ambiguous transport error.
@@ -421,4 +453,101 @@ pub(crate) fn policy_blocks_activity(
             .any(|p| p.user_did.to_string() == owner && p.status == "active")
         || (canonical.conversation_kind == "direct"
             && canonical.participants.iter().any(|p| p.status == "pending"))
+}
+
+/// Resolve only the shared engine's authenticated, currently pending invitation.
+#[tauri::command]
+pub async fn get_group_invitation_reference(
+    state: State<'_, AppState>,
+    owner_did: String,
+    conversation_id: String,
+    recipient_did: String,
+) -> Result<Option<GroupInvitationReference>, String> {
+    let _scope = state.request_scope.lock().await;
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|_| "Sign in to write an invitation note")?;
+    if session.actor_did != owner_did {
+        return Err("Account changed".into());
+    }
+    let reference = state.orchestrator.get_group_invitation_reference(&conversation_id, &recipient_did).await.map_err(|_| "Invitation could not be verified. The invitation may still be delivered; no note was sent.")?;
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|_| "Account changed")?;
+    Ok(reference)
+}
+
+/// Explicit second operation after a signed ExistingDirect result. An uncertain
+/// ordinary send is retained for inspection and is never retried with a new ID.
+#[tauri::command]
+pub async fn send_existing_invitation_note(
+    state: State<'_, AppState>,
+    owner_did: String,
+    draft_id: String,
+) -> Result<RequestDraft, String> {
+    let _scope = state.request_scope.lock().await;
+    let session = state
+        .api_client
+        .current_session()
+        .map_err(|_| "Sign in to send this note")?;
+    if session.actor_did != owner_did {
+        return Err("Account changed".into());
+    }
+    let mut draft = state
+        .orchestrator
+        .storage()
+        .request_draft(&owner_did, &draft_id)?
+        .ok_or("Draft not found")?;
+    if draft.archived || draft.note_delivery.is_some() {
+        return Err(
+            "This note was already attempted. Open the conversation to check delivery.".into(),
+        );
+    }
+    let cid = match &draft.outcome {
+        Some(DirectRequestOutcome::ExistingDirect {
+            conversation_id,
+            requires_acceptance: false,
+        }) => conversation_id.clone(),
+        _ => return Err("An accepted direct conversation is required; no note was sent".into()),
+    };
+    let reference = draft
+        .input
+        .invitation
+        .clone()
+        .ok_or("This draft has no group invitation")?;
+    if reference.recipient_did != draft.input.recipient_did {
+        return Err("Invitation recipient changed".into());
+    }
+    require_ordinary_activity(&state, &cid).await?;
+    let embed = catbird_mls::orchestrator::MLSEmbedData::group_invitation(reference)
+        .map_err(|_| "Invalid invitation reference")?;
+    // The core repeats the fresh recipient/invitation check immediately before
+    // encryption. This durable marker prevents duplicate ordinary sends on retry.
+    draft.note_delivery = Some(NoteDelivery {
+        conversation_id: cid.clone(),
+        message_id: None,
+    });
+    state
+        .orchestrator
+        .storage()
+        .save_request_draft(&owner_did, &draft)?;
+    let sent = state
+        .orchestrator
+        .send_message_with_embed(&cid, &draft.input.text, embed)
+        .await;
+    state
+        .api_client
+        .ensure_session_current(&session)
+        .map_err(|_| "Account changed; review this note when you return")?;
+    match sent {
+        Ok(message)=>{
+            draft.note_delivery.as_mut().unwrap().message_id=Some(message.id);
+            draft.archived=true;
+            state.orchestrator.storage().save_request_draft(&owner_did,&draft)?;
+            Ok(draft)
+        },
+        Err(_)=>Err("Invitation note delivery is not confirmed. Your text is retained; open the conversation before composing another note.".into()),
+    }
 }

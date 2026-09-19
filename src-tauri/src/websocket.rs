@@ -592,6 +592,7 @@ async fn handle_binary_frame(
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
+                group_invitation: None,
             };
             let _ = app.emit("mls-incoming-message", &ui_msg);
 
@@ -622,6 +623,7 @@ async fn handle_binary_frame(
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
+                group_invitation: None,
             };
             let _ = app.emit("mls-incoming-message", &ui_msg);
 
@@ -650,6 +652,7 @@ async fn handle_binary_frame(
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
+                group_invitation: None,
             };
             let _ = app.emit("mls-incoming-message", &ui_msg);
 
@@ -732,6 +735,7 @@ async fn handle_binary_frame(
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
+                group_invitation: None,
             };
             let _ = app.emit("mls-incoming-message", &ui_msg);
 
