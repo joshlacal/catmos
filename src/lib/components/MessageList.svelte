@@ -1,14 +1,17 @@
 <script lang="ts">
+	import type { DirectRequestView } from '$lib/request-types';
 	import type { Message } from '$lib/tauri';
 	import { auth } from '$lib/stores/auth';
 	import MessageBubble, { type ReplyInfo } from './MessageBubble.svelte';
 
 	let {
 		messages = [],
+		request,
 		typingUsers = [],
 		onReply
 	}: {
 		messages: Message[];
+		request?: DirectRequestView;
 		typingUsers?: string[];
 		onReply?: (info: ReplyInfo) => void;
 	} = $props();
@@ -47,7 +50,10 @@
 </script>
 
 <div class="message-list" bind:this={scrollContainer}>
-	{#if messages.length === 0}
+	{#if request?.consent === 'accepted' && request.firstMessageId && request.preview?.type === 'ready' && !messages.some(m => m.id === request?.firstMessageId)}
+		<article class="request-first-message" data-message-id={request.firstMessageId}><small>First message · encrypted introduction{#if request.introduction} · {new Date(request.introduction.receivedAt).toLocaleString()}{/if}</small><p>{request.preview.text}</p>{#if request.preview.invitation}<small>Includes a separate group invitation; group consent is unchanged.</small>{/if}</article>
+	{/if}
+	{#if messages.length === 0 && request?.preview?.type !== 'ready'}
 		<div class="empty-messages">
 			<div class="empty-icon">
 				<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
@@ -77,6 +83,9 @@
 </div>
 
 <style>
+	.request-first-message { margin: 20px; padding: 20px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg-secondary); }
+	.request-first-message p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+	.request-first-message small { color: var(--text-tertiary); font-size: 11px; }
 	.message-list {
 		flex: 1;
 		overflow-y: auto;

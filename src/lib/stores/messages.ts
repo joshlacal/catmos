@@ -35,7 +35,9 @@ function sortMessages(msgs: Message[]): Message[] {
 }
 
 function createMessagesStore() {
-	const { subscribe, update } = writable<MessagesStore>({
+	let ownerDid: string | null = null;
+	let epoch = 0;
+	const { subscribe, update, set } = writable<MessagesStore>({
 		byConversation: new Map(),
 		typingByConversation: new Map(),
 		loading: false
@@ -43,10 +45,13 @@ function createMessagesStore() {
 
 	return {
 		subscribe,
+		bindAccount(owner: string | null) { if (owner === ownerDid) return; ownerDid = owner; epoch++; set({ byConversation: new Map(), typingByConversation: new Map(), loading: false }); },
 		async load(conversationId: string) {
+			const revision = epoch;
 			update((s) => ({ ...s, loading: true }));
 			try {
 				const msgs = await api.getMessages(conversationId);
+				if (revision !== epoch) return;
 				// Deduplicate by ID to prevent Svelte {#each} key collisions
 				const seen = new Set<string>();
 				const deduped = msgs.filter((m) => {
@@ -64,8 +69,10 @@ function createMessagesStore() {
 			}
 		},
 		async fetchFromServer(conversationId: string) {
+			const revision = epoch;
 			try {
 				const msgs = await api.fetchNewMessages(conversationId);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];
@@ -86,6 +93,7 @@ function createMessagesStore() {
 			}
 		},
 		async send(conversationId: string, content: string) {
+            const revision = epoch;
 			const optimistic: Message = {
 				id: `temp-${Date.now()}`,
 				conversationId,
@@ -104,6 +112,7 @@ function createMessagesStore() {
 			});
 			try {
 				const sent = await api.sendMessage(conversationId, content);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];
@@ -115,6 +124,7 @@ function createMessagesStore() {
 				});
 			} catch (e) {
 				console.error('[catmos] sendMessage failed:', e);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];
@@ -129,6 +139,7 @@ function createMessagesStore() {
 			}
 		},
 		async sendImage(conversationId: string, content: string, upload: PreparedImageUpload) {
+            const revision = epoch;
 			const optimistic: Message = {
 				id: `temp-image-${Date.now()}`,
 				conversationId,
@@ -167,6 +178,7 @@ function createMessagesStore() {
 					upload.height,
 					upload.altText
 				);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];
@@ -178,6 +190,7 @@ function createMessagesStore() {
 				});
 			} catch (e) {
 				console.error('[catmos] sendImage failed:', e);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];
@@ -192,6 +205,7 @@ function createMessagesStore() {
 			}
 		},
 		async sendVoice(conversationId: string, audioData: Uint8Array, durationMs: number, waveform: number[]) {
+            const revision = epoch;
 			const optimistic: Message = {
 				id: `temp-voice-${Date.now()}`,
 				conversationId,
@@ -226,6 +240,7 @@ function createMessagesStore() {
 					durationMs,
 					waveform
 				);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];
@@ -237,6 +252,7 @@ function createMessagesStore() {
 				});
 			} catch (e) {
 				console.error('[catmos] sendVoice failed:', e);
+				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					const existing = byConversation.get(conversationId) ?? [];

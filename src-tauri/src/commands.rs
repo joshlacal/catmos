@@ -46,6 +46,7 @@ async fn cleanup_ws_handle(
 /// Idempotent — re-running with the same DID is a no-op once the in-memory
 /// key matches the file on disk.
 fn install_content_root_key(state: &AppState, user_did: &str) {
+    state.orchestrator.storage().bind_request_owner(None);
     match crate::keys::load_or_create_content_root_key(&state.data_dir, user_did) {
         Ok(root_key) => {
             if let Err(err) = state
@@ -59,6 +60,7 @@ fn install_content_root_key(state: &AppState, user_did: &str) {
                     "install_content_root_key: set_content_root_key failed"
                 );
             } else {
+                state.orchestrator.storage().bind_request_owner(Some(user_did));
                 tracing::info!(
                     user_did = %user_did,
                     "install_content_root_key: field-level encryption key installed"
@@ -425,6 +427,7 @@ async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Conversation {
+    pub pending_consent: bool,
     /// Stable conversation identifier (survives group resets). Use for API calls and storage.
     pub id: String,
     /// Current MLS group identifier (hex). Changes on group reset. For display/debug only.
@@ -770,6 +773,7 @@ pub async fn complete_login(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<AuthResponse, String> {
+    let _request_scope = state.request_scope.lock().await;
     let session = fetch_session_info(&session_id)
         .await
         .map_err(actionable_error)?;
@@ -860,6 +864,7 @@ pub async fn complete_login(
 pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
+    let _request_scope = state.request_scope.lock().await;
     let session_id = keyring::Entry::new("catmos", "session_id")
         .and_then(|e| e.get_password())
         .ok();
@@ -973,6 +978,7 @@ pub async fn try_restore_session(
 
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    let _request_scope = state.request_scope.lock().await;
     // Stop key package monitor
     if let Some(handle) = state.kp_monitor.lock().await.take() {
         handle.abort();
@@ -984,6 +990,7 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
     // Drop the in-memory content-root key. The file on disk is preserved so
     // re-login on the same machine resumes the same chain seed; an explicit
     // wipe path (account removal) would also call `keys::delete_content_root_key`.
+    state.orchestrator.storage().bind_request_owner(None);
     state.orchestrator.mls_context().clear_content_root_key();
     state.orchestrator.shutdown().await;
     state.api_client.clear_auth();
@@ -996,6 +1003,8 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, String> {
+    let _scope = state.request_scope.lock().await;
+    let owner = state.api_client.current_session().map_err(|_| "Sign in to view conversations")?.actor_did;
     // Sync with server first — joins any groups we were added to
     if let Err(e) = state.orchestrator.sync_with_server(false).await {
         log_catmos!(" sync_with_server warning: {}", e);
@@ -1018,6 +1027,14 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
     // bootstrap inline so the very next render has a real title.
     let mut convos: Vec<Conversation> = Vec::with_capacity(page.conversations.len());
     for c in page.conversations.into_iter() {
+        let projection = catbird_mls::orchestrator::ConversationProjectionCommitRequest::live(&owner, c.clone(), vec![]);
+        let result = state.orchestrator.storage().commit_conversation_projection(&projection).await.map_err(|_| "Protected conversation projection is unavailable")?;
+        if matches!(result, catbird_mls::orchestrator::ConversationProjectionCommitOutcome::FenceMismatch { .. } | catbird_mls::orchestrator::ConversationProjectionCommitOutcome::Ambiguous { .. }) { return Err("Conversation projection changed; refresh after reconciliation".into()); }
+
+        // Preserve canonical policy even when device preview import is unavailable.
+        let pending_consent = c.canonical_state.as_ref().map(|canonical| {
+            crate::request_commands::policy_blocks_activity(canonical, &owner)
+        }).unwrap_or(true);
         let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
 
         // Lazy bootstrap on miss. Best-effort; failure leaves the snapshot
@@ -1030,7 +1047,7 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
             .as_ref()
             .map(|s| s.metadata_json.is_none())
             .unwrap_or(true);
-        if needs_bootstrap {
+        if needs_bootstrap && !pending_consent {
             if let Err(e) = bootstrap_group_metadata(&state, &c.group_id, &c.conversation_id).await
             {
                 log_catmos!(
@@ -1070,6 +1087,7 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
             });
 
         convos.push(Conversation {
+            pending_consent,
             id: c.conversation_id.clone(),
             group_id: c.group_id,
             display_name,
@@ -1173,6 +1191,7 @@ pub async fn create_group(
         });
 
     Ok(Conversation {
+        pending_consent: true,
         id: convo.conversation_id.clone(),
         group_id: convo.group_id,
         display_name,
@@ -1272,6 +1291,7 @@ pub async fn send_message(
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
         .require_canonical_admission()
@@ -1313,6 +1333,7 @@ pub async fn send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<Message, String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
         .require_canonical_admission()
@@ -1377,12 +1398,14 @@ pub async fn send_image(
 #[tauri::command]
 pub async fn get_image_attachment(
     state: State<'_, AppState>,
+    conversation_id: String,
     blob_id: String,
     key_b64: String,
     iv_b64: String,
     sha256: String,
     content_type: String,
 ) -> Result<String, String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     let key = B64
         .decode(key_b64)
         .map_err(|e| format!("Invalid image key: {e}"))?;
@@ -1409,6 +1432,7 @@ pub async fn get_messages(
     conversation_id: String,
     before: Option<String>,
 ) -> Result<Vec<Message>, String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     // Try local storage first
     let before_seq = before.and_then(|b| b.parse::<u64>().ok());
     let mut stored = state
@@ -1469,6 +1493,7 @@ pub async fn subscribe_conversation(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<(), String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     // Don't subscribe twice
     {
         let handles = state.ws_handles.lock().await;
@@ -1616,6 +1641,7 @@ pub async fn fetch_new_messages(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<Message>, String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     let (msgs, _cursor) = state
         .orchestrator
         .fetch_messages(&conversation_id, None, 50, Some("app"), None, None)
@@ -1686,6 +1712,7 @@ pub async fn send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
         .require_canonical_admission()
@@ -1752,6 +1779,7 @@ pub async fn update_cursor(
     conversation_id: String,
     cursor: String,
 ) -> Result<(), String> {
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         " update_cursor: convo={}, cursor={}",
         conversation_id,

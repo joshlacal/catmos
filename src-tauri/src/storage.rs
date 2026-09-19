@@ -1,3 +1,7 @@
+#[path = "request_storage.rs"]
+mod request_storage;
+#[path = "request_projection.rs"]
+mod request_projection;
 use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
 use std::sync::{Arc, Mutex, RwLock};
@@ -50,6 +54,7 @@ pub struct SqliteStorage {
     /// the orchestrator can keep functioning during the bootstrap window
     /// (initial sync may run before login completes).
     mls_context: RwLock<Option<Arc<MLSContext>>>,
+    request_owner: RwLock<Option<String>>,
 }
 
 impl SqliteStorage {
@@ -71,9 +76,20 @@ impl SqliteStorage {
         let storage = Self {
             conn: Mutex::new(conn),
             mls_context: RwLock::new(None),
+            request_owner: RwLock::new(None),
         };
         storage.create_tables()?;
+        storage.create_request_tables()?;
         Ok(storage)
+    }
+
+    pub(crate) fn bind_request_owner(&self, owner: Option<&str>) {
+        if let Ok(mut scope)=self.request_owner.write() { *scope=owner.map(str::to_owned); }
+    }
+    fn request_owner_guard(&self, owner: &str) -> std::result::Result<std::sync::RwLockReadGuard<'_,Option<String>>,String> {
+        let scope=self.request_owner.read().map_err(|_|"Account storage scope unavailable")?;
+        if scope.as_deref()!=Some(owner) {return Err("Account storage scope changed".into());}
+        Ok(scope)
     }
 
     /// Bind the per-process MLS context for the field-level encryption layer.
@@ -689,6 +705,10 @@ impl SqliteStorage {
 
 #[async_trait]
 impl MLSStorageBackend for SqliteStorage {
+    async fn commit_conversation_projection(&self, request: &ConversationProjectionCommitRequest) -> Result<ConversationProjectionCommitOutcome> {
+        self.commit_live_projection(request).map_err(OrchestratorError::Storage)
+    }
+
     async fn ensure_conversation_exists(
         &self,
         user_did: &str,
@@ -729,6 +749,7 @@ impl MLSStorageBackend for SqliteStorage {
         user_did: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationView>> {
+        if let Some(canonical)=self.canonical_projection(user_did,conversation_id).map_err(OrchestratorError::Storage)? { return Ok(Some(canonical)); }
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
@@ -777,7 +798,7 @@ impl MLSStorageBackend for SqliteStorage {
         let mut stmt = conn
             .prepare(
                 "SELECT conversation_id, group_id, epoch, members_json, metadata_json, created_at, updated_at, sequencer_did
-                 FROM conversations WHERE user_did = ?1",
+                 FROM conversations WHERE user_did = ?1 AND NOT EXISTS(SELECT 1 FROM conversation_projection_aliases a WHERE a.owner_did=conversations.user_did AND a.alias_id=conversations.conversation_id)",
             )
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
@@ -815,6 +836,11 @@ impl MLSStorageBackend for SqliteStorage {
         let mut result = Vec::new();
         for row in rows {
             result.push(row.map_err(|e| OrchestratorError::Storage(e.to_string()))?);
+        }
+        drop(stmt);
+        drop(conn);
+        for view in &mut result {
+            if let Some(canonical)=self.canonical_projection(user_did,&view.conversation_id).map_err(OrchestratorError::Storage)? { *view=canonical; }
         }
         Ok(result)
     }
@@ -1031,47 +1057,33 @@ impl MLSStorageBackend for SqliteStorage {
     /// Persist the RESET_PENDING payload (spec §8.5) so a `groupReset`
     /// observed before a restart survives the restart and the deferred
     /// recovery loop can resume Phase 1 against the new group id.
-    async fn mark_reset_pending(
-        &self,
-        conversation_id: &str,
-        new_group_id_hex: &str,
-        reset_generation: i32,
-        notified_at_ms: i64,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations
-             SET reset_new_group_id = ?1,
-                 reset_generation = ?2,
-                 reset_notified_at_ms = ?3
-             WHERE conversation_id = ?4",
-            rusqlite::params![
-                new_group_id_hex,
-                reset_generation as i64,
-                notified_at_ms,
-                conversation_id,
-            ],
-        )
-        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
+    async fn mark_reset_pending(&self, conversation_id: &str, new_group_id_hex: &str, reset_generation: i32, notified_at_ms: i64) -> Result<()> {
+        let owner=self.request_owner.read().ok().and_then(|o|o.clone()).ok_or_else(||OrchestratorError::Storage("Reset account scope unavailable".into()))?;
+        let conn=self.conn.lock().unwrap();
+        conn.execute("UPDATE conversations SET reset_new_group_id=?1,reset_generation=?2,reset_notified_at_ms=?3 WHERE conversation_id=?4 AND user_did=?5 AND (reset_generation IS NULL OR reset_generation<?2 OR (reset_generation=?2 AND reset_new_group_id=?1)) AND state NOT IN ('\"Closed\"','\"DeviceRemoved\"')",rusqlite::params![new_group_id_hex,reset_generation,notified_at_ms,conversation_id,owner]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
         Ok(())
     }
+    async fn adopt_reset_pending_target(&self, conversation_id:&str, expected_generation:i32, expected_old_target:&str, authoritative_new_target:&str)->Result<bool>{
+        if hex::decode(authoritative_new_target).map_or(true,|v|v.len()!=32){return Ok(false);}
+        let owner=self.request_owner.read().ok().and_then(|o|o.clone()).ok_or_else(||OrchestratorError::Storage("Reset account scope unavailable".into()))?;
+        let changed=self.conn.lock().unwrap().execute("UPDATE conversations SET reset_new_group_id=?1 WHERE conversation_id=?2 AND user_did=?3 AND reset_generation=?4 AND reset_new_group_id=?5 AND reset_notified_at_ms IS NOT NULL AND state NOT IN ('\"Closed\"','\"DeviceRemoved\"')",rusqlite::params![authoritative_new_target,conversation_id,owner,expected_generation,expected_old_target]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        Ok(changed==1)
+    }
+    async fn complete_reset_pending(&self, conversation_id:&str, expected_generation:i32, target:&str, landed_epoch:u64)->Result<bool>{
+        let owner=self.request_owner.read().ok().and_then(|o|o.clone()).ok_or_else(||OrchestratorError::Storage("Reset account scope unavailable".into()))?;
+        let _scope=self.request_owner_guard(&owner).map_err(OrchestratorError::Storage)?;
+        let mut conn=self.conn.lock().unwrap();let tx=conn.transaction().map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        let old:Option<(String,u64)>=tx.query_row("SELECT group_id,epoch FROM conversations WHERE conversation_id=?1 AND user_did=?2 AND reset_generation=?3 AND reset_new_group_id=?4 AND reset_notified_at_ms IS NOT NULL AND state NOT IN ('\"Closed\"','\"DeviceRemoved\"')",rusqlite::params![conversation_id,owner,expected_generation,target],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        let Some((old_group,old_epoch))=old else {return Ok(false);};
+        tx.execute("INSERT OR IGNORE INTO conversation_projection_group_history(owner_did,conversation_id,group_id,epoch) VALUES(?1,?2,?3,?4)",rusqlite::params![owner,conversation_id,old_group,old_epoch]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        tx.execute("UPDATE conversations SET group_id=?1,epoch=?2,join_epoch=?2,state='\"Active\"',needs_rejoin=0,reset_new_group_id=NULL,reset_notified_at_ms=NULL WHERE conversation_id=?3 AND user_did=?4",rusqlite::params![target,landed_epoch,conversation_id,owner]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        tx.commit().map_err(|e|OrchestratorError::Storage(e.to_string()))?;Ok(true)
+    }
 
-    async fn clear_reset_pending_for_delete(
-        &self,
-        conversation_id: &str,
-        expected_generation: i32,
-    ) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE conversations
-             SET reset_new_group_id = NULL,
-                 reset_generation = NULL,
-                 reset_notified_at_ms = NULL
-             WHERE conversation_id = ?1 AND reset_generation = ?2",
-            rusqlite::params![conversation_id, expected_generation],
-        )
-        .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
-        Ok(true)
+    async fn clear_reset_pending_for_delete(&self,conversation_id:&str,expected_generation:i32)->Result<bool>{
+        let owner=self.request_owner.read().ok().and_then(|o|o.clone()).ok_or_else(||OrchestratorError::Storage("Reset account scope unavailable".into()))?;
+        let changed=self.conn.lock().unwrap().execute("UPDATE conversations SET reset_new_group_id=NULL,reset_notified_at_ms=NULL WHERE conversation_id=?1 AND user_did=?2 AND reset_generation=?3 AND reset_new_group_id IS NOT NULL",rusqlite::params![conversation_id,owner,expected_generation]).map_err(|e|OrchestratorError::Storage(e.to_string()))?;
+        Ok(changed==1)
     }
 
     async fn set_conversation_sequencer(
@@ -1200,6 +1212,7 @@ impl MLSStorageBackend for SqliteStorage {
         limit: u32,
         before_sequence: Option<u64>,
     ) -> Result<Vec<Message>> {
+        let owner = self.request_owner.read().ok().and_then(|s| s.clone()).unwrap_or_default();
         let mls_ctx = self.mls_context_snapshot();
         let conn = self.conn.lock().unwrap();
         let mut result = Vec::new();
@@ -1208,13 +1221,13 @@ impl MLSStorageBackend for SqliteStorage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted
-                     FROM messages WHERE conversation_id = ?1 AND sequence_number < ?2 AND COALESCE(is_tombstone, 0) = 0
+                     FROM messages WHERE conversation_id IN (SELECT ?1 UNION SELECT alias_id FROM conversation_projection_aliases WHERE canonical_id=?1 AND owner_did=?4) AND sequence_number < ?2 AND COALESCE(is_tombstone, 0) = 0
                      ORDER BY sequence_number DESC LIMIT ?3",
                 )
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
             let rows = stmt
-                .query_map(rusqlite::params![conversation_id, before, limit], |row| {
+                .query_map(rusqlite::params![conversation_id, before, limit, owner], |row| {
                     row_to_message(row, mls_ctx.as_deref())
                 })
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -1226,13 +1239,13 @@ impl MLSStorageBackend for SqliteStorage {
             let mut stmt = conn
                 .prepare(
                     "SELECT id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, delivery_status_json, payload_json, payload_encrypted
-                     FROM messages WHERE conversation_id = ?1 AND COALESCE(is_tombstone, 0) = 0
+                     FROM messages WHERE conversation_id IN (SELECT ?1 UNION SELECT alias_id FROM conversation_projection_aliases WHERE canonical_id=?1 AND owner_did=?3) AND COALESCE(is_tombstone, 0) = 0
                      ORDER BY sequence_number DESC LIMIT ?2",
                 )
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
             let rows = stmt
-                .query_map(rusqlite::params![conversation_id, limit], |row| {
+                .query_map(rusqlite::params![conversation_id, limit, owner], |row| {
                     row_to_message(row, mls_ctx.as_deref())
                 })
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -1242,6 +1255,7 @@ impl MLSStorageBackend for SqliteStorage {
             }
         }
 
+        for message in &mut result { message.conversation_id=conversation_id.to_owned(); }
         result.reverse();
         Ok(result)
     }
@@ -1447,9 +1461,12 @@ impl MLSStorageBackend for SqliteStorage {
 
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
+            "commit_conversation_projection",
             "get_conversation_state",
             "complete_account_exit",
             "mark_reset_pending",
+            "adopt_reset_pending_target",
+            "complete_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
             "mark_quarantined",
@@ -1595,6 +1612,128 @@ mod field_encryption_tests {
     /// 32-byte hex key suitable for SQLCipher's `PRAGMA key`.
     const TEST_DB_KEY: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 
+    #[tokio::test]
+    async fn request_storage_is_encrypted_account_bound_and_restart_durable() {
+        use crate::request_commands::RequestDraft;
+        use catbird_mls::orchestrator::{DirectRequestInput, DirectRequestOutcome};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("requests.db");
+        let storage = SqliteStorage::new(path.to_str().unwrap(), TEST_DB_KEY).unwrap();
+        let context = catbird_mls::MLSContext::new(tmp.path().join("mls.db").to_string_lossy().into_owned(), TEST_DB_KEY.into(), Box::new(InMemoryKeychain::new())).unwrap();
+        let draft = RequestDraft { input: DirectRequestInput { draft_id: "889e606a-a7c2-4a10-8c14-535a7055f2aa".into(), recipient_did: "did:plc:bob".into(), text: "secret introduction never in plaintext".into(), invitation: None }, recipient_label: "Bob".into(), phase: "checking".into(), outcome: Some(DirectRequestOutcome::OutcomeUnknown { request_id: "request-stable".into() }), archived: false };
+        assert!(storage.save_request_draft("did:plc:alice", &draft).is_err());
+        storage.set_mls_context(context.clone());
+        assert!(storage.save_request_draft("did:plc:alice", &draft).is_err());
+        context.set_content_root_key(vec![0x42;32]).unwrap();
+        storage.bind_request_owner(Some("did:plc:alice"));
+        storage.save_request_draft("did:plc:alice", &draft).unwrap();
+        let ciphertext:Vec<u8>=storage.conn.lock().unwrap().query_row("SELECT payload FROM encrypted_request_projection",[],|r|r.get(0)).unwrap();
+        assert!(!String::from_utf8_lossy(&ciphertext).contains(&draft.input.text));
+        assert!(storage.request_draft("did:plc:bob", &draft.input.draft_id).is_err());
+        drop(storage);
+        let reopened=SqliteStorage::new(path.to_str().unwrap(), TEST_DB_KEY).unwrap();
+        reopened.set_mls_context(context.clone());
+        reopened.bind_request_owner(Some("did:plc:alice"));
+        let restored=reopened.request_draft("did:plc:alice", &draft.input.draft_id).unwrap().unwrap();
+        assert_eq!(restored.input,draft.input); assert_eq!(restored.phase,"checking"); assert_eq!(restored.outcome,draft.outcome);
+        // Moving ciphertext across an owner/id domain cannot reveal the body.
+        reopened.conn.lock().unwrap().execute("UPDATE encrypted_request_projection SET owner_did='did:plc:bob'",[]).unwrap();
+        assert!(reopened.request_draft("did:plc:bob", &draft.input.draft_id).is_err());
+        context.clear_content_root_key();
+        assert!(reopened.request_drafts("did:plc:bob").is_err());
+    }
+
+    #[tokio::test]
+    async fn request_canonical_projection_preserves_policy_and_rejects_stale_overwrite() {
+        let tmp=tempfile::tempdir().unwrap();
+        let storage=SqliteStorage::new(tmp.path().join("host.db").to_str().unwrap(),TEST_DB_KEY).unwrap();
+        let context=MLSContext::new(tmp.path().join("mls.db").to_string_lossy().into_owned(),TEST_DB_KEY.into(),Box::new(InMemoryKeychain::new())).unwrap();
+        context.set_content_root_key(vec![0x63;32]).unwrap();storage.set_mls_context(context);
+        let canonical=catbird_mls::orchestrator::canonical_transport::decode_conversation_state(serde_json::from_str::<serde_json::Value>(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap().to_string().as_bytes()).unwrap();
+        let owner=canonical.participants[0].user_did.to_string();
+        storage.bind_request_owner(Some(&owner));
+        let view=ConversationView { conversation_id:canonical.coordinates.conversation_id.to_string(),group_id:hex::encode(canonical.coordinates.group_id.as_ref()),epoch:canonical.coordinates.epoch as u64,members:vec![],metadata:None,created_at:None,updated_at:None,sequencer_did:None,canonical_state:Some(canonical.clone()) };
+        let request=ConversationProjectionCommitRequest::live(&owner,view.clone(),vec![]);
+        assert!(matches!(storage.commit_conversation_projection(&request).await.unwrap(),ConversationProjectionCommitOutcome::AlreadyAbsent { affected_rows:1 }));
+        assert_eq!(storage.get_conversation(&owner,&view.conversation_id).await.unwrap().unwrap().canonical_state,Some(canonical.clone()));
+        assert_eq!(storage.list_conversations(&owner).await.unwrap()[0].canonical_state,Some(canonical.clone()));
+        assert!(storage.list_conversations("did:plc:unrelated").await.unwrap().is_empty());
+        let mut accepted=view.clone();
+        accepted.canonical_state.as_mut().unwrap().coordinates.state_version+=1;
+        accepted.canonical_state.as_mut().unwrap().participants[1].status="active".into();
+        storage.commit_conversation_projection(&ConversationProjectionCommitRequest::live(&owner,accepted.clone(),vec![])).await.unwrap();
+        assert!(matches!(storage.commit_conversation_projection(&request).await.unwrap(),ConversationProjectionCommitOutcome::FenceMismatch{affected_rows:0}));
+        assert_eq!(storage.get_conversation(&owner,&view.conversation_id).await.unwrap().unwrap().canonical_state,accepted.canonical_state);
+        // Host terminal state must prevent replayed active UI projection.
+        storage.set_conversation_state(&view.conversation_id,ConversationState::Closed).await.unwrap();
+        assert!(matches!(storage.commit_conversation_projection(&ConversationProjectionCommitRequest::live(&owner,accepted,vec![])).await.unwrap(),ConversationProjectionCommitOutcome::FenceMismatch{affected_rows:0}));
+    }
+
+    #[tokio::test]
+    async fn request_policy_distinguishes_pending_direct_from_existing_group_members() {
+        let mut canonical=catbird_mls::orchestrator::canonical_transport::decode_conversation_state(serde_json::from_str::<serde_json::Value>(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap().to_string().as_bytes()).unwrap();
+        let active=canonical.participants[0].user_did.to_string();let pending=canonical.participants[1].user_did.to_string();
+        assert!(!crate::request_commands::policy_blocks_activity(&canonical,&active));
+        assert!(crate::request_commands::policy_blocks_activity(&canonical,&pending));
+        canonical.conversation_kind="direct".into();
+        assert!(crate::request_commands::policy_blocks_activity(&canonical,&active));
+        canonical.participants[1].status="active".into();
+        assert!(!crate::request_commands::policy_blocks_activity(&canonical,&active));
+        canonical.coordinates.lifecycle="closed".into();
+        assert!(crate::request_commands::policy_blocks_activity(&canonical,&active));
+    }
+
+    #[tokio::test]
+    async fn request_alias_retirement_replay_preserves_history_and_exact_fences() {
+        use catbird_mls::orchestrator::AliasRetirementAuthority;
+        let tmp=tempfile::tempdir().unwrap();
+        let path=tmp.path().join("host.db");
+        let storage=SqliteStorage::new(path.to_str().unwrap(),TEST_DB_KEY).unwrap();
+        let context=MLSContext::new(tmp.path().join("mls.db").to_string_lossy().into_owned(),TEST_DB_KEY.into(),Box::new(InMemoryKeychain::new())).unwrap();
+        context.set_content_root_key(vec![0x64;32]).unwrap();storage.set_mls_context(context.clone());
+        let canonical=catbird_mls::orchestrator::canonical_transport::decode_conversation_state(serde_json::from_str::<serde_json::Value>(include_str!("../tests/fixtures/canonical-conversation-state.json")).unwrap().to_string().as_bytes()).unwrap();
+        let owner=canonical.participants[0].user_did.to_string();storage.bind_request_owner(Some(&owner));
+        let view=ConversationView {conversation_id:canonical.coordinates.conversation_id.to_string(),group_id:hex::encode(canonical.coordinates.group_id.as_ref()),epoch:canonical.coordinates.epoch as u64,members:vec![],metadata:None,created_at:None,updated_at:None,sequencer_did:None,canonical_state:Some(canonical)};
+        let mut alias=view.clone();alias.conversation_id=view.group_id.clone();alias.canonical_state=None;
+        storage.ensure_conversation_exists(&owner,&alias.conversation_id,&alias.group_id).await.unwrap();
+        storage.conn.lock().unwrap().execute("UPDATE conversations SET epoch=?1 WHERE user_did=?2",rusqlite::params![alias.epoch,owner]).unwrap();
+        let message=Message{id:"retained-alias-first".into(),conversation_id:alias.conversation_id.clone(),sender_did:owner.clone(),text:"protected alias history".into(),timestamp:Utc::now(),epoch:alias.epoch,sequence_number:1,is_own:true,delivery_status:None,payload_json:None};
+        storage.store_message(&message).await.unwrap();
+        let authority=AliasRetirementAuthority::from_views(&owner,&view,&alias).unwrap();
+        let mut wrong=authority.clone();wrong.alias_incarnation+=1;
+        assert!(matches!(storage.commit_conversation_projection(&ConversationProjectionCommitRequest::live(&owner,view.clone(),vec![wrong])).await.unwrap(),ConversationProjectionCommitOutcome::FenceMismatch{affected_rows:0}));
+        assert!(storage.get_conversation(&owner,&view.conversation_id).await.unwrap().is_none());
+        assert!(matches!(storage.commit_conversation_projection(&ConversationProjectionCommitRequest::live(&owner,view.clone(),vec![authority.clone()])).await.unwrap(),ConversationProjectionCommitOutcome::Retired{..}));
+        assert_eq!(storage.list_conversations(&owner).await.unwrap().len(),1);
+        let messages=storage.get_messages(&view.conversation_id,50,None).await.unwrap();assert_eq!(messages.len(),1);assert_eq!(messages[0].text,message.text);assert_eq!(messages[0].conversation_id,view.conversation_id);
+        assert!(storage.get_conversation(&owner,&alias.conversation_id).await.unwrap().is_some());
+        drop(storage);
+        let storage=SqliteStorage::new(path.to_str().unwrap(),TEST_DB_KEY).unwrap();storage.set_mls_context(context);storage.bind_request_owner(Some(&owner));
+        assert!(matches!(storage.commit_conversation_projection(&ConversationProjectionCommitRequest::replay(authority.clone())).await.unwrap(),ConversationProjectionCommitOutcome::AlreadyAbsent{affected_rows:0}));
+        let mut changed=authority.clone();changed.alias_incarnation+=1;
+        assert!(matches!(storage.commit_conversation_projection(&ConversationProjectionCommitRequest::replay(changed)).await.unwrap(),ConversationProjectionCommitOutcome::FenceMismatch{affected_rows:0}));
+        storage.bind_request_owner(Some("did:plc:other"));
+        assert!(storage.commit_conversation_projection(&ConversationProjectionCommitRequest::replay(authority)).await.is_err());
+        assert!(storage.list_conversations("did:plc:other").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_reset_projection_exact_target_epoch_and_owner_are_atomic() {
+        let (_tmp,storage)=new_temp_storage();let owner="did:plc:alice";let other="did:plc:bob";let cid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";let old="11".repeat(32);let first="22".repeat(32);let next="33".repeat(32);
+        storage.ensure_conversation_exists(owner,cid,&old).await.unwrap();storage.ensure_conversation_exists(other,cid,&old).await.unwrap();storage.bind_request_owner(Some(owner));
+        storage.mark_reset_pending(cid,&first,7,123).await.unwrap();
+        assert!(!storage.complete_reset_pending(cid,6,&first,9).await.unwrap());
+        assert!(!storage.adopt_reset_pending_target(cid,7,&next,&first).await.unwrap());
+        assert!(storage.adopt_reset_pending_target(cid,7,&first,&next).await.unwrap());
+        assert!(!storage.complete_reset_pending(cid,7,&first,9).await.unwrap());
+        assert!(storage.complete_reset_pending(cid,7,&next,9).await.unwrap());
+        let conn=storage.conn.lock().unwrap();
+        let row:(String,u64,u64,Option<i32>,Option<String>)=conn.query_row("SELECT group_id,epoch,join_epoch,reset_generation,reset_new_group_id FROM conversations WHERE conversation_id=?1 AND user_did=?2",rusqlite::params![cid,owner],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap();
+        assert_eq!(row,(next,9,9,Some(7),None));
+        let other_group:String=conn.query_row("SELECT group_id FROM conversations WHERE conversation_id=?1 AND user_did=?2",rusqlite::params![cid,other],|r|r.get(0)).unwrap();assert_eq!(other_group,old);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM conversation_projection_group_history WHERE owner_did=?1 AND group_id=?2",rusqlite::params![owner,old],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
     fn new_temp_storage() -> (tempfile::TempDir, SqliteStorage) {
         let tmp = tempfile::tempdir().expect("temp dir");
         let db_path = tmp.path().join("catmos-test.db");
@@ -1606,6 +1745,7 @@ mod field_encryption_tests {
     #[tokio::test]
     async fn account_exit_cas_retires_only_exact_reset_and_preserves_history() {
         let (tmp, storage) = new_temp_storage();
+        storage.bind_request_owner(Some("did:plc:alice"));
         let old = "11".repeat(32);
         let target = "22".repeat(32);
         storage.ensure_conversation_exists("did:plc:alice", "9cf78d05-d9e1-4a20-b501-80e6d3d1b764", &old).await.unwrap();

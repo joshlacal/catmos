@@ -459,6 +459,7 @@ async fn handle_binary_frame(
             let msg_convo_id_owned = msg_convo_id.clone();
 
             let envelope = IncomingEnvelope {
+                canonical_entry_json: None,
                 conversation_id: msg_convo_id,
                 sender_did: String::new(),
                 ciphertext,

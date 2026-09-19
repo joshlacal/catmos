@@ -1,5 +1,6 @@
 <script lang="ts">
 	import '../app.css';
+	import { dev } from '$app/environment';
 	import { onMount, onDestroy } from 'svelte';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import TabBlockedMessage from '$lib/components/TabBlockedMessage.svelte';
@@ -58,6 +59,7 @@
 	}
 
 	onMount(async () => {
+        if (dev && window.location.pathname === '/dev/request-preview') { tabLockStatus = 'granted'; return; }
 		// Restore theme preference
 		const saved = localStorage.getItem('catmos-theme') as 'light' | 'dark' | null;
 		if (saved) {

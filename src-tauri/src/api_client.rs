@@ -1326,6 +1326,21 @@ impl ReqwestApiClient {
         format!("{}{}", self.base_url, path)
     }
 
+    /// Read current policy with the admitted exact-device session. This is a
+    /// restriction gate for host side effects; it never mints request consent.
+    pub(crate) async fn request_conversation_policy(&self, conversation_id: &str) -> Result<blue_catbird::chat::ConversationState> {
+        let auth = self.chat_auth.canonical_read_context().map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        let route = catbird_mls::orchestrator::canonical_route(catbird_mls::orchestrator::CanonicalOperation::GetConversationState);
+        let path = format!("{}?actorDeviceId={}&conversationId={}", route.path, urlencoding::encode(&auth.device_id), urlencoding::encode(conversation_id));
+        let response = self.client.get(self.canonical_url(&path)).header(reqwest::header::AUTHORIZATION, &auth.authorization).header("x-catbird-chat-device-id", &auth.device_id).send().await.map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if !response.status().is_success() { return Err(self.handle_error_for_session(response, &auth.session).await); }
+        let body = response.bytes().await.map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        self.ensure_session_current(&auth.session)?;
+        let output = parse_lexicon_json::<blue_catbird::chat::get_conversation_state::GetConversationStateOutput>(&body).map_err(|e| OrchestratorError::Api(e.to_string()))?;
+        if output.state.coordinates.conversation_id != conversation_id { return Err(OrchestratorError::Api("Conversation policy identity mismatch".into())); }
+        Ok(output.state)
+    }
+
     async fn canonical_get_conversations(
         &self,
         limit: u32,
@@ -1426,13 +1441,17 @@ impl ReqwestApiClient {
         let output = parse_lexicon_json::<
             catbird_atproto::blue_catbird::chat::get_entries::GetEntriesOutput<String>,
         >(body.as_ref())?;
-        let entries = output
-            .entries
-            .into_iter()
-            .filter(|entry| canonical_entry_matches_type(entry, message_type))
-            .map(|entry| map_canonical_entry(entry, convo_id))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter().flatten().collect();
+        // Preserve original complete control rows. Typed round trips can change
+        // byte wrappers; shared verification must receive the actual entry.
+        let raw:serde_json::Value=serde_json::from_slice(&body).map_err(|e|OrchestratorError::Api(e.to_string()))?;
+        let raw_entries=raw["entries"].as_array().ok_or_else(||OrchestratorError::Api("Entry array missing".into()))?;
+        if raw_entries.len()!=output.entries.len(){return Err(OrchestratorError::Api("Entry count mismatch".into()));}
+        let mut entries=Vec::new();
+        for (typed,raw) in output.entries.iter().zip(raw_entries) {
+            if canonical_entry_matches_type(typed,message_type) {
+                if let Some(envelope)=IncomingEnvelope::from_canonical_entry(raw,convo_id)? {entries.push(envelope);}
+            }
+        }
         let next = if output.has_more {
             Some(output.next_after_seq.to_string())
         } else {
@@ -1471,6 +1490,9 @@ fn canonical_entry_matches_type(
     entry: &catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
     message_type: Option<&str>,
 ) -> bool {
+    // Request controls are authority, not optional content filtering. Dropping
+    // one before returning the append cursor could permanently lose consent.
+    if matches!(entry, catbird_atproto::blue_catbird::chat::ConversationEntry::DirectRequestEntry(_) | catbird_atproto::blue_catbird::chat::ConversationEntry::DirectRequestAcceptanceEntry(_) | catbird_atproto::blue_catbird::chat::ConversationEntry::ConversationCloseEntry(_)) { return true; }
     match message_type {
         Some("commit") => matches!(
             entry,
@@ -1537,7 +1559,8 @@ impl MLSAPIClient for ReqwestApiClient {
             )));
         }
         let expected_method = match request.operation {
-            CanonicalOperation::GetConversations
+            CanonicalOperation::GetDirectRequestOutcome
+            | CanonicalOperation::GetConversations
             | CanonicalOperation::GetBlob
             | CanonicalOperation::GetBlobUsage
             | CanonicalOperation::GetConversationState

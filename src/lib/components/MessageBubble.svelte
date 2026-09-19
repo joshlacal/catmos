@@ -154,7 +154,7 @@
 					</button>
 				{/if}
 				{#if message.image}
-					<MessageImage image={message.image} fallbackAlt={rawContent || undefined} />
+					<MessageImage conversationId={message.conversationId} image={message.image} fallbackAlt={rawContent || undefined} />
 				{/if}
 				{#if textContent}
 					<div class="bubble-text">{textContent}</div>

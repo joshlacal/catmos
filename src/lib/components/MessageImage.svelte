@@ -3,7 +3,7 @@
 	import type { ImageAttachment } from '$lib/tauri';
 	import { getImageAttachment } from '$lib/wasm';
 
-	let { image, fallbackAlt }: { image: ImageAttachment; fallbackAlt?: string } = $props();
+	let { image, conversationId, fallbackAlt }: { image: ImageAttachment; conversationId: string; fallbackAlt?: string } = $props();
 
 	let src = $state('');
 	let loading = $state(false);
@@ -21,7 +21,7 @@
 
 		(async () => {
 			try {
-				const resolved = await getImageAttachment(image);
+				const resolved = await getImageAttachment(image, conversationId);
 				if (!cancelled) {
 					src = resolved;
 					loading = false;

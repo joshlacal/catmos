@@ -2,6 +2,7 @@ mod api_client;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
 mod commands;
+mod request_commands;
 mod credentials;
 mod keychain;
 mod keys;
@@ -88,6 +89,7 @@ impl WsHandle {
 }
 
 pub struct AppState {
+    pub(crate) request_scope: Mutex<()>,
     pub orchestrator: Arc<CatmosOrchestrator>,
     pub api_client: Arc<ReqwestApiClient>,
     /// Runtime-owned clean-chat auth capabilities. The provider contains
@@ -170,6 +172,7 @@ pub fn run() {
     ));
     let chat_auth = api_client.chat_auth_provider();
     let app_state = AppState {
+        request_scope: Mutex::new(()),
         orchestrator,
         chat_auth,
         api_client,
@@ -183,6 +186,16 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
+            request_commands::get_request_workspace,
+            request_commands::set_request_delivery_enabled,
+            request_commands::save_request_draft,
+            request_commands::submit_request_draft,
+            request_commands::resume_request_draft,
+            request_commands::cancel_request_draft,
+            request_commands::refresh_direct_request,
+            request_commands::accept_direct_request,
+            request_commands::close_direct_request,
+            request_commands::block_request_sender,
             commands::start_login,
             commands::complete_login,
             commands::try_restore_session,

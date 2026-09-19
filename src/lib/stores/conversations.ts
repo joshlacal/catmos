@@ -16,11 +16,14 @@ function createConversationsStore() {
 		loading: false
 	});
 
+	let ownerDid: string | null = null;
+	let epoch = 0;
 	let currentState: ConversationsStore = { items: [], selectedId: null, loading: false };
 	subscribe((s) => { currentState = s; });
 
 	return {
 		subscribe,
+		bindAccount(owner: string | null) { if (owner === ownerDid) return; ownerDid = owner; epoch++; set({ items: [], selectedId: null, loading: false }); },
 		findDirectConversation(targetDid: string): string | null {
 			const match = currentState.items.find(
 				(c) =>
@@ -31,9 +34,11 @@ function createConversationsStore() {
 			return match?.id ?? null;
 		},
 		async load() {
+			const revision = epoch;
 			update((s) => ({ ...s, loading: true }));
 			try {
 				const raw = await api.getConversations();
+				if (revision !== epoch) return;
 				// Deduplicate by ID to prevent Svelte {#each} key collisions
 				const seen = new Set<string>();
 				const items = raw.filter((c) => {
@@ -43,6 +48,7 @@ function createConversationsStore() {
 				});
 				update((s) => ({ ...s, items, loading: false }));
 			} catch {
+				if (revision !== epoch) return;
 				update((s) => ({ ...s, loading: false }));
 			}
 		},
@@ -154,7 +160,7 @@ export async function reconcileBlockedConversations(): Promise<number> {
 
 	const state = get(conversations);
 	const toLeave = state.items.filter((c) =>
-		c.members.some((did) => blocked.has(did))
+		!c.pendingConsent && c.members.some((did) => blocked.has(did))
 	);
 
 	let leftCount = 0;

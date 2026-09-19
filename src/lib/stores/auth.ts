@@ -2,6 +2,7 @@ import { writable } from 'svelte/store';
 import * as api from '$lib/wasm';
 import { listenForEvent, isTauri } from '$lib/wasm';
 import type { AuthState } from '$lib/tauri';
+import { requests } from './requests';
 import { profiles } from './profiles';
 
 interface AuthStore {
@@ -63,6 +64,8 @@ function createAuthStore() {
 			set(initialState);
 		},
 		async logout() {
+			requests.bindAccount(null);
+			set(initialState);
 			try {
 				await api.logout();
 			} finally {

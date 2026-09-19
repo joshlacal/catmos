@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { requests } from '$lib/stores/requests';
 	import { conversations } from '$lib/stores/conversations';
 	import { auth } from '$lib/stores/auth';
 	import { drafts } from '$lib/stores/drafts';
@@ -65,6 +66,7 @@
 	}
 
 	function selectConversation(id: string) {
+		requests.hide();
 		conversations.select(id);
 	}
 
@@ -86,12 +88,13 @@
 			if (selectedMembers.length === 1) {
 				const existingId = conversations.findDirectConversation(memberDids[0]);
 				if (existingId) {
-					conversations.select(existingId);
+					selectConversation(existingId);
 					showCreateDialog = false;
 					return;
 				}
 				const displayName = selectedMembers[0].displayName || selectedMembers[0].handle;
-				await conversations.createGroup(displayName, memberDids);
+				conversations.select(null);
+				requests.begin(memberDids[0], displayName);
 			} else {
 				if (!newGroupName.trim()) return;
 				const desc = newGroupDescription.trim() || undefined;
@@ -146,6 +149,9 @@
 	</div>
 
 	<div class="conversations-list">
+		<button class="conversation-item" class:selected={$requests.pane !== 'none'} onclick={() => { conversations.select(null); requests.showInbox(); requests.load(); }}>
+			<span class="convo-avatar">✉</span><span>Message requests</span><span>{$requests.views.filter(v => v.consent === 'incomingPending').length || ''}</span>
+		</button>
 		{#each $conversations.items as convo (convo.id)}
 			<button
 				class="conversation-item"

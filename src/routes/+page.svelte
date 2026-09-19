@@ -1,5 +1,9 @@
 <script lang="ts">
-	import { onDestroy, onMount } from 'svelte';
+	import { requests } from '$lib/stores/requests';
+	import RequestInbox from '$lib/components/RequestInbox.svelte';
+	import RequestComposer from '$lib/components/RequestComposer.svelte';
+	import RequestDetail from '$lib/components/RequestDetail.svelte';
+	import { onDestroy, onMount, untrack } from 'svelte';
 	import { auth } from '$lib/stores/auth';
 	import {
 		conversations,
@@ -70,6 +74,7 @@
 		window.addEventListener('keydown', handleGlobalKeydown);
 
 		listenForEvent<Message>('mls-incoming-message', (payload) => {
+			if (!ordinaryAllowed(payload.conversationId)) { requests.load(); return; }
 			messages.addIncoming(payload);
 			saveCursor(payload.conversationId, payload.id);
 			notifyIncomingMessage(payload.senderHandle, payload.content, payload.conversationId);
@@ -78,12 +83,14 @@
 		});
 
 		listenForEvent<ReactionEvent>('mls-reaction-event', (payload) => {
+			if (!ordinaryAllowed(payload.conversationId)) return;
 			messages.applyReaction(payload);
 		}).then((unlisten) => {
 			unlistenReaction = unlisten;
 		});
 
 		listenForEvent<TypingEvent>('mls-typing-event', (payload) => {
+			if (!ordinaryAllowed(payload.conversationId)) return;
 			messages.applyTyping(payload);
 		}).then((unlisten) => {
 			unlistenTyping = unlisten;
@@ -129,6 +136,7 @@
 	});
 
 	async function subscribeToConversation(convoId: string, force = false) {
+		if (!ordinaryAllowed(convoId)) return;
 		if (!force && subscribedConvoId === convoId) return;
 		// On Tauri, the global WS started on login already covers this convo;
 		// spawning an extra per-convo WS here would just open a duplicate
@@ -199,6 +207,7 @@
 
 	$effect(() => {
 		if ($auth.user) {
+            untrack(() => { requests.bindAccount($auth.user!.did); conversations.bindAccount($auth.user!.did); messages.bindAccount($auth.user!.did); });
 			// Open a single global WS so we receive events for every convo
 			// the user belongs to, not just the currently-selected one.
 			// Matches iOS/Android/CLI; without it, messages landing in a
@@ -221,6 +230,33 @@
 			});
 		}
 	});
+
+	$effect(() => {
+		const owner = $auth.user?.did ?? null;
+		untrack(() => {
+			requests.bindAccount(owner);
+			conversations.bindAccount(owner);
+			messages.bindAccount(owner);
+			if (owner) requests.load();
+		});
+	});
+	function ordinaryAllowed(id: string): boolean {
+		const conversation = $conversations.items.find(c => c.id === id);
+		const view = $requests.views.find(v => v.conversationId === id);
+		return !!$auth.user && !($requests.loading) && (view
+			? view.consent === 'accepted' && view.capabilities.canSend && view.capabilities.canEmitReceipts
+			: conversation?.pendingConsent !== true);
+	}
+	let activeRequest = $derived($requests.views.find(v => v.conversationId === ($requests.pane === 'request' ? $requests.selectedId : $selectedConversation?.id)));
+	let activeDraft = $derived($requests.drafts.find(d => d.input.draftId === $requests.selectedId));
+	async function openRequestConversation(id: string, requiresAcceptance = false) {
+		if (requiresAcceptance || !ordinaryAllowed(id)) { requests.selectRequest(id); await requests.refresh(id); return; }
+		await conversations.load(); requests.hide(); conversations.select(id);
+	}
+	function viewGroupInvitation(id: string) {
+		// Navigation only: the exact reference came from the verified Rust preview.
+		requests.hide(); conversations.select(id);
+	}
 
 	let currentConversation = $derived($selectedConversation);
 
@@ -250,7 +286,7 @@
 	});
 
 	$effect(() => {
-		if (currentConversation) {
+		if (currentConversation && $requests.pane === 'none' && ordinaryAllowed(currentConversation.id)) {
 			replyingTo = null;
 			const convoId = currentConversation.id;
 			(async () => {
@@ -297,7 +333,7 @@
 	);
 
 	async function handleSend(content: string) {
-		if (!currentConversation) return;
+		if (!currentConversation || !ordinaryAllowed(currentConversation.id)) return;
 		let finalContent = content;
 		if (replyingTo) {
 			finalContent = JSON.stringify({
@@ -314,13 +350,13 @@
 	}
 
 	async function handleSendImage(content: string, image: PreparedImageUpload) {
-		if (currentConversation) {
+		if (currentConversation && ordinaryAllowed(currentConversation.id)) {
 			await messages.sendImage(currentConversation.id, content, image);
 		}
 	}
 
 	async function handleTypingChanged(isTyping: boolean) {
-		if (!currentConversation) return;
+		if (!currentConversation || !ordinaryAllowed(currentConversation.id)) return;
 		try {
 			await api.sendTyping(currentConversation.id, isTyping);
 		} catch (e) {
@@ -382,6 +418,14 @@
 			</form>
 		{/if}
 	</div>
+{:else if $requests.pane === 'inbox'}
+	<RequestInbox />
+{:else if $requests.pane === 'draft' && activeDraft}
+	<RequestComposer draft={activeDraft} onOpenConversation={openRequestConversation} />
+{:else if activeRequest && ($requests.pane === 'request' || activeRequest.consent !== 'accepted')}
+	<RequestDetail view={activeRequest} title={currentDisplayName || 'Message request'} onOpenConversation={openRequestConversation} onViewInvitation={viewGroupInvitation} />
+{:else if $requests.pane === 'request' || (currentConversation && !ordinaryAllowed(currentConversation.id))}
+	<section class="empty-state"><div class="empty-state-content"><h2>Conversation is awaiting consent</h2><p>Ordinary activity is paused while request authority is unavailable.</p><button onclick={() => requests.showInbox()}>Open message requests</button></div></section>
 {:else if currentConversation}
 	<div class="chat-area">
 		<header class="chat-header">
@@ -469,7 +513,7 @@
 			/>
 		{/if}
 		<div class="chat-body">
-			<MessageList messages={currentMessages} typingUsers={currentTypingUsers} onReply={(info) => { replyingTo = info; }} />
+			<MessageList request={activeRequest} messages={currentMessages} typingUsers={currentTypingUsers} onReply={(info) => { replyingTo = info; }} />
 			{#if showMembers && currentConversation.isGroup}
 				<MemberList conversationId={currentConversation.id} quarantine={activeQuarantine} />
 			{/if}

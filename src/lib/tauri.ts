@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 export interface Conversation {
+  pendingConsent?: boolean;
 	id: string;
 	/** Current MLS group identifier (hex). Changes on group reset. */
 	groupId: string;
@@ -180,8 +181,9 @@ export async function getMessages(conversationId: string, before?: string): Prom
 	return invoke('get_messages', { conversationId, before });
 }
 
-export async function getImageAttachment(image: ImageAttachment): Promise<string> {
+export async function getImageAttachment(image: ImageAttachment, conversationId: string): Promise<string> {
 	return invoke('get_image_attachment', {
+        conversationId,
 		blobId: image.blobId,
 		keyB64: image.keyB64,
 		ivB64: image.ivB64,
