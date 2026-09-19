@@ -204,6 +204,9 @@ impl CredentialStore for KeyringCredentialStore {
             })?;
         let key_id = catbird_mls::chat_v2::ids::KeyId::parse(&binding.key_id)
             .map_err(|_| OrchestratorError::Credential("Invalid retained key binding".into()))?;
+        let public: [u8; 32] = public
+            .try_into()
+            .map_err(|_| OrchestratorError::Credential("Invalid scoped public key".into()))?;
         if !key_id.matches_public_key(&public) || !authority.session_is_current(&current.session) {
             return Ok(None);
         }

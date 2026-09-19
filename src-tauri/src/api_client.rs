@@ -2096,6 +2096,110 @@ mod tests {
         )
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verified_generation_signs_request_and_expires_on_same_did_session_rebind() {
+        use catbird_mls::chat_v2::transcript::direct_request::{
+            direct_request_signing_bytes, verify_signed_request, DirectRequestKind,
+        };
+        use catbird_mls::orchestrator::credentials::CredentialStore;
+        let did = format!(
+            "did:web:generation-{}.request-fixture.catbird.blue",
+            uuid::Uuid::new_v4()
+        );
+        let device = uuid::Uuid::new_v4().to_string();
+        let identity = format!("{did}#{device}");
+        let directory = tempfile::tempdir().unwrap();
+        let context = catbird_mls::MLSContext::new(
+            directory
+                .path()
+                .join("mls.db")
+                .to_string_lossy()
+                .into_owned(),
+            "01".repeat(32),
+            Box::new(crate::keychain::KeyringKeychainAccess::new()),
+        )
+        .unwrap();
+        context
+            .create_key_package(identity.as_bytes().to_vec())
+            .unwrap();
+        let public: [u8; 32] = context
+            .identity_public_key(identity.clone())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let key_id = catbird_mls::chat_v2::ids::KeyId::from_public_key(&public).to_string();
+        let mut response: serde_json::Value =
+            serde_json::from_str(&list_devices_body(&did, &device)).unwrap();
+        response["items"][0]["device"]["authGeneration"] = serde_json::json!(7);
+        response["items"][0]["device"]["keyId"] = serde_json::json!(key_id);
+        response["items"][0]["device"]["signaturePublicKey"] =
+            serde_json::json!({"$bytes":B64.encode(public)});
+        let (base, requests) = spawn_scripted_json_server(vec![(
+            200,
+            response.to_string(),
+            std::time::Duration::ZERO,
+        )]);
+        let client = ReqwestApiClient::new(base);
+        client.set_auth(did.clone(), "first-generation-session".into());
+        let store = crate::credentials::KeyringCredentialStore::with_chat_auth(
+            client.chat_auth_provider(),
+            context.clone(),
+        );
+        assert_eq!(store.get_auth_generation(&did).await.unwrap(), None);
+        client
+            .resolve_server_device_id_for_local_uuid(&device, &public)
+            .await
+            .unwrap();
+        requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let generation = store.get_auth_generation(&did).await.unwrap().unwrap();
+        assert_eq!(generation, 7);
+        let request = uuid::Uuid::new_v4().to_string();
+        let body = serde_json::json!({"$type":"blue.catbird.chat.defs#directRequestPreparationBody","signatureDomain":"CATBIRD-DIRECT-REQUEST-PREPARE\u{0000}","protocolVersion":"2","actorDid":did,"actorDeviceId":device,"keyId":key_id,"authGeneration":generation,"requestId":request,"firstMessageId":uuid::Uuid::new_v4().to_string(),"conversationId":uuid::Uuid::new_v4().to_string(),"recipientDid":"did:web:recipient.request-fixture.catbird.blue","origin":{"$type":"blue.catbird.chat.defs#freshDirectOrigin"},"profile":"encryptedIntroduction1","idempotencyKey":request,"signedAt":"2026-09-19T12:00:00.000Z"});
+        let transcript = direct_request_signing_bytes(
+            DirectRequestKind::Prepare,
+            &serde_json::to_vec(&body).unwrap(),
+        )
+        .unwrap();
+        let signature = context
+            .sign_with_identity_key(identity.clone(), transcript)
+            .unwrap();
+        let wrapper =
+            serde_json::to_vec(&serde_json::json!({"body":body,"signature":B64.encode(signature)}))
+                .unwrap();
+        assert_eq!(
+            verify_signed_request(DirectRequestKind::Prepare, &wrapper, &public)
+                .unwrap()
+                .auth_generation(),
+            Some(7)
+        );
+        // The same account/device coordinates cannot reuse generation evidence
+        // after the local scoped key changes independently.
+        let original = context.export_identity_key(identity.clone()).unwrap();
+        let other = format!("{did}#{}", uuid::Uuid::new_v4());
+        context
+            .create_key_package(other.as_bytes().to_vec())
+            .unwrap();
+        let replacement = context.export_identity_key(other).unwrap();
+        context
+            .import_identity_key(identity.clone(), replacement)
+            .unwrap();
+        assert_eq!(store.get_auth_generation(&did).await.unwrap(), None);
+        context.import_identity_key(identity, original).unwrap();
+        assert_eq!(store.get_auth_generation(&did).await.unwrap(), Some(7));
+        client.clear_auth();
+        client.set_auth(did.clone(), "second-generation-session".into());
+        assert_eq!(store.get_auth_generation(&did).await.unwrap(), None);
+        assert_eq!(
+            store
+                .get_auth_generation("did:web:other.request-fixture.catbird.blue")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn own_device_view_populates_complete_scoped_device_identity() {
         let did = "did:plc:device-view-owner";

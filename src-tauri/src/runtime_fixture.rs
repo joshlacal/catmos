@@ -7,6 +7,9 @@ pub(crate) fn keychain_service(production: &str) -> String {
     if let Some(config) = enabled::CONFIG.get() {
         return format!("{}.{}", config.keychain_namespace, production);
     }
+    if cfg!(test) {
+        return format!("{production}.unit-fixture");
+    }
     production.to_owned()
 }
 
@@ -99,16 +102,37 @@ mod enabled {
         {
             return Err("Fixture file must be a bounded private regular file".into());
         }
-        std::fs::read(path).map_err(|_| "Fixture file unreadable".into())
+        use std::io::Read;
+        let file = std::fs::File::open(path).map_err(|_| "Fixture file unreadable")?;
+        let opened = file
+            .metadata()
+            .map_err(|_| "Fixture file metadata unavailable")?;
+        use std::os::unix::fs::MetadataExt;
+        if !opened.is_file()
+            || opened.ino() != metadata.ino()
+            || opened.dev() != metadata.dev()
+            || opened.permissions().mode() & 0o077 != 0
+        {
+            return Err("Fixture file changed during admission".into());
+        }
+        let mut bytes = Vec::new();
+        file.take(65537)
+            .read_to_end(&mut bytes)
+            .map_err(|_| "Fixture file unreadable")?;
+        if bytes.len() > 65536 {
+            return Err("Fixture file exceeded admission bound".into());
+        }
+        Ok(bytes)
     }
     pub(super) fn initialize() -> Result<(), String> {
-        let Some(path) = std::env::var_os("CATMOS_RUNTIME_FIXTURE_CONFIG") else {
-            return Ok(());
-        };
+        let path = required_launch_path(std::env::var_os("CATMOS_RUNTIME_FIXTURE_CONFIG"))?;
         let launch: Launch = serde_json::from_slice(&read_private(Path::new(&path))?)
             .map_err(|_| "Invalid fixture launch document")?;
-        let manifest: Manifest = serde_json::from_slice(&read_private(&launch.manifest)?)
+        let mut manifest: Manifest = serde_json::from_slice(&read_private(&launch.manifest)?)
             .map_err(|_| "Invalid fixture manifest")?;
+        // This shared manifest entry is for the DS relationship fixture only.
+        // Desktop traffic has no authority to contact it through this profile.
+        manifest.hosts.remove("public.api.bsky.app");
         validate_manifest(&manifest)?;
         if !launch.profile.is_absolute()
             || launch
@@ -184,6 +208,24 @@ mod enabled {
             .map_err(|_| "Fixture already configured")?;
         Ok(())
     }
+    fn required_launch_path(
+        path: Option<std::ffi::OsString>,
+    ) -> Result<std::ffi::OsString, String> {
+        path.filter(|p|!p.is_empty()).ok_or_else(||"Fixture binary requires CATMOS_RUNTIME_FIXTURE_CONFIG; production profile fallback is forbidden".into())
+    }
+    fn fixture_host(host: &str) -> bool {
+        host.len() <= 253
+            && host.ends_with(".request-fixture.catbird.blue")
+            && host.split('.').all(|part| {
+                !part.is_empty()
+                    && part.len() <= 63
+                    && !part.starts_with('-')
+                    && !part.ends_with('-')
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            })
+    }
     fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
         let origin = reqwest::Url::parse(&manifest.origin).map_err(|_| "Invalid fixture origin")?;
         if !manifest.fixture_only
@@ -202,12 +244,36 @@ mod enabled {
             return Err("Invalid fixture authority".into());
         }
         for (host, address) in &manifest.hosts {
-            if host.is_empty()
-                || host.contains(['/', ':'])
+            if !(host == "chat.catbird.blue" || fixture_host(host))
                 || !address.ip().is_loopback()
                 || address.port() == 0
             {
                 return Err("Fixture DNS must map exact hosts to loopback".into());
+            }
+        }
+        if manifest.accounts.is_empty() || manifest.accounts.len() > 2 {
+            return Err("Fixture requires bounded synthetic accounts".into());
+        }
+        let mut labels = std::collections::HashSet::new();
+        let mut dids = std::collections::HashSet::new();
+        let mut devices = std::collections::HashSet::new();
+        for account in &manifest.accounts {
+            let host = account
+                .did
+                .strip_prefix("did:web:")
+                .ok_or("Fixture account must be did:web")?;
+            let device = uuid::Uuid::parse_str(&account.device_id)
+                .map_err(|_| "Fixture device UUID invalid")?;
+            if !fixture_host(host)
+                || !manifest.hosts.contains_key(host)
+                || device.get_version_num() != 4
+                || device.to_string() != account.device_id
+                || !matches!(account.label.as_str(), "alice" | "bob")
+                || !labels.insert(&account.label)
+                || !dids.insert(&account.did)
+                || !devices.insert(&account.device_id)
+            {
+                return Err("Invalid or duplicate synthetic fixture account".into());
             }
         }
         Ok(())
@@ -289,5 +355,80 @@ mod enabled {
                 .map_err(|_| "Cannot retain isolated fixture session")?;
         }
         Ok(())
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn manifest() -> Manifest {
+            Manifest {
+                fixture_only: true,
+                origin: "https://fixture.request-fixture.catbird.blue".into(),
+                ca_pem: "/tmp/unused.pem".into(),
+                hosts: BTreeMap::from([(
+                    "fixture.request-fixture.catbird.blue".into(),
+                    "127.0.0.1:4443".parse().unwrap(),
+                )]),
+                accounts: vec![Account {
+                    label: "alice".into(),
+                    did: "did:web:fixture.request-fixture.catbird.blue".into(),
+                    device_id: "00000000-0000-4000-8000-000000000001".into(),
+                    session: None,
+                }],
+            }
+        }
+        #[test]
+        fn manifest_rejects_remote_addresses_and_unmapped_or_insecure_origins() {
+            let mut m = manifest();
+            assert!(validate_manifest(&m).is_ok());
+            m.hosts.insert(
+                "fixture.request-fixture.catbird.blue".into(),
+                "192.0.2.1:443".parse().unwrap(),
+            );
+            assert!(validate_manifest(&m).is_err());
+            let mut m = manifest();
+            m.origin = "http://fixture.request-fixture.catbird.blue".into();
+            assert!(validate_manifest(&m).is_err());
+            m.origin = "https://unmapped.request-fixture.catbird.blue".into();
+            assert!(validate_manifest(&m).is_err());
+            let mut m = manifest();
+            m.fixture_only = false;
+            assert!(validate_manifest(&m).is_err());
+        }
+        #[test]
+        fn missing_config_and_nonsynthetic_accounts_are_rejected() {
+            assert!(required_launch_path(None).is_err());
+            let mut m = manifest();
+            m.accounts[0].did = "did:web:real.example.com".into();
+            assert!(validate_manifest(&m).is_err());
+            let mut m = manifest();
+            m.hosts
+                .insert("real.example.com".into(), "127.0.0.1:4443".parse().unwrap());
+            assert!(validate_manifest(&m).is_err());
+            let mut m = manifest();
+            m.accounts[0].device_id = "00000000-0000-1000-8000-000000000001".into();
+            assert!(validate_manifest(&m).is_err());
+        }
+        #[tokio::test]
+        async fn unlisted_dns_never_falls_back_to_public_resolution() {
+            use reqwest::dns::Resolve;
+            assert!(DenyDns
+                .resolve("example.com".parse().unwrap())
+                .await
+                .is_err());
+        }
+        #[test]
+        fn private_fixture_reader_rejects_broad_permissions_and_symlinks() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("session");
+            std::fs::write(&path, b"{}").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_private(&path).is_err());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert!(read_private(&path).is_ok());
+            let link = dir.path().join("link");
+            symlink(&path, &link).unwrap();
+            assert!(read_private(&link).is_err());
+        }
     }
 }
