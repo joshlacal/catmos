@@ -243,8 +243,23 @@ async function installContentRootKey(did: string, w: Remote<WorkerApi>, check: (
 // Nest BFF URL
 // ---------------------------------------------------------------------------
 
+// A separately built local fixture may use only the synthetic gateway domain.
+// Production/preview builds ignore this environment variable entirely.
+const localRuntimeFixtureOrigin: string | null = (() => {
+    if (import.meta.env.MODE !== 'local-runtime-fixture') return null;
+    const value = import.meta.env.VITE_LOCAL_REQUEST_FIXTURE_ORIGIN;
+    if (!value) throw new Error('Local runtime fixture origin is required');
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !/^gateway-[a-z0-9-]+\.request-fixture\.catbird\.blue$/.test(url.hostname)
+        || url.username || url.password || url.search || url.hash || url.pathname !== '/' || url.port) {
+        throw new Error('Invalid local runtime fixture origin');
+    }
+    return url.origin;
+})();
+
 /** Nest BFF gateway URL — resolve from current hostname. */
 const NEST_URL = (() => {
+    if (localRuntimeFixtureOrigin) return localRuntimeFixtureOrigin;
 	if (typeof window === 'undefined') return 'https://api.catbird.blue';
 	const { hostname } = window.location;
 	if (hostname === 'catmos.catbird.blue') return 'https://api.catbird.blue';
@@ -1431,7 +1446,7 @@ export async function confirmManualReset(conversationId: string, ownerDid?: stri
 
 // Request provider parity is a separate qualification gate. Never route a v2
 // request to legacy browser create/send or persist its plaintext in web storage.
-export const requestBackendAvailable = isTauri;
+export const requestBackendAvailable = isTauri || localRuntimeFixtureOrigin !== null;
 async function requestInvoke<T>(command: string, args: Record<string, unknown>): Promise<T> {
 	if (isTauri) return tauriInvoke<T>(command, args);
 	effectOwner(args.ownerDid as string, args.ownerRevision as string | undefined);
