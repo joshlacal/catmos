@@ -179,13 +179,14 @@ const api = {
 	getMessages: async (convoId: string, before?: string) =>
 		plain(await wasm.catbird_mls_messages(convoId, before)),
 	getImageAttachment: async (
+        conversationId: string,
 		blobId: string,
 		keyB64: string,
 		ivB64: string,
 		sha256: string,
 		contentType: string
 	) =>
-		wasm.catbird_mls_get_image_attachment(blobId, keyB64, ivB64, sha256, contentType),
+		(wasm.catbird_mls_get_image_attachment as unknown as (cid:string,b:string,k:string,i:string,s:string,t:string)=>Promise<string>)(conversationId, blobId, keyB64, ivB64, sha256, contentType),
 	fetchNewMessages: async (convoId: string) =>
 		plain(await wasm.catbird_mls_fetch_new_messages(convoId)),
 	sendReaction: async (convoId: string, msgId: string, emoji: string, action: string) => {
