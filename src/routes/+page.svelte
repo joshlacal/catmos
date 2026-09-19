@@ -136,6 +136,9 @@
 	});
 
 	async function subscribeToConversation(convoId: string, force = false) {
+        const session = $auth.user;
+        const owner = session?.did;
+        if (!owner) return;
 		if (!ordinaryAllowed(convoId)) return;
 		if (!force && subscribedConvoId === convoId) return;
 		// On Tauri, the global WS started on login already covers this convo;
@@ -145,6 +148,7 @@
 		if (subscribedConvoId) {
 			await api.unsubscribeConversation(subscribedConvoId).catch(() => {});
 		}
+		if ($auth.user !== session) return;
 		subscribedConvoId = convoId;
 
 		if (!isTauri) {
@@ -180,15 +184,17 @@
 							connection.setDisconnected(s.type);
 						}
 					},
-					savedCursor ?? undefined
+					savedCursor ?? undefined,
+                    owner
 				)
 				.catch((e: unknown) => {
 					console.error('WebSocket subscribe failed:', e);
 					connection.setDisconnected(String(e));
 				});
 		}
+		if ($auth.user !== session) return;
 		connection.setConnected();
-		api.updateCursor(convoId, '').catch(() => {});
+		api.updateCursor(convoId, '', owner).catch(() => {});
 		conversations.markConversationRead(convoId);
 	}
 

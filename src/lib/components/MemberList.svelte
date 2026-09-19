@@ -88,12 +88,15 @@
 	}
 
 	async function handleAddMembers() {
-		if (addMemberSelection.length === 0) return;
+		const session = $auth.user;
+        if (!session || addMemberSelection.length === 0) return;
 		addingMembers = true;
 		try {
-			await addGroupMembers(conversationId, addMemberSelection.map((m) => m.did));
+			await addGroupMembers(conversationId, addMemberSelection.map((m) => m.did), session.did);
+            if ($auth.user !== session) return;
 			showAddMember = false;
 			addMemberSelection = [];
+			if ($auth.user !== session) return;
 			await loadMembers();
 		} catch (err) {
 			console.error('Add members failed:', err);
@@ -134,7 +137,8 @@
 	}
 
 	async function executeAction() {
-		if (!confirmAction) return;
+		const session = $auth.user;
+        if (!session || !confirmAction) return;
 		const { type, did } = confirmAction;
 		processing = did;
 		confirmAction = null;
@@ -144,15 +148,16 @@
 			} else if (type === 'demote') {
 				await demoteMember(conversationId, did);
 			} else if (type === 'remove') {
-				await removeGroupMember(conversationId, did);
+				await removeGroupMember(conversationId, did, session.did);
 			} else if (type === 'leave') {
-				await conversations.leaveConversation(conversationId);
+				await conversations.leaveConversation(conversationId, session.did);
 				return;
 			} else if (type === 'block') {
 				await blockAndLeave(did);
 				// blockAndLeave may have left the current conversation already.
 				// Refreshing members is fine either way.
 			}
+			if ($auth.user !== session) return;
 			await loadMembers();
 		} catch (err) {
 			console.error(`${type} failed:`, err);
@@ -175,15 +180,18 @@
 	}
 
 	async function submitReport() {
-		if (!showReportSpam) return;
+		const session = $auth.user;
+        if (!session || !showReportSpam) return;
 		reportSubmitting = true;
 		reportResult = null;
 		try {
 			await reportSpam(
 				conversationId,
 				showReportSpam.did,
-				reportReason.trim() || undefined
+				reportReason.trim() || undefined,
+                session.did
 			);
+			if ($auth.user !== session) return;
 			reportResult = { success: true, message: 'Report submitted successfully.' };
 		} catch (err) {
 			const message = err instanceof Error ? err.message : 'Failed to submit report.';

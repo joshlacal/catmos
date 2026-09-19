@@ -36,6 +36,7 @@ async function storeWith(api = {}) {
 		throw new Error(`Unexpected store dependency: ${specifier}`);
 	});
 	await subject.evaluate();
+	subject.namespace.messages.bindAccount('did:plc:alice');
 	return subject.namespace.messages;
 }
 
@@ -125,3 +126,69 @@ for (const kind of ['text', 'image', 'voice']) {
 		assert.deepEqual(ids(store), ['own-10', 'peer-11']);
 	});
 }
+
+test('queued text and image carry initiating owner and discard post-switch results', async () => {
+    for (const kind of ['text', 'image']) {
+        let acknowledge;
+        const response = new Promise(resolve => { acknowledge = resolve; });
+        let observedOwner;
+        const store = await storeWith({
+            sendMessage: (_cid, _text, owner) => { observedOwner = owner; return response; },
+            sendImage: (...args) => { observedOwner = args[7]; return response; }
+        });
+        const sending = kind === 'text' ? store.send(conversationId, 'alice text') : store.sendImage(conversationId, 'alice photo', {
+            data: new Uint8Array([1]), contentType: 'image/png', width: 1, height: 1
+        });
+        assert.equal(observedOwner, 'did:plc:alice');
+        store.bindAccount('did:plc:bob');
+        acknowledge({ ...own10, status: 'sent' });
+        await sending;
+        assert.deepEqual(ids(store), []);
+    }
+});
+
+async function conversationsWith(overrides = {}) {
+    const context = vm.createContext({ console });
+    const transport = { getConversations: async () => [], createGroup: async () => { throw new Error('Unexpected create'); }, leaveConversation: async () => {}, createBlock: async () => {}, listOwnBlocks: async () => new Set(), ...overrides };
+    const mock = new vm.SyntheticModule(Object.keys(transport), function () { for (const [key, value] of Object.entries(transport)) this.setExport(key, value); }, { context });
+    const { derived } = await import('svelte/store');
+    const svelte = new vm.SyntheticModule(['writable', 'derived', 'get'], function () { this.setExport('writable', writable); this.setExport('derived', derived); this.setExport('get', get); }, { context });
+    const auth = writable({ user: { did: 'alice' } });
+    const authModule = new vm.SyntheticModule(['auth'], function () { this.setExport('auth', auth); }, { context });
+    const text = await readFile(new URL('../src/lib/stores/conversations.ts', import.meta.url), 'utf8');
+    const subject = new vm.SourceTextModule(ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText, { context });
+    await subject.link(name => name === 'svelte/store' ? svelte : name === '$lib/wasm' ? mock : authModule);
+    await subject.evaluate();
+    subject.namespace.conversations.bindAccount('alice');
+    return { ...subject.namespace, auth };
+}
+
+test('group creation and leave retain initiating owner and ignore acknowledgments after account switch', async () => {
+    let finish;
+    const owners = [];
+    const subject = await conversationsWith({ createGroup: async (...args) => { owners.push(args.at(-1)); return new Promise(resolve => { finish = resolve; }); }, leaveConversation: async (...args) => { owners.push(args.at(-1)); return new Promise(resolve => { finish = resolve; }); } });
+    const pending = subject.conversations.createGroup('group', ['peer']);
+    subject.conversations.bindAccount('bob');
+    finish({ id: 'old-group', members: ['alice', 'peer'] });
+    await assert.rejects(pending, /Account changed/);
+    assert.equal(get(subject.conversations).items.length, 0);
+    subject.conversations.bindAccount('alice');
+    const leave = subject.conversations.leaveConversation('old-group');
+    subject.conversations.bindAccount('bob');
+    finish(); await leave;
+    assert.deepEqual(owners, ['alice', 'alice']);
+    assert.equal(get(subject.conversations).items.length, 0);
+    await assert.rejects(subject.conversations.leaveConversation('old-group', 'alice'), /Account changed/);
+});
+
+test('block-and-leave stops its multi-effect sequence when the initiating account changes', async () => {
+    let finish; const calls = [];
+    const subject = await conversationsWith({ getConversations: async () => [{ id: 'group', members: ['alice', 'peer'] }], createBlock: async (...args) => { calls.push(args); return new Promise(resolve => { finish = resolve; }); }, leaveConversation: async () => { throw new Error('Foreign leave'); } });
+    await subject.conversations.load();
+    const pending = subject.blockAndLeave('peer');
+    subject.auth.set({ user: { did: 'bob' } });
+    subject.conversations.bindAccount('bob');
+    finish();
+    assert.deepEqual(Array.from(await pending), []);
+    assert.deepEqual(calls, [['peer', 'alice']]);
+});

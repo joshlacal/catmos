@@ -307,12 +307,26 @@ pub async fn accept_direct_request(
     Ok(view)
 }
 
+/// Capture initiating account after acquiring the same lock used by every auth
+/// transition. The returned guard must remain live through the complete effect.
+pub(crate) async fn capture_effect_owner<'a>(
+    scope: &'a tokio::sync::Mutex<()>,
+    expected_owner: &str,
+    current_owner: impl FnOnce() -> Result<String, String>,
+) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
+    let guard = scope.lock().await;
+    if expected_owner.is_empty() || current_owner()? != expected_owner {
+        return Err("Account changed; reopen the conversation before continuing".into());
+    }
+    Ok(guard)
+}
+
 /// Supplement shared Rust permission checks at IPC boundaries that historically
 /// called transport directly (cursor/media). Never turn absent consent into acceptance.
 pub(crate) async fn require_ordinary_activity(
     state: &AppState,
     conversation_id: &str,
-) -> Result<(), String> {
+) -> Result<catbird_atproto::blue_catbird::chat::ConversationState, String> {
     let views = state
         .orchestrator
         .list_direct_request_views()
@@ -338,7 +352,7 @@ pub(crate) async fn require_ordinary_activity(
     if policy_blocks_activity(&canonical, &owner) {
         return Err("Conversation is awaiting consent".into());
     }
-    Ok(())
+    Ok(canonical)
 }
 
 /// Device-local receive preference is explicit; background maintenance never opts in.
@@ -433,7 +447,7 @@ pub async fn block_request_sender(
     if sender == owner_did {
         return Err("Cannot block yourself".into());
     }
-    crate::commands::create_block(state.clone(), sender)
+    crate::commands::create_block_for_captured_owner(state.clone(), sender)
         .await
         .map_err(|_| "Block is not confirmed".to_string())?;
     state
@@ -507,10 +521,9 @@ pub async fn send_existing_invitation_note(
     }
     let cid = match &draft.outcome {
         Some(DirectRequestOutcome::ExistingDirect {
-            conversation_id,
-            requires_acceptance: false,
+            conversation_id, ..
         }) => conversation_id.clone(),
-        _ => return Err("An accepted direct conversation is required; no note was sent".into()),
+        _ => return Err("An existing direct conversation is required; no note was sent".into()),
     };
     let reference = draft
         .input
@@ -520,7 +533,8 @@ pub async fn send_existing_invitation_note(
     if reference.recipient_did != draft.input.recipient_did {
         return Err("Invitation recipient changed".into());
     }
-    require_ordinary_activity(&state, &cid).await?;
+    let policy = require_ordinary_activity(&state, &cid).await?;
+    validate_note_policy(&policy, &owner_did, &draft.input.recipient_did, &cid)?;
     let embed = catbird_mls::orchestrator::MLSEmbedData::group_invitation(reference)
         .map_err(|_| "Invalid invitation reference")?;
     // The core repeats the fresh recipient/invitation check immediately before
@@ -549,5 +563,113 @@ pub async fn send_existing_invitation_note(
             Ok(draft)
         },
         Err(_)=>Err("Invitation note delivery is not confirmed. Your text is retained; open the conversation before composing another note.".into()),
+    }
+}
+
+fn validate_note_policy(
+    policy: &catbird_atproto::blue_catbird::chat::ConversationState,
+    owner: &str,
+    recipient: &str,
+    conversation: &str,
+) -> Result<(), String> {
+    if policy.coordinates.conversation_id != conversation
+        || policy.conversation_kind != "direct"
+        || policy_blocks_activity(policy, owner)
+        || policy.participants.len() != 2
+        || !policy
+            .participants
+            .iter()
+            .any(|p| p.user_did.as_str() == recipient && p.status == "active")
+        || owner == recipient
+    {
+        return Err(
+            "Accept the exact direct conversation before sending this invitation note".into(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod authority_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn paused_effect_keeps_original_account_until_completion() {
+        let scope = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = Arc::new(Mutex::new("alice".to_string()));
+        let captured = capture_effect_owner(&scope, "alice", || Ok(owner.lock().unwrap().clone()))
+            .await
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let next_scope = scope.clone();
+        let next_owner = owner.clone();
+        let transition = tokio::spawn(async move {
+            entered_tx.send(()).unwrap();
+            let _guard = next_scope.lock().await;
+            *next_owner.lock().unwrap() = "bob".into();
+        });
+        entered_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!transition.is_finished());
+        assert_eq!(*owner.lock().unwrap(), "alice"); // policy and network effect use this session
+        drop(captured);
+        transition.await.unwrap();
+        assert_eq!(*owner.lock().unwrap(), "bob");
+        assert!(
+            capture_effect_owner(&scope, "alice", || Ok(owner.lock().unwrap().clone()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_old_owner_is_rejected_after_auth_transition() {
+        let scope = Arc::new(tokio::sync::Mutex::new(()));
+        let owner = Arc::new(Mutex::new("alice".to_string()));
+        let transition = scope.lock().await;
+        let queued_scope = scope.clone();
+        let queued_owner = owner.clone();
+        let queued = tokio::spawn(async move {
+            capture_effect_owner(&queued_scope, "alice", || {
+                Ok(queued_owner.lock().unwrap().clone())
+            })
+            .await
+            .is_ok()
+        });
+        tokio::task::yield_now().await;
+        *owner.lock().unwrap() = "bob".into();
+        drop(transition);
+        assert!(!queued.await.unwrap());
+    }
+
+    #[test]
+    fn historical_pending_hint_does_not_override_fresh_note_consent() {
+        let mut policy = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(
+            serde_json::from_str::<serde_json::Value>(include_str!(
+                "../tests/fixtures/canonical-conversation-state.json"
+            ))
+            .unwrap()
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        policy.conversation_kind = "direct".into();
+        let owner = policy.participants[0].user_did.to_string();
+        let recipient = policy.participants[1].user_did.to_string();
+        let cid = policy.coordinates.conversation_id.to_string();
+        let outcome = DirectRequestOutcome::ExistingDirect {
+            conversation_id: cid.clone(),
+            requires_acceptance: true,
+        };
+        let original = serde_json::to_vec(&outcome).unwrap();
+        assert!(validate_note_policy(&policy, &owner, &recipient, &cid).is_err());
+        policy.participants[1].status = "active".into();
+        assert!(validate_note_policy(&policy, &owner, &recipient, &cid).is_ok());
+        assert!(
+            validate_note_policy(&policy, &owner, "did:plc:cccccccccccccccccccccccc", &cid)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_vec(&outcome).unwrap(), original);
     }
 }

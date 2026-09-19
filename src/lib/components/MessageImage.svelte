@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
+    import { auth } from '$lib/stores/auth';
 	import type { ImageAttachment } from '$lib/tauri';
 	import { getImageAttachment } from '$lib/wasm';
 
@@ -8,36 +9,39 @@
 	let src = $state('');
 	let loading = $state(false);
 	let error = $state<string | null>(null);
-	let cancelled = false;
+
 
 	$effect(() => {
+        const session = $auth.user;
+        const owner = session?.did;
+        let cancelled = false;
 		src = image.localUrl ?? '';
 		error = null;
 		loading = !image.localUrl && !!image.blobId;
 
-		if (image.localUrl || !image.blobId) {
+		if (!owner || image.localUrl || !image.blobId) {
 			return;
 		}
 
 		(async () => {
 			try {
-				const resolved = await getImageAttachment(image, conversationId);
-				if (!cancelled) {
+				const resolved = await getImageAttachment(image, conversationId, owner);
+				if (!cancelled && $auth.user === session) {
 					src = resolved;
 					loading = false;
 				}
 			} catch (err) {
-				if (!cancelled) {
+				if (!cancelled && $auth.user === session) {
 					console.error('[catmos] getImageAttachment failed:', err);
 					error = 'Failed to load image';
 					loading = false;
 				}
 			}
 		})();
+        return () => { cancelled = true; };
 	});
 
 	onDestroy(() => {
-		cancelled = true;
 		if (image.localUrl?.startsWith('blob:')) {
 			URL.revokeObjectURL(image.localUrl);
 		}

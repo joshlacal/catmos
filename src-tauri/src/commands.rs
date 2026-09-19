@@ -1159,11 +1159,20 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
 #[tauri::command]
 pub async fn create_group(
     state: State<'_, AppState>,
+    owner_did: String,
     name: String,
     member_dids: Vec<String>,
     description: Option<String>,
 ) -> Result<Conversation, String> {
-    let _scope = state.request_scope.lock().await;
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     let session = state
         .api_client
         .current_session()
@@ -1356,9 +1365,19 @@ fn validate_current_group_id(conversation_id: &str, group_id: &str) -> Result<St
 #[tauri::command]
 pub async fn send_message(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
@@ -1393,6 +1412,7 @@ pub async fn send_message(
 #[tauri::command]
 pub async fn send_image(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     content: String,
     data: Vec<u8>,
@@ -1401,6 +1421,15 @@ pub async fn send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<Message, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
@@ -1466,6 +1495,7 @@ pub async fn send_image(
 #[tauri::command]
 pub async fn get_image_attachment(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     blob_id: String,
     key_b64: String,
@@ -1473,6 +1503,15 @@ pub async fn get_image_attachment(
     sha256: String,
     content_type: String,
 ) -> Result<String, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     let key = B64
         .decode(key_b64)
@@ -1497,9 +1536,19 @@ pub async fn get_image_attachment(
 #[tauri::command]
 pub async fn get_messages(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     before: Option<String>,
 ) -> Result<Vec<Message>, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     // Try local storage first
     let before_seq = before.and_then(|b| b.parse::<u64>().ok());
@@ -1565,8 +1614,18 @@ pub async fn get_group_members(
 pub async fn subscribe_conversation(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     // Don't subscribe twice
     {
@@ -1711,8 +1770,18 @@ pub async fn unsubscribe_all_events(state: State<'_, AppState>) -> Result<(), St
 #[tauri::command]
 pub async fn fetch_new_messages(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
 ) -> Result<Vec<Message>, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     let (msgs, _cursor) = state
         .orchestrator
@@ -1779,11 +1848,21 @@ pub async fn get_profiles(
 #[tauri::command]
 pub async fn send_reaction(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     message_id: String,
     emoji: String,
     action: String,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
@@ -1848,9 +1927,19 @@ pub async fn send_typing(
 #[tauri::command]
 pub async fn update_cursor(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     cursor: String,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         " update_cursor: convo={}, cursor={}",
@@ -2027,9 +2116,20 @@ pub async fn demote_member(
 #[tauri::command]
 pub async fn remove_group_member(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "remove_group_member: convo={}, target={}",
         conversation_id,
@@ -2564,12 +2664,23 @@ async fn republish_group_metadata_after_reset(
 #[tauri::command]
 pub async fn update_group_metadata(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     name: Option<String>,
     description: Option<String>,
     avatar_blob_locator: Option<String>,
     avatar_content_type: Option<String>,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "update_group_metadata (encrypted Phase A.2): convo={}, name={:?}, description={:?}",
         conversation_id,
@@ -2596,9 +2707,20 @@ pub async fn update_group_metadata(
 #[tauri::command]
 pub async fn add_group_members(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     member_dids: Vec<String>,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "add_group_members: convo={}, members={:?}",
         conversation_id,
@@ -2617,8 +2739,18 @@ pub async fn add_group_members(
 #[tauri::command]
 pub async fn leave_conversation(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     log_catmos!("leave_conversation: convo={}", conversation_id);
 
     state
@@ -2732,10 +2864,20 @@ pub async fn search_messages(
 #[tauri::command]
 pub async fn report_spam(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     reported_did: String,
     reason: Option<String>,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
     log_catmos!(
         " report_spam: convo={}, reported={}",
         conversation_id,
@@ -2755,9 +2897,20 @@ pub async fn report_spam(
 #[tauri::command]
 pub async fn reset_group(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     reason: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!("reset_group: convo={}", conversation_id);
 
     let mut body = serde_json::json!({
@@ -2803,10 +2956,21 @@ pub async fn reset_group(
 #[tauri::command]
 pub async fn republish_group_metadata(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
     new_group_id: String,
     new_reset_generation: i64,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "republish_group_metadata: convo={} newGroupId={} gen={}",
         conversation_id,
@@ -2852,6 +3016,23 @@ pub async fn republish_group_metadata(
 /// Returns the record's AT-URI on success.
 #[tauri::command]
 pub async fn create_block(
+    state: State<'_, AppState>,
+    owner_did: String,
+    subject_did: String,
+) -> Result<String, String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    create_block_for_captured_owner(state.clone(), subject_did).await
+}
+
+pub(crate) async fn create_block_for_captured_owner(
     state: State<'_, AppState>,
     subject_did: String,
 ) -> Result<String, String> {
@@ -3045,8 +3226,19 @@ pub async fn get_quarantine_state(
 #[tauri::command]
 pub async fn confirm_manual_reset(
     state: State<'_, AppState>,
+    owner_did: String,
     conversation_id: String,
 ) -> Result<(), String> {
+    let _account =
+        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+            state
+                .api_client
+                .current_session()
+                .map(|s| s.actor_did)
+                .map_err(|_| "Sign in to continue".to_string())
+        })
+        .await?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!("confirm_manual_reset: convo={}", conversation_id);
     state
         .orchestrator

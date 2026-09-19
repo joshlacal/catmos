@@ -10,6 +10,7 @@
 	 * - `Learn more` → opens an inline disclosure with the suspected DIDs.
 	 */
 	import type { QuarantineState } from '$lib/tauri';
+	import { auth } from '$lib/stores/auth';
 	import { confirmManualReset } from '$lib/wasm';
 	import { quarantineReasonCopy } from '$lib/stores/quarantine';
 
@@ -26,17 +27,19 @@
 	let showDetails = $state(false);
 
 	async function handleReset() {
-		if (resetting) return;
+		const session = $auth.user;
+        if (!session || resetting) return;
 		resetting = true;
 		resetError = null;
 		try {
-			await confirmManualReset(conversationId);
+			await confirmManualReset(conversationId, session.did);
 			// Server emits a groupResetEvent on quorum; the page-level
 			// `mls:group-reset` listener picks it up. The orchestrator also
 			// clears local quarantine, which fires `mls://quarantine-cleared`,
 			// so the banner unmounts.
 		} catch (err) {
-			resetError = String(err);
+			if ($auth.user !== session) return;
+            resetError = String(err);
 			console.error('[quarantine] manual reset failed:', err);
 		} finally {
 			resetting = false;

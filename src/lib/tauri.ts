@@ -150,13 +150,14 @@ export async function getConversations(): Promise<Conversation[]> {
 export async function createGroup(
 	name: string,
 	memberDids: string[],
-	description?: string
+	description?: string,
+	ownerDid?: string
 ): Promise<Conversation> {
-	return invoke('create_group', { name, memberDids, description });
+	return invoke('create_group', { ownerDid, name, memberDids, description });
 }
 
-export async function sendMessage(conversationId: string, content: string): Promise<Message> {
-	return invoke('send_message', { conversationId, content });
+export async function sendMessage(conversationId: string, content: string, ownerDid?: string): Promise<Message> {
+	return invoke('send_message', { ownerDid, conversationId, content });
 }
 
 export async function sendImage(
@@ -166,9 +167,11 @@ export async function sendImage(
 	contentType: string,
 	width: number,
 	height: number,
-	altText?: string
+	altText?: string,
+	ownerDid?: string
 ): Promise<Message> {
 	return invoke('send_image', {
+		ownerDid,
 		conversationId,
 		content,
 		data: Array.from(data),
@@ -179,12 +182,13 @@ export async function sendImage(
 	});
 }
 
-export async function getMessages(conversationId: string, before?: string): Promise<Message[]> {
-	return invoke('get_messages', { conversationId, before });
+export async function getMessages(conversationId: string, before?: string, ownerDid?: string): Promise<Message[]> {
+	return invoke('get_messages', { ownerDid, conversationId, before });
 }
 
-export async function getImageAttachment(image: ImageAttachment, conversationId: string): Promise<string> {
+export async function getImageAttachment(image: ImageAttachment, conversationId: string, ownerDid?: string): Promise<string> {
 	return invoke('get_image_attachment', {
+		ownerDid,
         conversationId,
 		blobId: image.blobId,
 		keyB64: image.keyB64,
@@ -198,8 +202,8 @@ export async function getGroupMembers(conversationId: string): Promise<GroupMemb
 	return invoke('get_group_members', { conversationId });
 }
 
-export async function subscribeConversation(conversationId: string): Promise<void> {
-	return invoke('subscribe_conversation', { conversationId });
+export async function subscribeConversation(conversationId: string, ownerDid?: string): Promise<void> {
+	return invoke('subscribe_conversation', { ownerDid, conversationId });
 }
 
 export async function unsubscribeConversation(conversationId: string): Promise<void> {
@@ -214,8 +218,8 @@ export async function unsubscribeAllEvents(): Promise<void> {
 	return invoke('unsubscribe_all_events');
 }
 
-export async function fetchNewMessages(conversationId: string): Promise<Message[]> {
-	return invoke('fetch_new_messages', { conversationId });
+export async function fetchNewMessages(conversationId: string, ownerDid?: string): Promise<Message[]> {
+	return invoke('fetch_new_messages', { ownerDid, conversationId });
 }
 
 export async function getProfiles(dids: string[]): Promise<ProfileView[]> {
@@ -226,9 +230,10 @@ export async function sendReaction(
 	conversationId: string,
 	messageId: string,
 	emoji: string,
-	action: 'add' | 'remove'
+	action: 'add' | 'remove',
+	ownerDid?: string
 ): Promise<void> {
-	return invoke('send_reaction', { conversationId, messageId, emoji, action });
+	return invoke('send_reaction', { ownerDid, conversationId, messageId, emoji, action });
 }
 
 export async function sendTyping(conversationId: string, isTyping: boolean): Promise<void> {
@@ -237,9 +242,10 @@ export async function sendTyping(conversationId: string, isTyping: boolean): Pro
 
 export async function updateCursor(
 	conversationId: string,
-	cursor: string
+	cursor: string,
+	ownerDid?: string
 ): Promise<void> {
-	return invoke('update_cursor', { conversationId, cursor });
+	return invoke('update_cursor', { ownerDid, conversationId, cursor });
 }
 
 export interface SearchResult {
@@ -270,8 +276,10 @@ export async function demoteMember(conversationId: string, targetDid: string): P
 	return invoke('demote_member', { conversationId, targetDid });
 }
 
-export async function removeGroupMember(conversationId: string, targetDid: string): Promise<void> {
-	return invoke('remove_group_member', { conversationId, targetDid });
+export async function removeGroupMember(conversationId: string, targetDid: string,
+	ownerDid?: string
+): Promise<void> {
+	return invoke('remove_group_member', { ownerDid, conversationId, targetDid });
 }
 
 export interface SearchHit {
@@ -300,9 +308,11 @@ export async function updateGroupMetadata(
 	name?: string,
 	description?: string,
 	avatarBlobLocator?: string,
-	avatarContentType?: string
+	avatarContentType?: string,
+	ownerDid?: string
 ): Promise<void> {
 	return invoke('update_group_metadata', {
+		ownerDid,
 		conversationId,
 		name,
 		description,
@@ -314,9 +324,10 @@ export async function updateGroupMetadata(
 export async function reportSpam(
 	conversationId: string,
 	reportedDid: string,
-	reason?: string
+	reason?: string,
+	ownerDid?: string
 ): Promise<void> {
-	return invoke('report_spam', { conversationId, reportedDid, reason });
+	return invoke('report_spam', { ownerDid, conversationId, reportedDid, reason });
 }
 
 // ── Layer 3 quarantine ───────────────────────────────────────────────────────
@@ -357,6 +368,8 @@ export async function getQuarantineState(
 	return invoke('get_quarantine_state', { conversationId });
 }
 
-export async function confirmManualReset(conversationId: string): Promise<void> {
-	return invoke('confirm_manual_reset', { conversationId });
+export async function confirmManualReset(conversationId: string,
+	ownerDid?: string
+): Promise<void> {
+	return invoke('confirm_manual_reset', { ownerDid, conversationId });
 }

@@ -48,9 +48,11 @@ function createMessagesStore() {
 		bindAccount(owner: string | null) { if (owner === ownerDid) return; ownerDid = owner; epoch++; set({ byConversation: new Map(), typingByConversation: new Map(), loading: false }); },
 		async load(conversationId: string) {
 			const revision = epoch;
+            const operationOwner = ownerDid;
+            if (!operationOwner) return;
 			update((s) => ({ ...s, loading: true }));
 			try {
-				const msgs = await api.getMessages(conversationId);
+				const msgs = await api.getMessages(conversationId, undefined, operationOwner);
 				if (revision !== epoch) return;
 				// Deduplicate by ID to prevent Svelte {#each} key collisions
 				const seen = new Set<string>();
@@ -70,8 +72,10 @@ function createMessagesStore() {
 		},
 		async fetchFromServer(conversationId: string) {
 			const revision = epoch;
+            const operationOwner = ownerDid;
+            if (!operationOwner) return;
 			try {
-				const msgs = await api.fetchNewMessages(conversationId);
+				const msgs = await api.fetchNewMessages(conversationId, operationOwner);
 				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
@@ -94,6 +98,8 @@ function createMessagesStore() {
 		},
 		async send(conversationId: string, content: string) {
             const revision = epoch;
+            const operationOwner = ownerDid;
+            if (!operationOwner) return;
 			const optimistic: Message = {
 				id: `temp-${Date.now()}`,
 				conversationId,
@@ -111,7 +117,7 @@ function createMessagesStore() {
 				return { ...s, byConversation };
 			});
 			try {
-				const sent = await api.sendMessage(conversationId, content);
+				const sent = await api.sendMessage(conversationId, content, operationOwner);
 				if (revision !== epoch) return;
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
@@ -140,6 +146,8 @@ function createMessagesStore() {
 		},
 		async sendImage(conversationId: string, content: string, upload: PreparedImageUpload) {
             const revision = epoch;
+            const operationOwner = ownerDid;
+            if (!operationOwner) return;
 			const optimistic: Message = {
 				id: `temp-image-${Date.now()}`,
 				conversationId,
@@ -176,7 +184,8 @@ function createMessagesStore() {
 					upload.contentType,
 					upload.width,
 					upload.height,
-					upload.altText
+					upload.altText,
+                    operationOwner
 				);
 				if (revision !== epoch) return;
 				update((s) => {
@@ -206,6 +215,8 @@ function createMessagesStore() {
 		},
 		async sendVoice(conversationId: string, audioData: Uint8Array, durationMs: number, waveform: number[]) {
             const revision = epoch;
+            const operationOwner = ownerDid;
+            if (!operationOwner) return;
 			const optimistic: Message = {
 				id: `temp-voice-${Date.now()}`,
 				conversationId,

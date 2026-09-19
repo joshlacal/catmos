@@ -1,6 +1,6 @@
 {
   "kind": "local-ui-fixture-only",
-  "base": "http://127.0.0.1:1420",
+  "base": "http://127.0.0.1:5197",
   "screenshots": 6,
   "errors": [],
   "externalRequests": [

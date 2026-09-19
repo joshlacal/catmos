@@ -2,6 +2,7 @@ import { writable, derived, get } from 'svelte/store';
 import type { Conversation } from '$lib/tauri';
 import * as api from '$lib/wasm';
 import { createBlock, listOwnBlocks } from '$lib/wasm';
+import { auth } from '$lib/stores/auth';
 
 interface ConversationsStore {
 	items: Conversation[];
@@ -56,7 +57,10 @@ function createConversationsStore() {
 			update((s) => ({ ...s, selectedId: id }));
 		},
 		async createGroup(name: string, memberDids: string[], description?: string) {
-			const conversation = await api.createGroup(name, memberDids, description);
+			const owner = ownerDid, revision = epoch;
+            if (!owner) throw new Error('Sign in to create a group');
+            const conversation = await api.createGroup(name, memberDids, description, owner);
+            if (revision !== epoch) throw new Error('Account changed while creating the group');
 			update((s) => ({
 				...s,
 				// Avoid duplicate if conversation already in list from a prior load()
@@ -81,8 +85,11 @@ function createConversationsStore() {
 				)
 			}));
 		},
-		async leaveConversation(id: string) {
-			await api.leaveConversation(id);
+		async leaveConversation(id: string, expectedOwner?: string) {
+            const owner = ownerDid, revision = epoch;
+            if (!owner || (expectedOwner && owner !== expectedOwner)) throw new Error('Account changed');
+            await api.leaveConversation(id, owner);
+            if (revision !== epoch) return;
 			update((s) => ({
 				...s,
 				items: s.items.filter((c) => c.id !== id),
@@ -120,16 +127,20 @@ export function affectedConversationsFor(did: string): Conversation[] {
  * Returns the list of conversation IDs we successfully left.
  */
 export async function blockAndLeave(targetDid: string): Promise<string[]> {
-	const affected = affectedConversationsFor(targetDid);
+	const session = get(auth).user;
+    if (!session) throw new Error('Sign in to block');
+    const affected = affectedConversationsFor(targetDid);
 
 	// Publish the block first — a failed leave can be retried by startup
 	// reconciliation, but a missing block would leave the UX inconsistent.
-	await createBlock(targetDid);
+	await createBlock(targetDid, session.did);
+    if (get(auth).user !== session) return [];
 
 	const leftIds: string[] = [];
 	for (const convo of affected) {
 		try {
-			await conversations.leaveConversation(convo.id);
+			if (get(auth).user !== session) break;
+            await conversations.leaveConversation(convo.id, session.did);
 			leftIds.push(convo.id);
 		} catch (e) {
 			console.error(`[catmos] leave ${convo.id} failed after block`, e);
@@ -149,6 +160,8 @@ export async function blockAndLeave(targetDid: string): Promise<string[]> {
  * should be guarded by a flag to avoid repeated API traffic.
  */
 export async function reconcileBlockedConversations(): Promise<number> {
+    const session = get(auth).user;
+    if (!session) return 0;
 	let blocked: Set<string>;
 	try {
 		blocked = await listOwnBlocks();
@@ -156,7 +169,7 @@ export async function reconcileBlockedConversations(): Promise<number> {
 		console.warn('[catmos] block reconciliation skipped — listOwnBlocks failed', e);
 		return 0;
 	}
-	if (blocked.size === 0) return 0;
+	if (get(auth).user !== session || blocked.size === 0) return 0;
 
 	const state = get(conversations);
 	const toLeave = state.items.filter((c) =>
@@ -166,7 +179,8 @@ export async function reconcileBlockedConversations(): Promise<number> {
 	let leftCount = 0;
 	for (const convo of toLeave) {
 		try {
-			await conversations.leaveConversation(convo.id);
+			if (get(auth).user !== session) break;
+            await conversations.leaveConversation(convo.id, session.did);
 			leftCount += 1;
 		} catch (e) {
 			console.warn(`[catmos] reconcile leave ${convo.id} failed`, e);

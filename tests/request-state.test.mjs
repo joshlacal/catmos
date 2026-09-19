@@ -56,3 +56,26 @@ test('delayed note outcome never crosses an account switch',async()=>{const pend
 test('explicit note selection attaches a verified reference to an unattempted local draft only',async()=>{const store=await subject();store.begin('did:plc:bob','Bob','Retained local text');const id=get(store).selectedId;const invitation={authorityDid:'did:web:chat.catbird.blue',conversationId:'group'};assert.equal(store.begin('did:plc:bob','Bob','',invitation),true);assert.equal(get(store).selectedId,id);assert.equal(get(store).drafts[0].input.text,'Retained local text');assert.equal(get(store).drafts[0].input.invitation.conversationId,'group');assert.equal(get(store).drafts[0].phase,'draft');});
 
 test('late local draft acknowledgement cannot erase a newly attached invitation',async()=>{const pending=deferred();let first=true;const store=await subject({saveRequestDraft:async(owner,input,recipientLabel)=>{if(first){first=false;await pending.promise;}return {input,recipientLabel,phase:'draft',archived:false};}});store.begin('did:plc:bob','Bob','Same text');await Promise.resolve();store.begin('did:plc:bob','Bob','',{authorityDid:'did:web:chat.catbird.blue',conversationId:'group'});pending.resolve();for(let i=0;i<8;i++)await Promise.resolve();assert.equal(get(store).drafts[0].input.invitation.conversationId,'group');});
+
+test('pending ExistingDirect note can retry explicit action after current consent becomes accepted without changing outcome', async () => {
+    let accepted = false, sends = 0;
+    const store = await subject({
+        submitRequestDraft: async () => ({...get(store).drafts[0],phase:'resolved',outcome:{type:'existingDirect',conversationId:'direct',requiresAcceptance:true}}),
+        getRequestWorkspace: async owner => ({ownerDid:owner,drafts:get(store).drafts,requests:[]}),
+        sendExistingInvitationNote: async () => {
+            if (!accepted) throw Error('Acceptance required');
+            sends++;
+            return {...get(store).drafts[0],noteDelivery:{conversationId:'direct',messageId:'note'}};
+        }
+    });
+    store.begin('did:plc:bob','Bob','Note',{authorityDid:'did:web:chat.catbird.blue',conversationId:'group'});
+    const id = get(store).selectedId;
+    await store.send(id);
+    const original = JSON.stringify(get(store).drafts[0].outcome);
+    await store.sendInvitationNote(id);
+    assert.equal(sends,0);
+    accepted=true;
+    await store.sendInvitationNote(id);
+    assert.equal(sends,1);
+    assert.equal(JSON.stringify(get(store).drafts[0].outcome),original);
+});

@@ -24,7 +24,8 @@
 	}
 
 	async function toggleReaction(emoji: string) {
-		const userDid = $auth.user?.did;
+		const session = $auth.user;
+        const userDid = session?.did;
 		if (!userDid) return;
 		const action = hasReacted(emoji) ? 'remove' : 'add';
 
@@ -38,9 +39,10 @@
 		showPicker = false;
 
 		try {
-			await api.sendReaction(conversationId, messageId, emoji, action);
+			await api.sendReaction(conversationId, messageId, emoji, action, userDid);
 		} catch (e) {
 			console.error('Failed to send reaction:', e);
+            if ($auth.user !== session) return;
 			messages.applyReaction({
 				conversationId,
 				messageId,
