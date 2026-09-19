@@ -25,7 +25,7 @@
 
 		(async () => {
 			try {
-				const resolved = await getImageAttachment(image, conversationId, owner);
+				const resolved = await getImageAttachment(image, conversationId, owner, session.authRevision);
 				if (!cancelled && $auth.user === session) {
 					src = resolved;
 					loading = false;

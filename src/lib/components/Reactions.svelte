@@ -39,7 +39,7 @@
 		showPicker = false;
 
 		try {
-			await api.sendReaction(conversationId, messageId, emoji, action, userDid);
+			await api.sendReaction(conversationId, messageId, emoji, action, userDid, session.authRevision);
 		} catch (e) {
 			console.error('Failed to send reaction:', e);
             if ($auth.user !== session) return;

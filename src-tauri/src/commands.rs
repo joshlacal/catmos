@@ -204,6 +204,7 @@ async fn start_sync_loop(state: &AppState) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthResponse {
+    pub auth_revision: String,
     pub did: String,
     pub handle: String,
     pub display_name: Option<String>,
@@ -867,6 +868,12 @@ pub async fn complete_login(
     }
 
     Ok(AuthResponse {
+        auth_revision: state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue")?
+            .revision
+            .to_string(),
         did: session.did,
         handle: session.handle,
         display_name: None,
@@ -980,6 +987,12 @@ pub async fn try_restore_session(
             log_catmos!("Session restored: handle={}", session.handle);
 
             Ok(Some(AuthResponse {
+                auth_revision: state
+                    .api_client
+                    .current_session()
+                    .map_err(|_| "Sign in to continue")?
+                    .revision
+                    .to_string(),
                 did: session.did,
                 handle: session.handle,
                 display_name: None,
@@ -1160,19 +1173,23 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
 pub async fn create_group(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     name: String,
     member_dids: Vec<String>,
     description: Option<String>,
 ) -> Result<Conversation, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -1366,18 +1383,22 @@ fn validate_current_group_id(conversation_id: &str, group_id: &str) -> Result<St
 pub async fn send_message(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
@@ -1413,6 +1434,7 @@ pub async fn send_message(
 pub async fn send_image(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     content: String,
     data: Vec<u8>,
@@ -1421,15 +1443,18 @@ pub async fn send_image(
     height: u32,
     alt_text: Option<String>,
 ) -> Result<Message, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
@@ -1496,6 +1521,7 @@ pub async fn send_image(
 pub async fn get_image_attachment(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     blob_id: String,
     key_b64: String,
@@ -1503,15 +1529,18 @@ pub async fn get_image_attachment(
     sha256: String,
     content_type: String,
 ) -> Result<String, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     let key = B64
         .decode(key_b64)
@@ -1537,18 +1566,22 @@ pub async fn get_image_attachment(
 pub async fn get_messages(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     before: Option<String>,
 ) -> Result<Vec<Message>, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     // Try local storage first
     let before_seq = before.and_then(|b| b.parse::<u64>().ok());
@@ -1615,17 +1648,21 @@ pub async fn subscribe_conversation(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     // Don't subscribe twice
     {
@@ -1771,17 +1808,21 @@ pub async fn unsubscribe_all_events(state: State<'_, AppState>) -> Result<(), St
 pub async fn fetch_new_messages(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<Vec<Message>, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     let (msgs, _cursor) = state
         .orchestrator
@@ -1849,20 +1890,24 @@ pub async fn get_profiles(
 pub async fn send_reaction(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     message_id: String,
     emoji: String,
     action: String,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     state
         .api_client
@@ -1928,18 +1973,22 @@ pub async fn send_typing(
 pub async fn update_cursor(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     cursor: String,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         " update_cursor: convo={}, cursor={}",
@@ -2117,18 +2166,22 @@ pub async fn demote_member(
 pub async fn remove_group_member(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "remove_group_member: convo={}, target={}",
@@ -2665,21 +2718,25 @@ async fn republish_group_metadata_after_reset(
 pub async fn update_group_metadata(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     name: Option<String>,
     description: Option<String>,
     avatar_blob_locator: Option<String>,
     avatar_content_type: Option<String>,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "update_group_metadata (encrypted Phase A.2): convo={}, name={:?}, description={:?}",
@@ -2708,18 +2765,22 @@ pub async fn update_group_metadata(
 pub async fn add_group_members(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     member_dids: Vec<String>,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "add_group_members: convo={}, members={:?}",
@@ -2740,17 +2801,21 @@ pub async fn add_group_members(
 pub async fn leave_conversation(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     log_catmos!("leave_conversation: convo={}", conversation_id);
 
     state
@@ -2865,19 +2930,23 @@ pub async fn search_messages(
 pub async fn report_spam(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     reported_did: String,
     reason: Option<String>,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     log_catmos!(
         " report_spam: convo={}, reported={}",
         conversation_id,
@@ -2898,18 +2967,22 @@ pub async fn report_spam(
 pub async fn reset_group(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     reason: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!("reset_group: convo={}", conversation_id);
 
@@ -2957,19 +3030,23 @@ pub async fn reset_group(
 pub async fn republish_group_metadata(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     new_group_id: String,
     new_reset_generation: i64,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!(
         "republish_group_metadata: convo={} newGroupId={} gen={}",
@@ -3018,17 +3095,21 @@ pub async fn republish_group_metadata(
 pub async fn create_block(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     subject_did: String,
 ) -> Result<String, String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     create_block_for_captured_owner(state.clone(), subject_did).await
 }
 
@@ -3227,17 +3308,21 @@ pub async fn get_quarantine_state(
 pub async fn confirm_manual_reset(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<(), String> {
-    let _account =
-        crate::request_commands::capture_effect_owner(&state.request_scope, &owner_did, || {
+    let _account = crate::request_commands::capture_effect_owner(
+        &state.request_scope,
+        &owner_did,
+        &owner_revision,
+        || {
             state
                 .api_client
                 .current_session()
-                .map(|s| s.actor_did)
                 .map_err(|_| "Sign in to continue".to_string())
-        })
-        .await?;
+        },
+    )
+    .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
     log_catmos!("confirm_manual_reset: convo={}", conversation_id);
     state

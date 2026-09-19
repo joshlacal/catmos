@@ -166,7 +166,7 @@ async function conversationsWith(overrides = {}) {
 test('group creation and leave retain initiating owner and ignore acknowledgments after account switch', async () => {
     let finish;
     const owners = [];
-    const subject = await conversationsWith({ createGroup: async (...args) => { owners.push(args.at(-1)); return new Promise(resolve => { finish = resolve; }); }, leaveConversation: async (...args) => { owners.push(args.at(-1)); return new Promise(resolve => { finish = resolve; }); } });
+    const subject = await conversationsWith({ createGroup: async (...args) => { owners.push(args.at(-2)); return new Promise(resolve => { finish = resolve; }); }, leaveConversation: async (...args) => { owners.push(args.at(-2)); return new Promise(resolve => { finish = resolve; }); } });
     const pending = subject.conversations.createGroup('group', ['peer']);
     subject.conversations.bindAccount('bob');
     finish({ id: 'old-group', members: ['alice', 'peer'] });
@@ -190,5 +190,32 @@ test('block-and-leave stops its multi-effect sequence when the initiating accoun
     subject.conversations.bindAccount('bob');
     finish();
     assert.deepEqual(Array.from(await pending), []);
-    assert.deepEqual(calls, [['peer', 'alice']]);
+    assert.deepEqual(calls, [['peer', 'alice', undefined]]);
+});
+
+test('native IPC authority snapshot survives import delay and cannot adopt a same-DID replacement', async () => {
+    const source = await readFile(new URL('../src/lib/native-authority.ts', import.meta.url), 'utf8');
+    const context = vm.createContext({});
+    const subject = new vm.SourceTextModule(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } }).outputText, { context });
+    await subject.link(() => { throw Error('Unexpected dependency'); }); await subject.evaluate();
+    const api = subject.namespace;
+    api.recordNativeAuthority({ did:'alice', authRevision:'1' });
+    assert.throws(() => api.captureNativeAuthority({ ownerDid:'alice' }), /changed/);
+    const queued = api.captureNativeAuthority({ ownerDid:'alice', ownerRevision:'1' });
+    api.clearNativeAuthority();
+    assert.throws(() => api.captureNativeAuthority({ ownerDid:'alice' }), /changed/);
+    api.recordNativeAuthority({ did:'alice', authRevision:'3' });
+    assert.equal(queued.ownerRevision, '1');
+    assert.throws(() => api.captureNativeAuthority(queued), /changed/);
+    assert.equal(api.captureNativeAuthority({ ownerDid:'alice', ownerRevision:'3' }).ownerRevision, '3');
+});
+
+test('same-DID replacement discards message acknowledgment from the previous native session', async () => {
+    let finish;
+    const store = await storeWith({ sendMessage: async () => new Promise(resolve => { finish = resolve; }) });
+    store.bindAccount('did:plc:alice', '1');
+    const pending = store.send('fixture-conversation', 'old session');
+    store.bindAccount('did:plc:alice', '3');
+    finish(own10); await pending;
+    assert.deepEqual(ids(store), []);
 });

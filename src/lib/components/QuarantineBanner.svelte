@@ -32,7 +32,7 @@
 		resetting = true;
 		resetError = null;
 		try {
-			await confirmManualReset(conversationId, session.did);
+			await confirmManualReset(conversationId, session.did, session.authRevision);
 			// Server emits a groupResetEvent on quorum; the page-level
 			// `mls:group-reset` listener picks it up. The orchestrator also
 			// clears local quarantine, which fires `mls://quarantine-cleared`,

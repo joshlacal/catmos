@@ -185,7 +185,7 @@
 						}
 					},
 					savedCursor ?? undefined,
-                    owner
+                    owner, session.authRevision
 				)
 				.catch((e: unknown) => {
 					console.error('WebSocket subscribe failed:', e);
@@ -194,7 +194,7 @@
 		}
 		if ($auth.user !== session) return;
 		connection.setConnected();
-		api.updateCursor(convoId, '', owner).catch(() => {});
+		api.updateCursor(convoId, '', owner, session.authRevision).catch(() => {});
 		conversations.markConversationRead(convoId);
 	}
 
@@ -213,7 +213,7 @@
 
 	$effect(() => {
 		if ($auth.user) {
-            untrack(() => { requests.bindAccount($auth.user!.did); conversations.bindAccount($auth.user!.did); messages.bindAccount($auth.user!.did); });
+            untrack(() => { requests.bindAccount($auth.user!.did, $auth.user!.authRevision); conversations.bindAccount($auth.user!.did, $auth.user!.authRevision); messages.bindAccount($auth.user!.did, $auth.user!.authRevision); });
 			// Open a single global WS so we receive events for every convo
 			// the user belongs to, not just the currently-selected one.
 			// Matches iOS/Android/CLI; without it, messages landing in a
@@ -239,10 +239,11 @@
 
 	$effect(() => {
 		const owner = $auth.user?.did ?? null;
+        const revision = $auth.user?.authRevision;
 		untrack(() => {
-			requests.bindAccount(owner);
-			conversations.bindAccount(owner);
-			messages.bindAccount(owner);
+			requests.bindAccount(owner, revision);
+			conversations.bindAccount(owner, revision);
+			messages.bindAccount(owner, revision);
 			if (owner) requests.load();
 		});
 	});

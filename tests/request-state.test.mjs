@@ -79,3 +79,20 @@ test('pending ExistingDirect note can retry explicit action after current consen
     assert.equal(sends,1);
     assert.equal(JSON.stringify(get(store).drafts[0].outcome),original);
 });
+
+test('same-DID replacement discards old request save before submitting a new-session effect', async () => {
+    const pending = deferred(); let submit = 0, saves = 0;
+    const store = await subject({
+        saveRequestDraft: async (owner, input, recipientLabel) => { saves++; await pending.promise; return {input, recipientLabel, phase:'draft', archived:false}; },
+        submitRequestDraft: async () => { submit++; throw Error('Old intent used new session'); }
+    });
+    store.bindAccount('did:plc:alice', '1');
+    store.begin('did:plc:bob', 'Bob', 'old session draft');
+    const id = get(store).selectedId;
+    const send = store.send(id);
+    await Promise.resolve();
+    store.bindAccount('did:plc:alice', '3');
+    pending.resolve(); await send;
+    assert.equal(submit, 0); assert.equal(get(store).drafts.length, 0);
+    assert.equal(get(store).ownerDid, 'did:plc:alice');
+});

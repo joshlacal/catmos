@@ -40,8 +40,15 @@ pub struct RequestWorkspace {
 pub async fn get_request_workspace(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
 ) -> Result<RequestWorkspace, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -101,10 +108,17 @@ pub async fn get_request_workspace(
 pub async fn save_request_draft(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     input: DirectRequestInput,
     recipient_label: String,
 ) -> Result<RequestDraft, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -145,10 +159,17 @@ pub async fn save_request_draft(
 async fn operate(
     state: &AppState,
     owner_did: &str,
+    owner_revision: &str,
     draft_id: &str,
     action: &str,
 ) -> Result<RequestDraft, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -211,34 +232,44 @@ async fn operate(
 pub async fn submit_request_draft(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     draft_id: String,
 ) -> Result<RequestDraft, String> {
-    operate(&state, &owner_did, &draft_id, "send").await
+    operate(&state, &owner_did, &owner_revision, &draft_id, "send").await
 }
 #[tauri::command]
 pub async fn resume_request_draft(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     draft_id: String,
 ) -> Result<RequestDraft, String> {
-    operate(&state, &owner_did, &draft_id, "resume").await
+    operate(&state, &owner_did, &owner_revision, &draft_id, "resume").await
 }
 #[tauri::command]
 pub async fn cancel_request_draft(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     draft_id: String,
 ) -> Result<RequestDraft, String> {
-    operate(&state, &owner_did, &draft_id, "cancel").await
+    operate(&state, &owner_did, &owner_revision, &draft_id, "cancel").await
 }
 
 #[tauri::command]
 pub async fn refresh_direct_request(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<DirectRequestView, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -265,9 +296,16 @@ pub async fn refresh_direct_request(
 pub async fn accept_direct_request(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<DirectRequestView, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -312,11 +350,20 @@ pub async fn accept_direct_request(
 pub(crate) async fn capture_effect_owner<'a>(
     scope: &'a tokio::sync::Mutex<()>,
     expected_owner: &str,
-    current_owner: impl FnOnce() -> Result<String, String>,
+    expected_revision: &str,
+    current_session: impl Fn() -> Result<crate::api_client::ChatSessionSnapshot, String>,
 ) -> Result<tokio::sync::MutexGuard<'a, ()>, String> {
+    // Snapshot before the first await: a same-DID login is a new authority.
+    let captured = current_session()?;
+    if expected_owner.is_empty()
+        || captured.actor_did != expected_owner
+        || captured.revision.to_string() != expected_revision
+    {
+        return Err("Account session changed; reopen the conversation before continuing".into());
+    }
     let guard = scope.lock().await;
-    if expected_owner.is_empty() || current_owner()? != expected_owner {
-        return Err("Account changed; reopen the conversation before continuing".into());
+    if current_session()? != captured {
+        return Err("Account session changed while the operation was queued".into());
     }
     Ok(guard)
 }
@@ -360,9 +407,16 @@ pub(crate) async fn require_ordinary_activity(
 pub async fn set_request_delivery_enabled(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -387,9 +441,16 @@ pub async fn set_request_delivery_enabled(
 pub async fn close_direct_request(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<DirectRequestView, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -417,9 +478,16 @@ pub async fn close_direct_request(
 pub async fn block_request_sender(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
 ) -> Result<(), String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -474,10 +542,17 @@ pub(crate) fn policy_blocks_activity(
 pub async fn get_group_invitation_reference(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     conversation_id: String,
     recipient_did: String,
 ) -> Result<Option<GroupInvitationReference>, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -499,9 +574,16 @@ pub async fn get_group_invitation_reference(
 pub async fn send_existing_invitation_note(
     state: State<'_, AppState>,
     owner_did: String,
+    owner_revision: String,
     draft_id: String,
 ) -> Result<RequestDraft, String> {
-    let _scope = state.request_scope.lock().await;
+    let _scope = capture_effect_owner(&state.request_scope, &owner_did, &owner_revision, || {
+        state
+            .api_client
+            .current_session()
+            .map_err(|_| "Sign in to continue".to_string())
+    })
+    .await?;
     let session = state
         .api_client
         .current_session()
@@ -597,27 +679,32 @@ mod authority_tests {
     #[tokio::test]
     async fn paused_effect_keeps_original_account_until_completion() {
         let scope = Arc::new(tokio::sync::Mutex::new(()));
-        let owner = Arc::new(Mutex::new("alice".to_string()));
-        let captured = capture_effect_owner(&scope, "alice", || Ok(owner.lock().unwrap().clone()))
-            .await
-            .unwrap();
+        let owner = Arc::new(Mutex::new(crate::api_client::ChatSessionSnapshot {
+            actor_did: "alice".into(),
+            token: "first".into(),
+            revision: 1,
+        }));
+        let captured =
+            capture_effect_owner(&scope, "alice", "1", || Ok(owner.lock().unwrap().clone()))
+                .await
+                .unwrap();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let next_scope = scope.clone();
         let next_owner = owner.clone();
         let transition = tokio::spawn(async move {
             entered_tx.send(()).unwrap();
             let _guard = next_scope.lock().await;
-            *next_owner.lock().unwrap() = "bob".into();
+            next_owner.lock().unwrap().actor_did = "bob".into();
         });
         entered_rx.await.unwrap();
         tokio::task::yield_now().await;
         assert!(!transition.is_finished());
-        assert_eq!(*owner.lock().unwrap(), "alice"); // policy and network effect use this session
+        assert_eq!(owner.lock().unwrap().actor_did, "alice"); // policy and network effect use this session
         drop(captured);
         transition.await.unwrap();
-        assert_eq!(*owner.lock().unwrap(), "bob");
+        assert_eq!(owner.lock().unwrap().actor_did, "bob");
         assert!(
-            capture_effect_owner(&scope, "alice", || Ok(owner.lock().unwrap().clone()))
+            capture_effect_owner(&scope, "alice", "1", || Ok(owner.lock().unwrap().clone()))
                 .await
                 .is_err()
         );
@@ -626,21 +713,72 @@ mod authority_tests {
     #[tokio::test]
     async fn queued_old_owner_is_rejected_after_auth_transition() {
         let scope = Arc::new(tokio::sync::Mutex::new(()));
-        let owner = Arc::new(Mutex::new("alice".to_string()));
+        let owner = Arc::new(Mutex::new(crate::api_client::ChatSessionSnapshot {
+            actor_did: "alice".into(),
+            token: "first".into(),
+            revision: 1,
+        }));
         let transition = scope.lock().await;
         let queued_scope = scope.clone();
         let queued_owner = owner.clone();
         let queued = tokio::spawn(async move {
-            capture_effect_owner(&queued_scope, "alice", || {
+            capture_effect_owner(&queued_scope, "alice", "1", || {
                 Ok(queued_owner.lock().unwrap().clone())
             })
             .await
             .is_ok()
         });
         tokio::task::yield_now().await;
-        *owner.lock().unwrap() = "bob".into();
+        owner.lock().unwrap().actor_did = "bob".into();
         drop(transition);
         assert!(!queued.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn queued_same_did_rebind_rejects_old_session_and_ipc_revision() {
+        let scope = Arc::new(tokio::sync::Mutex::new(()));
+        let api = Arc::new(crate::api_client::ReqwestApiClient::new(
+            "https://example.invalid".into(),
+        ));
+        api.set_auth("alice".into(), "first-session".into());
+        let revision = api.current_session().unwrap().revision.to_string();
+        let transition = scope.lock().await;
+        let queued_scope = scope.clone();
+        let queued_api = api.clone();
+        let queued_revision = revision.clone();
+        let (captured_tx, captured_rx) = tokio::sync::oneshot::channel();
+        let captured = std::sync::Mutex::new(Some(captured_tx));
+        let queued = tokio::spawn(async move {
+            capture_effect_owner(&queued_scope, "alice", &queued_revision, || {
+                let result = queued_api
+                    .current_session()
+                    .map_err(|_| "No session".to_string());
+                if let Some(tx) = captured.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                result
+            })
+            .await
+            .is_ok()
+        });
+        captured_rx.await.unwrap();
+        api.clear_auth();
+        api.set_auth("alice".into(), "second-session".into());
+        drop(transition);
+        assert!(!queued.await.unwrap());
+        // An IPC invocation dispatched before the switch but polled only now
+        // must also fail: its explicit browser-side revision is immutable.
+        assert!(capture_effect_owner(&scope, "alice", &revision, || api
+            .current_session()
+            .map_err(|_| "No session".into()))
+        .await
+        .is_err());
+        let current = api.current_session().unwrap().revision.to_string();
+        assert!(capture_effect_owner(&scope, "alice", &current, || api
+            .current_session()
+            .map_err(|_| "No session".into()))
+        .await
+        .is_ok());
     }
 
     #[test]

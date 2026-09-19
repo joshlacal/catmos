@@ -92,7 +92,7 @@
         if (!session || addMemberSelection.length === 0) return;
 		addingMembers = true;
 		try {
-			await addGroupMembers(conversationId, addMemberSelection.map((m) => m.did), session.did);
+			await addGroupMembers(conversationId, addMemberSelection.map((m) => m.did), session.did, session.authRevision);
             if ($auth.user !== session) return;
 			showAddMember = false;
 			addMemberSelection = [];
@@ -106,16 +106,18 @@
 	}
 
 	async function writeInvitationNote(member: GroupMember) {
-        const owner = currentUserDid(), group = conversationId;
+        const session = $auth.user;
+        if (!session) return;
+        const owner = session.did, group = conversationId;
         processing = member.did;
         invitationNotice = null;
         try {
-            const reference = await getGroupInvitationReference(owner, group, member.did);
-            if (currentUserDid() !== owner || conversationId !== group) return;
+            const reference = await getGroupInvitationReference(owner, group, member.did, session.authRevision);
+            if ($auth.user !== session || conversationId !== group) return;
             if (!reference) { invitationNotice = 'No current invitation could be verified. No note was sent.'; return; }
             requests.begin(member.did, memberDisplayName(member), '', reference);
             conversations.select(null);
-        } catch { if (currentUserDid() === owner && conversationId === group) invitationNotice = 'The group invitation is separate. Its note could not be started; no note was sent.'; }
+        } catch { if ($auth.user === session && conversationId === group) invitationNotice = 'The group invitation is separate. Its note could not be started; no note was sent.'; }
         finally { processing = null; }
     }
 
@@ -148,7 +150,7 @@
 			} else if (type === 'demote') {
 				await demoteMember(conversationId, did);
 			} else if (type === 'remove') {
-				await removeGroupMember(conversationId, did, session.did);
+				await removeGroupMember(conversationId, did, session.did, session.authRevision);
 			} else if (type === 'leave') {
 				await conversations.leaveConversation(conversationId, session.did);
 				return;
@@ -189,7 +191,7 @@
 				conversationId,
 				showReportSpam.did,
 				reportReason.trim() || undefined,
-                session.did
+                session.did, session.authRevision
 			);
 			if ($auth.user !== session) return;
 			reportResult = { success: true, message: 'Report submitted successfully.' };

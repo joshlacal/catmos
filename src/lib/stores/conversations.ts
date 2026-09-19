@@ -19,12 +19,13 @@ function createConversationsStore() {
 
 	let ownerDid: string | null = null;
 	let epoch = 0;
+	let authRevision: string | undefined;
 	let currentState: ConversationsStore = { items: [], selectedId: null, loading: false };
 	subscribe((s) => { currentState = s; });
 
 	return {
 		subscribe,
-		bindAccount(owner: string | null) { if (owner === ownerDid) return; ownerDid = owner; epoch++; set({ items: [], selectedId: null, loading: false }); },
+		bindAccount(owner: string | null, revision?: string) { if (owner === ownerDid && authRevision === revision) return; authRevision = revision; ownerDid = owner; epoch++; set({ items: [], selectedId: null, loading: false }); },
 		findDirectConversation(targetDid: string): string | null {
 			const match = currentState.items.find(
 				(c) =>
@@ -59,7 +60,7 @@ function createConversationsStore() {
 		async createGroup(name: string, memberDids: string[], description?: string) {
 			const owner = ownerDid, revision = epoch;
             if (!owner) throw new Error('Sign in to create a group');
-            const conversation = await api.createGroup(name, memberDids, description, owner);
+            const conversation = await api.createGroup(name, memberDids, description, owner, authRevision);
             if (revision !== epoch) throw new Error('Account changed while creating the group');
 			update((s) => ({
 				...s,
@@ -88,7 +89,7 @@ function createConversationsStore() {
 		async leaveConversation(id: string, expectedOwner?: string) {
             const owner = ownerDid, revision = epoch;
             if (!owner || (expectedOwner && owner !== expectedOwner)) throw new Error('Account changed');
-            await api.leaveConversation(id, owner);
+            await api.leaveConversation(id, owner, authRevision);
             if (revision !== epoch) return;
 			update((s) => ({
 				...s,
@@ -133,7 +134,7 @@ export async function blockAndLeave(targetDid: string): Promise<string[]> {
 
 	// Publish the block first — a failed leave can be retried by startup
 	// reconciliation, but a missing block would leave the UX inconsistent.
-	await createBlock(targetDid, session.did);
+	await createBlock(targetDid, session.did, session.authRevision);
     if (get(auth).user !== session) return [];
 
 	const leftIds: string[] = [];

@@ -1,4 +1,12 @@
-import { invoke } from '@tauri-apps/api/core';
+import { invoke as rawInvoke } from '@tauri-apps/api/core';
+import { captureNativeAuthority, recordNativeAuthority, clearNativeAuthority } from './native-authority';
+async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const captured = captureNativeAuthority(args);
+  if (command === 'logout') clearNativeAuthority();
+  const result = await rawInvoke<T>(command, captured);
+  if (command === 'complete_login' || command === 'try_restore_session') recordNativeAuthority(result);
+  return result;
+}
 
 export interface Conversation {
   pendingConsent?: boolean;
@@ -106,6 +114,7 @@ export interface GroupResetEvent {
 }
 
 export interface AuthState {
+	authRevision?: string;
 	did: string;
 	handle: string;
 	displayName?: string;
@@ -151,13 +160,13 @@ export async function createGroup(
 	name: string,
 	memberDids: string[],
 	description?: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<Conversation> {
-	return invoke('create_group', { ownerDid, name, memberDids, description });
+	return invoke('create_group', { ownerDid, ownerRevision, name, memberDids, description });
 }
 
-export async function sendMessage(conversationId: string, content: string, ownerDid?: string): Promise<Message> {
-	return invoke('send_message', { ownerDid, conversationId, content });
+export async function sendMessage(conversationId: string, content: string, ownerDid?: string, ownerRevision?: string): Promise<Message> {
+	return invoke('send_message', { ownerDid, ownerRevision, conversationId, content });
 }
 
 export async function sendImage(
@@ -168,10 +177,10 @@ export async function sendImage(
 	width: number,
 	height: number,
 	altText?: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<Message> {
 	return invoke('send_image', {
-		ownerDid,
+		ownerDid, ownerRevision,
 		conversationId,
 		content,
 		data: Array.from(data),
@@ -182,13 +191,13 @@ export async function sendImage(
 	});
 }
 
-export async function getMessages(conversationId: string, before?: string, ownerDid?: string): Promise<Message[]> {
-	return invoke('get_messages', { ownerDid, conversationId, before });
+export async function getMessages(conversationId: string, before?: string, ownerDid?: string, ownerRevision?: string): Promise<Message[]> {
+	return invoke('get_messages', { ownerDid, ownerRevision, conversationId, before });
 }
 
-export async function getImageAttachment(image: ImageAttachment, conversationId: string, ownerDid?: string): Promise<string> {
+export async function getImageAttachment(image: ImageAttachment, conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<string> {
 	return invoke('get_image_attachment', {
-		ownerDid,
+		ownerDid, ownerRevision,
         conversationId,
 		blobId: image.blobId,
 		keyB64: image.keyB64,
@@ -202,8 +211,8 @@ export async function getGroupMembers(conversationId: string): Promise<GroupMemb
 	return invoke('get_group_members', { conversationId });
 }
 
-export async function subscribeConversation(conversationId: string, ownerDid?: string): Promise<void> {
-	return invoke('subscribe_conversation', { ownerDid, conversationId });
+export async function subscribeConversation(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<void> {
+	return invoke('subscribe_conversation', { ownerDid, ownerRevision, conversationId });
 }
 
 export async function unsubscribeConversation(conversationId: string): Promise<void> {
@@ -218,8 +227,8 @@ export async function unsubscribeAllEvents(): Promise<void> {
 	return invoke('unsubscribe_all_events');
 }
 
-export async function fetchNewMessages(conversationId: string, ownerDid?: string): Promise<Message[]> {
-	return invoke('fetch_new_messages', { ownerDid, conversationId });
+export async function fetchNewMessages(conversationId: string, ownerDid?: string, ownerRevision?: string): Promise<Message[]> {
+	return invoke('fetch_new_messages', { ownerDid, ownerRevision, conversationId });
 }
 
 export async function getProfiles(dids: string[]): Promise<ProfileView[]> {
@@ -231,9 +240,9 @@ export async function sendReaction(
 	messageId: string,
 	emoji: string,
 	action: 'add' | 'remove',
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
-	return invoke('send_reaction', { ownerDid, conversationId, messageId, emoji, action });
+	return invoke('send_reaction', { ownerDid, ownerRevision, conversationId, messageId, emoji, action });
 }
 
 export async function sendTyping(conversationId: string, isTyping: boolean): Promise<void> {
@@ -243,9 +252,9 @@ export async function sendTyping(conversationId: string, isTyping: boolean): Pro
 export async function updateCursor(
 	conversationId: string,
 	cursor: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
-	return invoke('update_cursor', { ownerDid, conversationId, cursor });
+	return invoke('update_cursor', { ownerDid, ownerRevision, conversationId, cursor });
 }
 
 export interface SearchResult {
@@ -277,9 +286,9 @@ export async function demoteMember(conversationId: string, targetDid: string): P
 }
 
 export async function removeGroupMember(conversationId: string, targetDid: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
-	return invoke('remove_group_member', { ownerDid, conversationId, targetDid });
+	return invoke('remove_group_member', { ownerDid, ownerRevision, conversationId, targetDid });
 }
 
 export interface SearchHit {
@@ -309,10 +318,10 @@ export async function updateGroupMetadata(
 	description?: string,
 	avatarBlobLocator?: string,
 	avatarContentType?: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
 	return invoke('update_group_metadata', {
-		ownerDid,
+		ownerDid, ownerRevision,
 		conversationId,
 		name,
 		description,
@@ -325,9 +334,9 @@ export async function reportSpam(
 	conversationId: string,
 	reportedDid: string,
 	reason?: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
-	return invoke('report_spam', { ownerDid, conversationId, reportedDid, reason });
+	return invoke('report_spam', { ownerDid, ownerRevision, conversationId, reportedDid, reason });
 }
 
 // ── Layer 3 quarantine ───────────────────────────────────────────────────────
@@ -369,7 +378,7 @@ export async function getQuarantineState(
 }
 
 export async function confirmManualReset(conversationId: string,
-	ownerDid?: string
+	ownerDid?: string, ownerRevision?: string
 ): Promise<void> {
-	return invoke('confirm_manual_reset', { ownerDid, conversationId });
+	return invoke('confirm_manual_reset', { ownerDid, ownerRevision, conversationId });
 }

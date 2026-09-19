@@ -19,6 +19,7 @@ function newer(old: DirectRequestView | undefined, incoming: DirectRequestView):
 export function createRequestsStore() {
   const store = writable<RequestState>(empty());
   let epoch = 0;
+  let authRevision: string | undefined;
   const saves = new Map<string, Promise<void>>();
   const active = (owner: string, revision: number) => get(store).ownerDid === owner && epoch === revision;
   const mergeView = (view: DirectRequestView) => store.update(s => ({ ...s, views: [...s.views.filter(v => v.conversationId !== view.conversationId), newer(s.views.find(v => v.conversationId === view.conversationId), view)] }));
@@ -34,7 +35,7 @@ export function createRequestsStore() {
     const id=updated.input.draftId;
     const save=(saves.get(id) ?? Promise.resolve()).then(async()=>{
       if(!active(owner,revision))return;
-      try { const saved=await api.saveRequestDraft(owner,updated.input,updated.recipientLabel); if(active(owner,revision) && JSON.stringify(get(store).drafts.find(d=>d.input.draftId===id)?.input)===JSON.stringify(updated.input))mergeDraft(saved); }
+      try { const saved=await api.saveRequestDraft(owner,updated.input,updated.recipientLabel,authRevision); if(active(owner,revision) && JSON.stringify(get(store).drafts.find(d=>d.input.draftId===id)?.input)===JSON.stringify(updated.input))mergeDraft(saved); }
       catch(e){if(active(owner,revision))store.update(s=>({...s,error:String(e)}));}
     });
     saves.set(id,save);await save;
@@ -43,13 +44,13 @@ export function createRequestsStore() {
     const owner=get(store).ownerDid, revision=epoch; if(!owner || !api.requestBackendAvailable) return;
     store.update(s=>({...s,loading:true}));
     try {
-      const value=await api.getRequestWorkspace(owner); if(!active(owner,revision) || value.ownerDid!==owner) return;
+      const value=await api.getRequestWorkspace(owner,authRevision); if(!active(owner,revision) || value.ownerDid!==owner) return;
       store.update(s=>({...s,notice:value.discoveryError ?? null,deliveryEnabled:value.deliveryEnabled ?? null,drafts:[...s.drafts.filter(local=>!value.drafts.some(saved=>saved.input.draftId===local.input.draftId)),...value.drafts.map(saved=>{const local=s.drafts.find(d=>d.input.draftId===saved.input.draftId);return local?.phase==='draft'&&saved.phase==='draft'?local:saved;})],views:value.requests.reduce((all,v)=>{const previous=all.find(x=>x.conversationId===v.conversationId);return [...all.filter(x=>x.conversationId!==v.conversationId),newer(previous,v)];},s.views),loading:false}));
     } catch(e) { if(active(owner,revision)) store.update(s=>({...s,loading:false,error:String(e)})); }
   }
   return {
     subscribe: store.subscribe,
-    bindAccount(ownerDid: string | null) { if(get(store).ownerDid===ownerDid)return; epoch++; saves.clear(); store.set({...empty(),ownerDid}); },
+    bindAccount(ownerDid: string | null, revision?: string) { if(get(store).ownerDid===ownerDid && authRevision===revision)return; authRevision=revision; epoch++; saves.clear(); store.set({...empty(),ownerDid}); },
     load,
     showInbox() { store.update(s=>({...s,pane:'inbox',selectedId:null,error:null})); },
     hide() { store.update(s=>({...s,pane:'none',selectedId:null,error:null})); },
@@ -75,22 +76,22 @@ export function createRequestsStore() {
     async send(id: string) { await operation(async owner=>{
       const revision=epoch, draft=get(store).drafts.find(d=>d.input.draftId===id); if(!draft)return;
       await saves.get(id); if(!active(owner,revision))return;
-      const persisted=await api.saveRequestDraft(owner,draft.input,draft.recipientLabel); if(!active(owner,revision))return;
+      const persisted=await api.saveRequestDraft(owner,draft.input,draft.recipientLabel,authRevision); if(!active(owner,revision))return;
       mergeDraft({...persisted,phase:'attempted'});
-      const result=await api.submitRequestDraft(owner,id); if(!active(owner,revision))return;
+      const result=await api.submitRequestDraft(owner,id,authRevision); if(!active(owner,revision))return;
       mergeDraft(result); await load();
     }); },
-    async resume(id: string) { await operation(async owner=>{const revision=epoch; const result=await api.resumeRequestDraft(owner,id);if(active(owner,revision)){mergeDraft(result);await load();}}); },
+    async resume(id: string) { await operation(async owner=>{const revision=epoch; const result=await api.resumeRequestDraft(owner,id,authRevision);if(active(owner,revision)){mergeDraft(result);await load();}}); },
     async cancel(id: string) { await operation(async owner=>{const revision=epoch; const draft=get(store).drafts.find(d=>d.input.draftId===id);if(!draft)return;
       if(draft.phase==='draft'&&!api.requestBackendAvailable){mergeDraft({...draft,archived:true});store.update(s=>({...s,pane:'inbox'}));return;}
-      await api.saveRequestDraft(owner,draft.input,draft.recipientLabel);if(!active(owner,revision))return;const result=await api.cancelRequestDraft(owner,id);if(active(owner,revision)){mergeDraft(result);if(result.archived)store.update(s=>({...s,pane:'inbox'}));}
+      await api.saveRequestDraft(owner,draft.input,draft.recipientLabel,authRevision);if(!active(owner,revision))return;const result=await api.cancelRequestDraft(owner,id,authRevision);if(active(owner,revision)){mergeDraft(result);if(result.archived)store.update(s=>({...s,pane:'inbox'}));}
     }); },
-    async sendInvitationNote(id:string) { await operation(async owner=>{const revision=epoch;try {const draft=await api.sendExistingInvitationNote(owner,id);if(active(owner,revision))mergeDraft(draft);} finally {if(active(owner,revision))await load();}}); },
-    async refresh(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.refreshDirectRequest(owner,id);if(active(owner,revision))mergeView(view);}); },
-    async accept(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.acceptDirectRequest(owner,id);if(active(owner,revision))mergeView(view);}); },
-    async close(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.closeDirectRequest(owner,id);if(active(owner,revision))mergeView(view);}); },
-    async block(id:string) { await operation(async owner=>{const revision=epoch;await api.blockRequestSender(owner,id);if(active(owner,revision))store.update(s=>({...s,notice:'Sender blocked. You can close this request separately.'}));}); },
-    async setDeliveryEnabled(enabled: boolean) { await operation(async owner => {const revision=epoch;await api.setRequestDeliveryEnabled(owner, enabled);if(active(owner,revision))store.update(s=>({...s,deliveryEnabled:enabled,notice:enabled?'Encrypted request delivery enabled for this device.':'New request delivery turned off for this device.'})); }); },
+    async sendInvitationNote(id:string) { await operation(async owner=>{const revision=epoch;try {const draft=await api.sendExistingInvitationNote(owner,id,authRevision);if(active(owner,revision))mergeDraft(draft);} finally {if(active(owner,revision))await load();}}); },
+    async refresh(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.refreshDirectRequest(owner,id,authRevision);if(active(owner,revision))mergeView(view);}); },
+    async accept(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.acceptDirectRequest(owner,id,authRevision);if(active(owner,revision))mergeView(view);}); },
+    async close(id:string) { await operation(async owner=>{const revision=epoch;const view=await api.closeDirectRequest(owner,id,authRevision);if(active(owner,revision))mergeView(view);}); },
+    async block(id:string) { await operation(async owner=>{const revision=epoch;await api.blockRequestSender(owner,id,authRevision);if(active(owner,revision))store.update(s=>({...s,notice:'Sender blocked. You can close this request separately.'}));}); },
+    async setDeliveryEnabled(enabled: boolean) { await operation(async owner => {const revision=epoch;await api.setRequestDeliveryEnabled(owner, enabled,authRevision);if(active(owner,revision))store.update(s=>({...s,deliveryEnabled:enabled,notice:enabled?'Encrypted request delivery enabled for this device.':'New request delivery turned off for this device.'})); }); },
     applyView(owner:string,view:DirectRequestView) { if(get(store).ownerDid===owner)mergeView(view); },
     canUseOrdinaryActivity(id:string) { const view=get(store).views.find(v=>v.conversationId===id);return !view || (view.consent==='accepted'&&view.capabilities.canSend&&view.capabilities.canEmitReceipts); }
   };
