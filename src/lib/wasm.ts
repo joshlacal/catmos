@@ -106,7 +106,7 @@ function getWorker(): Remote<WorkerApi> {
  * Get the per-account database key through its persistent wrapping key.
  * Legacy session keys are migrated without replacing existing database custody.
  */
-async function getOrCreateMlsDbKey(did: string): Promise<{ key: string; dbPrefix: string }> {
+async function getOrCreateMlsDbKey(did: string): Promise<{ key: string; dbPrefix: string; contentRootKey: Uint8Array }> {
 	if (!did.startsWith('did:') || !navigator.locks || !globalThis.indexedDB) throw new Error('Protected persistent browser storage is unavailable.');
 	return navigator.locks.request('catbird-protected-database-keys-v1', async () => {
 		const db = await new Promise<IDBDatabase>((resolve, reject) => {
@@ -155,27 +155,29 @@ async function getOrCreateMlsDbKey(did: string): Promise<{ key: string; dbPrefix
 				await write(id, { iv, ciphertext, dbPrefix });
 			}
 			if (bytes.byteLength !== 32) throw new Error('Protected database key has invalid length.');
-			return { key: Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(''), dbPrefix };
+			const contentId = `content:${id}`;
+			const contentAad = new TextEncoder().encode(`catbird.content.key.v1:${did}`);
+			const contentRecord = await read(contentId) as { iv: Uint8Array; ciphertext: ArrayBuffer } | undefined;
+			let contentRootKey: Uint8Array;
+			if (contentRecord) {
+				contentRootKey = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: contentRecord.iv as BufferSource, additionalData: contentAad }, wrapping, contentRecord.ciphertext));
+			} else {
+				const legacy = localStorage.getItem(CONTENT_ROOT_PREFIX + id);
+				contentRootKey = legacy ? Uint8Array.from(atob(legacy), value => value.charCodeAt(0)) : crypto.getRandomValues(new Uint8Array(32));
+				if (contentRootKey.byteLength !== 32) throw new Error('Existing content key is invalid; custody was retained.');
+				const iv = crypto.getRandomValues(new Uint8Array(12));
+				const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: contentAad }, wrapping, contentRootKey as BufferSource);
+				await write(contentId, { iv, ciphertext });
+			}
+			if (contentRootKey.byteLength !== 32) throw new Error('Protected content key has invalid length.');
+			return { key: Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join(''), dbPrefix, contentRootKey };
 		} finally { db.close(); }
 	});
 }
 
 // ---------------------------------------------------------------------------
-// MLS field-level encryption: per-DID content root key (localStorage)
-//
-// The 32-byte content root key feeds catbird-mls's field_encryption layer:
-//   - per-conversation AES-GCM content keys (envelope around `text`)
-//   - per-conversation HMAC chain keys (tamper-evident transcript)
-//
-// Persisted in localStorage so cold-starts on the same browser profile
-// can decrypt the existing transcript. Namespaced by sha256(did) so that
-// (a) DID strings don't end up readable in DevTools and (b) multi-account
-// scenarios stay isolated. Browser localStorage is per-origin so the key
-// never leaks across catmos / Bluesky / unrelated sites.
-//
-// This is intentionally separate from the SQLCipher DB key (sessionStorage)
-// so that compromise of the DB-at-rest key alone (where sealed rows live)
-// doesn't directly expose decrypted message bodies.
+// MLS field-level content keys use the same persistent wrapping vault. Legacy
+// plaintext keys are imported once without replacing incompatible custody.
 // ---------------------------------------------------------------------------
 
 const CONTENT_ROOT_PREFIX = 'mls.content.root.';
@@ -188,35 +190,8 @@ async function sha256Hex(input: string): Promise<string> {
 		.join('');
 }
 
-async function contentRootStorageKey(userDid: string): Promise<string> {
-	return CONTENT_ROOT_PREFIX + (await sha256Hex(userDid));
-}
-
-/**
- * Load the per-DID content root key from localStorage, creating a fresh
- * random 32-byte key on first use. Returns the raw bytes so they can be
- * pushed into the Worker via comlink (Uint8Array is structured-cloneable).
- */
 async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> {
-	const storageKey = await contentRootStorageKey(userDid);
-	const existing = localStorage.getItem(storageKey);
-	if (existing) {
-		try {
-			const bytes = Uint8Array.from(atob(existing), (c) => c.charCodeAt(0));
-			if (bytes.length === 32) return bytes;
-			console.warn(
-				'[catmos] content root key has wrong length, regenerating:',
-				bytes.length
-			);
-		} catch (e) {
-			console.warn('[catmos] content root key base64 decode failed, regenerating:', e);
-		}
-	}
-	const fresh = new Uint8Array(32);
-	crypto.getRandomValues(fresh);
-	const b64 = btoa(String.fromCharCode(...fresh));
-	localStorage.setItem(storageKey, b64);
-	return fresh;
+	return (await getOrCreateMlsDbKey(userDid)).contentRootKey;
 }
 
 /**
