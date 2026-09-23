@@ -13,6 +13,8 @@ mod runtime_fixture;
 mod session_restore;
 mod storage;
 mod websocket;
+#[cfg(test)]
+mod request_ipc_tests;
 
 use std::collections::HashMap;
 pub(crate) fn nest_url() -> String {

@@ -1882,8 +1882,32 @@ mod field_encryption_tests {
         assert!(reopened
             .request_draft("did:plc:bob", &draft.input.draft_id)
             .is_err());
-        context.clear_content_root_key();
+        // C30: Account switch: switching bound owner to Bob strictly isolates state.
+        reopened.bind_request_owner(Some("did:plc:bob"));
+        // Querying Alice's draft under Alice's DID while bound to Bob fails with scope error
+        assert!(reopened.request_draft("did:plc:alice", &draft.input.draft_id).is_err());
+        assert!(reopened.save_request_draft("did:plc:alice", &draft).is_err());
+        // Transplanted or forged ciphertext under Bob fails cryptographic decryption
+        assert!(reopened.request_draft("did:plc:bob", &draft.input.draft_id).is_err());
         assert!(reopened.request_drafts("did:plc:bob").is_err());
+        // Clean up the transplanted row and restore Alice's legitimate ownership
+        reopened.conn.lock().unwrap().execute("UPDATE encrypted_request_projection SET owner_did='did:plc:alice'", []).unwrap();
+        // Now Bob cleanly has zero drafts and cannot see Alice's draft
+        assert_eq!(reopened.request_drafts("did:plc:bob").unwrap().len(), 0);
+        assert!(reopened.request_draft("did:plc:bob", &draft.input.draft_id).unwrap().is_none());
+        // Switching back to Alice restores access to Alice's draft
+        reopened.bind_request_owner(Some("did:plc:alice"));
+        assert!(reopened.request_draft("did:plc:alice", &draft.input.draft_id).unwrap().is_some());
+        // C30: Protected storage: raw on-disk bytes contain zero plaintext
+        let disk_bytes = std::fs::read(&path).unwrap();
+        assert!(!String::from_utf8_lossy(&disk_bytes).contains(&draft.input.text));
+        // C30: Protected storage: opening with wrong key fails
+        assert!(SqliteStorage::new(path.to_str().unwrap(), &"ff".repeat(32)).is_err());
+        // C30: Protected storage: unkeyed raw SQLite open fails (not a database without key)
+        let unkeyed_conn = rusqlite::Connection::open(&path).unwrap();
+        assert!(unkeyed_conn.execute_batch("SELECT count(*) FROM sqlite_master;").is_err());
+        context.clear_content_root_key();
+        assert!(reopened.request_drafts("did:plc:alice").is_err());
     }
 
     #[tokio::test]

@@ -249,10 +249,8 @@
 	});
 	function ordinaryAllowed(id: string): boolean {
 		const conversation = $conversations.items.find(c => c.id === id);
-		const view = $requests.views.find(v => v.conversationId === id);
-		return !!$auth.user && !($requests.loading) && (view
-			? view.consent === 'accepted' && view.capabilities.canSend && view.capabilities.canEmitReceipts
-			: conversation?.pendingConsent !== true);
+		const hasView = $requests.views.some(v => v.conversationId === id);
+		return !!$auth.user && !($requests.loading) && (hasView ? requests.canUseOrdinaryActivity(id) : conversation?.pendingConsent !== true);
 	}
 	let activeRequest = $derived($requests.views.find(v => v.conversationId === ($requests.pane === 'request' ? $requests.selectedId : $selectedConversation?.id)));
 	let activeDraft = $derived($requests.drafts.find(d => d.input.draftId === $requests.selectedId));
