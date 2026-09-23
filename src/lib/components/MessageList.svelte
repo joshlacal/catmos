@@ -64,9 +64,11 @@
 			<p class="empty-subtitle">Send a message to start the conversation</p>
 		</div>
 	{:else}
-		<div class="messages-inner">
+		<div class="messages-inner" role="log" aria-live="polite">
 			{#each messages as message, i (message.id)}
-				<MessageBubble {message} showSender={shouldShowSender(i)} {onReply} />
+				<div class="message-item" data-status={message.status ?? 'confirmed'} data-message-id={message.id}>
+					<MessageBubble {message} showSender={shouldShowSender(i)} {onReply} />
+				</div>
 			{/each}
 		</div>
 	{/if}

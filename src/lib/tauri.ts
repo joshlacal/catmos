@@ -49,6 +49,8 @@ export interface Message {
 	/** Canonical conversation sequence; absent or zero means not yet confirmed. */
 	sequenceNumber?: number;
 	status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+	/** Local-only reason a send failed; never present on confirmed rows. */
+	error?: string;
 	messageType?: 'text' | 'image' | 'voice' | 'system' | 'event';
 	image?: ImageAttachment;
 	groupInvitation?: import("./request-types").GroupInvitationReference;

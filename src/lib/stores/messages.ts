@@ -7,6 +7,7 @@ import type {
 	TypingEvent
 } from '$lib/tauri';
 import * as api from '$lib/wasm';
+import { recoveryNotice } from '$lib/recovery';
 
 interface MessagesStore {
 	byConversation: Map<string, Message[]>;
@@ -104,7 +105,7 @@ function createMessagesStore() {
 			const optimistic: Message = {
 				id: `temp-${Date.now()}`,
 				conversationId,
-				senderDid: '',
+				senderDid: operationOwner,
 				senderHandle: 'You',
 				content,
 				timestamp: new Date().toISOString(),
@@ -138,7 +139,9 @@ function createMessagesStore() {
 					byConversation.set(
 						conversationId,
 						existing.map((m) =>
-							m.id === optimistic.id ? { ...m, status: 'failed' as const } : m
+							m.id === optimistic.id
+								? { ...m, status: 'failed' as const, error: recoveryNotice(e).message }
+								: m
 						)
 					);
 					return { ...s, byConversation };
@@ -152,7 +155,7 @@ function createMessagesStore() {
 			const optimistic: Message = {
 				id: `temp-image-${Date.now()}`,
 				conversationId,
-				senderDid: '',
+				senderDid: operationOwner,
 				senderHandle: 'You',
 				content,
 				timestamp: new Date().toISOString(),
@@ -207,7 +210,9 @@ function createMessagesStore() {
 					byConversation.set(
 						conversationId,
 						existing.map((m) =>
-							m.id === optimistic.id ? { ...m, status: 'failed' as const } : m
+							m.id === optimistic.id
+								? { ...m, status: 'failed' as const, error: recoveryNotice(e).message }
+								: m
 						)
 					);
 					return { ...s, byConversation };
@@ -221,7 +226,7 @@ function createMessagesStore() {
 			const optimistic: Message = {
 				id: `temp-voice-${Date.now()}`,
 				conversationId,
-				senderDid: '',
+				senderDid: operationOwner,
 				senderHandle: 'You',
 				content: '',
 				timestamp: new Date().toISOString(),
@@ -271,7 +276,9 @@ function createMessagesStore() {
 					byConversation.set(
 						conversationId,
 						existing.map((m) =>
-							m.id === optimistic.id ? { ...m, status: 'failed' as const } : m
+							m.id === optimistic.id
+								? { ...m, status: 'failed' as const, error: recoveryNotice(e).message }
+								: m
 						)
 					);
 					return { ...s, byConversation };

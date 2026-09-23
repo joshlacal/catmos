@@ -1351,6 +1351,10 @@ pub async fn send_message(
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
+    log_catmos!(
+        " send_message enter: convo={}, owner={}, rev={}",
+        conversation_id, owner_did, owner_revision
+    );
     let _account = crate::request_commands::capture_effect_owner(
         &state.request_scope,
         &owner_did,
@@ -1362,13 +1366,24 @@ pub async fn send_message(
                 .map_err(|_| "Sign in to continue".to_string())
         },
     )
-    .await?;
-    crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
+    .await
+    .map_err(|e| {
+        log_catmos!(" send_message capture_effect_owner rejected: {}", e);
+        e
+    })?;
+    crate::request_commands::require_ordinary_activity(&state, &conversation_id)
+        .await
+        .map_err(|e| {
+            log_catmos!(" send_message require_ordinary_activity rejected: {}", e);
+            e
+        })?;
     state
         .api_client
         .require_canonical_admission()
         .map_err(|error| {
-            actionable_error(format!("Signed clean-chat send unavailable: {error}"))
+            let msg = actionable_error(format!("Signed clean-chat send unavailable: {error}"));
+            log_catmos!(" send_message require_canonical_admission rejected: {}", msg);
+            msg
         })?;
     log_catmos!(" send_message: convo={}", conversation_id);
 

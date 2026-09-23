@@ -1210,19 +1210,6 @@ impl ReqwestApiClient {
         Ok(OwnDevicesSnapshot { devices })
     }
 
-    async fn send_message_request(
-        &self,
-        convo_id: &str,
-        ciphertext: &[u8],
-        epoch: u64,
-        msg_id: &str,
-    ) -> Result<SendMessageResponse> {
-        let _ = (convo_id, ciphertext, epoch, msg_id);
-        Err(OrchestratorError::Api(crate::recovery::actionable_error(
-            "legacy mlsChat sendMessage is disabled; canonical signed application transport is not wired for the generic MLS caller",
-        )))
-    }
-
     /// Internal helper that POSTs a recovery failure report to the server.
     /// Matches the `MLSAPIClient::report_recovery_failure` impl but lives on the
     /// concrete struct so it can be reused by `opt_in` / admin flows later.

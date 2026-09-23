@@ -170,9 +170,9 @@
 					<span class="bubble-time">{formatTime(message.timestamp)}</span>
 					{#if isOwn}
 						{#if message.status === 'sending'}
-							<span class="status-dot sending"></span>
+							<span class="status-dot sending" role="status" aria-label="Sending"></span>
 						{:else if message.status === 'failed'}
-							<span class="status-icon failed">!</span>
+							<span class="status-icon failed" role="img" aria-label="Not sent">!</span>
 						{:else if message.status === 'read'}
 							<svg class="status-check read" width="16" height="10" viewBox="0 0 16 10">
 								<path d="M1 5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -191,6 +191,9 @@
 					{/if}
 				</div>
 			</div>
+			{#if isOwn && message.status === 'failed'}
+				<p class="send-error" role="alert">Not sent: {message.error ?? 'Send failed'}</p>
+			{/if}
 			{#if onReply}
 				<button class="reply-btn" onclick={handleReply} aria-label="Reply">
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -480,5 +483,14 @@
 	/* ── Failed state ── */
 	.message-row.failed .bubble {
 		opacity: 0.6;
+		outline: 1px solid var(--danger);
+	}
+
+	.send-error {
+		margin: 4px 12px 0;
+		font-size: 11px;
+		color: var(--danger);
+		text-align: right;
+		overflow-wrap: anywhere;
 	}
 </style>
