@@ -390,7 +390,7 @@ pub(crate) async fn require_ordinary_activity(
         .api_client
         .request_conversation_policy(conversation_id)
         .await
-        .map_err(|_| "Conversation policy is unavailable")?;
+        .map_err(|error| format!("Conversation policy is unavailable: {error}"))?;
     let owner = state
         .api_client
         .current_session()
