@@ -48,7 +48,7 @@ async fn cleanup_ws_handle(
 /// layer keeps writing legacy plaintext columns until the next attempt.
 /// Idempotent — re-running with the same DID is a no-op once the in-memory
 /// key matches the file on disk.
-fn install_content_root_key(state: &AppState, user_did: &str) {
+pub(crate) fn install_content_root_key(state: &AppState, user_did: &str) {
     state.orchestrator.storage().bind_request_owner(None);
     match crate::keys::load_or_create_content_root_key(&state.data_dir, user_did) {
         Ok(root_key) => {
@@ -575,16 +575,6 @@ async fn refresh_message_delivery_statuses(
             );
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ReactionEvent {
-    pub conversation_id: String,
-    pub message_id: String,
-    pub sender_did: String,
-    pub emoji: String,
-    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1643,59 +1633,10 @@ pub async fn subscribe_conversation(
     )
     .await?;
     crate::request_commands::require_ordinary_activity(&state, &conversation_id).await?;
-    // Don't subscribe twice
-    {
-        let handles = state.ws_handles.lock().await;
-        if handles.contains_key(&conversation_id) {
-            return Ok(());
-        }
-    }
-
-    state
-        .api_client
-        .require_canonical_admission()
-        .map_err(actionable_error)?;
-
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let base_url = crate::nest_url();
-
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let owner = shutdown_tx.clone();
-    let orchestrator = state.orchestrator.clone();
-
-    let handle = WsHandle {
-        shutdown: shutdown_tx,
-    };
-
-    state
-        .ws_handles
-        .lock()
-        .await
-        .insert(conversation_id.clone(), handle);
-
-    let convo_id = conversation_id.clone();
-    let task_convo_id = convo_id.clone();
-    let api_client = state.api_client.clone();
-    let ws_handles = state.ws_handles.clone();
-    tokio::spawn(async move {
-        crate::websocket::subscribe_conversation(
-            app,
-            orchestrator,
-            api_client,
-            base_url,
-            token,
-            task_convo_id,
-            shutdown_rx,
-        )
-        .await;
-        cleanup_ws_handle(&ws_handles, &convo_id, &owner).await;
-    });
-
-    log_catmos!(" subscribe_conversation: convo={}", conversation_id);
+    // The canonical stream is per actor device and already carries this
+    // conversation; a second stream would supersede the global cursor fence.
+    subscribe_all_events(app, state.clone()).await?;
+    log_catmos!(" subscribe_conversation: convo={} served by global stream", conversation_id);
     Ok(())
 }
 
@@ -1735,13 +1676,6 @@ pub async fn subscribe_all_events(
         .require_canonical_admission()
         .map_err(actionable_error)?;
 
-    let token = state
-        .api_client
-        .get_auth_token()
-        .ok_or("Not authenticated")?;
-
-    let base_url = crate::nest_url();
-
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
     let orchestrator = state.orchestrator.clone();
@@ -1753,18 +1687,9 @@ pub async fn subscribe_all_events(
         },
     );
 
-    let api_client = state.api_client.clone();
     let ws_handles = state.ws_handles.clone();
     tokio::spawn(async move {
-        crate::websocket::subscribe_all(
-            app,
-            orchestrator,
-            api_client,
-            base_url,
-            token,
-            shutdown_rx,
-        )
-        .await;
+        crate::websocket::subscribe_all(app, orchestrator, shutdown_rx).await;
         cleanup_ws_handle(&ws_handles, GLOBAL_KEY, &owner).await;
     });
 
