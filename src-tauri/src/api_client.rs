@@ -1626,7 +1626,6 @@ impl MLSAPIClient for ReqwestApiClient {
             | CanonicalOperation::GetLeafRecoveryInbox
             | CanonicalOperation::GetOwnDevices
             | CanonicalOperation::GetPendingWelcomes
-            | CanonicalOperation::GetSubscriptionTicket
             | CanonicalOperation::SubscribeEvents => "GET",
             _ => "POST",
         };
