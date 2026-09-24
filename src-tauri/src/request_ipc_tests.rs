@@ -7,6 +7,7 @@ use crate::credentials::KeyringCredentialStore;
 use crate::storage::SqliteStorage;
 use crate::{commands, request_commands, AppState};
 use catbird_mls::orchestrator::CredentialStore as _;
+use catbird_mls::orchestrator::MlsCryptoContext as _;
 use catbird_mls::{KeychainAccess, MLSContext, MLSError};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -352,6 +353,176 @@ async fn concurrent_ownership_and_storage_fences_prevent_simultaneous_mutation()
     let queued_result = queued_task.await.unwrap();
     assert!(queued_result.is_err());
     assert!(queued_result.unwrap_err().contains("Account session changed while the operation was queued"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_switch_isolates_mls_context_and_intents_stay_unreadable() {
+    use crate::request_commands::RequestDraft;
+    use catbird_mls::orchestrator::DirectRequestInput;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (base, transport) = transport_spy();
+
+    // 1. Setup Alice's isolated context and storage
+    let alice_db_file = tmp.path().join("mls_alice.db");
+    let alice_context = MLSContext::new(
+        alice_db_file.to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    let alice_storage_file = tmp.path().join("catmos_alice.db");
+    let alice_storage = Arc::new(SqliteStorage::new(alice_storage_file.to_str().unwrap(), DB_KEY).unwrap());
+    let alice_api_client = Arc::new(ReqwestApiClient::new(base.clone()));
+    alice_api_client.set_mls_context(alice_context.clone());
+    alice_storage.set_mls_context(alice_context.clone());
+    alice_context.set_content_root_key(vec![0x42; 32]).unwrap();
+    alice_storage.bind_request_owner(Some(ALICE));
+
+    let alice_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        alice_api_client.chat_auth_provider(),
+        alice_context.clone(),
+    ));
+
+    // Seed Alice's device and identity in her own context
+    let alice_dev = "00000000-0000-4000-8000-000000000001";
+    let a_identity = format!("{}#{}", ALICE, alice_dev);
+    alice_context.create_key_package(a_identity.as_bytes().to_vec()).unwrap();
+    let a_private = alice_context.export_identity_key(a_identity.clone()).unwrap();
+    let _ = alice_context.import_identity_key(ALICE.to_string(), a_private.clone());
+    alice_credentials.store_signing_key(ALICE, &a_private).await.unwrap();
+    alice_credentials.store_local_device_uuid(ALICE, alice_dev).await.unwrap();
+    alice_credentials.store_server_device_id(ALICE, alice_dev).await.unwrap();
+
+    let alice_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        alice_context.clone(),
+        alice_storage.clone(),
+        alice_api_client.clone(),
+        alice_credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+
+    // Alice initializes her orchestrator cleanly
+    alice_orchestrator.initialize(ALICE).await.unwrap();
+
+    // 2. Alice saves an encrypted draft with private content
+    let draft_id = uuid::Uuid::new_v4().to_string();
+    let draft = RequestDraft {
+        input: DirectRequestInput {
+            draft_id: draft_id.clone(),
+            recipient_did: PEER.into(),
+            text: SECRET.into(),
+            invitation: None,
+        },
+        recipient_label: "Peer".into(),
+        phase: "draft".into(),
+        outcome: None,
+        archived: false,
+        note_delivery: None,
+    };
+    alice_storage.save_request_draft(ALICE, &draft).unwrap();
+    assert!(alice_storage.request_draft(ALICE, &draft_id).unwrap().is_some());
+    // 3. Alice logs out: tear down Alice's context and storage
+    alice_storage.bind_request_owner(None);
+    alice_context.clear_content_root_key();
+    alice_orchestrator.shutdown().await;
+    alice_api_client.clear_auth();
+
+    // Verify Alice's storage is locked and unreadable while logged out
+    assert!(alice_storage.request_draft(ALICE, &draft_id).is_err());
+    assert!(alice_storage.request_drafts(ALICE).is_err());
+
+    // 4. Bob logs in with his OWN isolated context and storage
+    let bob_db_file = tmp.path().join("mls_bob.db");
+    let bob_context = MLSContext::new(
+        bob_db_file.to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    let bob_storage_file = tmp.path().join("catmos_bob.db");
+    let bob_storage = Arc::new(SqliteStorage::new(bob_storage_file.to_str().unwrap(), DB_KEY).unwrap());
+    let bob_api_client = Arc::new(ReqwestApiClient::new(base.clone()));
+    bob_api_client.set_mls_context(bob_context.clone());
+    bob_storage.set_mls_context(bob_context.clone());
+    bob_context.set_content_root_key(vec![0x77; 32]).unwrap();
+    bob_storage.bind_request_owner(Some(BOB));
+
+    let bob_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        bob_api_client.chat_auth_provider(),
+        bob_context.clone(),
+    ));
+
+    // Seed Bob's device and identity in Bob's own context
+    let bob_dev = "00000000-0000-4000-8000-000000000002";
+    let b_identity = format!("{}#{}", BOB, bob_dev);
+    bob_context.create_key_package(b_identity.as_bytes().to_vec()).unwrap();
+    let b_private = bob_context.export_identity_key(b_identity.clone()).unwrap();
+    let _ = bob_context.import_identity_key(BOB.to_string(), b_private.clone());
+    bob_credentials.store_signing_key(BOB, &b_private).await.unwrap();
+    bob_credentials.store_local_device_uuid(BOB, bob_dev).await.unwrap();
+    bob_credentials.store_server_device_id(BOB, bob_dev).await.unwrap();
+
+    let bob_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        bob_context.clone(),
+        bob_storage.clone(),
+        bob_api_client.clone(),
+        bob_credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+
+    // Bob initializes his orchestrator: MUST hydrate cleanly without any error!
+    bob_orchestrator.initialize(BOB).await.unwrap();
+
+    // 5. Verify Alice's intents and drafts are completely unreadable and absent for Bob
+    assert_eq!(bob_storage.request_drafts(BOB).unwrap().len(), 0, "Bob sees zero drafts");
+    assert!(bob_storage.request_draft(BOB, &draft_id).unwrap().is_none(), "Alice's draft not in Bob store");
+    assert!(bob_storage.request_draft(ALICE, &draft_id).is_err(), "Accessing Alice DID while bound to Bob fails scope check");
+    assert!(bob_context.read_direct_request_intent(&draft_id).unwrap().is_none(), "Alice's intent absent from Bob MLS context");
+    assert_eq!(bob_context.list_direct_request_intents().unwrap().len(), 0, "Bob MLS context has 0 intents");
+
+    // 6. Bob creates his own draft and saves it cleanly
+    let bob_draft_id = uuid::Uuid::new_v4().to_string();
+    let bob_draft = RequestDraft {
+        input: DirectRequestInput {
+            draft_id: bob_draft_id.clone(),
+            recipient_did: PEER.into(),
+            text: "Bob secret introduction".into(),
+            invitation: None,
+        },
+        recipient_label: "Peer".into(),
+        phase: "draft".into(),
+        outcome: None,
+        archived: false,
+        note_delivery: None,
+    };
+    bob_storage.save_request_draft(BOB, &bob_draft).unwrap();
+    assert_eq!(bob_storage.request_drafts(BOB).unwrap().len(), 1);
+    assert_eq!(bob_storage.request_draft(BOB, &bob_draft_id).unwrap().unwrap().input.text, "Bob secret introduction");
+
+    // 7. Bob logs out and Alice logs back in: Alice's state is preserved, Bob's state is absent
+    bob_storage.bind_request_owner(None);
+    bob_context.clear_content_root_key();
+    bob_orchestrator.shutdown().await;
+
+    // Reopen Alice
+    alice_storage.bind_request_owner(Some(ALICE));
+    alice_context.set_content_root_key(vec![0x42; 32]).unwrap();
+    let alice_reopened_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        alice_context.clone(),
+        alice_storage.clone(),
+        alice_api_client.clone(),
+        alice_credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+    alice_reopened_orchestrator.initialize(ALICE).await.unwrap();
+
+    assert_eq!(alice_storage.request_drafts(ALICE).unwrap().len(), 1, "Alice sees her original draft");
+    assert_eq!(alice_storage.request_draft(ALICE, &draft_id).unwrap().unwrap().input.text, SECRET);
+    assert!(alice_storage.request_draft(ALICE, &bob_draft_id).unwrap().is_none(), "Bob's draft absent from Alice store");
+    assert_eq!(alice_context.list_direct_request_intents().unwrap().len(), 0, "Alice context has 0 unisolated intents");
+
+    // All transport effects during this entire multi-account test must be zero
+    let all_effects = transport.lock().unwrap().clone();
+    assert!(all_effects.is_empty(), "account switch and draft operations reached the network: {all_effects:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
