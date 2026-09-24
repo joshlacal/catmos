@@ -174,17 +174,17 @@
 						{:else if message.status === 'failed'}
 							<span class="status-icon failed" role="img" aria-label="Not sent">!</span>
 						{:else if message.status === 'read'}
-							<svg class="status-check read" width="16" height="10" viewBox="0 0 16 10">
+							<svg class="status-check read" width="16" height="10" viewBox="0 0 16 10" role="img" aria-label="Read">
 								<path d="M1 5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 								<path d="M5 5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 							</svg>
 						{:else if message.status === 'delivered'}
-							<svg class="status-check delivered" width="16" height="10" viewBox="0 0 16 10">
+							<svg class="status-check delivered" width="16" height="10" viewBox="0 0 16 10" role="img" aria-label="Delivered">
 								<path d="M1 5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 								<path d="M5 5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 							</svg>
 						{:else if message.status === 'sent'}
-							<svg class="status-check sent" width="12" height="10" viewBox="0 0 12 10">
+							<svg class="status-check sent" width="12" height="10" viewBox="0 0 12 10" role="img" aria-label="Sent">
 								<path d="M1 5l3 3 7-7" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
 							</svg>
 						{/if}

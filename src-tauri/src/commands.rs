@@ -728,18 +728,18 @@ pub async fn complete_login(
         .await
         .map_err(actionable_error)?;
 
+    // Install the per-DID content-root key and bind the request-storage owner
+    // before initialize, which reads retained owner-scoped request
+    // projections. Best-effort: a key failure downgrades to legacy plaintext
+    // writes with a warning rather than blocking login.
+    install_content_root_key(&state, &session.did);
+
     // Initialize orchestrator for this user
     state
         .orchestrator
         .initialize(&session.did)
         .await
         .map_err(|e| actionable_error(format!("{e:?}")))?;
-
-    // Install the per-DID content-root key so the field-level (envelope)
-    // encryption layer can encrypt subsequent message inserts. Best-effort:
-    // a failure here downgrades to legacy plaintext writes with a warning
-    // rather than blocking login.
-    install_content_root_key(&state, &session.did);
 
     // Set auth on API client (before device registration and opt-in, which need auth)
     state
@@ -871,14 +871,15 @@ pub async fn try_restore_session(
                 }
             }
             log_catmos!("Restoring session for DID: {}", session.did);
+            // Bind the per-DID content-root key and request-storage owner
+            // before initialize: initialize reads retained, owner-scoped
+            // request projections and fails closed without that scope.
+            install_content_root_key(&state, &session.did);
             state
                 .orchestrator
                 .initialize(&session.did)
                 .await
                 .map_err(|e| actionable_error(format!("{e:?}")))?;
-            // Install the per-DID content-root key for the field-level
-            // encryption layer; see `complete_login` for rationale.
-            install_content_root_key(&state, &session.did);
             state.api_client.set_auth(session.did.clone(), sid.clone());
 
             // Reconcile before any registration. An existing UUID with a
