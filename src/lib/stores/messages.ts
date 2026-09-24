@@ -65,7 +65,12 @@ function createMessagesStore() {
 				});
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
-					byConversation.set(conversationId, sortMessages(deduped));
+					// A reload must not silently drop a local send that is still
+					// pending or failed; those rows exist only in this store.
+					const unconfirmed = (byConversation.get(conversationId) ?? []).filter(
+						(m) => (m.status === 'sending' || m.status === 'failed') && !seen.has(m.id)
+					);
+					byConversation.set(conversationId, sortMessages([...deduped, ...unconfirmed]));
 					return { ...s, byConversation, loading: false };
 				});
 			} catch {

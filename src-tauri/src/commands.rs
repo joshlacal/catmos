@@ -1253,25 +1253,34 @@ pub async fn create_group(
     })
 }
 
-/// Resolve the hex MLS group id for a canonical conversation id (UUID).
+/// Fence a send on the current local MLS group for a canonical conversation.
 ///
-/// The canonical projection exposes the UUID `conversationId` and the hex
-/// `groupId` as separate fields; the Rust orchestrator hex-decodes the id it
-/// is handed and encrypts under that MLS group. Every send must translate at
-/// the boundary or the orchestrator fails with "Invalid hex group ID".
-async fn resolve_group_id(state: &AppState, conversation_id: &str) -> Result<String, String> {
+/// Sends are addressed to the orchestrator by canonical conversation UUID: it
+/// resolves the current group itself, and its commit catch-up and canonical
+/// reads (`getEntries`, `getConversationState`) require the UUID. This check
+/// only fails closed when the persisted group mapping is stale or missing.
+async fn send_address(state: &AppState, conversation_id: &str) -> Result<String, String> {
     let user_did = state
         .orchestrator
         .api_client()
         .current_did()
         .await
         .unwrap_or_default();
-    resolve_current_group_id(
+    send_address_in(
         state.orchestrator.storage().as_ref(),
         &user_did,
         conversation_id,
     )
     .await
+}
+
+async fn send_address_in<S: MLSStorageBackend + ?Sized>(
+    storage: &S,
+    user_did: &str,
+    conversation_id: &str,
+) -> Result<String, String> {
+    resolve_current_group_id(storage, user_did, conversation_id).await?;
+    Ok(conversation_id.to_string())
 }
 
 /// Resolve a reaction/send coordinate only when the persisted group state
@@ -1377,23 +1386,19 @@ pub async fn send_message(
         })?;
     log_catmos!(" send_message: convo={}", conversation_id);
 
-    // The canonical projection exposes the UUID conversationId and the hex
-    // groupId as separate fields; the Rust orchestrator hex-decodes the id it
-    // is handed. Translate at the send boundary so the orchestrator encrypts
-    // under the MLS group, not the UUID.
-    let group_id = resolve_group_id(&state, &conversation_id).await?;
+    let target = send_address(&state, &conversation_id).await?;
 
     let msg = state
         .orchestrator
-        .send_message(&group_id, &content)
+        .send_message(&target, &content)
         .await
         .map_err(|e| {
             log_catmos!(" send_message error: {:?}", e);
             actionable_error(format!("{e:?}"))
         })?;
 
-    // The orchestrator stamps the hex group id on the message; the UI keys
-    // conversations by the canonical UUID, so restore it at the boundary.
+    // The UI keys conversations by the canonical UUID; keep it authoritative
+    // regardless of the identifier the orchestrator stamps on the message.
     let mut ui = ui_message_from_orchestrator(msg);
     ui.conversation_id = conversation_id;
     Ok(ui)
@@ -1470,11 +1475,11 @@ pub async fn send_image(
     )
     .map_err(|e| e.to_string())?;
 
-    let group_id = resolve_group_id(&state, &conversation_id).await?;
+    let target = send_address(&state, &conversation_id).await?;
 
     let msg = state
         .orchestrator
-        .send_message_with_embed(&group_id, &content, embed)
+        .send_message_with_embed(&target, &content, embed)
         .await
         .map_err(|e| {
             log_catmos!(" send_image error: {:?}", e);
@@ -1835,13 +1840,11 @@ pub async fn send_reaction(
         catbird_mls::orchestrator::types::ReactionAction::Add
     };
 
-    // Resolve the stable conversation UUID to the current hex MLS group ID
-    // before the reaction enters the Rust orchestrator.
-    let group_id = resolve_group_id(&state, &conversation_id).await?;
+    let target = send_address(&state, &conversation_id).await?;
 
     state
         .orchestrator
-        .send_reaction(&group_id, &message_id, &emoji, reaction_action)
+        .send_reaction(&target, &message_id, &emoji, reaction_action)
         .await
         .map_err(|e| {
             log_catmos!(" send_reaction error: {:?}", e);
@@ -3240,7 +3243,7 @@ pub async fn confirm_manual_reset(
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_ws_handle, resolve_current_group_id, restore_registered_signer,
+        cleanup_ws_handle, resolve_current_group_id, restore_registered_signer, send_address_in,
         validate_current_group_id,
     };
     use crate::credentials::KeyringCredentialStore;
@@ -3440,15 +3443,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reaction_resolution_feeds_the_actual_orchestrator_call() {
+    async fn sends_are_addressed_by_canonical_conversation_id_not_group_id() {
         let temp = tempfile::tempdir().expect("temporary storage directory");
-        let storage_db = temp.path().join("commands-orchestrator.sqlite");
-        let mls_db = temp.path().join("commands-orchestrator-mls.sqlite");
-        let storage = Arc::new(
-            SqliteStorage::new(storage_db.to_str().unwrap(), "test-key")
-                .expect("storage should open"),
-        );
-        let did = "did:plc:reaction-owner";
+        let storage_db = temp.path().join("commands-send-address.sqlite");
+        let storage = SqliteStorage::new(storage_db.to_str().unwrap(), "test-key")
+            .expect("storage should open");
+        let did = "did:plc:send-owner";
         let conversation_id = "00000000-0000-4000-8000-000000000002";
         let group_id = "0123456789abcdef";
         storage
@@ -3464,57 +3464,21 @@ mod tests {
             })
             .await
             .expect("group state should be persisted");
-        // New SQLite rows use the historical `Active` default for backwards
-        // compatibility, while the orchestrator rehydrates JSON. Seed the
-        // canonical JSON state before exercising the real initialize/send
-        // path so this test reaches the transport boundary.
-        storage
-            .set_conversation_state(conversation_id, ConversationState::Active)
-            .await
-            .expect("conversation state should be persisted");
 
-        let resolved = resolve_current_group_id(storage.as_ref(), did, conversation_id)
-            .await
-            .expect("fresh storage mapping should resolve");
-        let context = MLSContext::new(
-            mls_db.to_string_lossy().to_string(),
-            "test-key".to_string(),
-            Box::new(TestKeychain {
-                values: Mutex::new(HashMap::new()),
-            }),
-        )
-        .expect("MLS context should initialize");
-        let api_client = Arc::new(crate::api_client::ReqwestApiClient::new(
-            "http://127.0.0.1:1".to_string(),
-        ));
-        let credentials = Arc::new(
-            crate::credentials::KeyringCredentialStore::try_new()
-                .expect("credential store should initialize"),
+        // The core's send catch-up and canonical reads (getEntries,
+        // getConversationState) use this value verbatim as conversationId; the
+        // service rejects the hex group id as InvalidRequest.
+        assert_eq!(
+            send_address_in(&storage, did, conversation_id)
+                .await
+                .expect("current group mapping should admit the send"),
+            conversation_id
         );
-        let orchestrator = Arc::new(crate::CatmosOrchestrator::new(
-            context,
-            storage,
-            api_client,
-            credentials,
-            catbird_mls::orchestrator::OrchestratorConfig::default(),
-        ));
-        orchestrator
-            .initialize(did)
-            .await
-            .expect("orchestrator should initialize");
-
-        let error = orchestrator
-            .send_reaction(
-                &resolved,
-                "00000000-0000-4000-8000-000000000003",
-                "👍",
-                catbird_mls::orchestrator::types::ReactionAction::Add,
-            )
-            .await
-            .expect_err("the unauthenticated fixture should stop at transport");
         assert!(
-            !error.to_string().contains("Invalid hex group ID"),
-            "actual orchestrator call must receive the resolved hex group ID: {error}"
+            send_address_in(&storage, did, "00000000-0000-4000-8000-00000000000f")
+                .await
+                .is_err(),
+            "a conversation without a current group mapping must fail closed"
         );
     }
 
