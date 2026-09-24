@@ -225,7 +225,10 @@ async fn operate(
             state.orchestrator.storage().save_request_draft(&session.actor_did, &draft)?;
             Ok(draft)
         }
-        Err(_) => Err("Delivery is not confirmed. Your draft is saved; check delivery or retry the same request.".into()),
+        Err(e) => {
+            eprintln!("operate error: {:?}", e);
+            Err("Delivery is not confirmed. Your draft is saved; check delivery or retry the same request.".into())
+        }
     }
 }
 #[tauri::command]

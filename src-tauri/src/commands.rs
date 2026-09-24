@@ -233,7 +233,7 @@ fn clear_saved_session_credentials() {
 /// Install only opaque runtime capabilities after login/device enrollment.
 /// Persisted session/device identifiers never enter command logs; DPoP
 /// binding evidence is admitted only through the runtime authority provider.
-async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) -> Result<(), String> {
+pub(crate) async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) -> Result<(), String> {
     state
         .api_client
         .set_auth(did.to_string(), session_id.to_string());
