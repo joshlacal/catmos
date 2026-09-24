@@ -191,3 +191,173 @@ fn draft_entrypoints_and_account_switch_have_zero_transport_effects() {
     eprintln!("transport effects observed: {all:?}");
     assert!(all.is_empty(), "draft-only entrypoints and account switch reached the network: {all:?}");
 }
+
+#[tokio::test]
+async fn concurrent_ownership_and_storage_fences_prevent_simultaneous_mutation() {
+    use crate::request_commands::RequestDraft;
+    use catbird_mls::orchestrator::DirectRequestInput;
+    let tmp = tempfile::tempdir().unwrap();
+    let shared_db = tmp.path().join("concurrent_shared.db");
+    let db_path = shared_db.to_str().unwrap();
+
+    // 1. Two separate SqliteStorage instances opening the SAME physical database file
+    let storage_a = Arc::new(SqliteStorage::new(db_path, DB_KEY).unwrap());
+    let storage_b = Arc::new(SqliteStorage::new(db_path, DB_KEY).unwrap());
+
+    let ctx_a = MLSContext::new(
+        tmp.path().join("mls_a.db").to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    ctx_a.set_content_root_key(vec![0xAA; 32]).unwrap();
+    storage_a.set_mls_context(ctx_a.clone());
+    storage_a.bind_request_owner(Some(ALICE));
+
+    let ctx_b = MLSContext::new(
+        tmp.path().join("mls_b.db").to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    ctx_b.set_content_root_key(vec![0xBB; 32]).unwrap();
+    storage_b.set_mls_context(ctx_b.clone());
+    storage_b.bind_request_owner(Some(BOB));
+
+    let draft_alice = RequestDraft {
+        input: DirectRequestInput {
+            draft_id: uuid::Uuid::new_v4().to_string(),
+            recipient_did: PEER.into(),
+            text: "Alice exclusive draft".into(),
+            invitation: None,
+        },
+        recipient_label: "Peer".into(),
+        phase: "draft".into(),
+        outcome: None,
+        archived: false,
+        note_delivery: None,
+    };
+
+    // Instance A writes Alice's draft successfully
+    storage_a.save_request_draft(ALICE, &draft_alice).unwrap();
+    assert_eq!(
+        storage_a.request_draft(ALICE, &draft_alice.input.draft_id).unwrap().unwrap().input.text,
+        "Alice exclusive draft"
+    );
+
+    // 2. Instance B (bound to Bob) CANNOT read Alice's draft
+    let cross_read = storage_b.request_draft(ALICE, &draft_alice.input.draft_id);
+    assert!(cross_read.is_err());
+    assert!(cross_read.unwrap_err().contains("Account storage scope changed"));
+
+    // 3. Instance B CANNOT write or mutate under Alice's DID
+    let mut forged_draft = draft_alice.clone();
+    forged_draft.input.text = "Bob forged mutation of Alice draft".into();
+    let cross_write = storage_b.save_request_draft(ALICE, &forged_draft);
+    assert!(cross_write.is_err());
+    assert!(cross_write.unwrap_err().contains("Account storage scope changed"));
+
+    // Verify Alice's draft in the database is completely unmutated
+    assert_eq!(
+        storage_a.request_draft(ALICE, &draft_alice.input.draft_id).unwrap().unwrap().input.text,
+        "Alice exclusive draft"
+    );
+
+    // 4. Bob's draft list in the shared file is empty
+    assert!(storage_b.request_drafts(BOB).unwrap().is_empty());
+    assert!(storage_b.request_draft(BOB, &draft_alice.input.draft_id).unwrap().is_none());
+
+    let raw_conn = rusqlite::Connection::open(db_path).unwrap();
+    raw_conn.execute_batch(&format!("PRAGMA key = '{DB_KEY}';")).unwrap();
+    raw_conn.execute(
+        "UPDATE encrypted_request_projection SET owner_did=?1 WHERE record_id=?2",
+        rusqlite::params![BOB, &draft_alice.input.draft_id],
+    ).unwrap();
+    let tamper_read = storage_b.request_draft(BOB, &draft_alice.input.draft_id);
+    assert!(tamper_read.is_err());
+    assert!(tamper_read.unwrap_err().contains("Request storage is locked or belongs to another account"));
+    // Restore legitimate row
+    raw_conn.execute(
+        "UPDATE encrypted_request_projection SET owner_did=?1 WHERE record_id=?2",
+        rusqlite::params![ALICE, &draft_alice.input.draft_id],
+    ).unwrap();
+    let draft_bob = RequestDraft {
+        input: DirectRequestInput {
+            draft_id: uuid::Uuid::new_v4().to_string(),
+            recipient_did: PEER.into(),
+            text: "Bob exclusive draft".into(),
+            invitation: None,
+        },
+        recipient_label: "Peer".into(),
+        phase: "draft".into(),
+        outcome: None,
+        archived: false,
+        note_delivery: None,
+    };
+    storage_b.save_request_draft(BOB, &draft_bob).unwrap();
+
+    let sa = storage_a.clone();
+    let sb = storage_b.clone();
+    let id_a = draft_alice.input.draft_id.clone();
+    let id_b = draft_bob.input.draft_id.clone();
+    let task_id_a = id_a.clone();
+    let handle_a = tokio::spawn(async move {
+        for i in 0..20 {
+            let mut d = sa.request_draft(ALICE, &task_id_a).unwrap().unwrap();
+            d.recipient_label = format!("Label-A-{i}");
+            sa.save_request_draft(ALICE, &d).unwrap();
+        }
+    });
+    let task_id_b = id_b.clone();
+    let handle_b = tokio::spawn(async move {
+        for i in 0..20 {
+            let mut d = sb.request_draft(BOB, &task_id_b).unwrap().unwrap();
+            d.recipient_label = format!("Label-B-{i}");
+            sb.save_request_draft(BOB, &d).unwrap();
+        }
+    });
+    handle_a.await.unwrap();
+    handle_b.await.unwrap();
+    let check_conn = rusqlite::Connection::open(db_path).unwrap();
+    check_conn.execute_batch(&format!("PRAGMA key = '{DB_KEY}';")).unwrap();
+    let integrity: String = check_conn.query_row(
+        "PRAGMA integrity_check;", [], |r| r.get(0)
+    ).unwrap();
+    assert_eq!(integrity, "ok");
+    assert_eq!(storage_a.request_draft(ALICE, &id_a).unwrap().unwrap().recipient_label, "Label-A-19");
+    assert_eq!(storage_b.request_draft(BOB, &id_b).unwrap().unwrap().recipient_label, "Label-B-19");
+
+    // 7. Session race fence via capture_effect_owner
+    let scope = Arc::new(tokio::sync::Mutex::new(()));
+    let session_state = Arc::new(Mutex::new(crate::api_client::ChatSessionSnapshot {
+        actor_did: ALICE.into(),
+        token: "session-1".into(),
+        revision: 1,
+    }));
+    let scope_guard = scope.lock().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let entered_slot = Mutex::new(Some(entered_tx));
+    let queued_scope = scope.clone();
+    let queued_session = session_state.clone();
+    let queued_task = tokio::spawn(async move {
+        request_commands::capture_effect_owner(&queued_scope, ALICE, "1", || {
+            let session = queued_session.lock().unwrap().clone();
+            if let Some(tx) = entered_slot.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            Ok(session)
+        }).await.map(|_guard| ())
+    });
+    entered_rx.await.unwrap();
+    // Now queued_task has taken the pre-await snapshot and is blocked on scope
+    session_state.lock().unwrap().actor_did = BOB.into();
+    session_state.lock().unwrap().revision = 2;
+    // Release scope: queued task must be rejected atomically upon wake
+    drop(scope_guard);
+    let queued_result = queued_task.await.unwrap();
+    assert!(queued_result.is_err());
+    assert!(queued_result.unwrap_err().contains("Account session changed while the operation was queued"));
+
+    // 8. Storage unbinding fence: unbinding the owner blocks any further mutations
+    storage_a.bind_request_owner(None);
+    assert!(storage_a.request_draft(ALICE, &id_a).is_err());
+    assert!(storage_a.save_request_draft(ALICE, &draft_alice).is_err());
+}
