@@ -47,9 +47,9 @@ def package_row(
     wasm_path = ROOT / "catbird-mls-web/pkg/catbird_mls_web_bg.wasm"
     wasm_bytes, wasm_sha = sha256_file(wasm_path)
     
-    desktop_bin = ROOT / "catmos/src-tauri/target/debug/catmos"
+    desktop_bin = ROOT / "catmos/src-tauri/target/debug/bundle/macos/Catmos Request Fixture.app/Contents/MacOS/catmos"
     if not desktop_bin.exists():
-        desktop_bin = find_desktop_binary()
+        desktop_bin = ROOT / "catmos/src-tauri/target/debug/catmos"
     bin_bytes, bin_sha = sha256_file(desktop_bin)
 
     binary_hashes = [

@@ -24,7 +24,13 @@ const BOB: &str = "did:plc:c29bobbbbbbbbbbbbbbbbbbb";
 const PEER: &str = "did:plc:c29peerpppppppppppppppp";
 const SECRET: &str = "C29 private introduction that must stay local";
 
-struct MemoryKeychain(Mutex<HashMap<String, Vec<u8>>>);
+#[derive(Clone)]
+struct MemoryKeychain(Arc<Mutex<HashMap<String, Vec<u8>>>>);
+impl MemoryKeychain {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+}
 #[async_trait::async_trait]
 impl KeychainAccess for MemoryKeychain {
     async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
@@ -98,7 +104,7 @@ fn draft_entrypoints_and_account_switch_have_zero_transport_effects() {
     let mls_context = MLSContext::new(
         tmp.path().join("mls.db").to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(MemoryKeychain::new()),
     )
     .unwrap();
     api_client.set_mls_context(mls_context.clone());
@@ -211,7 +217,7 @@ async fn concurrent_ownership_and_storage_fences_prevent_simultaneous_mutation()
     let context = MLSContext::new(
         mls_path.to_string(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(MemoryKeychain::new()),
     ).unwrap();
     context.set_content_root_key(vec![0x42; 32]).unwrap();
     storage.set_mls_context(context.clone());
@@ -368,7 +374,7 @@ async fn account_switch_isolates_mls_context_and_intents_stay_unreadable() {
     let alice_context = MLSContext::new(
         alice_db_file.to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(MemoryKeychain::new()),
     ).unwrap();
     let alice_storage_file = tmp.path().join("catmos_alice.db");
     let alice_storage = Arc::new(SqliteStorage::new(alice_storage_file.to_str().unwrap(), DB_KEY).unwrap());
@@ -436,7 +442,7 @@ async fn account_switch_isolates_mls_context_and_intents_stay_unreadable() {
     let bob_context = MLSContext::new(
         bob_db_file.to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(MemoryKeychain::new()),
     ).unwrap();
     let bob_storage_file = tmp.path().join("catmos_bob.db");
     let bob_storage = Arc::new(SqliteStorage::new(bob_storage_file.to_str().unwrap(), DB_KEY).unwrap());
@@ -623,8 +629,13 @@ async fn catmos_browser_live_row() {
     let bob_session = sessions["accounts"].as_array().unwrap().iter().find(|a| a["label"] == "bob").unwrap()["session"].as_str().unwrap();
 
     // 4. Start Vite
+    let _ = Command::new("sh")
+        .args(["-c", "lsof -ti :5173 | xargs kill -9 2>/dev/null || true; rm -rf node_modules/.vite"])
+        .current_dir(format!("{workspace}/catmos"))
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let vite_child = Command::new("node")
-        .args(["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort", "--mode", "local-runtime-fixture"])
+        .args(["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort", "--force", "--mode", "local-runtime-fixture"])
         .current_dir(format!("{workspace}/catmos"))
         .env("VITE_LOCAL_REQUEST_FIXTURE_ORIGIN", manifest["origin"].as_str().unwrap())
         .env("VITE_LOCAL_REQUEST_FIXTURE_RUN_ID", uuid::Uuid::new_v4().to_string())
@@ -660,10 +671,11 @@ async fn catmos_browser_live_row() {
     let host_db = tmp.path().join("catmos_desktop.db");
     let storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
     let api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
+    let desktop_keychain = MemoryKeychain::new();
     let mls_context = MLSContext::new(
         tmp.path().join("mls_desktop.db").to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(desktop_keychain.clone()),
     ).unwrap();
     api_client.set_mls_context(mls_context.clone());
     storage.set_mls_context(mls_context.clone());
@@ -839,7 +851,7 @@ async fn catmos_browser_live_row() {
     let reopened_mls_context = MLSContext::new(
         tmp.path().join("mls_desktop.db").to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(desktop_keychain.clone()),
     ).unwrap();
     reopened_api_client.set_mls_context(reopened_mls_context.clone());
     reopened_storage.set_mls_context(reopened_mls_context.clone());
@@ -865,8 +877,8 @@ async fn catmos_browser_live_row() {
         sync_loop: tokio::sync::Mutex::new(None),
         data_dir: tmp.path().to_path_buf(),
     };
-    reopened_state.orchestrator.initialize(alice_did).await.unwrap();
     commands::install_content_root_key(&reopened_state, alice_did);
+    reopened_state.orchestrator.initialize(alice_did).await.unwrap();
     commands::configure_chat_auth(&reopened_state, alice_did, alice_session).await.unwrap();
     let reopened_alice_rev = reopened_state.api_client.current_session().unwrap().revision.to_string();
 
@@ -912,7 +924,7 @@ async fn catmos_browser_live_row() {
     let r2_mls_context = MLSContext::new(
         tmp.path().join("mls_desktop.db").to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(desktop_keychain.clone()),
     ).unwrap();
     r2_api_client.set_mls_context(r2_mls_context.clone());
     r2_storage.set_mls_context(r2_mls_context.clone());
@@ -938,8 +950,8 @@ async fn catmos_browser_live_row() {
         sync_loop: tokio::sync::Mutex::new(None),
         data_dir: tmp.path().to_path_buf(),
     };
-    r2_state.orchestrator.initialize(alice_did).await.unwrap();
     commands::install_content_root_key(&r2_state, alice_did);
+    r2_state.orchestrator.initialize(alice_did).await.unwrap();
     commands::configure_chat_auth(&r2_state, alice_did, alice_session).await.unwrap();
     let r2_alice_rev = r2_state.api_client.current_session().unwrap().revision.to_string();
 
@@ -1128,8 +1140,13 @@ async fn browser_catmos_live_row() {
     let bob_session = sessions["accounts"].as_array().unwrap().iter().find(|a| a["label"] == "bob").unwrap()["session"].as_str().unwrap();
 
     // 4. Start Vite
+    let _ = Command::new("sh")
+        .args(["-c", "lsof -ti :5173 | xargs kill -9 2>/dev/null || true; rm -rf node_modules/.vite"])
+        .current_dir(format!("{workspace}/catmos"))
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let vite_child = Command::new("node")
-        .args(["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort", "--mode", "local-runtime-fixture"])
+        .args(["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort", "--force", "--mode", "local-runtime-fixture"])
         .current_dir(format!("{workspace}/catmos"))
         .env("VITE_LOCAL_REQUEST_FIXTURE_ORIGIN", manifest["origin"].as_str().unwrap())
         .env("VITE_LOCAL_REQUEST_FIXTURE_RUN_ID", uuid::Uuid::new_v4().to_string())
@@ -1149,6 +1166,85 @@ async fn browser_catmos_live_row() {
     let started_at = chrono::Utc::now().to_rfc3339();
     let evid_dir = format!("{workspace}/docs/generated-artifacts/encrypted-requests/evidence/browser-catmos");
     let _ = std::fs::create_dir_all(&evid_dir);
+
+    // Pre-enroll recipient (Bob publishes key package on Desktop), then goes offline
+    let desktop_profile = format!("/tmp/catmos-desktop-profile-bob-{run_hex}");
+    let desktop_config = format!("/tmp/catmos-fixture-bob-{run_hex}.json");
+    std::fs::write(&desktop_config, json!({
+        "manifest": manifest_path,
+        "sessions": format!("{out_dir}/sessions.json"),
+        "label": "bob",
+        "profile": desktop_profile,
+        "keychain_namespace": format!("blue.catbird.catmos.fixture.{run_uuid}")
+    }).to_string()).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&desktop_config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    std::env::set_var("CATMOS_RUNTIME_FIXTURE_CONFIG", &desktop_config);
+    crate::runtime_fixture::initialize();
+    let tmp = tempfile::tempdir().unwrap();
+    let host_db = tmp.path().join("catmos_desktop_bob.db");
+    let storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
+    let api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
+    let bob_desktop_keychain = MemoryKeychain::new();
+    let mls_context = MLSContext::new(
+        tmp.path().join("mls_desktop_bob.db").to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(bob_desktop_keychain.clone()),
+    ).unwrap();
+    api_client.set_mls_context(mls_context.clone());
+    storage.set_mls_context(mls_context.clone());
+    let credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        api_client.chat_auth_provider(),
+        mls_context.clone(),
+    ));
+    crate::runtime_fixture::seed_native_authority(mls_context.as_ref(), credentials.as_ref()).await.unwrap();
+    credentials.store_server_device_id(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
+    let orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        mls_context.clone(),
+        storage.clone(),
+        api_client.clone(),
+        credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+    let state = AppState {
+        request_scope: tokio::sync::Mutex::new(()),
+        orchestrator,
+        chat_auth: api_client.chat_auth_provider(),
+        api_client: api_client.clone(),
+        ws_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        kp_monitor: tokio::sync::Mutex::new(None),
+        sync_loop: tokio::sync::Mutex::new(None),
+        data_dir: tmp.path().to_path_buf(),
+    };
+    commands::install_content_root_key(&state, bob_did);
+    state.orchestrator.initialize(bob_did).await.unwrap();
+    commands::configure_chat_auth(&state, bob_did, bob_session).await.unwrap();
+    state.orchestrator.publish_key_package().await.unwrap();
+    state.orchestrator.set_direct_request_delivery_enabled(true).await.unwrap();
+    let bob_rev = state.api_client.current_session().unwrap().revision.to_string();
+
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            request_commands::save_request_draft,
+            request_commands::cancel_request_draft,
+            request_commands::submit_request_draft,
+            request_commands::refresh_direct_request,
+            request_commands::accept_direct_request,
+            request_commands::set_request_delivery_enabled,
+            commands::send_message,
+            commands::get_messages,
+            commands::fetch_new_messages,
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
+    call(&webview, "set_request_delivery_enabled", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "enabled": true})).unwrap();
+
+    // Bob goes offline
+    drop(webview);
+    drop(app);
 
     // =========================================================================
     // 5. Spawn browser-live-controller as ALICE (Sender in Browser)
@@ -1223,64 +1319,45 @@ async fn browser_catmos_live_row() {
     let _ = b_call(json!({"cmd": "close"}));
     let _ = browser_proc.kill();
 
-    // Initialize Desktop AppState as BOB (Recipient on Desktop)
-    let desktop_profile = format!("/tmp/catmos-desktop-profile-bob-{run_hex}");
-    let desktop_config = format!("/tmp/catmos-fixture-bob-{run_hex}.json");
-    std::fs::write(&desktop_config, json!({
-        "manifest": manifest_path,
-        "sessions": format!("{out_dir}/sessions.json"),
-        "label": "bob",
-        "profile": desktop_profile,
-        "keychain_namespace": format!("blue.catbird.catmos.fixture.{run_uuid}")
-    }).to_string()).unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&desktop_config, std::fs::Permissions::from_mode(0o600)).unwrap();
-
-    std::env::set_var("CATMOS_RUNTIME_FIXTURE_CONFIG", &desktop_config);
-    crate::runtime_fixture::initialize();
-    let tmp = tempfile::tempdir().unwrap();
-    let host_db = tmp.path().join("catmos_desktop_bob.db");
-    let storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
-    let api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
-    let mls_context = MLSContext::new(
+    // Reopen Desktop Bob from disk (reopens host_db and mls_desktop_bob.db with bob_desktop_keychain)
+    let reopened_storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
+    let reopened_api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
+    let reopened_mls_context = MLSContext::new(
         tmp.path().join("mls_desktop_bob.db").to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(bob_desktop_keychain.clone()),
     ).unwrap();
-    api_client.set_mls_context(mls_context.clone());
-    storage.set_mls_context(mls_context.clone());
-    let credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
-        api_client.chat_auth_provider(),
-        mls_context.clone(),
+    reopened_api_client.set_mls_context(reopened_mls_context.clone());
+    reopened_storage.set_mls_context(reopened_mls_context.clone());
+    let reopened_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        reopened_api_client.chat_auth_provider(),
+        reopened_mls_context.clone(),
     ));
-    crate::runtime_fixture::seed_native_authority(mls_context.as_ref(), credentials.as_ref()).await.unwrap();
-    credentials.store_server_device_id(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
-    let orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
-        mls_context.clone(),
-        storage.clone(),
-        api_client.clone(),
-        credentials.clone(),
+    reopened_credentials.store_server_device_id(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
+    let reopened_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        reopened_mls_context.clone(),
+        reopened_storage.clone(),
+        reopened_api_client.clone(),
+        reopened_credentials.clone(),
         catbird_mls::orchestrator::OrchestratorConfig::default(),
     ));
-    let state = AppState {
+    let reopened_state = AppState {
         request_scope: tokio::sync::Mutex::new(()),
-        orchestrator,
-        chat_auth: api_client.chat_auth_provider(),
-        api_client: api_client.clone(),
+        orchestrator: reopened_orchestrator,
+        chat_auth: reopened_api_client.chat_auth_provider(),
+        api_client: reopened_api_client.clone(),
         ws_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         kp_monitor: tokio::sync::Mutex::new(None),
         sync_loop: tokio::sync::Mutex::new(None),
         data_dir: tmp.path().to_path_buf(),
     };
-    state.orchestrator.initialize(bob_did).await.unwrap();
-    commands::install_content_root_key(&state, bob_did);
-    commands::configure_chat_auth(&state, bob_did, bob_session).await.unwrap();
-    state.orchestrator.publish_key_package().await.unwrap();
-    state.orchestrator.set_direct_request_delivery_enabled(true).await.unwrap();
-    let bob_rev = state.api_client.current_session().unwrap().revision.to_string();
+    commands::install_content_root_key(&reopened_state, bob_did);
+    reopened_state.orchestrator.initialize(bob_did).await.unwrap();
+    commands::configure_chat_auth(&reopened_state, bob_did, bob_session).await.unwrap();
+    let reopened_bob_rev = reopened_state.api_client.current_session().unwrap().revision.to_string();
 
-    let app = tauri::test::mock_builder()
-        .manage(state)
+    let reopened_app = tauri::test::mock_builder()
+        .manage(reopened_state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
             request_commands::cancel_request_draft,
@@ -1294,8 +1371,7 @@ async fn browser_catmos_live_row() {
         ])
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
-    call(&webview, "set_request_delivery_enabled", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "enabled": true})).unwrap();
+    let webview = tauri::WebviewWindowBuilder::new(&reopened_app, "reopened_main", Default::default()).build().unwrap();
 
     // Desktop Bob refreshes and previews decrypted intro before accept
     let preview = call(&webview, "refresh_direct_request", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "conversationId": cid})).unwrap();
@@ -1354,7 +1430,7 @@ async fn browser_catmos_live_row() {
     // Desktop Bob receives and decrypts Alice's reply
     let mut bob_msgs = Vec::new();
     for _ in 0..20 {
-        if let Ok(fetched) = call(&webview, "fetch_new_messages", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "conversationId": cid})) {
+        if let Ok(fetched) = call(&webview, "fetch_new_messages", json!({"ownerDid": bob_did, "ownerRevision": reopened_bob_rev, "conversationId": cid})) {
             if let Some(arr) = fetched.as_array() {
                 bob_msgs.extend(arr.clone());
                 if bob_msgs.iter().any(|m| m["content"] == alice_reply) {
@@ -1370,7 +1446,7 @@ async fn browser_catmos_live_row() {
     // LEG 5: Real restart on both sides & F37 sent-once
     // =========================================================================
     drop(webview);
-    drop(app);
+    drop(reopened_app);
 
     // Reopen desktop Bob
     let r_storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
@@ -1378,9 +1454,8 @@ async fn browser_catmos_live_row() {
     let r_mls_context = MLSContext::new(
         tmp.path().join("mls_desktop_bob.db").to_string_lossy().into_owned(),
         DB_KEY.into(),
-        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+        Box::new(bob_desktop_keychain.clone()),
     ).unwrap();
-    r_api_client.set_mls_context(r_mls_context.clone());
     r_storage.set_mls_context(r_mls_context.clone());
     let r_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
         r_api_client.chat_auth_provider(),
@@ -1404,8 +1479,8 @@ async fn browser_catmos_live_row() {
         sync_loop: tokio::sync::Mutex::new(None),
         data_dir: tmp.path().to_path_buf(),
     };
-    r_state.orchestrator.initialize(bob_did).await.unwrap();
     commands::install_content_root_key(&r_state, bob_did);
+    r_state.orchestrator.initialize(bob_did).await.unwrap();
     commands::configure_chat_auth(&r_state, bob_did, bob_session).await.unwrap();
     let r_bob_rev = r_state.api_client.current_session().unwrap().revision.to_string();
 

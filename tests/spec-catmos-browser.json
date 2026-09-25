@@ -1,0 +1,33 @@
+{
+  "assertions": [
+    "Local draft creation and cancellation produces 0 remote chat entries",
+    "Offline recipient first send records exactly 1 directRequestEntry on server",
+    "Browser OPFS worker reload before Welcome import preserves clean state",
+    "Sender offline: recipient decrypts intro and accepts, reply is encrypted",
+    "Sender restart from disk: decrypts reply and sends follow-up",
+    "Recipient decrypts sender reply in browser",
+    "Full desktop restart and browser reload: both messages persisted exactly once (F37 sent-once)",
+    "PostgreSQL chat.entries contains exactly 4 ordered entries with no duplicates or extra Add commits"
+  ],
+  "conversation_id": "5684fe55-63d0-4036-adf3-79504a2a9cbf",
+  "database_name": "catbird_direct_requests_fault_0421148ca53e48f9",
+  "draft_id": "da17b67c-6439-408a-a0d1-f09acfd74ea2",
+  "ended_at": "2026-09-25T17:37:57.150725+00:00",
+  "log_name": "catmos-browser-live.log",
+  "not_exercised": [
+    "unavailableDevicePreconsent: Local gateway manifest uses deterministic single-device recipient; multi-device key package race is tested in iOS/Android test suites",
+    "recipientDeclineBlockLeg: Interoperability row exercises the full acceptance, reply, and restart pipeline; decline/block behavior is tested in standalone unit suites"
+  ],
+  "recipient_info": {
+    "client": "Catmos Browser (WASM)",
+    "deviceId": "6aa37b93-8f79-4485-bc4a-00e3ada9d477",
+    "did": "did:web:bob-202f2b926c634b21b954871d115ff1cb.request-fixture.catbird.blue"
+  },
+  "row_id": "catmos-browser",
+  "sender_info": {
+    "client": "Catmos Desktop",
+    "deviceId": "7e515a3b-806e-4b67-8f83-74d3089d8fac",
+    "did": "did:web:alice-202f2b926c634b21b954871d115ff1cb.request-fixture.catbird.blue"
+  },
+  "started_at": "2026-09-25T17:35:52.557322+00:00"
+}
