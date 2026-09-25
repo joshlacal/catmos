@@ -535,11 +535,12 @@ mod enabled {
                 response.status()
             ));
         }
+        let service = super::keychain_service("catmos");
         for (key, value) in [
             ("session_id", a.session.as_ref().unwrap()),
             ("user_did", &a.did),
         ] {
-            super::keychain_set("catmos", key, value)
+            super::keychain_set(&service, key, value)
                 .map_err(|_| "Cannot retain isolated fixture session")?;
         }
         Ok(())
