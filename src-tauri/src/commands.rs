@@ -221,12 +221,9 @@ struct SessionInfo {
 }
 
 fn clear_saved_session_credentials() {
+    let service = crate::runtime_fixture::keychain_service("catmos");
     for key in ["session_id", "user_did", "chat_dpop_jkt"] {
-        if let Ok(entry) =
-            keyring::Entry::new(&crate::runtime_fixture::keychain_service("catmos"), key)
-        {
-            let _ = entry.delete_credential();
-        }
+        let _ = crate::runtime_fixture::keychain_delete(&service, key);
     }
 }
 
@@ -797,18 +794,9 @@ pub async fn complete_login(
     start_sync_loop(&state).await;
 
     // Persist session to keyring
-    if let Ok(entry) = keyring::Entry::new(
-        &crate::runtime_fixture::keychain_service("catmos"),
-        "session_id",
-    ) {
-        let _ = entry.set_password(&session_id);
-    }
-    if let Ok(entry) = keyring::Entry::new(
-        &crate::runtime_fixture::keychain_service("catmos"),
-        "user_did",
-    ) {
-        let _ = entry.set_password(&session.did);
-    }
+    let service = crate::runtime_fixture::keychain_service("catmos");
+    let _ = crate::runtime_fixture::keychain_set(&service, "session_id", &session_id);
+    let _ = crate::runtime_fixture::keychain_set(&service, "user_did", &session.did);
 
     Ok(AuthResponse {
         auth_revision: state
@@ -829,19 +817,9 @@ pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
     let _request_scope = state.request_scope.lock().await;
-    let session_id = keyring::Entry::new(
-        &crate::runtime_fixture::keychain_service("catmos"),
-        "session_id",
-    )
-    .and_then(|e| e.get_password())
-    .ok();
-    let did = keyring::Entry::new(
-        &crate::runtime_fixture::keychain_service("catmos"),
-        "user_did",
-    )
-    .and_then(|e| e.get_password())
-    .ok();
-
+    let service = crate::runtime_fixture::keychain_service("catmos");
+    let session_id = crate::runtime_fixture::keychain_get(&service, "session_id").ok();
+    let did = crate::runtime_fixture::keychain_get(&service, "user_did").ok();
     match (session_id, did) {
         (Some(sid), stored_did) => {
             let session = match fetch_session_info(&sid).await {
@@ -933,12 +911,8 @@ pub async fn try_restore_session(
             // Start periodic sync loop (spec §6.1)
             start_sync_loop(&state).await;
 
-            if let Ok(entry) = keyring::Entry::new(
-                &crate::runtime_fixture::keychain_service("catmos"),
-                "user_did",
-            ) {
-                let _ = entry.set_password(&session.did);
-            }
+            let service = crate::runtime_fixture::keychain_service("catmos");
+            let _ = crate::runtime_fixture::keychain_set(&service, "user_did", &session.did);
             log_catmos!("Session restored: handle={}", session.handle);
 
             Ok(Some(AuthResponse {

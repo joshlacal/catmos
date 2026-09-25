@@ -12,6 +12,32 @@ pub(crate) fn keychain_service(production: &str) -> String {
     }
     production.to_owned()
 }
+pub(crate) fn keychain_get(service: &str, key: &str) -> Result<String, keyring::Error> {
+    #[cfg(feature = "local-runtime-fixture")]
+    if let Some(config) = enabled::CONFIG.get() {
+        return config.keychain_get(service, key);
+    }
+    keyring::Entry::new(service, key)?.get_password()
+}
+
+pub(crate) fn keychain_set(service: &str, key: &str, value: &str) -> Result<(), keyring::Error> {
+    #[cfg(feature = "local-runtime-fixture")]
+    if let Some(config) = enabled::CONFIG.get() {
+        return config.keychain_set(service, key, value);
+    }
+    keyring::Entry::new(service, key)?.set_password(value)
+}
+
+pub(crate) fn keychain_delete(service: &str, key: &str) -> Result<(), keyring::Error> {
+    #[cfg(feature = "local-runtime-fixture")]
+    if let Some(config) = enabled::CONFIG.get() {
+        return config.keychain_delete(service, key);
+    }
+    match keyring::Entry::new(service, key)?.delete_credential() {
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 pub(crate) fn data_dir() -> Option<std::path::PathBuf> {
     #[cfg(feature = "local-runtime-fixture")]
@@ -128,6 +154,8 @@ mod enabled {
         account: Account,
         ca: reqwest::Certificate,
         ws_connector: tokio_tungstenite::Connector,
+        keychain_file: PathBuf,
+        keychain_store: Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
     }
 
     fn parse_pem_cert(pem: &[u8]) -> Result<rustls_pki_types::CertificateDer<'static>, String> {
@@ -261,6 +289,15 @@ mod enabled {
                 .and_then(|mut f| f.write_all(&marker_bytes))
                 .map_err(|_| "Cannot mark isolated fixture profile")?;
         }
+        let keychain_file = launch.profile.join("fixture-keychain.json");
+        let keychain_store = if keychain_file.exists() {
+            let bytes = read_private(&keychain_file)?;
+            let map: std::collections::BTreeMap<String, String> =
+                serde_json::from_slice(&bytes).unwrap_or_default();
+            Arc::new(std::sync::Mutex::new(map))
+        } else {
+            Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()))
+        };
         CONFIG
             .set(Config {
                 manifest,
@@ -269,6 +306,8 @@ mod enabled {
                 account,
                 ca,
                 ws_connector,
+                keychain_file,
+                keychain_store,
             })
             .map_err(|_| "Fixture already configured")?;
         Ok(())
@@ -372,6 +411,47 @@ mod enabled {
             }
             builder
         }
+        pub(super) fn keychain_get(&self, service: &str, key: &str) -> Result<String, keyring::Error> {
+            let store = self.keychain_store.lock().unwrap();
+            let map_key = format!("{service}:{key}");
+            store.get(&map_key).cloned().ok_or(keyring::Error::NoEntry)
+        }
+
+        pub(super) fn keychain_set(&self, service: &str, key: &str, value: &str) -> Result<(), keyring::Error> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut store = self.keychain_store.lock().unwrap();
+            let map_key = format!("{service}:{key}");
+            store.insert(map_key, value.to_string());
+            let bytes = serde_json::to_vec_pretty(&*store).map_err(|e| keyring::Error::PlatformFailure(Box::new(e)))?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.keychain_file)
+                .map_err(|e| keyring::Error::PlatformFailure(Box::new(e)))?;
+            file.write_all(&bytes).map_err(|e| keyring::Error::PlatformFailure(Box::new(e)))?;
+            Ok(())
+        }
+
+        pub(super) fn keychain_delete(&self, service: &str, key: &str) -> Result<(), keyring::Error> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut store = self.keychain_store.lock().unwrap();
+            let map_key = format!("{service}:{key}");
+            store.remove(&map_key);
+            let bytes = serde_json::to_vec_pretty(&*store).map_err(|e| keyring::Error::PlatformFailure(Box::new(e)))?;
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&self.keychain_file)
+                .map_err(|e| keyring::Error::PlatformFailure(Box::new(e)))?;
+            file.write_all(&bytes).map_err(|e| keyring::Error::PlatformFailure(Box::new(e)))?;
+            Ok(())
+        }
         pub(super) async fn connect_websocket(
             &self,
             url: &str,
@@ -459,8 +539,7 @@ mod enabled {
             ("session_id", a.session.as_ref().unwrap()),
             ("user_did", &a.did),
         ] {
-            keyring::Entry::new(&super::keychain_service("catmos"), key)
-                .and_then(|e| e.set_password(value))
+            super::keychain_set("catmos", key, value)
                 .map_err(|_| "Cannot retain isolated fixture session")?;
         }
         Ok(())
@@ -647,6 +726,8 @@ ssock.close()
                 },
                 ca: reqwest::Certificate::from_pem(&std::fs::read(&ca_pem).unwrap()).unwrap(),
                 ws_connector: build_ws_connector(&std::fs::read(&ca_pem).unwrap()).unwrap(),
+                keychain_file: dir.path().join("fixture-keychain.json"),
+                keychain_store: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             };
 
             // Test 1: Unpinned host must fail closed without DNS lookup
@@ -665,6 +746,52 @@ ssock.close()
             assert!(pinned_res.is_ok(), "Pinned host connection failed: {:?}", pinned_res.err());
 
             let _ = py_server.kill().await;
+        }
+
+        #[test]
+        fn fixture_keychain_is_file_backed_and_never_calls_system_keychain() {
+            let dir = tempfile::tempdir().unwrap();
+            let keychain_file = dir.path().join("fixture-keychain.json");
+            assert!(!keychain_file.exists());
+
+            let mut m = manifest();
+            let ca_pem = dir.path().join("ca.pem");
+            std::fs::write(&ca_pem, "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----").unwrap();
+            m.ca_pem = ca_pem.clone();
+
+            let config = Config {
+                manifest: m,
+                profile: dir.path().to_path_buf(),
+                keychain_namespace: "blue.catbird.catmos.fixture.00000000-0000-4000-8000-000000000001".into(),
+                account: Account {
+                    label: "alice".into(),
+                    did: "did:web:fixture.request-fixture.catbird.blue".into(),
+                    device_id: "00000000-0000-4000-8000-000000000001".into(),
+                    session: None,
+                },
+                ca: reqwest::Certificate::from_pem(&std::fs::read(&ca_pem).unwrap()).unwrap(),
+                ws_connector: tokio_tungstenite::Connector::Plain,
+                keychain_file: keychain_file.clone(),
+                keychain_store: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            };
+
+            // Pre-fix: setting a credential in fixture mode called keyring::Entry on macOS login keychain,
+            // producing 0 files in profile dir and prompting SecurityAgent for password.
+            // Post-fix: writes strictly to profile dir fixture-keychain.json with mode 0600.
+            config.keychain_set("catmos", "session_id", "test-session-token").unwrap();
+            assert!(keychain_file.exists(), "fixture-keychain.json must exist in profile dir");
+
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(&keychain_file).unwrap();
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600, "fixture-keychain.json must have 0600 permissions");
+
+            // Getting the credential reads back without touching system keychain
+            let val = config.keychain_get("catmos", "session_id").unwrap();
+            assert_eq!(val, "test-session-token");
+
+            // Deleting removes from the file
+            config.keychain_delete("catmos", "session_id").unwrap();
+            assert!(matches!(config.keychain_get("catmos", "session_id"), Err(keyring::Error::NoEntry)));
         }
     }
 }

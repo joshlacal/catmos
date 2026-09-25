@@ -38,19 +38,13 @@ use tokio::sync::Mutex;
 /// `label` distinguishes between multiple databases (e.g. "conversation-db", "mls-db").
 fn get_or_create_db_key(label: &str) -> String {
     let service = runtime_fixture::keychain_service("blue.catbird.catmos");
-    let entry =
-        keyring::Entry::new(&service, label).expect("Failed to create keyring entry for DB key");
-
-    // Try to load an existing key
-    match entry.get_password() {
+    match runtime_fixture::keychain_get(&service, label) {
         Ok(existing) => existing,
         Err(keyring::Error::NoEntry) => {
-            // Generate a random 32-byte key and hex-encode it
             let mut key_bytes = [0u8; 32];
             getrandom::getrandom(&mut key_bytes).expect("Failed to generate random DB key");
             let hex_key: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
-            entry
-                .set_password(&hex_key)
+            runtime_fixture::keychain_set(&service, label, &hex_key)
                 .expect("Failed to store DB key in keychain");
             hex_key
         }

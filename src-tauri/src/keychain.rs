@@ -31,39 +31,30 @@ impl KeyringKeychainAccess {
         }
     }
 
-    fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(&crate::runtime_fixture::keychain_service(SERVICE_NAME), key)
+    fn service() -> String {
+        crate::runtime_fixture::keychain_service(SERVICE_NAME)
     }
 }
 
 #[async_trait]
 impl KeychainAccess for KeyringKeychainAccess {
     async fn read(&self, key: String) -> Result<Option<Vec<u8>>, MLSError> {
-        match Self::entry(&key) {
-            Ok(entry) => match entry.get_password() {
-                Ok(val) => Ok(Some(val.into_bytes())),
-                Err(keyring::Error::NoEntry) => Ok(None),
-                Err(e) => Err(MLSError::Internal(e.to_string())),
-            },
+        match crate::runtime_fixture::keychain_get(&Self::service(), &key) {
+            Ok(val) => Ok(Some(val.into_bytes())),
+            Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(MLSError::Internal(e.to_string())),
         }
     }
 
     async fn write(&self, key: String, value: Vec<u8>) -> Result<(), MLSError> {
         let val_str = String::from_utf8(value).map_err(|e| MLSError::Internal(e.to_string()))?;
-        let entry =
-            Self::entry(&key).map_err(|e: keyring::Error| MLSError::Internal(e.to_string()))?;
-        entry
-            .set_password(&val_str)
+        crate::runtime_fixture::keychain_set(&Self::service(), &key, &val_str)
             .map_err(|e| MLSError::Internal(e.to_string()))
     }
 
     async fn delete(&self, key: String) -> Result<(), MLSError> {
-        match Self::entry(&key) {
-            Ok(entry) => match entry.delete_credential() {
-                Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                Err(e) => Err(MLSError::Internal(e.to_string())),
-            },
+        match crate::runtime_fixture::keychain_delete(&Self::service(), &key) {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(MLSError::Internal(e.to_string())),
         }
     }
