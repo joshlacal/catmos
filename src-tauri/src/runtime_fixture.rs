@@ -48,6 +48,33 @@ pub(crate) fn http_client() -> reqwest::Client {
         .build()
         .expect("HTTP client configuration must be valid")
 }
+pub(crate) async fn connect_websocket(
+    url: &str,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    ),
+    String,
+> {
+    #[cfg(feature = "local-runtime-fixture")]
+    if let Some(config) = enabled::CONFIG.get() {
+        return config.connect_websocket(url).await;
+    }
+    tokio_tungstenite::connect_async(url)
+        .await
+        .map_err(|e| format!("WebSocket connect failed: {e}"))
+}
+
+#[cfg(all(test, not(feature = "local-runtime-fixture")))]
+pub(crate) async fn seed_native_authority(
+    _context: &catbird_mls::MLSContext,
+    _credentials: &crate::credentials::KeyringCredentialStore,
+) -> Result<(), String> {
+    Ok(())
+}
 pub(crate) fn initialize() {
     #[cfg(feature = "local-runtime-fixture")]
     enabled::initialize().expect("Invalid isolated runtime fixture configuration");
@@ -100,6 +127,33 @@ mod enabled {
         pub keychain_namespace: String,
         account: Account,
         ca: reqwest::Certificate,
+        ws_connector: tokio_tungstenite::Connector,
+    }
+
+    fn parse_pem_cert(pem: &[u8]) -> Result<rustls_pki_types::CertificateDer<'static>, String> {
+        let s = std::str::from_utf8(pem).map_err(|e| e.to_string())?;
+        let start = s.find("-----BEGIN CERTIFICATE-----").ok_or("No cert start")?;
+        let end = s.find("-----END CERTIFICATE-----").ok_or("No cert end")?;
+        let b64 = &s[start + "-----BEGIN CERTIFICATE-----".len()..end];
+        let b64: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| e.to_string())?;
+        Ok(rustls_pki_types::CertificateDer::from(bytes))
+    }
+
+    fn build_ws_connector(ca_pem: &[u8]) -> Result<tokio_tungstenite::Connector, String> {
+        let ca_cert = parse_pem_cert(ca_pem)?;
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(ca_cert)
+            .map_err(|e| format!("Invalid fixture root cert: {e}"))?;
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        Ok(tokio_tungstenite::Connector::Rustls(Arc::new(
+            client_config,
+        )))
     }
     fn read_private(path: &Path) -> Result<Vec<u8>, String> {
         use std::os::unix::fs::PermissionsExt;
@@ -182,8 +236,10 @@ mod enabled {
         {
             return Err("Fixture session does not match public account".into());
         }
-        let ca = reqwest::Certificate::from_pem(&read_private(&manifest.ca_pem)?)
+        let ca_bytes = read_private(&manifest.ca_pem)?;
+        let ca = reqwest::Certificate::from_pem(&ca_bytes)
             .map_err(|_| "Invalid fixture CA")?;
+        let ws_connector = build_ws_connector(&ca_bytes)?;
         let marker = launch.profile.join("runtime-fixture.json");
         let marker_bytes=serde_json::to_vec(&serde_json::json!({"origin":manifest.origin,"did":account.did,"deviceId":account.device_id,"namespace":launch.keychain_namespace})).unwrap();
         use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -212,6 +268,7 @@ mod enabled {
                 keychain_namespace: launch.keychain_namespace,
                 account,
                 ca,
+                ws_connector,
             })
             .map_err(|_| "Fixture already configured")?;
         Ok(())
@@ -314,6 +371,50 @@ mod enabled {
                 builder = builder.resolve(host, *address);
             }
             builder
+        }
+        pub(super) async fn connect_websocket(
+            &self,
+            url: &str,
+        ) -> Result<
+            (
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                tokio_tungstenite::tungstenite::handshake::client::Response,
+            ),
+            String,
+        > {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let request = url
+                .into_client_request()
+                .map_err(|e| format!("Invalid WebSocket request: {e}"))?;
+            let uri = request.uri().clone();
+            let host = uri
+                .host()
+                .ok_or_else(|| "WebSocket URL missing host".to_string())?;
+
+            let pinned_addr = self
+                .manifest
+                .hosts
+                .get(host)
+                .copied()
+                .ok_or_else(|| format!("Host {host} absent from fixture manifest"))?;
+
+            let socket = tokio::net::TcpStream::connect(pinned_addr)
+                .await
+                .map_err(|e| format!("Failed to connect to pinned address {pinned_addr} for {host}: {e}"))?;
+            let _ = socket.set_nodelay(true);
+
+            let scheme = uri.scheme_str().unwrap_or("wss");
+            let connector = match scheme {
+                "wss" => Some(self.ws_connector.clone()),
+                "ws" => Some(tokio_tungstenite::Connector::Plain),
+                other => return Err(format!("Unsupported WebSocket scheme: {other}")),
+            };
+
+            tokio_tungstenite::client_async_tls_with_config(request, socket, None, connector)
+                .await
+                .map_err(|e| format!("WebSocket connect failed: {e}"))
         }
     }
     pub(crate) async fn seed_native_authority(
@@ -437,6 +538,133 @@ mod enabled {
             let link = dir.path().join("link");
             symlink(&path, &link).unwrap();
             assert!(read_private(&link).is_err());
+        }
+        #[tokio::test]
+        async fn fixture_websocket_routes_pinned_hosts_and_fails_closed_for_unpinned_hosts() {
+            let dir = tempfile::tempdir().unwrap();
+            let ca_key = dir.path().join("ca.key");
+            let ca_pem = dir.path().join("ca.pem");
+            let srv_key = dir.path().join("server.key");
+            let srv_csr = dir.path().join("server.csr");
+            let srv_pem = dir.path().join("server.pem");
+            let ext = dir.path().join("ext.cnf");
+            std::fs::write(&ext, "subjectAltName=DNS:fixture.request-fixture.catbird.blue\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n").unwrap();
+
+            std::process::Command::new("openssl")
+                .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Fixture CA", "-addext", "basicConstraints=critical,CA:TRUE", "-keyout"])
+                .arg(&ca_key)
+                .arg("-out")
+                .arg(&ca_pem)
+                .status()
+                .unwrap();
+
+            std::process::Command::new("openssl")
+                .args(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=fixture.request-fixture.catbird.blue", "-keyout"])
+                .arg(&srv_key)
+                .arg("-out")
+                .arg(&srv_csr)
+                .status()
+                .unwrap();
+
+            std::process::Command::new("openssl")
+                .args(["x509", "-req", "-days", "1", "-CA"])
+                .arg(&ca_pem)
+                .arg("-CAkey")
+                .arg(&ca_key)
+                .arg("-CAcreateserial")
+                .arg("-in")
+                .arg(&srv_csr)
+                .arg("-extfile")
+                .arg(&ext)
+                .arg("-out")
+                .arg(&srv_pem)
+                .status()
+                .unwrap();
+
+            let mut py_server = tokio::process::Command::new("python3")
+                .arg("-c")
+                .arg(r#"
+import ssl, socket, hashlib, base64, sys, time
+
+srv_pem = sys.argv[1]
+srv_key = sys.argv[2]
+
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(srv_pem, srv_key)
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('127.0.0.1', 0))
+port = sock.getsockname()[1]
+sock.listen(1)
+
+print(port, flush=True)
+
+raw, _ = sock.accept()
+ssock = ctx.wrap_socket(raw, server_side=True)
+data = ssock.recv(4096).decode('utf-8', errors='ignore')
+key = None
+for line in data.split('\r\n'):
+    if line.lower().startswith('sec-websocket-key:'):
+        key = line.split(':', 1)[1].strip()
+        break
+if key:
+    guid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+    accept = base64.b64encode(hashlib.sha1((key + guid).encode('utf-8')).digest()).decode('utf-8')
+    resp = f'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n'
+    ssock.sendall(resp.encode('utf-8'))
+    time.sleep(1.0)
+ssock.close()
+"#)
+                .arg(&srv_pem)
+                .arg(&srv_key)
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let stdout = py_server.stdout.take().unwrap();
+            let mut reader = tokio::io::BufReader::new(stdout);
+            let mut port_line = String::new();
+            tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut port_line).await.unwrap();
+            let tls_port: u16 = port_line.trim().parse().unwrap();
+
+            let mut m = manifest();
+            m.ca_pem = ca_pem.clone();
+            m.hosts = BTreeMap::from([(
+                "fixture.request-fixture.catbird.blue".into(),
+                format!("127.0.0.1:{tls_port}").parse().unwrap(),
+            )]);
+
+            let config = Config {
+                manifest: m,
+                profile: dir.path().to_path_buf(),
+                keychain_namespace: "blue.catbird.catmos.fixture.00000000-0000-4000-8000-000000000001".into(),
+                account: Account {
+                    label: "alice".into(),
+                    did: "did:web:fixture.request-fixture.catbird.blue".into(),
+                    device_id: "00000000-0000-4000-8000-000000000001".into(),
+                    session: None,
+                },
+                ca: reqwest::Certificate::from_pem(&std::fs::read(&ca_pem).unwrap()).unwrap(),
+                ws_connector: build_ws_connector(&std::fs::read(&ca_pem).unwrap()).unwrap(),
+            };
+
+            // Test 1: Unpinned host must fail closed without DNS lookup
+            let unpinned_err = config
+                .connect_websocket("wss://unpinned-test-host.catbird.blue/xrpc/blue.catbird.chat.subscribeEvents")
+                .await
+                .unwrap_err();
+            assert!(
+                unpinned_err.contains("absent from fixture manifest"),
+                "Unpinned host should fail closed with 'absent from fixture manifest', got: {unpinned_err}"
+            );
+
+            // Test 2: Pinned host must connect to local TLS listener
+            let pinned_url = format!("wss://fixture.request-fixture.catbird.blue:{tls_port}/xrpc/blue.catbird.chat.subscribeEvents");
+            let pinned_res = config.connect_websocket(&pinned_url).await;
+            assert!(pinned_res.is_ok(), "Pinned host connection failed: {:?}", pinned_res.err());
+
+            let _ = py_server.kill().await;
         }
     }
 }

@@ -28,6 +28,8 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 rusqlite = { version = "=0.37.0", default-features = false }
 base64 = "0.22"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pki-types = "1"
 async-trait = "0.1"
 tracing = "0.1"
 bytes = "1"

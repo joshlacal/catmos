@@ -93,7 +93,7 @@ async fn do_subscribe(
         .map_err(|e| format!("Failed to initialize subscription cursor: {e}"))?;
 
     log_ws!("Connecting to {}", ticket.endpoint);
-    let (stream, _) = tokio_tungstenite::connect_async(subscription_url(&ticket))
+    let (stream, _) = crate::runtime_fixture::connect_websocket(&subscription_url(&ticket))
         .await
         .map_err(|e| format!("WebSocket connect failed: {e}"))?;
     log_ws!("Connected");
