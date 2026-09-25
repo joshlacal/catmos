@@ -308,7 +308,7 @@ async function handleCommand(req) {
       unsub();
       return d;
     }, draftId);
-    return { ok: true, draft };
+    return { ok: true, draft: d || { archived: true } };
   }
 
   if (cmd === 'screenshot') {

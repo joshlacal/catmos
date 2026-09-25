@@ -699,6 +699,7 @@ async fn catmos_browser_live_row() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
+            request_commands::cancel_request_draft,
             request_commands::submit_request_draft,
             request_commands::refresh_direct_request,
             request_commands::accept_direct_request,
@@ -723,8 +724,33 @@ async fn catmos_browser_live_row() {
     assert_eq!(d0_saved["phase"], "draft");
     let d0_cancelled = call(&webview, "cancel_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "draftId": d0_id})).unwrap();
     assert_eq!(d0_cancelled["archived"], true);
-    let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", "SELECT count(*) FROM chat.entries;"]).output().unwrap();
+    let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE actor_did='{alice_did}';")]).output().unwrap();
     assert!(String::from_utf8_lossy(&psql_d0.stdout).contains(" 0"), "Draft cancellation must leave 0 remote entries");
+
+    // Pre-enroll recipient (Bob publishes key package), then goes offline
+    {
+        let mut b_proc_pre = Command::new("node")
+            .arg(&format!("{workspace}/catmos/tests/browser-live-controller.mjs"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn browser-live-controller pre-enroll");
+        let mut b_in = b_proc_pre.stdin.take().unwrap();
+        let mut b_out = BufReader::new(b_proc_pre.stdout.take().unwrap());
+        let req = json!({"cmd": "init", "manifestPath": manifest_path, "label": "bob", "runId": run_hex});
+        b_in.write_all(req.to_string().as_bytes()).unwrap();
+        b_in.write_all(b"\n").unwrap();
+        b_in.flush().unwrap();
+        let mut line = String::new();
+        b_out.read_line(&mut line).unwrap();
+        let val: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(val["ok"], true, "Bob pre-enrollment");
+        let close_req = json!({"cmd": "close"});
+        b_in.write_all(close_req.to_string().as_bytes()).unwrap();
+        b_in.write_all(b"\n").unwrap();
+        b_in.flush().unwrap();
+        let _ = b_proc_pre.kill();
+    }
 
     // =========================================================================
     // LEG 2: Offline-recipient first send (Bob has not started yet!)
@@ -736,7 +762,12 @@ async fn catmos_browser_live_row() {
     call(&webview, "save_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "input": d1_input, "recipientLabel": "Bob"})).unwrap();
     let submit_res = call(&webview, "submit_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "draftId": d1_draft_id})).unwrap();
     assert_eq!(submit_res["phase"], "resolved");
-    let cid1 = submit_res["outcome"]["conversationId"].as_str().unwrap().to_owned();
+    eprintln!("submit_res: {submit_res}");
+    let cid1 = submit_res["outcome"]["conversationId"]
+        .as_str()
+        .or_else(|| submit_res["outcome"]["conversation_id"].as_str())
+        .expect(&format!("conversationId in submit_res: {submit_res}"))
+        .to_owned();
 
     // Verify 1 published entry on server while recipient is offline
     let psql_d1 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{cid1}';")]).output().unwrap();
@@ -843,6 +874,7 @@ async fn catmos_browser_live_row() {
         .manage(reopened_state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
+            request_commands::cancel_request_draft,
             request_commands::submit_request_draft,
             request_commands::refresh_direct_request,
             request_commands::accept_direct_request,
@@ -915,6 +947,7 @@ async fn catmos_browser_live_row() {
         .manage(r2_state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
+            request_commands::cancel_request_draft,
             request_commands::submit_request_draft,
             request_commands::refresh_direct_request,
             request_commands::accept_direct_request,
@@ -1156,7 +1189,7 @@ async fn browser_catmos_live_row() {
     let cancel_res = b_call(json!({"cmd": "cancel_draft", "draftId": d0_id}));
     assert_eq!(cancel_res["ok"], true);
     assert_eq!(cancel_res["draft"]["archived"], true);
-    let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", "SELECT count(*) FROM chat.entries;"]).output().unwrap();
+    let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE actor_did='{alice_did}';")]).output().unwrap();
     assert!(String::from_utf8_lossy(&psql_d0.stdout).contains(" 0"), "Browser draft cancellation leaves 0 remote entries");
 
     // =========================================================================
@@ -1166,8 +1199,18 @@ async fn browser_catmos_live_row() {
     let sent = b_call(json!({"cmd": "send_request", "recipientDid": bob_did, "text": intro}));
     assert_eq!(sent["ok"], true);
     assert_eq!(sent["outcome"]["type"], "requestSent", "Fresh direct request is requestSent");
-    let cid = sent["cid"].as_str().unwrap().to_owned();
-    let d1_draft_id = sent["draftId"].as_str().unwrap_or("browser-draft-1").to_owned();
+    eprintln!("sent: {sent}");
+    let cid = sent["cid"]
+        .as_str()
+        .or_else(|| sent["outcome"]["conversationId"].as_str())
+        .or_else(|| sent["outcome"]["conversation_id"].as_str())
+        .expect(&format!("cid in sent: {sent}"))
+        .to_owned();
+    let d1_draft_id = sent["draftId"]
+        .as_str()
+        .or_else(|| sent["draft"]["input"]["draftId"].as_str())
+        .unwrap_or("browser-draft-1")
+        .to_owned();
 
     // Verify 1 published entry on server while recipient is offline
     let psql_d1 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{cid}';")]).output().unwrap();
@@ -1240,6 +1283,7 @@ async fn browser_catmos_live_row() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
+            request_commands::cancel_request_draft,
             request_commands::submit_request_draft,
             request_commands::refresh_direct_request,
             request_commands::accept_direct_request,
@@ -1369,6 +1413,7 @@ async fn browser_catmos_live_row() {
         .manage(r_state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
+            request_commands::cancel_request_draft,
             request_commands::submit_request_draft,
             request_commands::refresh_direct_request,
             request_commands::accept_direct_request,

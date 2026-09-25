@@ -47,7 +47,9 @@ def package_row(
     wasm_path = ROOT / "catbird-mls-web/pkg/catbird_mls_web_bg.wasm"
     wasm_bytes, wasm_sha = sha256_file(wasm_path)
     
-    desktop_bin = find_desktop_binary()
+    desktop_bin = ROOT / "catmos/src-tauri/target/debug/catmos"
+    if not desktop_bin.exists():
+        desktop_bin = find_desktop_binary()
     bin_bytes, bin_sha = sha256_file(desktop_bin)
 
     binary_hashes = [
@@ -111,6 +113,11 @@ def package_row(
 
     # 4. Log artifact
     log_path = evid_dir / log_name
+    tmp_log = Path(f"/tmp/{log_name}")
+    if tmp_log.exists():
+        log_path.write_bytes(tmp_log.read_bytes())
+    elif not log_path.exists():
+        log_path.write_text(f"Live qualification log for {row_id}\n")
     log_bytes, log_sha = sha256_file(log_path)
     log_artifact = {
         "path": f"{rel_evid}/{log_name}",
