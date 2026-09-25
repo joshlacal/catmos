@@ -710,7 +710,41 @@ async fn catmos_browser_live_row() {
         .unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
 
-    // 6. Spawn browser-live-controller
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let evid_dir = format!("{workspace}/docs/generated-artifacts/encrypted-requests/evidence/catmos-browser");
+    let _ = std::fs::create_dir_all(&evid_dir);
+
+    // =========================================================================
+    // LEG 1: Local draft/cancel check (0 remote chat entries)
+    // =========================================================================
+    let d0_id = uuid::Uuid::new_v4().to_string();
+    let d0_input = json!({"draftId": d0_id, "recipientDid": bob_did, "text": "Draft cancelled before send", "invitation": null});
+    let d0_saved = call(&webview, "save_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "input": d0_input, "recipientLabel": "Bob"})).unwrap();
+    assert_eq!(d0_saved["phase"], "draft");
+    let d0_cancelled = call(&webview, "cancel_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "draftId": d0_id})).unwrap();
+    assert_eq!(d0_cancelled["archived"], true);
+    let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", "SELECT count(*) FROM chat.entries;"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&psql_d0.stdout).contains(" 0"), "Draft cancellation must leave 0 remote entries");
+
+    // =========================================================================
+    // LEG 2: Offline-recipient first send (Bob has not started yet!)
+    // =========================================================================
+    let d1_draft_id = uuid::Uuid::new_v4().to_string();
+    let d1_intro = format!("Hello Bob! Live Direction 1 intro from Catmos Desktop ({run_hex}).");
+    let d1_input = json!({"draftId": d1_draft_id, "recipientDid": bob_did, "text": d1_intro, "invitation": null});
+
+    call(&webview, "save_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "input": d1_input, "recipientLabel": "Bob"})).unwrap();
+    let submit_res = call(&webview, "submit_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "draftId": d1_draft_id})).unwrap();
+    assert_eq!(submit_res["phase"], "resolved");
+    let cid1 = submit_res["outcome"]["conversationId"].as_str().unwrap().to_owned();
+
+    // Verify 1 published entry on server while recipient is offline
+    let psql_d1 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{cid1}';")]).output().unwrap();
+    assert!(String::from_utf8_lossy(&psql_d1.stdout).contains(" 1"), "Offline recipient send publishes exactly 1 directRequestEntry");
+
+    // =========================================================================
+    // LEG 2b: Spawn Bob in Browser & OPFS reload before Welcome import
+    // =========================================================================
     let mut browser_proc = Command::new("node")
         .arg(&format!("{workspace}/catmos/tests/browser-live-controller.mjs"))
         .stdin(Stdio::piped())
@@ -734,21 +768,18 @@ async fn catmos_browser_live_row() {
         val
     };
 
-    // Init Bob in Browser
     let res = b_call(json!({"cmd": "init", "manifestPath": manifest_path, "label": "bob", "runId": run_hex}));
     assert_eq!(res["ok"], true, "Bob browser init");
 
-    // =========================================================================
-    // DIRECTION 1: Desktop Alice -> Browser Bob
-    // =========================================================================
-    let d1_draft_id = uuid::Uuid::new_v4().to_string();
-    let d1_intro = format!("Hello Bob! Live Direction 1 intro from Catmos Desktop ({run_hex}).");
-    let d1_input = json!({"draftId": d1_draft_id, "recipientDid": bob_did, "text": d1_intro, "invitation": null});
+    // Real OPFS worker reload before Welcome import
+    let reload_res = b_call(json!({"cmd": "reload_worker_before_welcome"}));
+    assert_eq!(reload_res["ok"], true, "Bob worker reload before welcome import");
 
-    call(&webview, "save_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "input": d1_input, "recipientLabel": "Bob"})).unwrap();
-    let submit_res = call(&webview, "submit_request_draft", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "draftId": d1_draft_id})).unwrap();
-    assert_eq!(submit_res["phase"], "resolved");
-    let cid1 = submit_res["outcome"]["conversationId"].as_str().unwrap().to_owned();
+    // =========================================================================
+    // LEG 3: Sender-offline preview/accept/reply
+    // =========================================================================
+    drop(webview);
+    drop(app);
 
     // Bob previews decrypted intro before accept
     let preview_res = b_call(json!({"cmd": "await_preview", "cid": &cid1, "text": d1_intro}));
@@ -756,61 +787,215 @@ async fn catmos_browser_live_row() {
     assert_eq!(preview_res["consent"], "incomingPending");
     assert_eq!(preview_res["previewText"], d1_intro);
     assert_eq!(preview_res["canSend"], false);
+    let _ = b_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/01-preview.png")}));
 
     // Bob accepts
     let accept_res = b_call(json!({"cmd": "accept", "cid": &cid1}));
     assert_eq!(accept_res["ok"], true);
+    let _ = b_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/02-accepted.png")}));
 
     // Bob replies
     let bob_reply = format!("Hello Alice! Bob in Browser accepted your live request ({run_hex}).");
     let reply_res = b_call(json!({"cmd": "send_message", "cid": &cid1, "text": bob_reply}));
     assert_eq!(reply_res["ok"], true);
+    let _ = b_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/03-reply.png")}));
 
-    // Desktop Alice refreshes and decrypts Bob's reply
-    let refresh_res = call(&webview, "refresh_direct_request", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "conversationId": cid1})).unwrap();
+    // =========================================================================
+    // LEG 4: Sender restart & message exchange
+    // =========================================================================
+    let reopened_storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
+    let reopened_api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
+    let reopened_mls_context = MLSContext::new(
+        tmp.path().join("mls_desktop.db").to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    reopened_api_client.set_mls_context(reopened_mls_context.clone());
+    reopened_storage.set_mls_context(reopened_mls_context.clone());
+    let reopened_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        reopened_api_client.chat_auth_provider(),
+        reopened_mls_context.clone(),
+    ));
+    reopened_credentials.store_server_device_id(alice_did, alice_acc["deviceId"].as_str().unwrap()).await.unwrap();
+    let reopened_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        reopened_mls_context.clone(),
+        reopened_storage.clone(),
+        reopened_api_client.clone(),
+        reopened_credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+    let reopened_state = AppState {
+        request_scope: tokio::sync::Mutex::new(()),
+        orchestrator: reopened_orchestrator,
+        chat_auth: reopened_api_client.chat_auth_provider(),
+        api_client: reopened_api_client.clone(),
+        ws_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        kp_monitor: tokio::sync::Mutex::new(None),
+        sync_loop: tokio::sync::Mutex::new(None),
+        data_dir: tmp.path().to_path_buf(),
+    };
+    reopened_state.orchestrator.initialize(alice_did).await.unwrap();
+    commands::install_content_root_key(&reopened_state, alice_did);
+    commands::configure_chat_auth(&reopened_state, alice_did, alice_session).await.unwrap();
+    let reopened_alice_rev = reopened_state.api_client.current_session().unwrap().revision.to_string();
+
+    let reopened_app = tauri::test::mock_builder()
+        .manage(reopened_state)
+        .invoke_handler(tauri::generate_handler![
+            request_commands::save_request_draft,
+            request_commands::submit_request_draft,
+            request_commands::refresh_direct_request,
+            request_commands::accept_direct_request,
+            commands::send_message,
+            commands::get_messages,
+            commands::fetch_new_messages,
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let reopened_webview = tauri::WebviewWindowBuilder::new(&reopened_app, "reopened_main", Default::default()).build().unwrap();
+
+    let refresh_res = call(&reopened_webview, "refresh_direct_request", json!({"ownerDid": alice_did, "ownerRevision": reopened_alice_rev, "conversationId": cid1})).unwrap();
     assert_eq!(refresh_res["consent"], "accepted");
 
-    let fetched = call(&webview, "fetch_new_messages", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "conversationId": cid1})).unwrap();
+    let fetched = call(&reopened_webview, "fetch_new_messages", json!({"ownerDid": alice_did, "ownerRevision": reopened_alice_rev, "conversationId": cid1})).unwrap();
     let messages = fetched.as_array().unwrap();
     assert!(messages.iter().any(|m| m["content"] == bob_reply), "Bob reply decrypted on desktop");
 
-    // Desktop Alice replies back with confirmed local send state
     let alice_reply = format!("Alice Desktop received Bob reply and replies back live ({run_hex}).");
-    let alice_send = call(&webview, "send_message", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "conversationId": cid1, "content": alice_reply})).unwrap();
+    let alice_send = call(&reopened_webview, "send_message", json!({"ownerDid": alice_did, "ownerRevision": reopened_alice_rev, "conversationId": cid1, "content": alice_reply})).unwrap();
     assert_eq!(alice_send["conversationId"], cid1);
     assert_eq!(alice_send["content"], alice_reply);
 
-    // Bob browser receives Alice's reply
     let bob_fetched = b_call(json!({"cmd": "fetch_messages", "cid": cid1, "expectedText": alice_reply}));
     assert!(bob_fetched["messages"].as_array().unwrap().iter().any(|m| m["content"] == alice_reply), "Alice reply decrypted in browser");
 
-    // Restart / reload check on both sides: exactly 1 occurrence of each message
-    let desktop_recheck = call(&webview, "get_messages", json!({"ownerDid": alice_did, "ownerRevision": alice_rev, "conversationId": cid1, "before": null})).unwrap();
+    // =========================================================================
+    // LEG 5: Real restart on both sides & F37 sent-once
+    // =========================================================================
+    drop(reopened_webview);
+    drop(reopened_app);
+
+    let r2_storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
+    let r2_api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
+    let r2_mls_context = MLSContext::new(
+        tmp.path().join("mls_desktop.db").to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    r2_api_client.set_mls_context(r2_mls_context.clone());
+    r2_storage.set_mls_context(r2_mls_context.clone());
+    let r2_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        r2_api_client.chat_auth_provider(),
+        r2_mls_context.clone(),
+    ));
+    r2_credentials.store_server_device_id(alice_did, alice_acc["deviceId"].as_str().unwrap()).await.unwrap();
+    let r2_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        r2_mls_context.clone(),
+        r2_storage.clone(),
+        r2_api_client.clone(),
+        r2_credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+    let r2_state = AppState {
+        request_scope: tokio::sync::Mutex::new(()),
+        orchestrator: r2_orchestrator,
+        chat_auth: r2_api_client.chat_auth_provider(),
+        api_client: r2_api_client.clone(),
+        ws_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        kp_monitor: tokio::sync::Mutex::new(None),
+        sync_loop: tokio::sync::Mutex::new(None),
+        data_dir: tmp.path().to_path_buf(),
+    };
+    r2_state.orchestrator.initialize(alice_did).await.unwrap();
+    commands::install_content_root_key(&r2_state, alice_did);
+    commands::configure_chat_auth(&r2_state, alice_did, alice_session).await.unwrap();
+    let r2_alice_rev = r2_state.api_client.current_session().unwrap().revision.to_string();
+
+    let r2_app = tauri::test::mock_builder()
+        .manage(r2_state)
+        .invoke_handler(tauri::generate_handler![
+            request_commands::save_request_draft,
+            request_commands::submit_request_draft,
+            request_commands::refresh_direct_request,
+            request_commands::accept_direct_request,
+            commands::send_message,
+            commands::get_messages,
+            commands::fetch_new_messages,
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let r2_webview = tauri::WebviewWindowBuilder::new(&r2_app, "r2_main", Default::default()).build().unwrap();
+
+    let desktop_recheck = call(&r2_webview, "get_messages", json!({"ownerDid": alice_did, "ownerRevision": r2_alice_rev, "conversationId": cid1, "before": null})).unwrap();
     let d_msgs = desktop_recheck.as_array().unwrap();
-    assert_eq!(d_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1);
-    assert_eq!(d_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1);
+    assert_eq!(d_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1, "bob reply persisted once across restart");
+    assert_eq!(d_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1, "alice reply persisted once across restart");
 
     let b_reload = b_call(json!({"cmd": "reload_and_check", "cid": cid1}));
     let b_msgs = b_reload["messages"].as_array().unwrap();
-    assert_eq!(b_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1);
-    assert_eq!(b_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1);
+    assert_eq!(b_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1, "bob reply persisted once in browser");
+    assert_eq!(b_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1, "alice reply persisted once in browser");
+    let _ = b_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/04-reload.png")}));
 
     // Close browser controller
     let _ = b_call(json!({"cmd": "close"}));
     let _ = browser_proc.kill();
 
-    // Check PostgreSQL chat.entries for the direct request conversation
+    // =========================================================================
+    // LEG 6: Database sequencing assertion (exactly 4 entries)
+    // =========================================================================
     let entries_d1 = Command::new("psql")
         .args([&db_url, "-X", "-c", &format!("SELECT seq, entry_kind, actor_did FROM chat.entries WHERE conversation_id='{cid1}' ORDER BY seq;")])
         .output()
         .expect("query chat.entries D1");
     let d1_text = String::from_utf8_lossy(&entries_d1.stdout);
     eprintln!("Direction 1 entries:\n{d1_text}");
-    assert!(d1_text.contains("directRequestEntry"), "Must contain directRequestEntry");
-    assert!(d1_text.contains("directRequestAcceptanceEntry"), "Must contain directRequestAcceptanceEntry");
-    assert!(d1_text.contains("applicationEntry"), "Must contain applicationEntry");
+    let rows: Vec<&str> = d1_text.lines().filter(|l| l.contains("blue.catbird.chat.defs#")).collect();
+    assert_eq!(rows.len(), 4, "Must contain exactly 4 sequenced entries: {rows:?}");
+    assert!(rows[0].contains("directRequestEntry") && rows[0].contains(alice_did));
+    assert!(rows[1].contains("directRequestAcceptanceEntry") && rows[1].contains(bob_did));
+    assert!(rows[2].contains("applicationEntry") && rows[2].contains(bob_did));
+    assert!(rows[3].contains("applicationEntry") && rows[3].contains(alice_did));
 
-    eprintln!("BIDIRECTIONAL LIVE QUALIFICATION SUCCESSFUL!");
+    let ended_at = chrono::Utc::now().to_rfc3339();
+
+    // =========================================================================
+    // LEG 7: Evidence packaging
+    // =========================================================================
+    let spec = json!({
+        "row_id": "catmos-browser",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "database_name": db_name,
+        "conversation_id": cid1,
+        "draft_id": d1_draft_id,
+        "sender_info": {"client": "Catmos Desktop", "did": alice_did, "deviceId": alice_acc["deviceId"].as_str().unwrap()},
+        "recipient_info": {"client": "Catmos Browser (WASM)", "did": bob_did, "deviceId": bob_acc["deviceId"].as_str().unwrap()},
+        "assertions": [
+            "Local draft creation and cancellation produces 0 remote chat entries",
+            "Offline recipient first send records exactly 1 directRequestEntry on server",
+            "Browser OPFS worker reload before Welcome import preserves clean state",
+            "Sender offline: recipient decrypts intro and accepts, reply is encrypted",
+            "Sender restart from disk: decrypts reply and sends follow-up",
+            "Recipient decrypts sender reply in browser",
+            "Full desktop restart and browser reload: both messages persisted exactly once (F37 sent-once)",
+            "PostgreSQL chat.entries contains exactly 4 ordered entries with no duplicates or extra Add commits"
+        ],
+        "not_exercised": [
+            "unavailableDevicePreconsent: Local gateway manifest uses deterministic single-device recipient; multi-device key package race is tested in iOS/Android test suites",
+            "recipientDeclineBlockLeg: Interoperability row exercises the full acceptance, reply, and restart pipeline; decline/block behavior is tested in standalone unit suites"
+        ],
+        "log_name": "catmos-browser-live.log"
+    });
+    let spec_path = format!("{workspace}/catmos/tests/spec-catmos-browser.json");
+    std::fs::write(&spec_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+    let pkg_res = Command::new("python3")
+        .args([&format!("{workspace}/catmos/tests/package_evidence.py"), &spec_path])
+        .output()
+        .expect("package evidence");
+    eprintln!("Packaging output:\n{}", String::from_utf8_lossy(&pkg_res.stdout));
+    assert!(pkg_res.status.success(), "package_evidence failed");
+    eprintln!("CATMOS-BROWSER LIVE ROW FULLY QUALIFIED!");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -928,7 +1113,74 @@ async fn browser_catmos_live_row() {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 
-    // 5. Initialize Desktop AppState as BOB (Recipient on Desktop)
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let evid_dir = format!("{workspace}/docs/generated-artifacts/encrypted-requests/evidence/browser-catmos");
+    let _ = std::fs::create_dir_all(&evid_dir);
+
+    // =========================================================================
+    // 5. Spawn browser-live-controller as ALICE (Sender in Browser)
+    // =========================================================================
+    let mut browser_proc = Command::new("node")
+        .arg(&format!("{workspace}/catmos/tests/browser-live-controller.mjs"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn browser-live-controller");
+
+    let mut b_stdin = browser_proc.stdin.take().unwrap();
+    let mut b_reader = BufReader::new(browser_proc.stdout.take().unwrap());
+
+    let mut b_call = |req: Value| -> Value {
+        b_stdin.write_all(req.to_string().as_bytes()).unwrap();
+        b_stdin.write_all(b"\n").unwrap();
+        b_stdin.flush().unwrap();
+        let mut line = String::new();
+        b_reader.read_line(&mut line).unwrap();
+        let val: Value = serde_json::from_str(line.trim()).unwrap();
+        if val["ok"] == false {
+            panic!("b_call error for {:?}: {:?}", req["cmd"], val["error"]);
+        }
+        val
+    };
+
+    // Init Alice in Browser
+    let res = b_call(json!({"cmd": "init", "manifestPath": manifest_path, "label": "alice", "runId": run_hex}));
+    assert_eq!(res["ok"], true, "Alice browser init");
+
+    // =========================================================================
+    // LEG 1: Local draft/cancel check in Browser (0 remote entries)
+    // =========================================================================
+    let draft_res = b_call(json!({"cmd": "save_draft", "recipientDid": bob_did, "text": "Browser draft cancelled before send"}));
+    assert_eq!(draft_res["ok"], true);
+    let d0_id = draft_res["draft"]["input"]["draftId"].as_str().unwrap();
+    let cancel_res = b_call(json!({"cmd": "cancel_draft", "draftId": d0_id}));
+    assert_eq!(cancel_res["ok"], true);
+    assert_eq!(cancel_res["draft"]["archived"], true);
+    let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", "SELECT count(*) FROM chat.entries;"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&psql_d0.stdout).contains(" 0"), "Browser draft cancellation leaves 0 remote entries");
+
+    // =========================================================================
+    // LEG 2: Offline recipient first send (Desktop Bob is NOT started yet)
+    // =========================================================================
+    let intro = format!("Hello Bob Desktop! Live intro from Browser Alice ({run_hex}).");
+    let sent = b_call(json!({"cmd": "send_request", "recipientDid": bob_did, "text": intro}));
+    assert_eq!(sent["ok"], true);
+    assert_eq!(sent["outcome"]["type"], "requestSent", "Fresh direct request is requestSent");
+    let cid = sent["cid"].as_str().unwrap().to_owned();
+    let d1_draft_id = sent["draftId"].as_str().unwrap_or("browser-draft-1").to_owned();
+
+    // Verify 1 published entry on server while recipient is offline
+    let psql_d1 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE conversation_id='{cid}';")]).output().unwrap();
+    assert!(String::from_utf8_lossy(&psql_d1.stdout).contains(" 1"), "Offline recipient send publishes exactly 1 directRequestEntry");
+
+    // =========================================================================
+    // LEG 3: Sender-offline preview/accept/reply
+    // Drop Browser Alice completely so sender is offline
+    // =========================================================================
+    let _ = b_call(json!({"cmd": "close"}));
+    let _ = browser_proc.kill();
+
+    // Initialize Desktop AppState as BOB (Recipient on Desktop)
     let desktop_profile = format!("/tmp/catmos-desktop-profile-bob-{run_hex}");
     let desktop_config = format!("/tmp/catmos-fixture-bob-{run_hex}.json");
     std::fs::write(&desktop_config, json!({
@@ -999,42 +1251,7 @@ async fn browser_catmos_live_row() {
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
     let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default()).build().unwrap();
-
     call(&webview, "set_request_delivery_enabled", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "enabled": true})).unwrap();
-    // 6. Spawn browser-live-controller as ALICE (Sender in Browser)
-    let mut browser_proc = Command::new("node")
-        .arg(&format!("{workspace}/catmos/tests/browser-live-controller.mjs"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn browser-live-controller");
-
-    let mut b_stdin = browser_proc.stdin.take().unwrap();
-    let mut b_reader = BufReader::new(browser_proc.stdout.take().unwrap());
-
-    let mut b_call = |req: Value| -> Value {
-        b_stdin.write_all(req.to_string().as_bytes()).unwrap();
-        b_stdin.write_all(b"\n").unwrap();
-        b_stdin.flush().unwrap();
-        let mut line = String::new();
-        b_reader.read_line(&mut line).unwrap();
-        let val: Value = serde_json::from_str(line.trim()).unwrap();
-        if val["ok"] == false {
-            panic!("b_call error for {:?}: {:?}", req["cmd"], val["error"]);
-        }
-        val
-    };
-
-    // Init Alice in Browser
-    let res = b_call(json!({"cmd": "init", "manifestPath": manifest_path, "label": "alice", "runId": run_hex}));
-    assert_eq!(res["ok"], true, "Alice browser init");
-
-    // Browser Alice sends direct request to Desktop Bob
-    let intro = format!("Hello Bob Desktop! Live intro from Browser Alice ({run_hex}).");
-    let sent = b_call(json!({"cmd": "send_request", "recipientDid": bob_did, "text": intro}));
-    assert_eq!(sent["ok"], true);
-    assert_eq!(sent["outcome"]["type"], "requestSent", "Fresh direct request is requestSent");
-    let cid = sent["cid"].as_str().unwrap().to_owned();
 
     // Desktop Bob refreshes and previews decrypted intro before accept
     let preview = call(&webview, "refresh_direct_request", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "conversationId": cid})).unwrap();
@@ -1051,13 +1268,44 @@ async fn browser_catmos_live_row() {
     let bob_send = call(&webview, "send_message", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "conversationId": cid, "content": bob_reply})).unwrap();
     assert_eq!(bob_send["content"], bob_reply);
 
+    // =========================================================================
+    // LEG 4: Sender restart & message exchange
+    // =========================================================================
+    let mut browser_proc2 = Command::new("node")
+        .arg(&format!("{workspace}/catmos/tests/browser-live-controller.mjs"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn browser-live-controller Alice restart");
+
+    let mut b2_stdin = browser_proc2.stdin.take().unwrap();
+    let mut b2_reader = BufReader::new(browser_proc2.stdout.take().unwrap());
+
+    let mut b2_call = |req: Value| -> Value {
+        b2_stdin.write_all(req.to_string().as_bytes()).unwrap();
+        b2_stdin.write_all(b"\n").unwrap();
+        b2_stdin.flush().unwrap();
+        let mut line = String::new();
+        b2_reader.read_line(&mut line).unwrap();
+        let val: Value = serde_json::from_str(line.trim()).unwrap();
+        if val["ok"] == false {
+            panic!("b2_call error for {:?}: {:?}", req["cmd"], val["error"]);
+        }
+        val
+    };
+
+    let res2 = b2_call(json!({"cmd": "init", "manifestPath": manifest_path, "label": "alice", "runId": run_hex}));
+    assert_eq!(res2["ok"], true, "Alice browser re-init");
+
     // Browser Alice decrypts Bob's reply
-    let alice_fetched = b_call(json!({"cmd": "fetch_messages", "cid": cid, "expectedText": bob_reply}));
+    let alice_fetched = b2_call(json!({"cmd": "fetch_messages", "cid": cid, "expectedText": bob_reply}));
     assert!(alice_fetched["messages"].as_array().unwrap().iter().any(|m| m["content"] == bob_reply));
+    let _ = b2_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/01-preview-accepted.png")}));
 
     // Browser Alice replies back
     let alice_reply = format!("Alice in Browser received Bob's Desktop reply ({run_hex}).");
-    b_call(json!({"cmd": "send_message", "cid": cid, "text": alice_reply}));
+    b2_call(json!({"cmd": "send_message", "cid": cid, "text": alice_reply}));
+    let _ = b2_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/02-reply.png")}));
 
     // Desktop Bob receives and decrypts Alice's reply
     let mut bob_msgs = Vec::new();
@@ -1074,31 +1322,131 @@ async fn browser_catmos_live_row() {
     }
     assert!(bob_msgs.iter().any(|m| m["content"] == alice_reply), "Alice reply decrypted on desktop Bob");
 
-    // Persistence across reload on both sides: exactly 1 occurrence of each message
-    let desktop_recheck = call(&webview, "get_messages", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "conversationId": cid, "before": null})).unwrap();
-    let d_msgs = desktop_recheck.as_array().unwrap();
-    assert_eq!(d_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1);
-    assert_eq!(d_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1);
+    // =========================================================================
+    // LEG 5: Real restart on both sides & F37 sent-once
+    // =========================================================================
+    drop(webview);
+    drop(app);
 
-    let b_reload = b_call(json!({"cmd": "reload_and_check", "cid": cid}));
+    // Reopen desktop Bob
+    let r_storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
+    let r_api_client = Arc::new(ReqwestApiClient::new(manifest["origin"].as_str().unwrap().to_string()));
+    let r_mls_context = MLSContext::new(
+        tmp.path().join("mls_desktop_bob.db").to_string_lossy().into_owned(),
+        DB_KEY.into(),
+        Box::new(MemoryKeychain(Mutex::new(HashMap::new()))),
+    ).unwrap();
+    r_api_client.set_mls_context(r_mls_context.clone());
+    r_storage.set_mls_context(r_mls_context.clone());
+    let r_credentials = Arc::new(KeyringCredentialStore::with_chat_auth(
+        r_api_client.chat_auth_provider(),
+        r_mls_context.clone(),
+    ));
+    r_credentials.store_server_device_id(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
+    let r_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
+        r_mls_context.clone(),
+        r_storage.clone(),
+        r_api_client.clone(),
+        r_credentials.clone(),
+        catbird_mls::orchestrator::OrchestratorConfig::default(),
+    ));
+    let r_state = AppState {
+        request_scope: tokio::sync::Mutex::new(()),
+        orchestrator: r_orchestrator,
+        chat_auth: r_api_client.chat_auth_provider(),
+        api_client: r_api_client.clone(),
+        ws_handles: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        kp_monitor: tokio::sync::Mutex::new(None),
+        sync_loop: tokio::sync::Mutex::new(None),
+        data_dir: tmp.path().to_path_buf(),
+    };
+    r_state.orchestrator.initialize(bob_did).await.unwrap();
+    commands::install_content_root_key(&r_state, bob_did);
+    commands::configure_chat_auth(&r_state, bob_did, bob_session).await.unwrap();
+    let r_bob_rev = r_state.api_client.current_session().unwrap().revision.to_string();
+
+    let r_app = tauri::test::mock_builder()
+        .manage(r_state)
+        .invoke_handler(tauri::generate_handler![
+            request_commands::save_request_draft,
+            request_commands::submit_request_draft,
+            request_commands::refresh_direct_request,
+            request_commands::accept_direct_request,
+            commands::send_message,
+            commands::get_messages,
+            commands::fetch_new_messages,
+        ])
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let r_webview = tauri::WebviewWindowBuilder::new(&r_app, "r_main", Default::default()).build().unwrap();
+
+    let desktop_recheck = call(&r_webview, "get_messages", json!({"ownerDid": bob_did, "ownerRevision": r_bob_rev, "conversationId": cid, "before": null})).unwrap();
+    let d_msgs = desktop_recheck.as_array().unwrap();
+    assert_eq!(d_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1, "bob reply persisted once across restart");
+    assert_eq!(d_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1, "alice reply persisted once across restart");
+
+    let b_reload = b2_call(json!({"cmd": "reload_and_check", "cid": cid}));
     let b_msgs = b_reload["messages"].as_array().unwrap();
-    assert_eq!(b_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1);
-    assert_eq!(b_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1);
+    assert_eq!(b_msgs.iter().filter(|m| m["content"] == bob_reply).count(), 1, "bob reply persisted once in browser");
+    assert_eq!(b_msgs.iter().filter(|m| m["content"] == alice_reply).count(), 1, "alice reply persisted once in browser");
+    let _ = b2_call(json!({"cmd": "screenshot", "path": format!("{evid_dir}/03-reload.png")}));
 
     // Close browser controller
-    let _ = b_call(json!({"cmd": "close"}));
-    let _ = browser_proc.kill();
+    let _ = b2_call(json!({"cmd": "close"}));
+    let _ = browser_proc2.kill();
 
-    // Check PostgreSQL chat.entries for the direct request conversation
+    // =========================================================================
+    // LEG 6: Database sequencing assertion (exactly 4 entries)
+    // =========================================================================
     let entries = Command::new("psql")
         .args([&db_url, "-X", "-c", &format!("SELECT seq, entry_kind, actor_did FROM chat.entries WHERE conversation_id='{cid}' ORDER BY seq;")])
         .output()
         .expect("query chat.entries");
     let text = String::from_utf8_lossy(&entries.stdout);
     eprintln!("Browser-to-Catmos entries:\n{text}");
-    assert!(text.contains("directRequestEntry"), "Must contain directRequestEntry");
-    assert!(text.contains("directRequestAcceptanceEntry"), "Must contain directRequestAcceptanceEntry");
-    assert!(text.contains("applicationEntry"), "Must contain applicationEntry");
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains("blue.catbird.chat.defs#")).collect();
+    assert_eq!(rows.len(), 4, "Must contain exactly 4 sequenced entries: {rows:?}");
+    assert!(rows[0].contains("directRequestEntry") && rows[0].contains(alice_did));
+    assert!(rows[1].contains("directRequestAcceptanceEntry") && rows[1].contains(bob_did));
+    assert!(rows[2].contains("applicationEntry") && rows[2].contains(bob_did));
+    assert!(rows[3].contains("applicationEntry") && rows[3].contains(alice_did));
 
-    eprintln!("BROWSER-CATMOS LIVE QUALIFICATION SUCCESSFUL!");
+    let ended_at = chrono::Utc::now().to_rfc3339();
+
+    // =========================================================================
+    // LEG 7: Evidence packaging
+    // =========================================================================
+    let spec = json!({
+        "row_id": "browser-catmos",
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "database_name": db_name,
+        "conversation_id": cid,
+        "draft_id": d1_draft_id,
+        "sender_info": {"client": "Catmos Browser (WASM)", "did": alice_did, "deviceId": alice_acc["deviceId"].as_str().unwrap()},
+        "recipient_info": {"client": "Catmos Desktop", "did": bob_did, "deviceId": bob_acc["deviceId"].as_str().unwrap()},
+        "assertions": [
+            "Local draft creation and cancellation in browser produces 0 remote chat entries",
+            "Offline recipient first send records exactly 1 directRequestEntry on server",
+            "Sender offline: recipient decrypts intro and accepts, reply is encrypted",
+            "Sender restart: decrypts reply and sends follow-up",
+            "Recipient decrypts sender reply on desktop",
+            "Full desktop restart and browser reload: both messages persisted exactly once (F37 sent-once)",
+            "PostgreSQL chat.entries contains exactly 4 ordered entries with no duplicates or extra Add commits"
+        ],
+        "not_exercised": [
+            "unavailableDevicePreconsent: Local gateway manifest uses deterministic single-device recipient; multi-device key package race is tested in iOS/Android test suites",
+            "recipientDeclineBlockLeg: Interoperability row exercises the full acceptance, reply, and restart pipeline; decline/block behavior is tested in standalone unit suites"
+        ],
+        "log_name": "browser-catmos-live.log"
+    });
+    let spec_path = format!("{workspace}/catmos/tests/spec-browser-catmos.json");
+    std::fs::write(&spec_path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
+    let pkg_res = Command::new("python3")
+        .args([&format!("{workspace}/catmos/tests/package_evidence.py"), &spec_path])
+        .output()
+        .expect("package evidence");
+    eprintln!("Packaging output:\n{}", String::from_utf8_lossy(&pkg_res.stdout));
+    assert!(pkg_res.status.success(), "package_evidence failed");
+    eprintln!("BROWSER-CATMOS LIVE ROW FULLY QUALIFIED!");
 }

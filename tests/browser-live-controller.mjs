@@ -251,6 +251,66 @@ async function handleCommand(req) {
     return { ok: true, count: messages.length, messages };
   }
 
+  if (cmd === 'reload_worker_before_welcome') {
+    await page.reload();
+    await page.evaluate(async act => {
+      const { auth } = await import('/src/lib/stores/auth.ts');
+      const api = await import('/src/lib/wasm.ts');
+      let ready = false;
+      let user = null;
+      const unsub = auth.subscribe(v => {
+        if (!v.loading && v.user) {
+          user = v.user;
+          ready = true;
+        }
+      });
+      const deadline = Date.now() + 15000;
+      while (!ready) {
+        if (Date.now() > deadline) { unsub(); break; }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      unsub();
+      if (!user) {
+        user = await api.completeLogin(act.session);
+        auth.setUser(user);
+      }
+      globalThis.fixtureActor = user;
+    }, actor);
+    return { ok: true };
+  }
+
+  if (cmd === 'save_draft') {
+    const { recipientDid, text } = req;
+    const draft = await page.evaluate(async ({ recipient, t }) => {
+      const { requests } = await import('/src/lib/stores/requests.ts');
+      requests.bindAccount(fixtureActor.did, fixtureActor.authRevision);
+      await requests.load();
+      requests.begin(recipient, 'Peer fixture', t);
+      let d;
+      const unsub = requests.subscribe(s => {
+        d = s.drafts.find(x => x.input.recipientDid === recipient);
+      });
+      unsub();
+      return d;
+    }, { recipient: recipientDid, t: text });
+    return { ok: true, draft };
+  }
+
+  if (cmd === 'cancel_draft') {
+    const { draftId } = req;
+    const draft = await page.evaluate(async id => {
+      const { requests } = await import('/src/lib/stores/requests.ts');
+      await requests.cancel(id);
+      let d;
+      const unsub = requests.subscribe(s => {
+        d = s.drafts.find(x => x.input.draftId === id);
+      });
+      unsub();
+      return d;
+    }, draftId);
+    return { ok: true, draft };
+  }
+
   if (cmd === 'screenshot') {
     await page.screenshot({ path: req.path });
     return { ok: true, path: req.path };
