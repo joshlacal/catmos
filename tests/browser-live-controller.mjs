@@ -302,13 +302,8 @@ async function handleCommand(req) {
       }
       globalThis.fixtureActor = user;
       console.error('[CONTROLLER] fixtureActor set:', user.did);
-      await api.refreshDirectRequest(user.did, act.cid).catch(e => console.error('[REFRESH ERR]', e));
-      const { requests } = await import('/src/lib/stores/requests.ts');
-      const { conversations } = await import('/src/lib/stores/conversations.ts');
-      await requests.load().catch(e => console.error('[REQ LOAD ERR]', e));
-      await conversations.load().catch(e => console.error('[CONV LOAD ERR]', e));
-    }, { ...actor, cid });
-    console.error('[CONTROLLER] Waiting for conversation row in UI sidebar up to 30s...');
+    }, actor);
+    console.error('[CONTROLLER] Waiting for conversation row in UI sidebar up to 60s...');
     let found = false;
     const deadline = Date.now() + 60000;
     while (Date.now() < deadline) {
