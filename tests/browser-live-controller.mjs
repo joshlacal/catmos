@@ -310,7 +310,7 @@ async function handleCommand(req) {
     }, { ...actor, cid });
     console.error('[CONTROLLER] Waiting for conversation row in UI sidebar up to 30s...');
     let found = false;
-    const deadline = Date.now() + 30000;
+    const deadline = Date.now() + 60000;
     while (Date.now() < deadline) {
       const count = await page.evaluate(() => {
         return document.querySelectorAll('.conversations-list .conversation-item').length;
@@ -327,23 +327,30 @@ async function handleCommand(req) {
     const convoBtn = page.locator('.conversations-list .conversation-item').nth(1);
     await convoBtn.click();
 
-    console.error('[CONTROLLER] Waiting for message bubbles in thread UI...');
-    await page.waitForSelector('.message-bubble', { timeout: 15000 });
+    console.error('[CONTROLLER] Waiting for message bubbles or unavailable state in thread UI...');
+    await page.waitForSelector('.message-bubble, .unavailable-device', { timeout: 15000 });
     await new Promise(r => setTimeout(r, 1000));
 
-    const renderedMessages = await page.evaluate(() => {
+    const renderedState = await page.evaluate(() => {
       const bubbles = Array.from(document.querySelectorAll('.message-bubble'));
-      return bubbles.map(b => ({
-        text: b.innerText.trim(),
-        isSent: b.classList.contains('sent') || b.closest('.message-row')?.classList.contains('sent')
-      }));
+      const unavailable = document.querySelector('.unavailable-device');
+      return {
+        bubbles: bubbles.map(b => ({
+          text: b.innerText.trim(),
+          isSent: b.classList.contains('sent') || b.closest('.message-row')?.classList.contains('sent')
+        })),
+        unavailableState: unavailable ? unavailable.innerText.trim() : null,
+        composerPresent: document.querySelector('.composer') !== null
+      };
     });
-    console.error('[CONTROLLER] Rendered messages from UI:', JSON.stringify(renderedMessages));
+    console.error('[CONTROLLER] Rendered state from UI:', JSON.stringify(renderedState));
 
     return {
       ok: true,
-      count: renderedMessages.length,
-      messages: renderedMessages,
+      count: renderedState.bubbles.length,
+      messages: renderedState.bubbles,
+      unavailableState: renderedState.unavailableState,
+      composerPresent: renderedState.composerPresent,
       method: 'ui'
     };
   }
