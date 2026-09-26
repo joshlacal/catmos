@@ -25,7 +25,16 @@ function createConversationsStore() {
 
 	return {
 		subscribe,
-		bindAccount(owner: string | null, revision?: string) { if (owner === ownerDid && authRevision === revision) return; authRevision = revision; ownerDid = owner; epoch++; set({ items: [], selectedId: null, loading: false }); },
+		bindAccount(owner: string | null, revision?: string) {
+			if (owner === ownerDid && authRevision === revision) return;
+			const accountChanged = owner !== ownerDid;
+			authRevision = revision;
+			ownerDid = owner;
+			epoch++;
+			if (accountChanged) {
+				set({ items: [], selectedId: null, loading: false });
+			}
+		},
 		findDirectConversation(targetDid: string): string | null {
 			const match = currentState.items.find(
 				(c) =>

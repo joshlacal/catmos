@@ -58,11 +58,15 @@ test('F61: conversations store bindAccount preserves idempotency on same revisio
   convos.bindAccount('did:plc:alice', 'rev-1');
   assert.equal(get(convos).items.length, 1, 'idempotent bindAccount must not clear items');
 
-  // New revision wipes items for clean account switch, requiring load()
+  // New revision for same account updates authRevision and increments epoch, but preserves items until reload
   convos.bindAccount('did:plc:alice', 'rev-2');
-  assert.equal(get(convos).items.length, 0, 'new revision clears items');
+  assert.equal(get(convos).items.length, 1, 'same account new revision preserves items until reload');
   await convos.load();
   assert.equal(get(convos).items.length, 1, 'items repopulated after reload');
+
+  // Switching to a different account DID clears items immediately
+  convos.bindAccount('did:plc:bob', 'rev-1');
+  assert.equal(get(convos).items.length, 0, 'account switch to different DID clears items');
 });
 
 test('F62: accepted request on unaddressed device (canSend=false) disallows ordinary activity', async () => {
