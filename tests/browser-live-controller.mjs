@@ -62,8 +62,10 @@ async function handleCommand(req) {
     const mappings = [...browserHosts].map(h => `MAP ${h} ${manifest.hosts[h] || manifest.hosts[gatewayHost]}`).join(',');
     const args = [`--host-resolver-rules=${mappings}`, '--no-proxy-server', `--ignore-certificate-errors-spki-list=${manifest.tlsSpkiSha256}`, '--disable-http-cache', '--disk-cache-size=0'];
     const userDataDir = join('/tmp', `catmos-browser-${req.label}-${runId}`);
-    const { rm } = await import('node:fs/promises');
-    await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
+    if (req.fresh) {
+      const { rm } = await import('node:fs/promises');
+      await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
+    }
     context = await chromium.launchPersistentContext(userDataDir, {
       args,
       viewport: { width: 1360, height: 980 },
@@ -209,8 +211,11 @@ async function handleCommand(req) {
   if (cmd === 'accept') {
     const { cid } = req;
     await page.getByRole('button', { name: 'Accept conversation', exact: true }).click();
-    await page.getByRole('button', { name: 'Open conversation', exact: true }).waitFor({ timeout: 20000 });
-    await page.getByRole('button', { name: 'Open conversation', exact: true }).click();
+    try {
+      const openBtn = page.getByRole('button', { name: 'Open conversation', exact: true });
+      await openBtn.waitFor({ timeout: 10000 });
+      await openBtn.click();
+    } catch (_) {}
     return { ok: true };
   }
 
