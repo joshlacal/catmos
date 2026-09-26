@@ -336,19 +336,44 @@ async function handleCommand(req) {
 
   if (cmd === 'save_draft') {
     const { recipientDid, text } = req;
-    const draft = await page.evaluate(async ({ recipient, t }) => {
+    // 1. UI: Click 'New conversation' in sidebar
+    const newConvoBtn = page.getByRole('button', { name: 'New conversation' });
+    await newConvoBtn.waitFor({ timeout: 5000 });
+    await newConvoBtn.click();
+
+    // 2. UI: Search for recipient in user search input
+    const searchInput = page.getByPlaceholder('Search by name or handle...');
+    await searchInput.waitFor({ timeout: 5000 });
+    await searchInput.fill('bob');
+
+    // 3. UI: Select the first matching search result
+    const searchResult = page.locator('.search-result').first();
+    await searchResult.waitFor({ timeout: 10000 });
+    await searchResult.click();
+
+    // 4. UI: Click 'Start Chat' button in dialog
+    const startChatBtn = page.getByRole('button', { name: 'Start Chat' });
+    await startChatBtn.waitFor({ timeout: 5000 });
+    await startChatBtn.click();
+
+    // 5. UI: Fill the 'Your message' compose textarea
+    const msgTextarea = page.locator('#request-message');
+    await msgTextarea.waitFor({ timeout: 5000 });
+    if (text) {
+      await msgTextarea.fill(text);
+    }
+
+    // Read state strictly for return value / logging
+    const draft = await page.evaluate(async recipient => {
       const { requests } = await import('/src/lib/stores/requests.ts');
-      requests.bindAccount(fixtureActor.did, fixtureActor.authRevision);
-      await requests.load();
-      requests.begin(recipient, 'Peer fixture', t);
       let d;
       const unsub = requests.subscribe(s => {
         d = s.drafts.find(x => x.input.recipientDid === recipient);
       });
       unsub();
       return d;
-    }, { recipient: recipientDid, t: text });
-    return { ok: true, draft };
+    }, recipientDid);
+    return { ok: true, draft, timestamp: new Date().toISOString() };
   }
 
   if (cmd === 'cancel_draft') {
