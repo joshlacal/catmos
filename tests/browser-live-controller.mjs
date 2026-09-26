@@ -21,6 +21,8 @@ const rpcMethods = new Map();
 for(const name of ['getOwnDevices','getDevices','getDeviceKey','getConversations','getPendingWelcomes','getLeafRecoveryInbox','getConversationState','getEntries','getDirectRequestOutcome']) rpcMethods.set(`/xrpc/blue.catbird.chat.${name}`,'GET');
 for(const name of ['enrollDevice','publishDirectRequestKeys','replenishKeyPackages','prepareDirectRequest','publishDirectRequest','cancelDirectRequestPreparation','acknowledgeWelcome','rejectWelcome','acceptConversation','sendMessage','createConversation','submitTransition','closeConversation','requestLeave','getSubscriptionTicket']) rpcMethods.set(`/xrpc/blue.catbird.chat.${name}`,'POST');
 for(const path of ['/auth/session','/xrpc/app.bsky.actor.getProfile','/xrpc/app.bsky.actor.getProfiles','/xrpc/app.bsky.actor.searchActors','/xrpc/app.bsky.actor.searchActorsTypeahead','/xrpc/app.bsky.graph.getBlocks','/xrpc/com.atproto.repo.listRecords','/xrpc/com.atproto.repo.getRecord']) rpcMethods.set(path,'GET');
+// Block sender publishes app.bsky.graph.block; the fixture gateway accepts only that record shape.
+rpcMethods.set('/xrpc/com.atproto.repo.createRecord', 'POST');
 
 function allowedRemote(url, method='GET', websocket=false, browserHosts) {
   const isFixtureHost = url.hostname.endsWith('.request-fixture.catbird.blue') || (browserHosts && browserHosts.has(url.hostname));
