@@ -249,6 +249,7 @@ async function handleCommand(req) {
     let state = null;
     while (Date.now() < deadline) {
       state = await page.evaluate(() => ({
+        eyebrow: document.querySelector('.request-detail .eyebrow')?.textContent?.trim() ?? null,
         header: document.querySelector('.request-detail header p:last-child')?.textContent?.trim() ?? null,
         notice: document.querySelector('.request-detail .notice:not(.error)')?.textContent?.trim() ?? null,
         error: document.querySelector('.request-detail .notice.error')?.textContent?.trim() ?? null,
