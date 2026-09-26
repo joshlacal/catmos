@@ -43,6 +43,50 @@ function allowedLocal(url, method) {
     (url.pathname === '/' || /^\/(src|node_modules|@vite|@id|@fs|\.svelte-kit|_app)\//.test(url.pathname) || /^\/(favicon|logo|catmos)[^/]*\.(svg|png|ico)$/.test(url.pathname));
 }
 
+function mark(label) {
+  const line = `[CONTROLLER] MARK ${label} ${new Date().toISOString()}`;
+  console.error(line);
+  return line;
+}
+
+async function restoreLogin() {
+  await page.evaluate(async act => {
+    const { auth } = await import('/src/lib/stores/auth.ts');
+    const api = await import('/src/lib/wasm.ts');
+    let user = null;
+    const unsub = auth.subscribe(v => { if (!v.loading && v.user) user = v.user; });
+    const deadline = Date.now() + 15000;
+    while (!user && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
+    unsub();
+    if (!user) {
+      user = await api.tryRestoreSession();
+      if (!user) user = await api.completeLogin(act.session);
+      auth.setUser(user);
+    }
+    globalThis.fixtureActor = user;
+  }, actor);
+}
+
+// Real UI: New conversation -> search exact recipient DID -> pick that result -> Start Chat -> type text.
+async function composeDraftUI(recipientDid, text) {
+  await page.getByRole('button', { name: 'New conversation' }).click({ timeout: 10000 });
+  const search = page.getByPlaceholder('Search by name or handle...');
+  await search.fill(recipientDid, { timeout: 5000 });
+  const handle = recipientDid.slice('did:web:'.length);
+  await page.locator('.search-result', { hasText: handle }).first().click({ timeout: 15000 });
+  await page.getByRole('button', { name: 'Start Chat' }).click({ timeout: 5000 });
+  const box = page.locator('#request-message');
+  await box.fill(text, { timeout: 5000 });
+  const draft = await page.evaluate(async ({ recipient, t }) => {
+    const { requests } = await import('/src/lib/stores/requests.ts');
+    let d;
+    const unsub = requests.subscribe(s => { d = s.drafts.find(x => x.input.recipientDid === recipient && x.input.text === t); });
+    unsub();
+    return d ?? null;
+  }, { recipient: recipientDid, t: text });
+  return { draft, composerValue: await box.inputValue() };
+}
+
 async function handleCommand(req) {
   const { cmd } = req;
   if (cmd === 'init') {
@@ -164,123 +208,96 @@ async function handleCommand(req) {
   }
 
   if (cmd === 'await_preview') {
-    const { cid, text } = req;
-    // Wait for decrypted preview to show up
-    await page.evaluate(async c => {
-      const { requests } = await import('/src/lib/stores/requests.ts');
-      const api = await import('/src/lib/wasm.ts');
-      for (let i = 0; i < 40; i++) {
-        await requests.load();
-        try {
-          const refreshed = await api.refreshDirectRequest(globalThis.fixtureActor.did, c, globalThis.fixtureActor.authRevision);
-          requests.applyView(globalThis.fixtureActor.did, refreshed);
-        } catch (_) {}
-        requests.selectRequest(c);
-        let ready = false;
-        const unsub = requests.subscribe(s => {
-          const v = s.views.find(x => x.conversationId === c);
-          if (v && v.preview) ready = true;
-        });
-        unsub();
-        if (ready) break;
-        await new Promise(r => setTimeout(r, 500));
-      }
-    }, cid);
-
-    if (text) {
-      try {
-        await page.getByLabel('Decrypted introduction').getByText(text, { exact: false }).waitFor({ timeout: 10000 });
-      } catch (_) {}
+    const { text } = req;
+    await page.locator('.conversations-list .conversation-item', { hasText: 'Message requests' }).click({ timeout: 15000 });
+    const row = page.locator('.request-inbox .row', { hasText: 'Review' });
+    const deadline = Date.now() + 90000;
+    let refreshes = 0;
+    while (Date.now() < deadline && (await row.count()) === 0) {
+      const refresh = page.getByRole('button', { name: 'Refresh', exact: true });
+      if (await refresh.isEnabled().catch(() => false)) { await refresh.click().catch(() => {}); refreshes++; }
+      await page.waitForTimeout(2000);
     }
-
-    const pending = await page.evaluate(async c => {
-      const api = await import('/src/lib/wasm.ts');
-      const actor = globalThis.fixtureActor;
-      return api.refreshDirectRequest(actor.did, c, actor.authRevision);
-    }, cid);
-
-    return {
-      ok: true,
-      consent: pending.consent,
-      previewText: pending.preview?.text,
-      canSend: pending.capabilities.canSend,
-      canEmitReceipts: pending.capabilities.canEmitReceipts
-    };
+    await row.first().click({ timeout: 5000 });
+    const intro = page.locator('.request-detail .intro p');
+    await intro.waitFor({ timeout: 60000 });
+    const previewText = await intro.innerText();
+    const eyebrow = await page.locator('.request-detail .eyebrow').innerText().catch(() => null);
+    return { ok: true, previewText, eyebrow, refreshes, textMatches: text ? previewText === text : null };
   }
 
   if (cmd === 'accept') {
-    const { cid } = req;
-    await page.getByRole('button', { name: 'Accept conversation', exact: true }).click();
-    try {
-      const openBtn = page.getByRole('button', { name: 'Open conversation', exact: true });
-      await openBtn.waitFor({ timeout: 10000 });
-      await openBtn.click();
-    } catch (_) {}
-    return { ok: true };
+    await page.getByRole('button', { name: 'Accept conversation', exact: true }).click({ timeout: 10000 });
+    const openBtn = page.getByRole('button', { name: 'Open conversation', exact: true });
+    await openBtn.waitFor({ timeout: 60000 });
+    const deadline = Date.now() + 60000;
+    while (!(await openBtn.isEnabled()) && Date.now() < deadline) await page.waitForTimeout(500);
+    const openEnabled = await openBtn.isEnabled();
+    const eyebrow = await page.locator('.request-detail .eyebrow').innerText().catch(() => null);
+    if (!openEnabled) throw new Error(`Accepted request never became sendable; eyebrow=${eyebrow}`);
+    await openBtn.click();
+    const composer = page.locator('textarea[placeholder="Message..."]');
+    await composer.waitFor({ timeout: 30000 });
+    return { ok: true, eyebrow, openEnabled, composerEnabled: await composer.isEnabled() };
   }
 
-  if (cmd === 'decline') {
-    const { cid } = req;
-    await page.getByRole('button', { name: 'Decline', exact: true }).click();
-    await page.waitForTimeout(2000);
-    return { ok: true, cid };
+  if (cmd === 'decline' || cmd === 'block') {
+    const label = cmd === 'decline' ? 'Decline' : 'Block sender';
+    await page.getByRole('button', { name: label, exact: true }).click({ timeout: 10000 });
+    const deadline = Date.now() + 30000;
+    let state = null;
+    while (Date.now() < deadline) {
+      state = await page.evaluate(() => ({
+        header: document.querySelector('.request-detail header p:last-child')?.textContent?.trim() ?? null,
+        notice: document.querySelector('.request-detail .notice:not(.error)')?.textContent?.trim() ?? null,
+        error: document.querySelector('.request-detail .notice.error')?.textContent?.trim() ?? null,
+        busy: !!document.querySelector('.request-detail button:disabled')
+      }));
+      if (state.error || (cmd === 'decline' && state.header === 'This request is closed.') || (cmd === 'block' && state.notice)) break;
+      await page.waitForTimeout(500);
+    }
+    return { ok: true, action: cmd, ui: state };
   }
 
-  if (cmd === 'block') {
-    const { cid } = req;
-    await page.getByRole('button', { name: 'Block sender', exact: true }).click();
-    await page.waitForTimeout(2000);
-    return { ok: true, cid };
-  }
   if (cmd === 'send_message') {
-    const { cid, text } = req;
-    const msg = await page.evaluate(async ({ c, t }) => {
-      const api = await import('/src/lib/wasm.ts');
-      return api.sendMessage(c, t, fixtureActor.did, fixtureActor.authRevision);
-    }, { c: cid, t: text });
-    return { ok: true, message: msg };
+    const { text } = req;
+    const composer = page.locator('textarea[placeholder="Message..."]');
+    await composer.fill(text, { timeout: 10000 });
+    await page.getByRole('button', { name: 'Send message' }).click({ timeout: 5000 });
+    const bubble = page.locator('.bubble', { hasText: text });
+    await bubble.first().waitFor({ timeout: 30000 });
+    const bubbles = await page.locator('.bubble').allInnerTexts();
+    return { ok: true, bubbles };
   }
 
-  if (cmd === 'send_request') {
+  if (cmd === 'compose_request') {
+    const res = await composeDraftUI(req.recipientDid, req.text);
+    return { ok: true, ...res };
+  }
+
+  if (cmd === 'send_introduction') {
     const { recipientDid, text } = req;
-    const draftId = await page.evaluate(async ({ recipient, t }) => {
+    await page.getByRole('button', { name: 'Send introduction' }).click({ timeout: 5000 });
+    const res = await page.evaluate(async ({ recipient, t }) => {
       const { requests } = await import('/src/lib/stores/requests.ts');
-      requests.bindAccount(fixtureActor.did, fixtureActor.authRevision);
-      await requests.setDeliveryEnabled(true);
-      await requests.load();
-      requests.begin(recipient, 'Peer fixture', t);
-      let id;
-      const unsub = requests.subscribe(s => { id = s.selectedId; });
-      unsub();
-      if (!id) throw new Error('No draftId created by requests.begin');
-      return id;
-    }, { recipient: recipientDid, t: text });
-
-    // Click 'Send introduction' in the real Playwright UI
-    const sendBtn = page.getByRole('button', { name: 'Send introduction' });
-    await sendBtn.waitFor({ timeout: 5000 });
-    await sendBtn.click();
-
-    // Wait for the outcome to settle
-    const res = await page.evaluate(async id => {
-      const { requests } = await import('/src/lib/stores/requests.ts');
-      let deadline = Date.now() + 20000;
+      const deadline = Date.now() + 45000;
       while (Date.now() < deadline) {
         let d;
-        const unsub = requests.subscribe(s => {
-          d = s.drafts.find(x => x.input.draftId === id);
-        });
+        const unsub = requests.subscribe(s => { d = s.drafts.find(x => x.input.recipientDid === recipient && x.input.text === t && x.outcome); });
         unsub();
-        if (d && d.outcome) return { draftId: id, outcome: d.outcome };
-        await new Promise(r => setTimeout(r, 200));
+        if (d) return { draftId: d.input.draftId, outcome: d.outcome };
+        await new Promise(r => setTimeout(r, 250));
       }
-      throw new Error('Timeout waiting for request outcome');
-    }, draftId);
-
-    if (!res.outcome || (res.outcome.type !== 'requestSent' && res.outcome.type !== 'existingDirect')) {
-      throw new Error(`Unexpected outcome: ${JSON.stringify(res.outcome)}`);
-    }
-    return { ok: true, draftId: res.draftId, cid: res.outcome.conversationId, outcome: res.outcome, timestamp: new Date().toISOString() };
+      return { draftId: null, outcome: null };
+    }, { recipient: recipientDid, t: text });
+    await page.waitForTimeout(500);
+    const ui = await page.evaluate(() => ({
+      resultTitle: document.querySelector('.request-compose .result h2')?.textContent?.trim() ?? null,
+      resultBody: document.querySelector('.request-compose .result p')?.textContent?.trim() ?? null,
+      error: document.querySelector('.request-compose .notice.error')?.textContent?.trim() ?? null,
+      composerValue: document.querySelector('#request-message')?.value ?? null
+    }));
+    return { ok: true, ...res, cid: res.outcome?.conversationId ?? null, ui };
   }
 
   if (cmd === 'fetch_messages') {
@@ -366,13 +383,11 @@ async function handleCommand(req) {
 
     console.error('[CONTROLLER] Clicking conversation in UI sidebar...');
     const convoBtn = page.locator('.conversations-list .conversation-item').nth(1);
-    await convoBtn.click().catch(() => {});
-    await page.evaluate(async (c) => {
-      const { conversations } = await import('/src/lib/stores/conversations.ts');
-      const { requests } = await import('/src/lib/stores/requests.ts');
-      requests.hide();
-      conversations.select(c);
-    }, cid);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await convoBtn.click({ timeout: 10000 });
+      if (await page.locator('.message-list').count()) break;
+      await page.waitForTimeout(1000);
+    }
 
     console.error('[CONTROLLER] Waiting for message bubbles or thread state in UI...');
     await page.waitForSelector('.bubble, .message-row, .message-item, .request-first-message, .unavailable-device, .empty-messages, .message-list', { timeout: 30000 });
@@ -434,75 +449,31 @@ async function handleCommand(req) {
     return { ok: true, result: res };
   }
 
+  if (cmd === 'mark') {
+    return { ok: true, line: mark(req.label) };
+  }
+
+  // Unload the app document (and its MLS worker) while keeping the browser
+  // and its OPFS profile up, so nothing can sync until the next navigation.
+  if (cmd === 'park') {
+    const line = mark('parked');
+    await page.goto('about:blank');
+    return { ok: true, line };
+  }
+
+  // Real document + worker reload. From a parked page this is the first load
+  // after the peer's publication; otherwise it reloads the running app.
   if (cmd === 'reload_worker_before_welcome') {
-    await page.reload();
-    await page.evaluate(async act => {
-      const { auth } = await import('/src/lib/stores/auth.ts');
-      const api = await import('/src/lib/wasm.ts');
-      let ready = false;
-      let user = null;
-      const unsub = auth.subscribe(v => {
-        if (!v.loading && v.user) {
-          user = v.user;
-          ready = true;
-        }
-      });
-      const deadline = Date.now() + 15000;
-      while (!ready) {
-        if (Date.now() > deadline) { unsub(); break; }
-        await new Promise(r => setTimeout(r, 50));
-      }
-      unsub();
-      if (!user) {
-        user = await api.tryRestoreSession();
-        if (!user) user = await api.completeLogin(act.session);
-        auth.setUser(user);
-      }
-      globalThis.fixtureActor = user;
-    }, actor);
-    return { ok: true };
+    const line = mark('reload-before-welcome');
+    if (page.url() === 'about:blank') await page.goto(manifest.corsOrigin);
+    else await page.reload();
+    await restoreLogin();
+    return { ok: true, line };
   }
 
   if (cmd === 'save_draft') {
-    const { recipientDid, text } = req;
-    // 1. UI: Click 'New conversation' in sidebar
-    const newConvoBtn = page.getByRole('button', { name: 'New conversation' });
-    await newConvoBtn.waitFor({ timeout: 5000 });
-    await newConvoBtn.click();
-
-    // 2. UI: Search for recipient in user search input
-    const searchInput = page.getByPlaceholder('Search by name or handle...');
-    await searchInput.waitFor({ timeout: 5000 });
-    await searchInput.fill('bob');
-
-    // 3. UI: Select the first matching search result
-    const searchResult = page.locator('.search-result').first();
-    await searchResult.waitFor({ timeout: 10000 });
-    await searchResult.click();
-
-    // 4. UI: Click 'Start Chat' button in dialog
-    const startChatBtn = page.getByRole('button', { name: 'Start Chat' });
-    await startChatBtn.waitFor({ timeout: 5000 });
-    await startChatBtn.click();
-
-    // 5. UI: Fill the 'Your message' compose textarea
-    const msgTextarea = page.locator('#request-message');
-    await msgTextarea.waitFor({ timeout: 5000 });
-    if (text) {
-      await msgTextarea.fill(text);
-    }
-
-    // Read state strictly for return value / logging
-    const draft = await page.evaluate(async recipient => {
-      const { requests } = await import('/src/lib/stores/requests.ts');
-      let d;
-      const unsub = requests.subscribe(s => {
-        d = s.drafts.find(x => x.input.recipientDid === recipient);
-      });
-      unsub();
-      return d;
-    }, recipientDid);
-    return { ok: true, draft, timestamp: new Date().toISOString() };
+    const res = await composeDraftUI(req.recipientDid, req.text);
+    return { ok: true, ...res, timestamp: new Date().toISOString() };
   }
 
   if (cmd === 'cancel_draft') {

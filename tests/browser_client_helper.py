@@ -45,7 +45,8 @@ class BrowserClient:
         return self._req({"cmd": "send_message", "cid": cid, "text": text})
 
     def send_request(self, recipient_did, text):
-        return self._req({"cmd": "send_request", "recipientDid": recipient_did, "text": text})
+        self._req({"cmd": "compose_request", "recipientDid": recipient_did, "text": text})
+        return self._req({"cmd": "send_introduction", "recipientDid": recipient_did, "text": text})
 
     def fetch_messages(self, cid):
         return self._req({"cmd": "fetch_messages", "cid": cid})
