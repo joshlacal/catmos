@@ -53,7 +53,19 @@
 	{#if request?.consent === 'accepted' && request.firstMessageId && request.preview?.type === 'ready' && !messages.some(m => m.id === request?.firstMessageId)}
 		<article class="request-first-message" data-message-id={request.firstMessageId}><small>First message · encrypted introduction{#if request.introduction} · {new Date(request.introduction.receivedAt).toLocaleString()}{/if}</small><p>{request.preview.text}</p>{#if request.preview.invitation}<small>Includes a separate group invitation; group consent is unchanged.</small>{/if}</article>
 	{/if}
-	{#if messages.length === 0 && request?.preview?.type !== 'ready'}
+	{#if request?.consent === 'accepted' && (request.preview?.type === 'unavailable' || request.capabilities?.canSend === false)}
+		<div class="empty-messages unavailable-device" role="status">
+			<div class="empty-icon">
+				<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+					<circle cx="12" cy="12" r="10" />
+					<line x1="12" y1="8" x2="12" y2="12" />
+					<line x1="12" y1="16" x2="12.01" y2="16" />
+				</svg>
+			</div>
+			<p class="empty-title">Encrypted messages unavailable on this device</p>
+			<p class="empty-subtitle">This conversation was accepted on another device. Encrypted messages are not available here.</p>
+		</div>
+	{:else if messages.length === 0 && request?.preview?.type !== 'ready'}
 		<div class="empty-messages">
 			<div class="empty-icon">
 				<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">

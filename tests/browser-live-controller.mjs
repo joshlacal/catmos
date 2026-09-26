@@ -114,23 +114,30 @@ async function handleCommand(req) {
     await page.goto(manifest.corsOrigin);
 
     // Complete login
-    await page.evaluate(async () => {
+    await page.evaluate(async act => {
       const { auth } = await import('/src/lib/stores/auth.ts');
+      const api = await import('/src/lib/wasm.ts');
       let ready = false;
-      const unsub = auth.subscribe(v => { ready = !v.loading; });
+      let user = null;
+      const unsub = auth.subscribe(v => {
+        if (!v.loading && v.user) {
+          user = v.user;
+          ready = true;
+        }
+      });
       const deadline = Date.now() + 15000;
       while (!ready) {
-        if (Date.now() > deadline) { unsub(); throw new Error('Auth readiness timeout'); }
-        await new Promise(r => setTimeout(r, 20));
+        if (Date.now() > deadline) { unsub(); break; }
+        await new Promise(r => setTimeout(r, 50));
       }
       unsub();
-    });
-
-    await page.evaluate(async act => {
-      const api = await import('/src/lib/wasm.ts');
-      const { auth } = await import('/src/lib/stores/auth.ts');
-      const user = await api.completeLogin(act.session);
-      auth.setUser(user);
+      if (!user) {
+        user = await api.tryRestoreSession();
+        if (!user) {
+          user = await api.completeLogin(act.session);
+        }
+        auth.setUser(user);
+      }
       globalThis.fixtureActor = user;
     }, actor);
 
@@ -295,14 +302,54 @@ async function handleCommand(req) {
       }
       globalThis.fixtureActor = user;
       console.error('[CONTROLLER] fixtureActor set:', user.did);
-    }, actor);
-    console.error('[CONTROLLER] calling api.getMessages...');
-    const messages = await page.evaluate(async c => {
-      const api = await import('/src/lib/wasm.ts');
-      return api.getMessages(c, undefined, globalThis.fixtureActor.did, globalThis.fixtureActor.authRevision);
-    }, cid);
-    console.error('[CONTROLLER] api.getMessages returned:', messages.length, 'messages');
-    return { ok: true, count: messages.length, messages };
+      await api.refreshDirectRequest(user.did, act.cid).catch(e => console.error('[REFRESH ERR]', e));
+      const { requests } = await import('/src/lib/stores/requests.ts');
+      const { conversations } = await import('/src/lib/stores/conversations.ts');
+      await requests.load().catch(e => console.error('[REQ LOAD ERR]', e));
+      await conversations.load().catch(e => console.error('[CONV LOAD ERR]', e));
+    }, { ...actor, cid });
+    console.error('[CONTROLLER] Waiting for conversation row in UI sidebar up to 30s...');
+    let found = false;
+    const deadline = Date.now() + 30000;
+    while (Date.now() < deadline) {
+      const count = await page.evaluate(() => {
+        return document.querySelectorAll('.conversations-list .conversation-item').length;
+      });
+      if (count > 1) {
+        found = true;
+        break;
+      }
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    assert(found, 'Conversation row never appeared in UI sidebar after reload');
+
+    console.error('[CONTROLLER] Clicking conversation in UI sidebar...');
+    const convoBtn = page.locator('.conversations-list .conversation-item').nth(1);
+    await convoBtn.click();
+
+    console.error('[CONTROLLER] Waiting for message bubbles in thread UI...');
+    await page.waitForSelector('.message-bubble', { timeout: 15000 });
+    await new Promise(r => setTimeout(r, 1000));
+
+    const renderedMessages = await page.evaluate(() => {
+      const bubbles = Array.from(document.querySelectorAll('.message-bubble'));
+      return bubbles.map(b => ({
+        text: b.innerText.trim(),
+        isSent: b.classList.contains('sent') || b.closest('.message-row')?.classList.contains('sent')
+      }));
+    });
+    console.error('[CONTROLLER] Rendered messages from UI:', JSON.stringify(renderedMessages));
+
+    return {
+      ok: true,
+      count: renderedMessages.length,
+      messages: renderedMessages,
+      method: 'ui'
+    };
+  }
+  if (cmd === 'eval') {
+    const res = await page.evaluate(req.code);
+    return { ok: true, result: res };
   }
 
   if (cmd === 'reload_worker_before_welcome') {

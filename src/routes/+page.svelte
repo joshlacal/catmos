@@ -212,39 +212,29 @@
 	}
 
 	$effect(() => {
-		if ($auth.user) {
-            untrack(() => { requests.bindAccount($auth.user!.did, $auth.user!.authRevision); conversations.bindAccount($auth.user!.did, $auth.user!.authRevision); messages.bindAccount($auth.user!.did, $auth.user!.authRevision); });
-			// Open a single global WS so we receive events for every convo
-			// the user belongs to, not just the currently-selected one.
-			// Matches iOS/Android/CLI; without it, messages landing in a
-			// background conversation were invisible until the user clicked
-			// into it, which caused the "only see messages from same-account
-			// other-device" symptom.
-			api.subscribeAllEvents().catch((e) =>
-				console.warn('[catmos] subscribeAllEvents failed', e)
-			);
-			conversations.load().then(() => {
-				// Startup reconciliation: leave any group containing a DID the
-				// user has blocked (from another client or a previous interrupted
-				// blockAndLeave). Run once per session.
-				if (!blockReconcileRan) {
-					blockReconcileRan = true;
-					reconcileBlockedConversations().catch((e) =>
-						console.warn('[catmos] block reconciliation failed', e)
-					);
-				}
-			});
-		}
-	});
-
-	$effect(() => {
 		const owner = $auth.user?.did ?? null;
-        const revision = $auth.user?.authRevision;
+		const revision = $auth.user?.authRevision;
 		untrack(() => {
 			requests.bindAccount(owner, revision);
 			conversations.bindAccount(owner, revision);
 			messages.bindAccount(owner, revision);
-			if (owner) requests.load();
+			if (owner) {
+				requests.load();
+				api.subscribeAllEvents().catch((e) =>
+					console.warn('[catmos] subscribeAllEvents failed', e)
+				);
+				conversations.load().then(() => {
+					// Startup reconciliation: leave any group containing a DID the
+					// user has blocked (from another client or a previous interrupted
+					// blockAndLeave). Run once per session.
+					if (!blockReconcileRan) {
+						blockReconcileRan = true;
+						reconcileBlockedConversations().catch((e) =>
+							console.warn('[catmos] block reconciliation failed', e)
+						);
+					}
+				});
+			}
 		});
 	});
 	function ordinaryAllowed(id: string): boolean {
@@ -530,14 +520,16 @@
 				onCancel={() => { replyingTo = null; }}
 			/>
 		{/if}
-		<Composer
-			conversationId={currentConversation.id}
-			onSend={handleSend}
-			onSendImage={handleSendImage}
-			onTypingChanged={handleTypingChanged}
-			disabled={activeQuarantine !== null}
-			disabledPlaceholder={activeQuarantine ? 'Conversation paused. Reset to continue.' : undefined}
-		/>
+		{#if !activeRequest || activeRequest.consent !== 'accepted' || activeRequest.capabilities?.canSend !== false}
+			<Composer
+				conversationId={currentConversation.id}
+				onSend={handleSend}
+				onSendImage={handleSendImage}
+				onTypingChanged={handleTypingChanged}
+				disabled={activeQuarantine !== null}
+				disabledPlaceholder={activeQuarantine ? 'Conversation paused. Reset to continue.' : undefined}
+			/>
+		{/if}
 	</div>
 	<SearchPanel
 		open={showSearch}
