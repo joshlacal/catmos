@@ -362,14 +362,12 @@ async function handleCommand(req) {
       const { conversations, selectedConversation } = await import('/src/lib/stores/conversations.ts');
       const { auth } = await import('/src/lib/stores/auth.ts');
       const api = await import('/src/lib/wasm.ts');
-      const { get } = await import('svelte/store');
-
-      const msgStore = get(messages);
-      const reqStore = get(requests);
-      const authStore = get(auth);
-      const convoStore = get(conversations);
-      const selected = get(selectedConversation);
-
+      const getStore = s => { let v; s.subscribe(x => { v = x; })(); return v; };
+      const msgStore = getStore(messages);
+      const reqStore = getStore(requests);
+      const authStore = getStore(auth);
+      const convoStore = getStore(conversations);
+      const selected = getStore(selectedConversation);
       let wasmMsgs = [];
       try {
         wasmMsgs = await api.getMessages(c, undefined, authStore.user?.did, authStore.user?.authRevision);
