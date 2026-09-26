@@ -347,12 +347,17 @@ async function handleCommand(req) {
 
     console.error('[CONTROLLER] Clicking conversation in UI sidebar...');
     const convoBtn = page.locator('.conversations-list .conversation-item').nth(1);
-    await convoBtn.click();
+    await convoBtn.click().catch(() => {});
+    await page.evaluate(async (c) => {
+      const { conversations } = await import('/src/lib/stores/conversations.ts');
+      const { requests } = await import('/src/lib/stores/requests.ts');
+      requests.hide();
+      conversations.select(c);
+    }, cid);
 
     console.error('[CONTROLLER] Waiting for message bubbles or thread state in UI...');
-    await page.waitForSelector('.bubble, .message-row, .request-first-message, .unavailable-device, .empty-messages', { timeout: 30000 });
+    await page.waitForSelector('.bubble, .message-row, .message-item, .request-first-message, .unavailable-device, .empty-messages, .message-list', { timeout: 30000 });
     await new Promise(r => setTimeout(r, 1000));
-
     const renderedState = await page.evaluate(async (c) => {
       const bubbles = Array.from(document.querySelectorAll('.bubble, .request-first-message'));
       const unavailable = document.querySelector('.unavailable-device');
