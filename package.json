@@ -20,7 +20,7 @@
     "check:windows": "cd src-tauri && cargo check --target x86_64-pc-windows-msvc",
     "build:wasm": "bash ../catbird-mls-web/build.sh",
     "build:wasm:dev": "bash ../catbird-mls-web/build-dev.sh",
-    "test:request-state": "node --experimental-vm-modules --test tests/message-ordering.test.mjs tests/request-state.test.mjs",
+    "test:request-state": "node --experimental-vm-modules --test tests/message-ordering.test.mjs tests/request-state.test.mjs tests/f67-request-direction.test.mjs",
     "test:request-ui": "node tests/request-ui.mjs"
   },
   "devDependencies": {

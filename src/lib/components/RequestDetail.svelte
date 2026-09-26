@@ -2,12 +2,17 @@
  import { requests } from '$lib/stores/requests';
  import type { DirectRequestView } from '$lib/request-types';
  let { view, title='Message request', onOpenConversation, onViewInvitation }: { view:DirectRequestView; title?:string; onOpenConversation:(id:string)=>void; onViewInvitation:(id:string)=>void }=$props();
+ // Consent says what the account may still do; it does not say who wrote the introduction once the request is
+ // accepted or closed. Direction comes from the authenticated publication sender when it is known.
  let incoming=$derived(view.consent==='incomingPending');
+ let sender=$derived(view.introduction?.senderDid ?? null);
+ let toMe=$derived(incoming || (!!sender && !!$requests.ownerDid && sender!==$requests.ownerDid));
+ let fromMe=$derived(view.consent==='outgoingPending' || (!!sender && sender===$requests.ownerDid));
  let ready=$derived(view.preview?.type==='ready'?view.preview:null);
 </script>
 <section class="request-detail" aria-label="Encrypted message request">
  <button class="back" onclick={()=>requests.showInbox()}>← Message requests</button>
- <header><span class="avatar" aria-hidden="true">{incoming?'↙':'↗'}</span><p class="eyebrow">{view.consent==='accepted'?'ACCEPTED CONVERSATION':incoming?'WANTS TO CHAT WITH YOU':'YOUR INTRODUCTION'}</p><h1>{title}</h1><p>{incoming?'You can read this message without accepting the conversation.':view.consent==='outgoingPending'?'Request sent. You can send another message after acceptance.':view.consent==='closed'?'This request is closed.':'Your first message stays in the same conversation.'}</p></header>
+ <header><span class="avatar" aria-hidden="true">{toMe?'↙':fromMe?'↗':'✉'}</span><p class="eyebrow">{view.consent==='accepted'?'ACCEPTED CONVERSATION':incoming?'WANTS TO CHAT WITH YOU':toMe?'AN INTRODUCTION TO YOU':fromMe?'YOUR INTRODUCTION':'MESSAGE REQUEST'}</p><h1>{title}</h1><p>{incoming?'You can read this message without accepting the conversation.':view.consent==='outgoingPending'?'Request sent. You can send another message after acceptance.':view.consent==='closed'?'This request is closed.':'Your first message stays in the same conversation.'}</p></header>
  {#if $requests.notice}<p class="notice" role="status">{$requests.notice}</p>{/if}
  {#if $requests.error}<p class="notice error" role="alert">{$requests.error}</p>{/if}
  {#if ready}<article class="intro" aria-label="Decrypted introduction"><p>{ready.text}</p><footer>End-to-end encrypted introduction</footer></article>
