@@ -118,9 +118,10 @@ async function handleCommand(req) {
       serviceWorkers: 'block'
     });
     const dbKey = createHash('sha256').update(`catmos-mls-db-key-${req.label}-${runId}`).digest('hex');
-    await context.addInitScript(({ key }) => {
-      sessionStorage.setItem('catbird_mls_db_key', key);
-    }, { key: dbKey });
+    // Only the app document gets the key; a parked about:blank must run nothing at all.
+    await context.addInitScript(({ key, origin }) => {
+      if (location.origin === origin) sessionStorage.setItem('catbird_mls_db_key', key);
+    }, { key: dbKey, origin: new URL(manifest.corsOrigin).origin });
     await context.route('**/*', route => {
       const url = new URL(route.request().url());
       if (allowedLocal(url, route.request().method()) || allowedRemote(url, route.request().method(), false, browserHosts)) return route.continue();
