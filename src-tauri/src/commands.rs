@@ -1080,6 +1080,10 @@ pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Convers
                 format!("data:{};base64,{}", mime, B64.encode(&bytes))
             });
 
+        if pending_consent {
+            continue;
+        }
+
         convos.push(Conversation {
             pending_consent,
             id: c.conversation_id.clone(),
@@ -3510,5 +3514,16 @@ mod tests {
             .clear_all(did)
             .await
             .expect("clear signer fixture after test");
+    }
+
+    #[test]
+    fn pending_consent_policy_blocks_activity_excludes_conversation() {
+        let state_bytes = include_bytes!("../../../catbird-mls/tests/fixtures/swift_pending_conversation_state.json");
+        let state = catbird_mls::orchestrator::canonical_transport::decode_conversation_state(state_bytes)
+            .expect("decode swift_pending_conversation_state");
+        assert!(
+            crate::request_commands::policy_blocks_activity(&state, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb"),
+            "pending direct request must block activity and be excluded from conversation list"
+        );
     }
 }
