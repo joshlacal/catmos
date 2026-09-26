@@ -254,6 +254,10 @@ async function handleCommand(req) {
 
   if (cmd === 'decline' || cmd === 'block') {
     const label = cmd === 'decline' ? 'Decline' : 'Block sender';
+    // Block publishes an app.bsky.graph.block record; keep the exchange the page actually made.
+    const blockResponse = cmd === 'block'
+      ? page.waitForResponse(r => r.url().includes('/xrpc/com.atproto.repo.createRecord'), { timeout: 30000 })
+      : null;
     await page.getByRole('button', { name: label, exact: true }).click({ timeout: 10000 });
     const deadline = Date.now() + 30000;
     let state = null;
@@ -265,10 +269,17 @@ async function handleCommand(req) {
         error: document.querySelector('.request-detail .notice.error')?.textContent?.trim() ?? null,
         busy: !!document.querySelector('.request-detail button:disabled')
       }));
-      if (state.error || (cmd === 'decline' && state.header === 'This request is closed.') || (cmd === 'block' && state.notice)) break;
+      if (state.error || (cmd === 'decline' && state.header === 'This request is closed.') || (cmd === 'block' && state.notice?.startsWith('Sender blocked'))) break;
       await page.waitForTimeout(500);
     }
-    return { ok: true, action: cmd, ui: state };
+    let blockRecord = null;
+    if (blockResponse) {
+      const resp = await blockResponse;
+      const sent = JSON.parse(resp.request().postData() || '{}');
+      blockRecord = { status: resp.status(), repo: sent.repo ?? null, collection: sent.collection ?? null,
+        subject: sent.record?.subject ?? null, uri: resp.ok() ? (await resp.json()).uri ?? null : null };
+    }
+    return { ok: true, action: cmd, ui: state, blockRecord };
   }
 
   if (cmd === 'send_message') {
