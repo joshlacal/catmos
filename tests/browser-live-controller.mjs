@@ -160,6 +160,11 @@ async function handleCommand(req) {
           console.error('[WASM RESPONSE ERROR]', e);
         }
       }
+      if (resp.url().includes('/xrpc/blue.catbird.chat.getSubscriptionTicket')) {
+        // A rejected ticket names its protocol error only in the body.
+        const body = resp.status() === 200 ? '' : await resp.text().catch(() => '');
+        console.error('[TICKET RESPONSE]', resp.status(), body.slice(0, 512));
+      }
     });
     page.setDefaultTimeout(60000);
     await page.goto(manifest.corsOrigin);
@@ -282,6 +287,11 @@ async function handleCommand(req) {
         subject: sent.record?.subject ?? null, uri: resp.ok() ? (await resp.json()).uri ?? null : null };
     }
     return { ok: true, action: cmd, ui: state, blockRecord };
+  }
+
+  if (cmd === 'visible_text') {
+    const text = await page.locator('body').innerText();
+    return { ok: true, lines: text.split('\n').map(line => line.trim()).filter(Boolean) };
   }
 
   if (cmd === 'send_message') {
