@@ -112,35 +112,43 @@ async function handleCommand(req) {
     });
     page.setDefaultTimeout(60000);
     await page.goto(manifest.corsOrigin);
+    await page.waitForLoadState('domcontentloaded');
 
-    // Complete login
-    await page.evaluate(async act => {
-      const { auth } = await import('/src/lib/stores/auth.ts');
-      const api = await import('/src/lib/wasm.ts');
-      let ready = false;
-      let user = null;
-      const unsub = auth.subscribe(v => {
-        if (!v.loading && v.user) {
-          user = v.user;
-          ready = true;
-        }
-      });
-      const deadline = Date.now() + 15000;
-      while (!ready) {
-        if (Date.now() > deadline) { unsub(); break; }
-        await new Promise(r => setTimeout(r, 50));
+    // Complete login with retry in case Vite initialization navigates
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await page.evaluate(async act => {
+          const { auth } = await import('/src/lib/stores/auth.ts');
+          const api = await import('/src/lib/wasm.ts');
+          let ready = false;
+          let user = null;
+          const unsub = auth.subscribe(v => {
+            if (!v.loading && v.user) {
+              user = v.user;
+              ready = true;
+            }
+          });
+          const deadline = Date.now() + 15000;
+          while (!ready) {
+            if (Date.now() > deadline) { unsub(); break; }
+            await new Promise(r => setTimeout(r, 50));
+          }
+          unsub();
+          if (!user) {
+            user = await api.tryRestoreSession();
+            if (!user) {
+              user = await api.completeLogin(act.session);
+            }
+            auth.setUser(user);
+          }
+          globalThis.fixtureActor = user;
+        }, actor);
+        break;
+      } catch (e) {
+        if (attempt === 4) throw e;
+        await new Promise(r => setTimeout(r, 1000));
       }
-      unsub();
-      if (!user) {
-        user = await api.tryRestoreSession();
-        if (!user) {
-          user = await api.completeLogin(act.session);
-        }
-        auth.setUser(user);
-      }
-      globalThis.fixtureActor = user;
-    }, actor);
-
+    }
     await page.evaluate(async () => {
       const { requests } = await import('/src/lib/stores/requests.ts');
       requests.bindAccount(fixtureActor.did, fixtureActor.authRevision);
