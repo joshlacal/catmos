@@ -103,7 +103,8 @@ async function handleCommand(req) {
 
     const gatewayHost = new URL(manifest.origin).hostname;
     const browserHosts = new Set([gatewayHost, 'chat.catbird.blue', 'api.catbird.blue', 'public.api.bsky.app', ...Object.keys(manifest.hosts), ...manifest.accounts.map(a => a.did.slice('did:web:'.length))]);
-    const mappings = [...browserHosts].map(h => `MAP ${h} ${manifest.hosts[h] || manifest.hosts[gatewayHost]}`).join(',');
+    // Every other hostname fails to resolve, so nothing outside the fixture can be reached by name.
+    const mappings = [...[...browserHosts].map(h => `MAP ${h} ${manifest.hosts[h] || manifest.hosts[gatewayHost]}`), 'MAP * ~NOTFOUND', 'EXCLUDE 127.0.0.1'].join(',');
     const args = [`--host-resolver-rules=${mappings}`, '--no-proxy-server', `--ignore-certificate-errors-spki-list=${manifest.tlsSpkiSha256}`, '--disable-http-cache', '--disk-cache-size=0'];
     const userDataDir = join('/tmp', `catmos-browser-${req.label}-${runId}`);
     if (req.fresh) {
