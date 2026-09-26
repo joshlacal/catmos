@@ -60,10 +60,11 @@ async function handleCommand(req) {
     const gatewayHost = new URL(manifest.origin).hostname;
     const browserHosts = new Set([gatewayHost, 'chat.catbird.blue', 'api.catbird.blue', 'public.api.bsky.app', ...Object.keys(manifest.hosts), ...manifest.accounts.map(a => a.did.slice('did:web:'.length))]);
     const mappings = [...browserHosts].map(h => `MAP ${h} ${manifest.hosts[h] || manifest.hosts[gatewayHost]}`).join(',');
-    const args = [`--host-resolver-rules=${mappings}`, '--no-proxy-server', `--ignore-certificate-errors-spki-list=${manifest.tlsSpkiSha256}`];
+    const args = [`--host-resolver-rules=${mappings}`, '--no-proxy-server', `--ignore-certificate-errors-spki-list=${manifest.tlsSpkiSha256}`, '--disable-http-cache', '--disk-cache-size=0'];
     const userDataDir = join('/tmp', `catmos-browser-${req.label}-${runId}`);
+    const { rm } = await import('node:fs/promises');
+    await rm(userDataDir, { recursive: true, force: true }).catch(() => {});
     context = await chromium.launchPersistentContext(userDataDir, {
-      headless: true,
       args,
       viewport: { width: 1360, height: 980 },
       ignoreHTTPSErrors: true,
