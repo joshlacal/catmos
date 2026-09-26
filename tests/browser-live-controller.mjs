@@ -193,7 +193,8 @@ async function handleCommand(req) {
 
     const pending = await page.evaluate(async c => {
       const api = await import('/src/lib/wasm.ts');
-      return api.refreshDirectRequest(fixtureActor.did, c, fixtureActor.authRevision);
+      const actor = globalThis.fixtureActor;
+      return api.refreshDirectRequest(actor.did, c, actor.authRevision);
     }, cid);
 
     return {
