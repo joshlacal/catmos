@@ -325,30 +325,61 @@ async function handleCommand(req) {
     const convoBtn = page.locator('.conversations-list .conversation-item').nth(1);
     await convoBtn.click();
 
-    console.error('[CONTROLLER] Waiting for message bubbles or unavailable state in thread UI...');
-    await page.waitForSelector('.message-bubble, .unavailable-device', { timeout: 15000 });
+    console.error('[CONTROLLER] Waiting for message bubbles or thread state in UI...');
+    await page.waitForSelector('.bubble, .message-row, .request-first-message, .unavailable-device, .empty-messages', { timeout: 30000 });
     await new Promise(r => setTimeout(r, 1000));
 
-    const renderedState = await page.evaluate(() => {
-      const bubbles = Array.from(document.querySelectorAll('.message-bubble'));
+    const renderedState = await page.evaluate(async (c) => {
+      const bubbles = Array.from(document.querySelectorAll('.bubble, .request-first-message'));
       const unavailable = document.querySelector('.unavailable-device');
+      const emptyMsg = document.querySelector('.empty-messages');
+      const { messages } = await import('/src/lib/stores/messages.ts');
+      const { requests } = await import('/src/lib/stores/requests.ts');
+      const { conversations, selectedConversation } = await import('/src/lib/stores/conversations.ts');
+      const { auth } = await import('/src/lib/stores/auth.ts');
+      const api = await import('/src/lib/wasm.ts');
+      const { get } = await import('svelte/store');
+
+      const msgStore = get(messages);
+      const reqStore = get(requests);
+      const authStore = get(auth);
+      const convoStore = get(conversations);
+      const selected = get(selectedConversation);
+
+      let wasmMsgs = [];
+      try {
+        wasmMsgs = await api.getMessages(c, undefined, authStore.user?.did, authStore.user?.authRevision);
+      } catch (e) {
+        wasmMsgs = [{ error: String(e) }];
+      }
+
+      const convo = convoStore.items.find(item => item.id === c);
+      const hasView = reqStore.views.some(v => v.conversationId === c);
+      const ordinaryAllowedVal = !!authStore.user && !reqStore.loading && (hasView ? requests.canUseOrdinaryActivity(c) : convo?.pendingConsent !== true);
+      const activeRequestVal = reqStore.views.find(v => v.conversationId === (reqStore.pane === 'request' ? reqStore.selectedId : selected?.id));
+
       return {
         bubbles: bubbles.map(b => ({
           text: b.innerText.trim(),
-          isSent: b.classList.contains('sent') || b.closest('.message-row')?.classList.contains('sent')
+          className: b.className
         })),
         unavailableState: unavailable ? unavailable.innerText.trim() : null,
-        composerPresent: document.querySelector('.composer') !== null
+        emptyState: emptyMsg ? emptyMsg.innerText.trim() : null,
+        composerPresent: document.querySelector('.composer') !== null,
+        storeMessages: msgStore.byConversation.get(c) ?? [],
+        wasmMsgs,
+        ordinaryAllowedVal,
+        activeRequestVal,
+        selectedConvoId: selected?.id
       };
-    });
+    }, cid);
     console.error('[CONTROLLER] Rendered state from UI:', JSON.stringify(renderedState));
 
     return {
       ok: true,
       count: renderedState.bubbles.length,
       messages: renderedState.bubbles,
-      unavailableState: renderedState.unavailableState,
-      composerPresent: renderedState.composerPresent,
+      diag: renderedState,
       method: 'ui'
     };
   }
