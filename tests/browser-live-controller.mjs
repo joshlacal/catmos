@@ -200,12 +200,21 @@ async function handleCommand(req) {
     await page.evaluate(async () => {
       const { requests } = await import('/src/lib/stores/requests.ts');
       requests.bindAccount(fixtureActor.did, fixtureActor.authRevision);
-      await requests.setDeliveryEnabled(true);
       await requests.load();
-      requests.showInbox();
     });
+    // The SvelteKit app itself must have booted, not just the modules evaluated above.
+    await page.getByRole('button', { name: 'New conversation' }).waitFor({ timeout: 30000 });
+    return { ok: true, did: actor.did, label: actor.label, wasmHash: globalThis.loadedWasmHash, appBooted: true };
+  }
 
-    return { ok: true, did: actor.did, label: actor.label, wasmHash: globalThis.loadedWasmHash };
+  if (cmd === 'enable_delivery_ui') {
+    await page.locator('.conversations-list .conversation-item', { hasText: 'Message requests' }).click({ timeout: 15000 });
+    const summary = page.locator('summary', { hasText: 'Receive encrypted requests on this device' });
+    await summary.click({ timeout: 15000 });
+    await page.getByRole('button', { name: 'Enable delivery', exact: true }).click({ timeout: 10000 });
+    const status = page.getByRole('status').filter({ hasText: 'Encrypted request delivery enabled' });
+    await status.waitFor({ timeout: 30000 });
+    return { ok: true, notice: (await status.innerText()).trim(), summary: (await summary.innerText()).trim() };
   }
 
   if (cmd === 'await_preview') {
