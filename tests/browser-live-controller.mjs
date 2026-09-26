@@ -20,7 +20,7 @@ let runId = null;
 const rpcMethods = new Map();
 for(const name of ['getOwnDevices','getDevices','getDeviceKey','getConversations','getPendingWelcomes','getLeafRecoveryInbox','getConversationState','getEntries','getDirectRequestOutcome']) rpcMethods.set(`/xrpc/blue.catbird.chat.${name}`,'GET');
 for(const name of ['enrollDevice','publishDirectRequestKeys','replenishKeyPackages','prepareDirectRequest','publishDirectRequest','cancelDirectRequestPreparation','acknowledgeWelcome','rejectWelcome','acceptConversation','sendMessage','createConversation','submitTransition','closeConversation','requestLeave','getSubscriptionTicket']) rpcMethods.set(`/xrpc/blue.catbird.chat.${name}`,'POST');
-for(const path of ['/auth/session','/xrpc/app.bsky.actor.getProfile','/xrpc/app.bsky.actor.getProfiles','/xrpc/app.bsky.graph.getBlocks','/xrpc/com.atproto.repo.listRecords','/xrpc/com.atproto.repo.getRecord']) rpcMethods.set(path,'GET');
+for(const path of ['/auth/session','/xrpc/app.bsky.actor.getProfile','/xrpc/app.bsky.actor.getProfiles','/xrpc/app.bsky.actor.searchActors','/xrpc/app.bsky.actor.searchActorsTypeahead','/xrpc/app.bsky.graph.getBlocks','/xrpc/com.atproto.repo.listRecords','/xrpc/com.atproto.repo.getRecord']) rpcMethods.set(path,'GET');
 
 function allowedRemote(url, method='GET', websocket=false, browserHosts) {
   const isFixtureHost = url.hostname.endsWith('.request-fixture.catbird.blue') || (browserHosts && browserHosts.has(url.hostname));
@@ -35,7 +35,7 @@ function allowedRemote(url, method='GET', websocket=false, browserHosts) {
     if (!ok) console.error('[DISALLOWED_RPC]', url.pathname, 'method:', method, 'expected:', expected);
     return ok;
   }
-  return method === 'GET' && (url.pathname === '/.well-known/did.json' || /^\/xrpc\/com\.atproto\.repo\.(listRecords|getRecord)$/.test(url.pathname));
+  return method === 'GET' && (url.pathname === '/.well-known/did.json' || /^\/xrpc\/com\.atproto\.repo\.(listRecords|getRecord)$/.test(url.pathname) || /^\/xrpc\/app\.bsky\.actor\.searchActors(Typeahead)?$/.test(url.pathname));
 }
 
 function allowedLocal(url, method) {
@@ -58,7 +58,7 @@ async function handleCommand(req) {
     runId = req.runId;
 
     const gatewayHost = new URL(manifest.origin).hostname;
-    const browserHosts = new Set([gatewayHost, 'chat.catbird.blue', 'api.catbird.blue', ...manifest.accounts.map(a => a.did.slice('did:web:'.length))]);
+    const browserHosts = new Set([gatewayHost, 'chat.catbird.blue', 'api.catbird.blue', 'public.api.bsky.app', ...Object.keys(manifest.hosts), ...manifest.accounts.map(a => a.did.slice('did:web:'.length))]);
     const mappings = [...browserHosts].map(h => `MAP ${h} ${manifest.hosts[h] || manifest.hosts[gatewayHost]}`).join(',');
     const args = [`--host-resolver-rules=${mappings}`, '--no-proxy-server', `--ignore-certificate-errors-spki-list=${manifest.tlsSpkiSha256}`];
     const userDataDir = join('/tmp', `catmos-browser-${req.label}-${runId}`);
