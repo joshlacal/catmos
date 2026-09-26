@@ -213,6 +213,19 @@ async function handleCommand(req) {
     return { ok: true };
   }
 
+  if (cmd === 'decline') {
+    const { cid } = req;
+    await page.getByRole('button', { name: 'Decline', exact: true }).click();
+    await page.waitForTimeout(2000);
+    return { ok: true, cid };
+  }
+
+  if (cmd === 'block') {
+    const { cid } = req;
+    await page.getByRole('button', { name: 'Block sender', exact: true }).click();
+    await page.waitForTimeout(2000);
+    return { ok: true, cid };
+  }
   if (cmd === 'send_message') {
     const { cid, text } = req;
     const msg = await page.evaluate(async ({ c, t }) => {
