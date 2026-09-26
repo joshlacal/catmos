@@ -317,6 +317,21 @@ async function handleCommand(req) {
         break;
       }
       console.error('[CONTROLLER] Polling sidebar... current info:', JSON.stringify(info));
+      await page.evaluate(async (c) => {
+        try {
+          const { requests } = await import('/src/lib/stores/requests.ts');
+          const { conversations } = await import('/src/lib/stores/conversations.ts');
+          const api = await import('/src/lib/wasm.ts');
+          if (globalThis.fixtureActor?.did) {
+            try {
+              const refreshed = await api.refreshDirectRequest(globalThis.fixtureActor.did, c, globalThis.fixtureActor.authRevision);
+              requests.applyView(globalThis.fixtureActor.did, refreshed);
+            } catch {}
+          }
+          await requests.load();
+          await conversations.load();
+        } catch {}
+      }, cid);
       await new Promise(r => setTimeout(r, 1000));
     }
     assert(found, 'Conversation row never appeared in UI sidebar after reload');
