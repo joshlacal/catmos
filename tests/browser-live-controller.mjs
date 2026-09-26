@@ -312,13 +312,16 @@ async function handleCommand(req) {
     let found = false;
     const deadline = Date.now() + 60000;
     while (Date.now() < deadline) {
-      const count = await page.evaluate(() => {
-        return document.querySelectorAll('.conversations-list .conversation-item').length;
+      const info = await page.evaluate(() => {
+        const items = Array.from(document.querySelectorAll('.conversations-list .conversation-item'));
+        return { count: items.length, texts: items.map(b => b.innerText.trim().replace(/\n/g, ' ')) };
       });
-      if (count > 1) {
+      if (info.count > 1) {
+        console.error('[CONTROLLER] Found conversation row! Items:', JSON.stringify(info));
         found = true;
         break;
       }
+      console.error('[CONTROLLER] Polling sidebar... current info:', JSON.stringify(info));
       await new Promise(r => setTimeout(r, 1000));
     }
     assert(found, 'Conversation row never appeared in UI sidebar after reload');
