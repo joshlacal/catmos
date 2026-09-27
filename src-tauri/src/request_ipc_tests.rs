@@ -156,13 +156,6 @@ fn draft_entrypoints_and_account_switch_have_zero_transport_effects() {
     assert_eq!(saved["input"]["text"], SECRET);
     assert_eq!(effects(), Vec::<String>::new(), "composer open and draft typing");
 
-    // Attachment before acceptance on an unaccepted conversation: rejected, nothing uploaded.
-    let attach = call(&webview, "send_image", json!({"ownerDid":ALICE,"ownerRevision":alice_rev,"conversationId":uuid::Uuid::new_v4().to_string(),"content":"","data":[137,80,78,71],"contentType":"image/png","width":1,"height":1,"altText":null}));
-    let reason = attach.expect_err("attachment-first must be rejected");
-    eprintln!("attachment-first rejection: {reason}");
-    assert!(effects().iter().all(|line| !line.contains("upload") && !line.contains("Blob") && !line.contains("sendMessage")),
-        "no upload or send transport: {:?}", effects());
-
     // Draft cancel is local archival.
     let cancelled = call(&webview, "cancel_request_draft", json!({"ownerDid":ALICE,"ownerRevision":alice_rev,"draftId":first})).unwrap();
     assert_eq!(cancelled["archived"], true);
@@ -297,9 +290,12 @@ async fn concurrent_ownership_and_storage_fences_prevent_simultaneous_mutation()
         "SELECT count(*) FROM encrypted_request_projection WHERE owner_did=?1",
         [BOB], |r| r.get(0)
     ).unwrap();
-    assert_eq!(count_alice, 1);
+    assert_eq!(count_alice, 1, "Alice's draft row must be written to the database");
     assert_eq!(count_bob, 0, "Fenced owner Bob must have written 0 rows to the database");
-
+    // Verify database integrity via PRAGMA integrity_check on the actual desktop DB
+    let integrity: String = raw_conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0)).unwrap();
+    assert_eq!(integrity, "ok", "SQLCipher database integrity check failed: {integrity}");
+    eprintln!("Catmos Desktop PRAGMA integrity_check verified: {integrity}");
     // 3. SHOW IT FAILS WITHOUT THE FENCE:
     // A. Without the owner bound (fence removed: bind_request_owner(None)),
     //    any attempt to mutate or read is atomically blocked
@@ -565,6 +561,12 @@ async fn catmos_browser_live_row() {
     let _db_guard = DbGuard(db_name.clone());
 
     // 2. Install 39 reviewed migrations
+    let server_fixture_bin = std::env::var("REQUEST_SERVER_FIXTURE_BINARY")
+        .unwrap_or_else(|_| "/Users/joshlacalamito/Developer/.workspaces/freeze5-7-artifacts/servers/5.10/encrypted_request_server_fixture".to_string());
+    let gateway_bin = std::env::var("CLIENT_RUNTIME_GATEWAY_BINARY")
+        .unwrap_or_else(|_| "/Users/joshlacalamito/Developer/.workspaces/freeze5-7-artifacts/client_runtime_gateway".to_string());
+    eprintln!("catmos_browser_live_row using server fixture: {server_fixture_bin}");
+    eprintln!("catmos_browser_live_row using gateway: {gateway_bin}");
     let status = Command::new("cargo")
         .args([
             "test", "--manifest-path", &format!("{workspace}/mls-ds/e2e-tests/Cargo.toml"),
@@ -573,7 +575,7 @@ async fn catmos_browser_live_row() {
             "--", "--nocapture"
         ])
         .env("REQUEST_TEST_DATABASE_URL", &db_url)
-        .env("REQUEST_SERVER_FIXTURE_BINARY", &format!("{workspace}/mls-ds/target/debug/encrypted_request_server_fixture"))
+        .env("REQUEST_SERVER_FIXTURE_BINARY", &server_fixture_bin)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -582,9 +584,9 @@ async fn catmos_browser_live_row() {
 
     // 3. Start client_runtime_gateway
     let out_dir = format!("/tmp/catbird-gw-bidi-{run_hex}");
-    let mut gw_child = Command::new(&format!("{workspace}/mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway"))
+    let mut gw_child = Command::new(&gateway_bin)
         .env("REQUEST_TEST_DATABASE_URL", &db_url)
-        .env("REQUEST_SERVER_FIXTURE_BINARY", &format!("{workspace}/mls-ds/target/debug/encrypted_request_server_fixture"))
+        .env("REQUEST_SERVER_FIXTURE_BINARY", &server_fixture_bin)
         .env("RUST_LOG", "info,catbird_server=debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -629,11 +631,10 @@ async fn catmos_browser_live_row() {
     let bob_session = sessions["accounts"].as_array().unwrap().iter().find(|a| a["label"] == "bob").unwrap()["session"].as_str().unwrap();
 
     // 4. Start Vite
-    let _ = Command::new("sh")
-        .args(["-c", "lsof -ti :5173 | xargs kill -9 2>/dev/null || true; rm -rf node_modules/.vite"])
+    let _ = Command::new("rm")
+        .args(["-rf", "node_modules/.vite"])
         .current_dir(format!("{workspace}/catmos"))
         .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
     let vite_child = Command::new("node")
         .args(["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort", "--force", "--mode", "local-runtime-fixture"])
         .current_dir(format!("{workspace}/catmos"))
@@ -684,6 +685,7 @@ async fn catmos_browser_live_row() {
         mls_context.clone(),
     ));
     crate::runtime_fixture::seed_native_authority(mls_context.as_ref(), credentials.as_ref()).await.unwrap();
+    credentials.store_local_device_uuid(alice_did, alice_acc["deviceId"].as_str().unwrap()).await.unwrap();
     credentials.store_server_device_id(alice_did, alice_acc["deviceId"].as_str().unwrap()).await.unwrap();
     let orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
         mls_context.clone(),
@@ -1077,6 +1079,12 @@ async fn browser_catmos_live_row() {
     let _db_guard = DbGuard(db_name.clone());
 
     // 2. Install 39 reviewed migrations
+    let server_fixture_bin = std::env::var("REQUEST_SERVER_FIXTURE_BINARY")
+        .unwrap_or_else(|_| "/Users/joshlacalamito/Developer/.workspaces/freeze5-7-artifacts/servers/5.10/encrypted_request_server_fixture".to_string());
+    let gateway_bin = std::env::var("CLIENT_RUNTIME_GATEWAY_BINARY")
+        .unwrap_or_else(|_| "/Users/joshlacalamito/Developer/.workspaces/freeze5-7-artifacts/client_runtime_gateway".to_string());
+    eprintln!("browser_catmos_live_row using server fixture: {server_fixture_bin}");
+    eprintln!("browser_catmos_live_row using gateway: {gateway_bin}");
     let status = Command::new("cargo")
         .args([
             "test", "--manifest-path", &format!("{workspace}/mls-ds/e2e-tests/Cargo.toml"),
@@ -1085,7 +1093,7 @@ async fn browser_catmos_live_row() {
             "--", "--nocapture"
         ])
         .env("REQUEST_TEST_DATABASE_URL", &db_url)
-        .env("REQUEST_SERVER_FIXTURE_BINARY", &format!("{workspace}/mls-ds/target/debug/encrypted_request_server_fixture"))
+        .env("REQUEST_SERVER_FIXTURE_BINARY", &server_fixture_bin)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -1094,21 +1102,16 @@ async fn browser_catmos_live_row() {
 
     // 3. Start client_runtime_gateway
     let out_dir = format!("/tmp/catbird-gw-b2c-{run_hex}");
-    let mut gw_child = Command::new(&format!("{workspace}/mls-ds/e2e-tests/target/debug/examples/client_runtime_gateway"))
+    let cfg = json!({"output_dir": out_dir, "cors_origin": "http://127.0.0.1:5173"});
+    let mut gw_child = Command::new(&gateway_bin)
         .env("REQUEST_TEST_DATABASE_URL", &db_url)
-        .env("REQUEST_SERVER_FIXTURE_BINARY", &format!("{workspace}/mls-ds/target/debug/encrypted_request_server_fixture"))
+        .env("REQUEST_SERVER_FIXTURE_BINARY", &server_fixture_bin)
         .env("RUST_LOG", "info,catbird_server=debug")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("spawn gateway");
-
-    let cfg = json!({
-        "output_dir": out_dir,
-        "cors_origin": "http://127.0.0.1:5173",
-        "lifetime_seconds": 1800
-    });
     gw_child.stdin.as_mut().unwrap().write_all(cfg.to_string().as_bytes()).unwrap();
     gw_child.stdin.take();
 
@@ -1140,11 +1143,10 @@ async fn browser_catmos_live_row() {
     let bob_session = sessions["accounts"].as_array().unwrap().iter().find(|a| a["label"] == "bob").unwrap()["session"].as_str().unwrap();
 
     // 4. Start Vite
-    let _ = Command::new("sh")
-        .args(["-c", "lsof -ti :5173 | xargs kill -9 2>/dev/null || true; rm -rf node_modules/.vite"])
+    let _ = Command::new("rm")
+        .args(["-rf", "node_modules/.vite"])
         .current_dir(format!("{workspace}/catmos"))
         .status();
-    std::thread::sleep(std::time::Duration::from_millis(500));
     let vite_child = Command::new("node")
         .args(["node_modules/vite/bin/vite.js", "--host", "127.0.0.1", "--port", "5173", "--strictPort", "--force", "--mode", "local-runtime-fixture"])
         .current_dir(format!("{workspace}/catmos"))
@@ -1199,6 +1201,7 @@ async fn browser_catmos_live_row() {
         mls_context.clone(),
     ));
     crate::runtime_fixture::seed_native_authority(mls_context.as_ref(), credentials.as_ref()).await.unwrap();
+    credentials.store_local_device_uuid(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
     credentials.store_server_device_id(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
     let orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
         mls_context.clone(),
@@ -1217,8 +1220,8 @@ async fn browser_catmos_live_row() {
         sync_loop: tokio::sync::Mutex::new(None),
         data_dir: tmp.path().to_path_buf(),
     };
-    commands::install_content_root_key(&state, bob_did);
     state.orchestrator.initialize(bob_did).await.unwrap();
+    commands::install_content_root_key(&state, bob_did);
     commands::configure_chat_auth(&state, bob_did, bob_session).await.unwrap();
     state.orchestrator.publish_key_package().await.unwrap();
     state.orchestrator.set_direct_request_delivery_enabled(true).await.unwrap();
@@ -1284,7 +1287,7 @@ async fn browser_catmos_live_row() {
     let d0_id = draft_res["draft"]["input"]["draftId"].as_str().unwrap();
     let cancel_res = b_call(json!({"cmd": "cancel_draft", "draftId": d0_id}));
     assert_eq!(cancel_res["ok"], true);
-    assert_eq!(cancel_res["draft"]["archived"], true);
+    assert_eq!(cancel_res["remainingDraft"]["archived"], true, "Browser UI must archive the local draft");
     let psql_d0 = Command::new("psql").args([&db_url, "-X", "-c", &format!("SELECT count(*) FROM chat.entries WHERE actor_did='{alice_did}';")]).output().unwrap();
     assert!(String::from_utf8_lossy(&psql_d0.stdout).contains(" 0"), "Browser draft cancellation leaves 0 remote entries");
 
@@ -1292,7 +1295,9 @@ async fn browser_catmos_live_row() {
     // LEG 2: Offline recipient first send (Desktop Bob is NOT started yet)
     // =========================================================================
     let intro = format!("Hello Bob Desktop! Live intro from Browser Alice ({run_hex}).");
-    let sent = b_call(json!({"cmd": "send_request", "recipientDid": bob_did, "text": intro}));
+    let composed = b_call(json!({"cmd": "compose_request", "recipientDid": bob_did, "text": intro}));
+    assert_eq!(composed["composerValue"], intro, "Browser UI must hold the local introduction before send");
+    let sent = b_call(json!({"cmd": "send_introduction", "recipientDid": bob_did, "text": intro}));
     assert_eq!(sent["ok"], true);
     assert_eq!(sent["outcome"]["type"], "requestSent", "Fresh direct request is requestSent");
     eprintln!("sent: {sent}");
@@ -1318,6 +1323,7 @@ async fn browser_catmos_live_row() {
     // =========================================================================
     let _ = b_call(json!({"cmd": "close"}));
     let _ = browser_proc.kill();
+    let _ = browser_proc.wait();
 
     // Reopen Desktop Bob from disk (reopens host_db and mls_desktop_bob.db with bob_desktop_keychain)
     let reopened_storage = Arc::new(SqliteStorage::new(host_db.to_str().unwrap(), DB_KEY).unwrap());
@@ -1333,6 +1339,7 @@ async fn browser_catmos_live_row() {
         reopened_api_client.chat_auth_provider(),
         reopened_mls_context.clone(),
     ));
+    reopened_credentials.store_local_device_uuid(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
     reopened_credentials.store_server_device_id(bob_did, bob_acc["deviceId"].as_str().unwrap()).await.unwrap();
     let reopened_orchestrator = Arc::new(catbird_mls::orchestrator::MLSOrchestrator::new(
         reopened_mls_context.clone(),
@@ -1351,8 +1358,8 @@ async fn browser_catmos_live_row() {
         sync_loop: tokio::sync::Mutex::new(None),
         data_dir: tmp.path().to_path_buf(),
     };
-    commands::install_content_root_key(&reopened_state, bob_did);
     reopened_state.orchestrator.initialize(bob_did).await.unwrap();
+    commands::install_content_root_key(&reopened_state, bob_did);
     commands::configure_chat_auth(&reopened_state, bob_did, bob_session).await.unwrap();
     let reopened_bob_rev = reopened_state.api_client.current_session().unwrap().revision.to_string();
 
@@ -1366,6 +1373,7 @@ async fn browser_catmos_live_row() {
             request_commands::accept_direct_request,
             request_commands::set_request_delivery_enabled,
             commands::send_message,
+            commands::send_image,
             commands::get_messages,
             commands::fetch_new_messages,
         ])
@@ -1378,6 +1386,31 @@ async fn browser_catmos_live_row() {
     assert_eq!(preview["consent"], "incomingPending");
     assert_eq!(preview["preview"]["text"], intro);
     assert_eq!(preview["capabilities"]["canSend"], false);
+
+    // C29 Attachment-first rejection on a real pending conversation:
+    // Desktop Bob attempts to send an image on the incoming pending conversation before accepting.
+    // This must be strictly rejected with the specific pending-capability denial before any media transport.
+    let attach_pending = call(&webview, "send_image", json!({
+        "ownerDid": bob_did,
+        "ownerRevision": bob_rev,
+        "conversationId": cid,
+        "content": "",
+        "data": [137, 80, 78, 71, 13, 10, 26, 10], // PNG magic
+        "contentType": "image/png",
+        "width": 100,
+        "height": 100,
+        "altText": null,
+    }));
+    let attach_err = attach_pending.expect_err("send_image on real pending conversation must fail before accept");
+    eprintln!("C29 Desktop real pending attachment rejection: {attach_err}");
+    assert!(
+        attach_err.to_string().contains("Accept this request before sending messages or activity"),
+        "must specifically reject with pending capability denial, got: {attach_err}"
+    );
+
+    if std::env::var("CATMOS_C29_PENDING_ATTACHMENT_ONLY").as_deref() == Ok("1") {
+        return;
+    }
 
     // Desktop Bob accepts conversation
     let accepted = call(&webview, "accept_direct_request", json!({"ownerDid": bob_did, "ownerRevision": bob_rev, "conversationId": cid})).unwrap();
