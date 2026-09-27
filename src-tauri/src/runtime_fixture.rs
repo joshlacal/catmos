@@ -109,6 +109,41 @@ pub(crate) fn initialize() {
 #[cfg(feature = "local-runtime-fixture")]
 pub(crate) use enabled::seed_native_authority;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DenyDns;
+
+impl reqwest::dns::Resolve for DenyDns {
+    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Host absent from fixture manifest or peer resolution denied",
+            )
+            .into())
+        })
+    }
+}
+
+pub(crate) fn fixture_host_addr(host: &str) -> Option<std::net::SocketAddr> {
+    #[cfg(feature = "local-runtime-fixture")]
+    if let Some(config) = enabled::CONFIG.get() {
+        return config.manifest.hosts.get(host).copied();
+    }
+    let _ = host;
+    None
+}
+
+pub(crate) fn is_fixture_active() -> bool {
+    #[cfg(feature = "local-runtime-fixture")]
+    {
+        enabled::CONFIG.get().is_some()
+    }
+    #[cfg(not(feature = "local-runtime-fixture"))]
+    {
+        false
+    }
+}
+
 #[cfg(feature = "local-runtime-fixture")]
 mod enabled {
     use base64::Engine;
@@ -136,7 +171,7 @@ mod enabled {
         fixture_only: bool,
         pub origin: String,
         ca_pem: PathBuf,
-        hosts: BTreeMap<String, SocketAddr>,
+        pub(super) hosts: BTreeMap<String, SocketAddr>,
         accounts: Vec<Account>,
     }
     #[derive(Clone, Deserialize)]
@@ -382,18 +417,7 @@ mod enabled {
         }
         Ok(())
     }
-    struct DenyDns;
-    impl reqwest::dns::Resolve for DenyDns {
-        fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
-            Box::pin(async {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Host absent from fixture manifest",
-                )
-                .into())
-            })
-        }
-    }
+    use super::DenyDns;
     impl Config {
         pub(super) fn client_builder(
             &self,

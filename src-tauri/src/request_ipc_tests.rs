@@ -135,6 +135,7 @@ fn draft_entrypoints_and_account_switch_have_zero_transport_effects() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             request_commands::save_request_draft,
+            request_commands::submit_request_draft,
             request_commands::cancel_request_draft,
             request_commands::resume_request_draft,
             commands::send_image,
@@ -184,7 +185,7 @@ fn draft_entrypoints_and_account_switch_have_zero_transport_effects() {
     assert!(unkeyed.execute_batch("SELECT count(*) FROM sqlite_master;").is_err());
 
     // Returning to Alice restores her retained draft unchanged.
-    activate(&state, ALICE, "alice-session-2");
+    let alice_rev2 = activate(&state, ALICE, "alice-session-2");
     let restored = state.orchestrator.storage().request_draft(ALICE, &retained).unwrap().unwrap();
     assert_eq!(restored.input.text, SECRET);
     assert_eq!(restored.phase, "draft");
@@ -192,6 +193,30 @@ fn draft_entrypoints_and_account_switch_have_zero_transport_effects() {
     let all = effects();
     eprintln!("transport effects observed: {all:?}");
     assert!(all.is_empty(), "draft-only entrypoints and account switch reached the network: {all:?}");
+
+    // A failed capability/authority lookup before native intent custody is not an
+    // ambiguous delivery. The user must be able to edit and cancel this draft.
+    let refused = call(&webview, "submit_request_draft", json!({"ownerDid":ALICE,"ownerRevision":alice_rev2,"draftId":retained}));
+    assert!(refused.unwrap_err().to_string().contains("Request was not attempted. Your draft remains editable and cancellable."));
+    assert!(state.orchestrator.mls_context().read_direct_request_intent(&retained).unwrap().is_none());
+    let draft = state.orchestrator.storage().request_draft(ALICE, &retained).unwrap().unwrap();
+    assert_eq!(draft.phase, "draft");
+    assert!(draft.outcome.is_none());
+    // The open composer rereads this durable phase without remote inventory.
+    let reconciled = call(&webview, "save_request_draft", json!({"ownerDid":ALICE,"ownerRevision":alice_rev2,"input":input(&retained,SECRET),"recipientLabel":"Peer"})).unwrap();
+    assert_eq!(reconciled["phase"], "draft");
+    let edited = call(&webview, "save_request_draft", json!({"ownerDid":ALICE,"ownerRevision":alice_rev2,"input":input(&retained,"still editable"),"recipientLabel":"Peer"})).unwrap();
+    assert_eq!(edited["input"]["text"], "still editable");
+
+    // Recover a draft stranded by the old adapter's optimistic "attempted"
+    // marker: no native intent means no network send could have occurred.
+    let mut stranded = state.orchestrator.storage().request_draft(ALICE, &retained).unwrap().unwrap();
+    stranded.phase = "attempted".into();
+    state.orchestrator.storage().save_request_draft(ALICE, &stranded).unwrap();
+    let cancelled = call(&webview, "cancel_request_draft", json!({"ownerDid":ALICE,"ownerRevision":alice_rev2,"draftId":retained})).unwrap();
+    assert_eq!(cancelled["archived"], true);
+    assert_eq!(cancelled["phase"], "draft");
+    assert!(state.orchestrator.mls_context().read_direct_request_intent(&retained).unwrap().is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

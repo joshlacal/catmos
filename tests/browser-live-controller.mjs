@@ -397,21 +397,6 @@ async function handleCommand(req) {
         break;
       }
       console.error('[CONTROLLER] Polling sidebar... current info:', JSON.stringify(info));
-      await page.evaluate(async (c) => {
-        try {
-          const { requests } = await import('/src/lib/stores/requests.ts');
-          const { conversations } = await import('/src/lib/stores/conversations.ts');
-          const api = await import('/src/lib/wasm.ts');
-          if (globalThis.fixtureActor?.did) {
-            try {
-              const refreshed = await api.refreshDirectRequest(globalThis.fixtureActor.did, c, globalThis.fixtureActor.authRevision);
-              requests.applyView(globalThis.fixtureActor.did, refreshed);
-            } catch {}
-          }
-          await requests.load();
-          await conversations.load();
-        } catch {}
-      }, cid);
       await new Promise(r => setTimeout(r, 1000));
     }
     assert(found, 'Conversation row never appeared in UI sidebar after reload');
@@ -425,7 +410,11 @@ async function handleCommand(req) {
     }
 
     console.error('[CONTROLLER] Waiting for message bubbles or thread state in UI...');
-    await page.waitForSelector('.bubble, .message-row, .message-item, .request-first-message, .unavailable-device, .empty-messages, .message-list', { timeout: 30000 });
+    try {
+      await page.waitForSelector('.bubble, .message-row, .message-item, .request-first-message, .unavailable-device, .empty-messages, .message-list', { timeout: 30000 });
+    } catch (error) {
+      console.error('[CONTROLLER] Thread never became visible; collecting store and WASM diagnostics:', String(error));
+    }
     await new Promise(r => setTimeout(r, 1000));
     const renderedState = await page.evaluate(async (c) => {
       const bubbles = Array.from(document.querySelectorAll('.bubble, .request-first-message'));
@@ -470,6 +459,20 @@ async function handleCommand(req) {
       };
     }, cid);
     console.error('[CONTROLLER] Rendered state from UI:', JSON.stringify(renderedState));
+    if (!renderedState.bubbles.length) {
+      const refresh = await page.evaluate(async c => {
+        const { auth } = await import('/src/lib/stores/auth.ts');
+        const api = await import('/src/lib/wasm.ts');
+        let session;
+        auth.subscribe(value => { session = value.user; })();
+        try {
+          return await api.refreshDirectRequest(session.did, c, session.authRevision);
+        } catch (error) {
+          return { error: String(error) };
+        }
+      }, cid);
+      console.error('[CONTROLLER] Sender acceptance refresh after failed startup render:', JSON.stringify(refresh));
+    }
 
     return {
       ok: true,

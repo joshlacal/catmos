@@ -6,6 +6,8 @@ use catbird_mls::orchestrator::error::{OrchestratorError, Result};
 
 const SERVICE_NAME: &str = "blue.catbird.catmos";
 
+const MAX_RECEIPT_AUTHORITY_DOCUMENT_BYTES: usize = 1024 * 1024; // 1 MiB
+
 /// OS keychain-backed credential store using the `keyring` crate.
 pub struct KeyringCredentialStore {
     chat_auth: Option<std::sync::Arc<crate::api_client::ChatAuthProvider>>,
@@ -162,6 +164,306 @@ impl KeyringCredentialStore {
     }
 }
 
+fn is_forbidden_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || octets[0] == 0
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || (octets[0] == 100 && (octets[1] & 0xC0) == 64)
+                || (octets[0] == 198 && (octets[1] & 0xFE) == 18)
+                || (octets[0] >= 240)
+                || v4.is_multicast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || ((segments[0] & 0xfe00) == 0xfc00)
+                || ((segments[0] & 0xffc0) == 0xfe80)
+                || (segments[0] == 0x0100 && segments[1] == 0 && segments[2] == 0 && segments[3] == 0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x2001 && segments[1] == 0x0002 && segments[2] == 0)
+                || match v6.to_ipv4_mapped() {
+                    Some(mapped_v4) => is_forbidden_ip(&std::net::IpAddr::V4(mapped_v4)),
+                    None => false,
+                }
+                || (segments[0] == 0
+                    && segments[1] == 0
+                    && segments[2] == 0
+                    && segments[3] == 0
+                    && segments[4] == 0
+                    && segments[5] == 0
+                    && segments[6] != 0
+                    && segments[7] != 1)
+        }
+    }
+}
+
+fn parse_did_web_authority_url(
+    expected_authority_did: &str,
+) -> Result<Option<(reqwest::Url, String, Option<u16>)>> {
+    let Some(rest) = expected_authority_did.strip_prefix("did:web:") else {
+        return Ok(None);
+    };
+
+    let parts: Vec<&str> = rest.split(':').collect();
+    if parts.is_empty() || parts[0].is_empty() {
+        return Err(OrchestratorError::Credential(
+            "Malformed did:web: empty authority".into(),
+        ));
+    }
+
+    let raw_authority = parts[0];
+    let (host, port) = if let Some(idx) = raw_authority.to_ascii_lowercase().find("%3a") {
+        let host_part = &raw_authority[..idx];
+        let port_part = &raw_authority[idx + 3..];
+        if host_part.is_empty()
+            || host_part.contains('%')
+            || host_part.contains('/')
+            || host_part.contains('\\')
+        {
+            return Err(OrchestratorError::Credential(
+                "Malformed did:web authority host".into(),
+            ));
+        }
+        let p: u16 = port_part.parse().map_err(|_| {
+            OrchestratorError::Credential("Malformed did:web authority port".into())
+        })?;
+        if p == 0 {
+            return Err(OrchestratorError::Credential(
+                "Invalid did:web port 0".into(),
+            ));
+        }
+        (host_part, Some(p))
+    } else {
+        if raw_authority.contains('%')
+            || raw_authority.contains('/')
+            || raw_authority.contains('\\')
+        {
+            return Err(OrchestratorError::Credential(
+                "Malformed did:web authority host".into(),
+            ));
+        }
+        (raw_authority, None)
+    };
+
+    if host.is_empty()
+        || host.len() > 253
+        || host.contains(' ')
+        || host.chars().any(|c| c.is_control())
+    {
+        return Err(OrchestratorError::Credential(
+            "Malformed did:web authority host".into(),
+        ));
+    }
+
+    let path = if parts.len() == 1 {
+        "/.well-known/did.json".to_string()
+    } else {
+        let mut segments = Vec::new();
+        for segment in &parts[1..] {
+            if segment.is_empty()
+                || *segment == "."
+                || *segment == ".."
+                || segment.contains('/')
+                || segment.contains('\\')
+            {
+                return Err(OrchestratorError::Credential(
+                    "Invalid did:web path segment".into(),
+                ));
+            }
+            let decoded = urlencoding::decode(segment).map_err(|_| {
+                OrchestratorError::Credential("Invalid percent-encoded did:web path segment".into())
+            })?;
+            if decoded.is_empty()
+                || decoded == "."
+                || decoded == ".."
+                || decoded.contains('/')
+                || decoded.contains('\\')
+                || decoded.contains('\0')
+                || decoded.chars().any(|c| c.is_control())
+            {
+                return Err(OrchestratorError::Credential(
+                    "Invalid decoded did:web path segment".into(),
+                ));
+            }
+            segments.push(*segment);
+        }
+        format!("/{}/did.json", segments.join("/"))
+    };
+
+    let url_str = match port {
+        Some(p) => format!("https://{host}:{p}{path}"),
+        None => format!("https://{host}{path}"),
+    };
+    let url = reqwest::Url::parse(&url_str).map_err(|e| {
+        OrchestratorError::Credential(format!("Invalid did:web URL: {e}"))
+    })?;
+
+    Ok(Some((url, host.to_string(), port)))
+}
+
+#[cfg(test)]
+type DnsResolverHook = Box<dyn Fn(&str, u16) -> Result<Vec<std::net::SocketAddr>> + Send + Sync>;
+
+#[cfg(test)]
+static TEST_DNS_RESOLVER: std::sync::RwLock<Option<DnsResolverHook>> = std::sync::RwLock::new(None);
+
+#[cfg(test)]
+type ClientBuilderHook = Box<dyn Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync>;
+
+#[cfg(test)]
+static TEST_CLIENT_BUILDER: std::sync::RwLock<Option<ClientBuilderHook>> = std::sync::RwLock::new(None);
+
+async fn resolve_host_addresses(host: &str, port: u16) -> Result<Vec<std::net::SocketAddr>> {
+    #[cfg(test)]
+    if let Ok(guard) = TEST_DNS_RESOLVER.read() {
+        if let Some(hook) = guard.as_ref() {
+            return hook(host, port);
+        }
+    }
+
+    let addrs = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await
+    .map_err(|_| {
+        OrchestratorError::Credential(format!("DNS lookup timed out for {host}"))
+    })?
+    .map_err(|e| {
+        OrchestratorError::Credential(format!("Failed to resolve {host}: {e}"))
+    })?;
+
+    Ok(addrs.collect())
+}
+
+async fn fetch_hardened_document(
+    url: reqwest::Url,
+    host: String,
+    port: Option<u16>,
+    expected_doc_id: &str,
+) -> Result<Option<Vec<u8>>> {
+    let builder = if crate::runtime_fixture::is_fixture_active() {
+        if crate::runtime_fixture::fixture_host_addr(&host).is_none() {
+            return Err(OrchestratorError::Credential(format!(
+                "Host {host} absent from runtime fixture manifest"
+            )));
+        }
+        crate::runtime_fixture::http_builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15))
+    } else {
+        let host_lc = host.to_ascii_lowercase();
+        if host_lc == "localhost" || host_lc.ends_with(".localhost") {
+            return Err(OrchestratorError::Credential(format!(
+                "Blocked localhost authority host: {host}"
+            )));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if is_forbidden_ip(&ip) {
+                return Err(OrchestratorError::Credential(format!(
+                    "Blocked non-global IP authority host: {ip}"
+                )));
+            }
+        }
+
+        let addrs = resolve_host_addresses(&host, port.unwrap_or(443)).await?;
+        if addrs.is_empty() {
+            return Err(OrchestratorError::Credential(format!(
+                "Authority host {host} did not resolve to any address"
+            )));
+        }
+        for addr in &addrs {
+            if is_forbidden_ip(&addr.ip()) {
+                return Err(OrchestratorError::Credential(format!(
+                    "Authority host {host} resolved to forbidden IP: {}",
+                    addr.ip()
+                )));
+            }
+        }
+
+        let mut b = reqwest::Client::builder()
+            .no_proxy()
+            .https_only(true)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15))
+            .resolve_to_addrs(&host, &addrs)
+            .dns_resolver(std::sync::Arc::new(crate::runtime_fixture::DenyDns));
+
+        #[cfg(test)]
+        {
+            if let Ok(guard) = TEST_CLIENT_BUILDER.read() {
+                if let Some(hook) = guard.as_ref() {
+                    b = hook(b);
+                }
+            }
+        }
+
+        b
+    };
+
+    let client = builder.build().map_err(|e| {
+        OrchestratorError::Credential(format!("Authority document resolver unavailable: {e}"))
+    })?;
+
+    let mut response = client.get(url.clone()).send().await.map_err(|e| {
+        OrchestratorError::Credential(format!("Authority document could not be resolved: {e}"))
+    })?;
+
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(OrchestratorError::Credential(format!(
+            "Invalid authority document HTTP status: {}",
+            response.status()
+        )));
+    }
+
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RECEIPT_AUTHORITY_DOCUMENT_BYTES as u64)
+    {
+        return Err(OrchestratorError::Credential(
+            "Authority document exceeds 1MiB response limit".into(),
+        ));
+    }
+
+    let mut document = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        OrchestratorError::Credential(format!("Authority document read failed: {e}"))
+    })? {
+        if document.len() + chunk.len() > MAX_RECEIPT_AUTHORITY_DOCUMENT_BYTES {
+            return Err(OrchestratorError::Credential(
+                "Authority document exceeds 1MiB response limit".into(),
+            ));
+        }
+        document.extend_from_slice(&chunk);
+    }
+
+    let parsed_doc: serde_json::Value = serde_json::from_slice(&document).map_err(|e| {
+        OrchestratorError::Credential(format!("Invalid authority document JSON: {e}"))
+    })?;
+    let doc_id = parsed_doc
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            OrchestratorError::Credential("Authority document missing 'id'".into())
+        })?;
+    if doc_id != expected_doc_id {
+        return Err(OrchestratorError::Credential(format!(
+            "Authority document id mismatch: expected {expected_doc_id}, got {doc_id}"
+        )));
+    }
+
+    Ok(Some(document))
+}
+
 #[async_trait]
 impl CredentialStore for KeyringCredentialStore {
     async fn get_auth_generation(&self, user_did: &str) -> Result<Option<i64>> {
@@ -206,41 +508,277 @@ impl CredentialStore for KeyringCredentialStore {
         Ok(i64::try_from(binding.generation).ok())
     }
 
-    async fn direct_request_receipt_authority_document(&self) -> Result<Option<Vec<u8>>> {
-        // Fixed did:web origin; never follow a receipt-supplied URL or redirect.
-        let client = crate::runtime_fixture::http_builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .map_err(|_| {
-                OrchestratorError::Credential("Receipt authority resolver unavailable".into())
-            })?;
-        let mut response = client
-            .get("https://chat.catbird.blue/.well-known/did.json")
-            .send()
-            .await
-            .map_err(|_| {
-                OrchestratorError::Credential("Receipt authority could not be resolved".into())
-            })?;
-        if !response.status().is_success() || response.content_length().is_some_and(|n| n > 65536) {
+    async fn direct_request_receipt_authority_document(
+        &self,
+        expected_authority_did: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let (url, host, port) = match parse_did_web_authority_url(expected_authority_did)? {
+            Some(parsed) => parsed,
+            None => return Ok(None),
+        };
+        fetch_hardened_document(url, host, port, expected_authority_did).await
+    }
+
+    async fn get_chat_declaration_authority(&self, user_did: &str) -> Result<Option<String>> {
+        let (did_doc_url, did_doc_host, did_doc_port) = if user_did.starts_with("did:web:") {
+            match parse_did_web_authority_url(user_did)? {
+                Some(parsed) => parsed,
+                None => return Ok(None),
+            }
+        } else if user_did.starts_with("did:plc:") {
+            let rest = &user_did["did:plc:".len()..];
+            if rest.len() != 24 || !rest.chars().all(|c| matches!(c, 'a'..='z' | '2'..='7')) {
+                return Err(OrchestratorError::Credential(format!(
+                    "Malformed did:plc identifier: {user_did}"
+                )));
+            }
+            let url = reqwest::Url::parse(&format!("https://plc.directory/{user_did}"))
+                .map_err(|e| OrchestratorError::Credential(format!("Invalid PLC URL: {e}")))?;
+            (url, "plc.directory".to_string(), Some(443))
+        } else {
+            return Ok(None);
+        };
+
+        let doc_bytes = match fetch_hardened_document(did_doc_url, did_doc_host, did_doc_port, user_did).await? {
+            Some(bytes) => bytes,
+            None => return Ok(None),
+        };
+
+        let doc: serde_json::Value = serde_json::from_slice(&doc_bytes).map_err(|e| {
+            OrchestratorError::Credential(format!("Invalid DID document JSON: {e}"))
+        })?;
+
+        let services = doc.get("service").and_then(|s| s.as_array());
+        let matching: Vec<&serde_json::Value> = services
+            .map(|arr| {
+                arr.iter()
+                    .filter(|s| {
+                        let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                        let svc_type = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        (id == "#atproto_pds" || id == format!("{user_did}#atproto_pds"))
+                            && svc_type == "AtprotoPersonalDataServer"
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if matching.len() != 1 {
+            return Err(OrchestratorError::Credential(format!(
+                "DID document must contain exactly one #atproto_pds service, found {}",
+                matching.len()
+            )));
+        }
+        let pds_service = matching[0];
+
+        let pds_endpoint_str = pds_service
+            .get("serviceEndpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| OrchestratorError::Credential("PDS service missing serviceEndpoint".into()))?;
+
+        let pds_url = reqwest::Url::parse(pds_endpoint_str).map_err(|e| {
+            OrchestratorError::Credential(format!("Invalid PDS serviceEndpoint: {e}"))
+        })?;
+
+        if pds_url.scheme() != "https" && !(crate::runtime_fixture::is_fixture_active() && pds_url.scheme() == "http") {
+            return Err(OrchestratorError::Credential(format!(
+                "PDS endpoint must use HTTPS scheme, got: {}",
+                pds_url.scheme()
+            )));
+        }
+        if !pds_url.username().is_empty() || pds_url.password().is_some() {
             return Err(OrchestratorError::Credential(
-                "Invalid receipt authority response".into(),
+                "PDS endpoint must not contain userinfo".into(),
             ));
         }
-        let mut document = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| OrchestratorError::Credential("Receipt authority read failed".into()))?
+
+        let pds_host = pds_url
+            .host_str()
+            .ok_or_else(|| OrchestratorError::Credential("PDS endpoint missing host".into()))?
+            .to_string();
+        let pds_port = pds_url.port();
+
+        let get_record_url_str = format!(
+            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection=blue.catbird.chat.declaration&rkey=self",
+            pds_endpoint_str.trim_end_matches('/'),
+            urlencoding::encode(user_did)
+        );
+        let get_record_url = reqwest::Url::parse(&get_record_url_str).map_err(|e| {
+            OrchestratorError::Credential(format!("Invalid getRecord URL: {e}"))
+        })?;
+
+        let builder = if crate::runtime_fixture::is_fixture_active() {
+            if crate::runtime_fixture::fixture_host_addr(&pds_host).is_none() {
+                return Err(OrchestratorError::Credential(format!(
+                    "PDS host {pds_host} absent from runtime fixture manifest"
+                )));
+            }
+            crate::runtime_fixture::http_builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(15))
+        } else {
+            let host_lc = pds_host.to_ascii_lowercase();
+            if host_lc == "localhost" || host_lc.ends_with(".localhost") {
+                return Err(OrchestratorError::Credential(format!(
+                    "Blocked localhost PDS host: {pds_host}"
+                )));
+            }
+            if let Ok(ip) = pds_host.parse::<std::net::IpAddr>() {
+                if is_forbidden_ip(&ip) {
+                    return Err(OrchestratorError::Credential(format!(
+                        "Blocked non-global IP PDS host: {ip}"
+                    )));
+                }
+            }
+
+            let addrs = resolve_host_addresses(&pds_host, pds_port.unwrap_or(443)).await?;
+            if addrs.is_empty() {
+                return Err(OrchestratorError::Credential(format!(
+                    "PDS host {pds_host} did not resolve to any address"
+                )));
+            }
+            for addr in &addrs {
+                if is_forbidden_ip(&addr.ip()) {
+                    return Err(OrchestratorError::Credential(format!(
+                        "PDS host {pds_host} resolved to forbidden IP: {}",
+                        addr.ip()
+                    )));
+                }
+            }
+
+            let mut b = reqwest::Client::builder()
+                .no_proxy()
+                .https_only(true)
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(std::time::Duration::from_secs(15))
+                .resolve_to_addrs(&pds_host, &addrs)
+                .dns_resolver(std::sync::Arc::new(crate::runtime_fixture::DenyDns));
+
+            #[cfg(test)]
+            {
+                if let Ok(guard) = TEST_CLIENT_BUILDER.read() {
+                    if let Some(hook) = guard.as_ref() {
+                        b = hook(b);
+                    }
+                }
+            }
+
+            b
+        };
+
+        let client = builder.build().map_err(|e| {
+            OrchestratorError::Credential(format!("PDS client unavailable: {e}"))
+        })?;
+
+        let mut response = client.get(get_record_url).send().await.map_err(|e| {
+            OrchestratorError::Credential(format!("PDS declaration getRecord request failed: {e}"))
+        })?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
+            let mut err_bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|e| {
+                OrchestratorError::Credential(format!("PDS error response read failed: {e}"))
+            })? {
+                if err_bytes.len() + chunk.len() > MAX_RECEIPT_AUTHORITY_DOCUMENT_BYTES {
+                    return Err(OrchestratorError::Credential(
+                        "PDS error response exceeds 1MiB limit".into(),
+                    ));
+                }
+                err_bytes.extend_from_slice(&chunk);
+            }
+            if let Ok(err_json) = serde_json::from_slice::<serde_json::Value>(&err_bytes) {
+                if err_json.get("error").and_then(|v| v.as_str()) == Some("RecordNotFound") {
+                    return Ok(None);
+                }
+            }
+            return Err(OrchestratorError::Credential(format!(
+                "PDS declaration record fetch rejected with HTTP status {status}"
+            )));
+        }
+
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(OrchestratorError::Credential(format!(
+                "PDS declaration fetch failed with HTTP status: {}",
+                response.status()
+            )));
+        }
+
+        if response
+            .content_length()
+            .is_some_and(|n| n > MAX_RECEIPT_AUTHORITY_DOCUMENT_BYTES as u64)
         {
-            if document.len() + chunk.len() > 65536 {
+            return Err(OrchestratorError::Credential(
+                "PDS declaration record exceeds 1MiB response limit".into(),
+            ));
+        }
+
+        let mut record_bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            OrchestratorError::Credential(format!("PDS declaration read failed: {e}"))
+        })? {
+            if record_bytes.len() + chunk.len() > MAX_RECEIPT_AUTHORITY_DOCUMENT_BYTES {
                 return Err(OrchestratorError::Credential(
-                    "Receipt authority document too large".into(),
+                    "PDS declaration record exceeds 1MiB response limit".into(),
                 ));
             }
-            document.extend_from_slice(&chunk);
+            record_bytes.extend_from_slice(&chunk);
         }
-        Ok(Some(document))
+
+        let record_json: serde_json::Value = serde_json::from_slice(&record_bytes).map_err(|e| {
+            OrchestratorError::Credential(format!("Invalid declaration JSON: {e}"))
+        })?;
+
+        let uri = record_json
+            .get("uri")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Credential("Declaration record response missing 'uri'".into())
+            })?;
+        let expected_uri = format!("at://{user_did}/blue.catbird.chat.declaration/self");
+        if uri != expected_uri {
+            return Err(OrchestratorError::Credential(format!(
+                "Declaration record URI mismatch: expected exact {expected_uri}, got {uri}"
+            )));
+        }
+
+        let value = record_json
+            .get("value")
+            .ok_or_else(|| OrchestratorError::Credential("Declaration response missing 'value'".into()))?;
+
+        let rec_type = value.get("$type").and_then(|v| v.as_str());
+        if rec_type != Some("blue.catbird.chat.declaration") {
+            return Err(OrchestratorError::Credential(format!(
+                "Declaration record invalid $type: expected blue.catbird.chat.declaration, got {rec_type:?}"
+            )));
+        }
+
+        let proto_ver = value.get("protocolVersion").and_then(|v| v.as_str());
+        if proto_ver != Some("1") {
+            return Err(OrchestratorError::Credential(format!(
+                "Declaration record invalid protocolVersion: expected '1', got {proto_ver:?}"
+            )));
+        }
+
+        let delivery_service = value
+            .get("deliveryService")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                OrchestratorError::Credential("Declaration record missing 'deliveryService'".into())
+            })?;
+
+        let bare_did = catbird_mls::chat_v2::ids::BareDid::parse(delivery_service)
+            .map_err(|e| OrchestratorError::Credential(format!(
+                "Invalid deliveryService BareDid in declaration: {e}"
+            )))?;
+
+        if bare_did.method() != catbird_mls::chat_v2::ids::DidMethod::Web {
+            return Err(OrchestratorError::Credential(format!(
+                "deliveryService must be did:web for direct requests, got method: {:?}",
+                bare_did.method()
+            )));
+        }
+
+        Ok(Some(bare_did.as_str().to_string()))
     }
 
     async fn store_signing_key(&self, user_did: &str, key_data: &[u8]) -> Result<()> {
@@ -343,5 +881,565 @@ mod tests {
     fn non_android_credential_store_constructor_succeeds() {
         let _ =
             KeyringCredentialStore::try_new().expect("desktop credential constructor should work");
+    }
+    static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn set_test_dns_resolver<F>(f: F)
+    where
+        F: Fn(&str, u16) -> Result<Vec<std::net::SocketAddr>> + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = TEST_DNS_RESOLVER.write() {
+            *guard = Some(Box::new(f));
+        }
+    }
+
+    fn set_test_client_builder<F>(f: F)
+    where
+        F: Fn(reqwest::ClientBuilder) -> reqwest::ClientBuilder + Send + Sync + 'static,
+    {
+        if let Ok(mut guard) = TEST_CLIENT_BUILDER.write() {
+            *guard = Some(Box::new(f));
+        }
+    }
+
+    struct TestHooksGuard;
+    impl Drop for TestHooksGuard {
+        fn drop(&mut self) {
+            if let Ok(mut guard) = TEST_DNS_RESOLVER.write() {
+                *guard = None;
+            }
+            if let Ok(mut guard) = TEST_CLIENT_BUILDER.write() {
+                *guard = None;
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn direct_request_receipt_authority_document_resolves_valid_peer_and_asserts_doc_id() {
+        let _lock = TEST_MUTEX.lock().await;
+        let _guard = TestHooksGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = dir.path().join("ca.key");
+        let ca_pem = dir.path().join("ca.pem");
+        let srv_key = dir.path().join("server.key");
+        let srv_csr = dir.path().join("server.csr");
+        let srv_pem = dir.path().join("server.pem");
+        let ext = dir.path().join("ext.cnf");
+        std::fs::write(&ext, "subjectAltName=DNS:peer.example.com\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n").unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-keyout"])
+            .arg(&ca_key)
+            .arg("-out")
+            .arg(&ca_pem)
+            .status()
+            .unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=peer.example.com", "-keyout"])
+            .arg(&srv_key)
+            .arg("-out")
+            .arg(&srv_csr)
+            .status()
+            .unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["x509", "-req", "-days", "1", "-CA"])
+            .arg(&ca_pem)
+            .arg("-CAkey")
+            .arg(&ca_key)
+            .arg("-CAcreateserial")
+            .arg("-in")
+            .arg(&srv_csr)
+            .arg("-extfile")
+            .arg(&ext)
+            .arg("-out")
+            .arg(&srv_pem)
+            .status()
+            .unwrap();
+
+        let mut py_server = tokio::process::Command::new("python3")
+            .arg("-c")
+            .arg(r#"
+import ssl, socket, sys, json
+srv_pem, srv_key = sys.argv[1], sys.argv[2]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(srv_pem, srv_key)
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('127.0.0.1', 0))
+port = sock.getsockname()[1]
+sock.listen(1)
+print(port, flush=True)
+raw, _ = sock.accept()
+ssock = ctx.wrap_socket(raw, server_side=True)
+_ = ssock.recv(4096)
+body = json.dumps({"id": "did:web:peer.example.com"}).encode('utf-8')
+resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode('utf-8') + body
+ssock.sendall(resp)
+ssock.close()
+"#)
+            .arg(&srv_pem)
+            .arg(&srv_key)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stdout = py_server.stdout.take().unwrap();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut port_line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut port_line).await.unwrap();
+        let tls_port: u16 = port_line.trim().parse().unwrap();
+
+        let ca_cert = reqwest::Certificate::from_pem(&std::fs::read(&ca_pem).unwrap()).unwrap();
+
+        set_test_dns_resolver(move |_host, _port| {
+            Ok(vec!["93.184.216.34:443".parse().unwrap()])
+        });
+
+        set_test_client_builder(move |b| {
+            b.add_root_certificate(ca_cert.clone())
+                .resolve("peer.example.com", std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)))
+        });
+
+        let store = KeyringCredentialStore::try_new().unwrap();
+        let doc_bytes = store
+            .direct_request_receipt_authority_document("did:web:peer.example.com")
+            .await
+            .expect("Valid peer authority document should resolve")
+            .expect("Document should be present");
+
+        let doc: serde_json::Value = serde_json::from_slice(&doc_bytes).unwrap();
+        assert_eq!(doc["id"], "did:web:peer.example.com");
+
+        let _ = py_server.kill().await;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn direct_request_receipt_authority_document_rejects_doc_id_mismatch() {
+        let _lock = TEST_MUTEX.lock().await;
+        let _guard = TestHooksGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = dir.path().join("ca.key");
+        let ca_pem = dir.path().join("ca.pem");
+        let srv_key = dir.path().join("server.key");
+        let srv_csr = dir.path().join("server.csr");
+        let srv_pem = dir.path().join("server.pem");
+        let ext = dir.path().join("ext.cnf");
+        std::fs::write(&ext, "subjectAltName=DNS:peer.example.com\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n").unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-keyout"])
+            .arg(&ca_key)
+            .arg("-out")
+            .arg(&ca_pem)
+            .status()
+            .unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=peer.example.com", "-keyout"])
+            .arg(&srv_key)
+            .arg("-out")
+            .arg(&srv_csr)
+            .status()
+            .unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["x509", "-req", "-days", "1", "-CA"])
+            .arg(&ca_pem)
+            .arg("-CAkey")
+            .arg(&ca_key)
+            .arg("-CAcreateserial")
+            .arg("-in")
+            .arg(&srv_csr)
+            .arg("-extfile")
+            .arg(&ext)
+            .arg("-out")
+            .arg(&srv_pem)
+            .status()
+            .unwrap();
+
+        let mut py_server = tokio::process::Command::new("python3")
+            .arg("-c")
+            .arg(r#"
+import ssl, socket, sys, json
+srv_pem, srv_key = sys.argv[1], sys.argv[2]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(srv_pem, srv_key)
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('127.0.0.1', 0))
+port = sock.getsockname()[1]
+sock.listen(1)
+print(port, flush=True)
+raw, _ = sock.accept()
+ssock = ctx.wrap_socket(raw, server_side=True)
+_ = ssock.recv(4096)
+body = json.dumps({"id": "did:web:mismatched.example.com"}).encode('utf-8')
+resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode('utf-8') + body
+ssock.sendall(resp)
+ssock.close()
+"#)
+            .arg(&srv_pem)
+            .arg(&srv_key)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stdout = py_server.stdout.take().unwrap();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut port_line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut port_line).await.unwrap();
+        let tls_port: u16 = port_line.trim().parse().unwrap();
+
+        let ca_cert = reqwest::Certificate::from_pem(&std::fs::read(&ca_pem).unwrap()).unwrap();
+
+        set_test_dns_resolver(move |_host, _port| {
+            Ok(vec!["93.184.216.34:443".parse().unwrap()])
+        });
+
+        set_test_client_builder(move |b| {
+            b.add_root_certificate(ca_cert.clone())
+                .resolve("peer.example.com", std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)))
+        });
+
+        let store = KeyringCredentialStore::try_new().unwrap();
+        let err = store
+            .direct_request_receipt_authority_document("did:web:peer.example.com")
+            .await
+            .expect_err("Mismatched doc.id must be rejected");
+
+        assert!(
+            err.to_string().contains("id mismatch"),
+            "Error should indicate doc.id mismatch: {err}"
+        );
+
+        let _ = py_server.kill().await;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn direct_request_receipt_authority_document_rejects_ssrf_forbidden_ips() {
+        let _lock = TEST_MUTEX.lock().await;
+        let _guard = TestHooksGuard;
+
+        let store = KeyringCredentialStore::try_new().unwrap();
+
+        set_test_dns_resolver(|_host, _port| Ok(vec!["127.0.0.1:443".parse().unwrap()]));
+        let err = store
+            .direct_request_receipt_authority_document("did:web:loopback.example.com")
+            .await
+            .expect_err("Loopback DNS must be rejected");
+        assert!(err.to_string().contains("forbidden IP"), "Got: {err}");
+
+        set_test_dns_resolver(|_host, _port| Ok(vec!["10.0.0.1:443".parse().unwrap()]));
+        let err = store
+            .direct_request_receipt_authority_document("did:web:private.example.com")
+            .await
+            .expect_err("Private DNS must be rejected");
+        assert!(err.to_string().contains("forbidden IP"), "Got: {err}");
+
+        set_test_dns_resolver(|_host, _port| Ok(vec!["169.254.169.254:443".parse().unwrap()]));
+        let err = store
+            .direct_request_receipt_authority_document("did:web:metadata.example.com")
+            .await
+            .expect_err("Metadata IP must be rejected");
+        assert!(err.to_string().contains("forbidden IP"), "Got: {err}");
+
+        set_test_dns_resolver(|_host, _port| Ok(vec!["[fc00::1]:443".parse().unwrap()]));
+        let err = store
+            .direct_request_receipt_authority_document("did:web:ipv6-ula.example.com")
+            .await
+            .expect_err("IPv6 ULA must be rejected");
+        assert!(err.to_string().contains("forbidden IP"), "Got: {err}");
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn direct_request_receipt_authority_document_rejects_invalid_hosts_and_unsupported_methods() {
+        let _lock = TEST_MUTEX.lock().await;
+        let _guard = TestHooksGuard;
+
+        let store = KeyringCredentialStore::try_new().unwrap();
+
+        let err = store
+            .direct_request_receipt_authority_document("did:web:localhost")
+            .await
+            .expect_err("Localhost must be rejected");
+        assert!(err.to_string().contains("localhost"), "Got: {err}");
+
+        let err = store
+            .direct_request_receipt_authority_document("did:web:evil.localhost")
+            .await
+            .expect_err("Localhost subdomain must be rejected");
+        assert!(err.to_string().contains("localhost"), "Got: {err}");
+
+        let err = store
+            .direct_request_receipt_authority_document("did:web:example.com:..:escape")
+            .await
+            .expect_err("Path traversal must be rejected");
+        assert!(err.to_string().contains("path segment"), "Got: {err}");
+
+        let unsupported = store
+            .direct_request_receipt_authority_document("did:plc:abcdef1234567890abcdef12")
+            .await
+            .expect("Unsupported method should return Ok(None)");
+        assert!(unsupported.is_none());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn get_chat_declaration_authority_resolves_declared_authority_and_fails_closed_on_mismatch() {
+        let _lock = TEST_MUTEX.lock().await;
+        let _guard = TestHooksGuard;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_key = dir.path().join("ca.key");
+        let ca_pem = dir.path().join("ca.pem");
+        let srv_key = dir.path().join("server.key");
+        let srv_csr = dir.path().join("server.csr");
+        let srv_pem = dir.path().join("server.pem");
+        let ext = dir.path().join("ext.cnf");
+        std::fs::write(&ext, "subjectAltName=DNS:user.example.com,DNS:mismatch.example.com,DNS:missing.example.com,DNS:untyped404.example.com,DNS:nopds.example.com,DNS:wrongtype.example.com,DNS:wrongproto.example.com,DNS:badds.example.com,DNS:pds.example.com\nextendedKeyUsage=serverAuth\nbasicConstraints=CA:FALSE\n").unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=Test CA", "-addext", "basicConstraints=critical,CA:TRUE", "-keyout"])
+            .arg(&ca_key)
+            .arg("-out")
+            .arg(&ca_pem)
+            .status()
+            .unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=user.example.com", "-keyout"])
+            .arg(&srv_key)
+            .arg("-out")
+            .arg(&srv_csr)
+            .status()
+            .unwrap();
+
+        let _ = std::process::Command::new("openssl")
+            .args(["x509", "-req", "-days", "1", "-CA"])
+            .arg(&ca_pem)
+            .arg("-CAkey")
+            .arg(&ca_key)
+            .arg("-CAcreateserial")
+            .arg("-in")
+            .arg(&srv_csr)
+            .arg("-extfile")
+            .arg(&ext)
+            .arg("-out")
+            .arg(&srv_pem)
+            .status()
+            .unwrap();
+
+        let mut py_server = tokio::process::Command::new("python3")
+            .arg("-c")
+            .arg(r##"
+import ssl, socket, sys, json
+srv_pem, srv_key = sys.argv[1], sys.argv[2]
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(srv_pem, srv_key)
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(('127.0.0.1', 0))
+port = sock.getsockname()[1]
+sock.listen(10)
+print(port, flush=True)
+
+while True:
+    try:
+        raw, _ = sock.accept()
+        ssock = ctx.wrap_socket(raw, server_side=True)
+        req = ssock.recv(4096).decode('utf-8', errors='ignore')
+        if "GET /.well-known/did.json" in req:
+            host = "user.example.com"
+            has_pds = True
+            for candidate in ["mismatch", "missing", "untyped404", "wrongtype", "wrongproto", "badds"]:
+                if f"{candidate}.example.com" in req:
+                    host = f"{candidate}.example.com"
+                    break
+            if "nopds.example.com" in req:
+                host = "nopds.example.com"
+                has_pds = False
+            services = [{
+                "id": "#atproto_pds",
+                "type": "AtprotoPersonalDataServer",
+                "serviceEndpoint": f"https://pds.example.com:{port}"
+            }] if has_pds else []
+            doc = json.dumps({
+                "id": f"did:web:{host}",
+                "service": services
+            }).encode('utf-8')
+            resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(doc)}\r\nConnection: close\r\n\r\n".encode('utf-8') + doc
+            ssock.sendall(resp)
+        elif "GET /xrpc/com.atproto.repo.getRecord" in req:
+            if "repo=did%3Aweb%3Auser.example.com" in req:
+                record = json.dumps({
+                    "uri": "at://did:web:user.example.com/blue.catbird.chat.declaration/self",
+                    "value": {
+                        "$type": "blue.catbird.chat.declaration",
+                        "protocolVersion": "1",
+                        "deliveryService": "did:web:foreign-ds.example.org"
+                    }
+                }).encode('utf-8')
+                resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(record)}\r\nConnection: close\r\n\r\n".encode('utf-8') + record
+                ssock.sendall(resp)
+            elif "repo=did%3Aweb%3Amismatch.example.com" in req:
+                record = json.dumps({
+                    "uri": "at://did:web:other.example.com/blue.catbird.chat.declaration/self",
+                    "value": {
+                        "$type": "blue.catbird.chat.declaration",
+                        "protocolVersion": "1",
+                        "deliveryService": "did:web:evil-ds.example.org"
+                    }
+                }).encode('utf-8')
+                resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(record)}\r\nConnection: close\r\n\r\n".encode('utf-8') + record
+                ssock.sendall(resp)
+            elif "repo=did%3Aweb%3Awrongtype.example.com" in req:
+                record = json.dumps({
+                    "uri": "at://did:web:wrongtype.example.com/blue.catbird.chat.declaration/self",
+                    "value": {
+                        "$type": "blue.catbird.chat.profile",
+                        "protocolVersion": "1",
+                        "deliveryService": "did:web:foreign-ds.example.org"
+                    }
+                }).encode('utf-8')
+                resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(record)}\r\nConnection: close\r\n\r\n".encode('utf-8') + record
+                ssock.sendall(resp)
+            elif "repo=did%3Aweb%3Awrongproto.example.com" in req:
+                record = json.dumps({
+                    "uri": "at://did:web:wrongproto.example.com/blue.catbird.chat.declaration/self",
+                    "value": {
+                        "$type": "blue.catbird.chat.declaration",
+                        "protocolVersion": "2",
+                        "deliveryService": "did:web:foreign-ds.example.org"
+                    }
+                }).encode('utf-8')
+                resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(record)}\r\nConnection: close\r\n\r\n".encode('utf-8') + record
+                ssock.sendall(resp)
+            elif "repo=did%3Aweb%3Abadds.example.com" in req:
+                record = json.dumps({
+                    "uri": "at://did:web:badds.example.com/blue.catbird.chat.declaration/self",
+                    "value": {
+                        "$type": "blue.catbird.chat.declaration",
+                        "protocolVersion": "1",
+                        "deliveryService": "did:invalid:malformed"
+                    }
+                }).encode('utf-8')
+                resp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(record)}\r\nConnection: close\r\n\r\n".encode('utf-8') + record
+                ssock.sendall(resp)
+            elif "repo=did%3Aweb%3Amissing.example.com" in req:
+                body = b'{"error":"RecordNotFound","message":"nf"}'
+                resp = f"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode('utf-8') + body
+                ssock.sendall(resp)
+            elif "repo=did%3Aweb%3Auntyped404.example.com" in req:
+                body = b"<html>Not Found</html>"
+                resp = f"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode('utf-8') + body
+                ssock.sendall(resp)
+            else:
+                ssock.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        else:
+            ssock.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        ssock.close()
+    except Exception:
+        break
+"##)
+            .arg(&srv_pem)
+            .arg(&srv_key)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let stdout = py_server.stdout.take().unwrap();
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut port_line = String::new();
+        tokio::io::AsyncBufReadExt::read_line(&mut reader, &mut port_line).await.unwrap();
+        let tls_port: u16 = port_line.trim().parse().unwrap();
+
+        let ca_cert = reqwest::Certificate::from_pem(&std::fs::read(&ca_pem).unwrap()).unwrap();
+
+        set_test_dns_resolver(move |_host, _port| {
+            Ok(vec!["93.184.216.34:443".parse().unwrap()])
+        });
+
+        let ca_for_client = ca_cert.clone();
+        set_test_client_builder(move |b| {
+            let mut builder = b.add_root_certificate(ca_for_client.clone())
+                .resolve("pds.example.com", std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)));
+            for host in &[
+                "user.example.com", "mismatch.example.com", "missing.example.com",
+                "untyped404.example.com", "nopds.example.com", "wrongtype.example.com",
+                "wrongproto.example.com", "badds.example.com",
+            ] {
+                builder = builder.resolve(host, std::net::SocketAddr::from(([127, 0, 0, 1], tls_port)));
+            }
+            builder
+        });
+
+        let store = KeyringCredentialStore::try_new().unwrap();
+
+        // 1. Valid declaration: resolves to declared foreign authority
+        let authority = store
+            .get_chat_declaration_authority("did:web:user.example.com")
+            .await
+            .expect("Valid declaration should resolve")
+            .expect("Authority DID should be present");
+        assert_eq!(authority, "did:web:foreign-ds.example.org");
+
+        // 2. Absent declaration: typed RecordNotFound 404 returns Ok(None)
+        let missing = store
+            .get_chat_declaration_authority("did:web:missing.example.com")
+            .await
+            .expect("Typed RecordNotFound should return Ok(None)");
+        assert!(missing.is_none());
+
+        // 3. Malformed / untyped 404: must fail closed (Err)
+        let untyped_err = store
+            .get_chat_declaration_authority("did:web:untyped404.example.com")
+            .await
+            .expect_err("Untyped 404 must fail closed");
+        assert!(untyped_err.to_string().contains("HTTP status 404"), "Got: {untyped_err}");
+
+        // 4. Missing #atproto_pds service: must fail closed (Err)
+        let nopds_err = store
+            .get_chat_declaration_authority("did:web:nopds.example.com")
+            .await
+            .expect_err("Missing #atproto_pds must fail closed");
+        assert!(nopds_err.to_string().contains("#atproto_pds service"), "Got: {nopds_err}");
+
+        // 5. Mismatched repo in declaration record URI: must fail closed (Err)
+        let mismatch_err = store
+            .get_chat_declaration_authority("did:web:mismatch.example.com")
+            .await
+            .expect_err("Mismatched repo URI in declaration must fail closed");
+        assert!(mismatch_err.to_string().contains("URI mismatch"), "Got: {mismatch_err}");
+
+        // 6. Invalid record $type: must fail closed (Err)
+        let type_err = store
+            .get_chat_declaration_authority("did:web:wrongtype.example.com")
+            .await
+            .expect_err("Invalid $type must fail closed");
+        assert!(type_err.to_string().contains("$type"), "Got: {type_err}");
+
+        // 7. Invalid protocolVersion: must fail closed (Err)
+        let proto_err = store
+            .get_chat_declaration_authority("did:web:wrongproto.example.com")
+            .await
+            .expect_err("Invalid protocolVersion must fail closed");
+        assert!(proto_err.to_string().contains("protocolVersion"), "Got: {proto_err}");
+
+        // 8. Malformed deliveryService DID: must fail closed (Err)
+        let badds_err = store
+            .get_chat_declaration_authority("did:web:badds.example.com")
+            .await
+            .expect_err("Malformed deliveryService must fail closed");
+        assert!(badds_err.to_string().contains("deliveryService"), "Got: {badds_err}");
+
+        let _ = py_server.kill().await;
     }
 }

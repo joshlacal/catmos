@@ -78,10 +78,32 @@ export function createRequestsStore() {
       await saves.get(id); if(!active(owner,revision))return;
       const persisted=await api.saveRequestDraft(owner,draft.input,draft.recipientLabel,authRevision); if(!active(owner,revision))return;
       mergeDraft({...persisted,phase:'attempted'});
-      const result=await api.submitRequestDraft(owner,id,authRevision); if(!active(owner,revision))return;
-      mergeDraft(result); await load();
+      try {
+        const result=await api.submitRequestDraft(owner,id,authRevision); if(!active(owner,revision))return;
+        mergeDraft(result); await load();
+      } catch (error) {
+        // Read the host's durable phase without remote inventory. A verified
+        // terminal refusal is editable; ambiguous delivery remains immutable.
+        if(active(owner,revision))try {
+          const current=await api.saveRequestDraft(owner,draft.input,draft.recipientLabel,authRevision);
+          if(active(owner,revision))mergeDraft(current);
+        } catch {}
+        throw error;
+      }
     }); },
-    async resume(id: string) { await operation(async owner=>{const revision=epoch; const result=await api.resumeRequestDraft(owner,id,authRevision);if(active(owner,revision)){mergeDraft(result);await load();}}); },
+    async resume(id: string) { await operation(async owner=>{
+      const revision=epoch, draft=get(store).drafts.find(d=>d.input.draftId===id);
+      try {
+        const result=await api.resumeRequestDraft(owner,id,authRevision);
+        if(active(owner,revision)){mergeDraft(result);await load();}
+      } catch(error) {
+        if(active(owner,revision)&&draft)try {
+          const current=await api.saveRequestDraft(owner,draft.input,draft.recipientLabel,authRevision);
+          if(active(owner,revision))mergeDraft(current);
+        } catch {}
+        throw error;
+      }
+    }); },
     async cancel(id: string) { await operation(async owner=>{const revision=epoch; const draft=get(store).drafts.find(d=>d.input.draftId===id);if(!draft)return;
       if(draft.phase==='draft'&&!api.requestBackendAvailable){mergeDraft({...draft,archived:true});store.update(s=>({...s,pane:'inbox'}));return;}
       await api.saveRequestDraft(owner,draft.input,draft.recipientLabel,authRevision);if(!active(owner,revision))return;const result=await api.cancelRequestDraft(owner,id,authRevision);if(active(owner,revision)){mergeDraft(result);if(result.archived)store.update(s=>({...s,pane:'inbox'}));}

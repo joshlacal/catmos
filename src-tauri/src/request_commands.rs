@@ -1,9 +1,10 @@
 //! Desktop request adapter. The shared engine alone owns intent, crypto and consent.
 use crate::AppState;
 use catbird_mls::orchestrator::{
-    DirectRequestInput, DirectRequestOutcome, DirectRequestView, GroupInvitationReference,
-    RequestConsent,
+    direct_requests::DirectRequestIntent, CredentialStore, DirectRequestInput, DirectRequestOutcome,
+    DirectRequestView, GroupInvitationReference, MlsCryptoContext, OrchestratorError, RequestConsent,
 };
+use catbird_mls::MLSError;
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
@@ -225,8 +226,53 @@ async fn operate(
             state.orchestrator.storage().save_request_draft(&session.actor_did, &draft)?;
             Ok(draft)
         }
-        Err(e) => {
-            eprintln!("operate error: {:?}", e);
+        Err(error) => {
+            eprintln!("operate error: {:?}", error);
+            // A signed terminal refusal ends the attempt even though the
+            // native intent retains its authenticated receipt and tombstone.
+            // Unknown delivery still has no terminal receipt and stays immutable.
+            let retained = state
+                .orchestrator
+                .mls_context()
+                .read_direct_request_intent(draft_id)
+                .map_err(|_| "Request delivery state is unavailable; keep this draft unchanged")?;
+            let terminal_not_published = if let Some(raw) = retained.as_deref() {
+                match state
+                    .orchestrator
+                    .credentials()
+                    .get_device_uuid(&session.actor_did)
+                    .await
+                {
+                    Ok(Some(device)) => DirectRequestIntent::decode(raw, &session.actor_did, &device)
+                        .is_ok_and(|intent| {
+                            intent.input == draft.input
+                                && intent.terminal_response.is_some()
+                                && !intent.publication_attempted
+                        }),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if terminal_not_published || (retained.is_none() && draft.outcome.is_none()) {
+                draft.phase = "draft".into();
+                if terminal_not_published {
+                    draft.outcome = None;
+                }
+                if action == "cancel" {
+                    draft.archived = true;
+                }
+                state.orchestrator.storage().save_request_draft(&session.actor_did, &draft)?;
+                if action == "cancel" {
+                    return Ok(draft);
+                }
+            }
+            if let OrchestratorError::Mls(MLSError::OperationNotSupported { reason }) = error {
+                return Err(format!("{reason}. No legacy delivery was attempted."));
+            }
+            if retained.is_none() {
+                return Err("Request was not attempted. Your draft remains editable and cancellable.".into());
+            }
             Err("Delivery is not confirmed. Your draft is saved; check delivery or retry the same request.".into())
         }
     }
