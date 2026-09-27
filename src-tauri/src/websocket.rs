@@ -97,6 +97,7 @@ async fn do_subscribe(
         .await
         .map_err(|e| format!("WebSocket connect failed: {e}"))?;
     log_ws!("Connected");
+    let _ = app.emit("mls-ws-connected", ());
     let (mut write, mut read) = stream.split();
 
     loop {

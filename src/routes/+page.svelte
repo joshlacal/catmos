@@ -48,6 +48,7 @@
 	let unlistenQuarantined: (() => void) | null = null;
 	let unlistenQuarantineCleared: (() => void) | null = null;
 	let unlistenRecovery: (() => void) | null = null;
+	let unlistenConnected: (() => void) | null = null;
 	let subscribedConvoId: string | null = null;
 	let blockReconcileRan = false;
 
@@ -132,6 +133,11 @@
 			connection.setDisconnected(payload);
 		}).then((unlisten) => {
 			unlistenRecovery = unlisten;
+		});
+		listenForEvent('mls-ws-connected', () => {
+			connection.setConnected();
+		}).then((unlisten) => {
+			unlistenConnected = unlisten;
 		});
 	});
 
@@ -308,6 +314,7 @@
 		unlistenQuarantined?.();
 		unlistenQuarantineCleared?.();
 		unlistenRecovery?.();
+		unlistenConnected?.();
 		if (subscribedConvoId) {
 			api.unsubscribeConversation(subscribedConvoId).catch(() => {});
 		}
