@@ -68,6 +68,7 @@
 	function selectConversation(id: string) {
 		requests.hide();
 		conversations.select(id);
+		if ($requests.views.some((view) => view.conversationId === id && view.consent !== 'accepted' && view.consent !== 'closed')) void requests.refresh(id);
 	}
 
 	function openCreateDialog() {
