@@ -219,11 +219,10 @@
 			conversations.bindAccount(owner, revision);
 			messages.bindAccount(owner, revision);
 			if (owner) {
-				requests.load();
 				api.subscribeAllEvents().catch((e) =>
 					console.warn('[catmos] subscribeAllEvents failed', e)
 				);
-				conversations.load().then(() => {
+				requests.load().then(() => conversations.load()).then(() => {
 					// Startup reconciliation: leave any group containing a DID the
 					// user has blocked (from another client or a previous interrupted
 					// blockAndLeave). Run once per session.
