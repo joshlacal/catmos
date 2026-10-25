@@ -1,6 +1,6 @@
 import { writable, get } from 'svelte/store';
-import type { ProfileView } from '$lib/tauri';
-import * as api from '$lib/wasm';
+import type { ProfileView } from '#lib/tauri.ts';
+import * as api from '#lib/wasm.ts';
 
 interface ProfilesStore {
 	cache: Map<string, ProfileView>;

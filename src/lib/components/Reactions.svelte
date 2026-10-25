@@ -1,7 +1,7 @@
 <script lang="ts">
-	import * as api from '$lib/wasm';
-	import { auth } from '$lib/stores/auth';
-	import { messages } from '$lib/stores/messages';
+	import * as api from '#lib/wasm.ts';
+	import { auth } from '#lib/stores/auth.ts';
+	import { messages } from '#lib/stores/messages.ts';
 
 	let {
 		reactions = {},

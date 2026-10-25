@@ -1,7 +1,7 @@
 import { writable, derived, get } from 'svelte/store';
-import type { Conversation } from '$lib/tauri';
-import * as api from '$lib/wasm';
-import { createBlock, listOwnBlocks } from '$lib/wasm';
+import type { Conversation } from '#lib/tauri.ts';
+import * as api from '#lib/wasm.ts';
+import { createBlock, listOwnBlocks } from '#lib/wasm.ts';
 
 interface ConversationsStore {
 	items: Conversation[];

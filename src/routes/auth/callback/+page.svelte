@@ -1,13 +1,13 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { page } from '$app/stores';
-	import { auth } from '$lib/stores/auth';
+	import { page } from '$app/state';
+	import { auth } from '#lib/stores/auth.ts';
 
 	let status = $state('Completing sign in…');
 
 	onMount(async () => {
-		const sessionId = $page.url.searchParams.get('session_id');
+		const sessionId = page.url.searchParams.get('session_id');
 		if (!sessionId) {
 			status = 'Error: missing session_id in callback URL.';
 			return;

@@ -1,9 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { conversations } from '$lib/stores/conversations';
-  import { messages } from '$lib/stores/messages';
-  import * as api from '$lib/wasm';
-  import type { SearchHit } from '$lib/wasm';
+  import { conversations } from '#lib/stores/conversations.ts';
+  import { messages } from '#lib/stores/messages.ts';
+  import * as api from '#lib/wasm.ts';
+  import type { SearchHit } from '#lib/wasm.ts';
 
   let {
     open = false,

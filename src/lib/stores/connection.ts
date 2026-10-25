@@ -1,5 +1,5 @@
 import { writable } from 'svelte/store';
-import { recoveryNotice, type RecoveryCategory } from '$lib/recovery';
+import { recoveryNotice, type RecoveryCategory } from '#lib/recovery.ts';
 
 export type ConnectionState =
   | 'connected'

@@ -1,7 +1,7 @@
 import { writable } from 'svelte/store';
-import * as api from '$lib/wasm';
-import { listenForEvent, isTauri } from '$lib/wasm';
-import type { AuthState } from '$lib/tauri';
+import * as api from '#lib/wasm.ts';
+import { listenForEvent, isTauri } from '#lib/wasm.ts';
+import type { AuthState } from '#lib/tauri.ts';
 import { profiles } from './profiles';
 
 interface AuthStore {

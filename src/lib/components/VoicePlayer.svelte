@@ -1,5 +1,5 @@
 <script lang="ts">
-	import type { AudioAttachment } from '$lib/tauri';
+	import type { AudioAttachment } from '#lib/tauri.ts';
 
 	export let audio: AudioAttachment;
 	export let isOwnMessage = false;
@@ -32,7 +32,7 @@
 
 		isLoading = true;
 		try {
-			const { fetchAndDecryptBlob } = await import('$lib/wasm');
+			const { fetchAndDecryptBlob } = await import('#lib/wasm.ts');
 			const decryptedData = await fetchAndDecryptBlob(
 				audio.blobId,
 				audio.key,

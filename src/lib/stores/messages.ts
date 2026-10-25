@@ -5,8 +5,8 @@ import type {
 	PreparedImageUpload,
 	ReactionEvent,
 	TypingEvent
-} from '$lib/tauri';
-import * as api from '$lib/wasm';
+} from '#lib/tauri.ts';
+import * as api from '#lib/wasm.ts';
 
 interface MessagesStore {
 	byConversation: Map<string, Message[]>;

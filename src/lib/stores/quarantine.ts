@@ -16,8 +16,8 @@ import type {
 	QuarantineState,
 	QuarantineEnteredEvent,
 	QuarantineClearedEvent
-} from '$lib/tauri';
-import { getQuarantineState as fetchQuarantineState } from '$lib/wasm';
+} from '#lib/tauri.ts';
+import { getQuarantineState as fetchQuarantineState } from '#lib/wasm.ts';
 
 type QuarantineMap = Record<string, QuarantineState>;
 

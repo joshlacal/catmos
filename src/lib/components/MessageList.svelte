@@ -1,6 +1,6 @@
 <script lang="ts">
-	import type { Message } from '$lib/tauri';
-	import { auth } from '$lib/stores/auth';
+	import type { Message } from '#lib/tauri.ts';
+	import { auth } from '#lib/stores/auth.ts';
 	import MessageBubble, { type ReplyInfo } from './MessageBubble.svelte';
 
 	let {

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { searchUsers, checkOptInStatus, type SearchResult } from '$lib/wasm';
+	import { searchUsers, checkOptInStatus, type SearchResult } from '#lib/wasm.ts';
 
 	let { selected = $bindable([]) }: { selected: SearchResult[] } = $props();
 

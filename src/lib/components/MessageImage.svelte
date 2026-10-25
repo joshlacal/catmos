@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import type { ImageAttachment } from '$lib/tauri';
-	import { getImageAttachment } from '$lib/wasm';
+	import type { ImageAttachment } from '#lib/tauri.ts';
+	import { getImageAttachment } from '#lib/wasm.ts';
 
 	let { image, fallbackAlt }: { image: ImageAttachment; fallbackAlt?: string } = $props();
 

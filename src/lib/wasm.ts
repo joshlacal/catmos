@@ -973,8 +973,8 @@ export async function searchMessages(query: string): Promise<SearchHit[]> {
 	}
 	// Web fallback: client-side search through loaded messages
 	const { get } = await import('svelte/store');
-	const { messages } = await import('$lib/stores/messages');
-	const { conversations } = await import('$lib/stores/conversations');
+	const { messages } = await import('#lib/stores/messages.ts');
+	const { conversations } = await import('#lib/stores/conversations.ts');
 	const state = get(messages);
 	const convoState = get(conversations);
 	const lowerQuery = query.toLowerCase();

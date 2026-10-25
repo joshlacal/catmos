@@ -1,15 +1,15 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
-	import { auth } from '$lib/stores/auth';
+	import { auth } from '#lib/stores/auth.ts';
 	import {
 		conversations,
 		selectedConversation,
 		reconcileBlockedConversations
-	} from '$lib/stores/conversations';
-	import { messages } from '$lib/stores/messages';
-	import { saveCursor, getCursor } from '$lib/stores/cursors';
-	import * as api from '$lib/wasm';
-	import { listenForEvent, isTauri } from '$lib/wasm';
+	} from '#lib/stores/conversations.ts';
+	import { messages } from '#lib/stores/messages.ts';
+	import { saveCursor, getCursor } from '#lib/stores/cursors.ts';
+	import * as api from '#lib/wasm.ts';
+	import { listenForEvent, isTauri } from '#lib/wasm.ts';
 	import type {
 		Message,
 		PreparedImageUpload,
@@ -18,20 +18,20 @@
 		GroupResetEvent,
 		QuarantineEnteredEvent,
 		QuarantineClearedEvent
-	} from '$lib/tauri';
-	import MessageList from '$lib/components/MessageList.svelte';
-	import Composer from '$lib/components/Composer.svelte';
-	import MemberList from '$lib/components/MemberList.svelte';
-	import ReplyPreview from '$lib/components/ReplyPreview.svelte';
-	import ConnectionStatus from '$lib/components/ConnectionStatus.svelte';
-	import SearchPanel from '$lib/components/SearchPanel.svelte';
-	import QuarantineBanner from '$lib/components/QuarantineBanner.svelte';
-	import type { ReplyInfo } from '$lib/components/MessageBubble.svelte';
-	import { connection } from '$lib/stores/connection';
-	import { notifyIncomingMessage } from '$lib/notifications';
-	import { profiles } from '$lib/stores/profiles';
-	import { quarantine } from '$lib/stores/quarantine';
-	import type { Conversation } from '$lib/tauri';
+	} from '#lib/tauri.ts';
+	import MessageList from '#lib/components/MessageList.svelte';
+	import Composer from '#lib/components/Composer.svelte';
+	import MemberList from '#lib/components/MemberList.svelte';
+	import ReplyPreview from '#lib/components/ReplyPreview.svelte';
+	import ConnectionStatus from '#lib/components/ConnectionStatus.svelte';
+	import SearchPanel from '#lib/components/SearchPanel.svelte';
+	import QuarantineBanner from '#lib/components/QuarantineBanner.svelte';
+	import type { ReplyInfo } from '#lib/components/MessageBubble.svelte';
+	import { connection } from '#lib/stores/connection.ts';
+	import { notifyIncomingMessage } from '#lib/notifications.ts';
+	import { profiles } from '#lib/stores/profiles.ts';
+	import { quarantine } from '#lib/stores/quarantine.ts';
+	import type { Conversation } from '#lib/tauri.ts';
 
 	let loginIdentifier = $state('');
 	let replyingTo = $state<ReplyInfo | null>(null);

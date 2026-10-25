@@ -9,15 +9,15 @@
 		type GroupMember,
 		type SearchResult,
 		type QuarantineState
-	} from '$lib/wasm';
-	import { auth } from '$lib/stores/auth';
-	import { profiles } from '$lib/stores/profiles';
+	} from '#lib/wasm.ts';
+	import { auth } from '#lib/stores/auth.ts';
+	import { profiles } from '#lib/stores/profiles.ts';
 	import {
 		conversations,
 		affectedConversationsFor,
 		blockAndLeave
-	} from '$lib/stores/conversations';
-	import { quarantineReasonCopy } from '$lib/stores/quarantine';
+	} from '#lib/stores/conversations.ts';
+	import { quarantineReasonCopy } from '#lib/stores/quarantine.ts';
 	import UserSearch from './UserSearch.svelte';
 
 	let {

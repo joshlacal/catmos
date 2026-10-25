@@ -9,9 +9,9 @@
 	 *   handled by the existing `mls:group-reset` listener in `+page.svelte`.
 	 * - `Learn more` → opens an inline disclosure with the suspected DIDs.
 	 */
-	import type { QuarantineState } from '$lib/tauri';
-	import { confirmManualReset } from '$lib/wasm';
-	import { quarantineReasonCopy } from '$lib/stores/quarantine';
+	import type { QuarantineState } from '#lib/tauri.ts';
+	import { confirmManualReset } from '#lib/wasm.ts';
+	import { quarantineReasonCopy } from '#lib/stores/quarantine.ts';
 
 	let {
 		conversationId,

@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { connection } from '$lib/stores/connection';
-  import { recoveryLabel } from '$lib/recovery';
+  import { connection } from '#lib/stores/connection.ts';
+  import { recoveryLabel } from '#lib/recovery.ts';
 
   let visible = $derived(
     $connection.state !== 'connected' && $connection.state !== 'connecting'

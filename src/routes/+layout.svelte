@@ -1,12 +1,12 @@
 <script lang="ts">
 	import '../app.css';
 	import { onMount, onDestroy } from 'svelte';
-	import Sidebar from '$lib/components/Sidebar.svelte';
-	import TabBlockedMessage from '$lib/components/TabBlockedMessage.svelte';
-	import { auth } from '$lib/stores/auth';
-	import { selectedConversation } from '$lib/stores/conversations';
-	import { isTauri, initWasm } from '$lib/wasm';
-	import { acquireTabLock, type TabLockStatus } from '$lib/stores/tab-lock';
+	import Sidebar from '#lib/components/Sidebar.svelte';
+	import TabBlockedMessage from '#lib/components/TabBlockedMessage.svelte';
+	import { auth } from '#lib/stores/auth.ts';
+	import { selectedConversation } from '#lib/stores/conversations.ts';
+	import { isTauri, initWasm } from '#lib/wasm.ts';
+	import { acquireTabLock, type TabLockStatus } from '#lib/stores/tab-lock.ts';
 
 	let { children } = $props();
 	let sidebarCollapsed = $state(false);

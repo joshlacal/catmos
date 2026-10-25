@@ -1,7 +1,7 @@
 <script lang="ts">
-	import type { Message } from '$lib/tauri';
-	import { profiles } from '$lib/stores/profiles';
-	import { auth } from '$lib/stores/auth';
+	import type { Message } from '#lib/tauri.ts';
+	import { profiles } from '#lib/stores/profiles.ts';
+	import { auth } from '#lib/stores/auth.ts';
 	import Reactions from './Reactions.svelte';
 	import MessageImage from './MessageImage.svelte';
 	import BlueskyEmbed from './BlueskyEmbed.svelte';

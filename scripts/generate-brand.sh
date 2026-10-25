@@ -6,7 +6,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKSPACE_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
-TOKENS="$WORKSPACE_ROOT/docs/brand/tokens/Catbird.pkl"
+TOKENS="${CATBIRD_BRAND_TOKENS:-$WORKSPACE_ROOT/docs/brand/tokens/Catbird.pkl}"
 OUT="$PROJECT_ROOT/src/lib/brand/tokens.json"
 
 if ! command -v pkl > /dev/null 2>&1; then

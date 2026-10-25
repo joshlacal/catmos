@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { conversations } from '$lib/stores/conversations';
-	import { auth } from '$lib/stores/auth';
-	import { drafts } from '$lib/stores/drafts';
-	import { profiles } from '$lib/stores/profiles';
+	import { conversations } from '#lib/stores/conversations.ts';
+	import { auth } from '#lib/stores/auth.ts';
+	import { drafts } from '#lib/stores/drafts.ts';
+	import { profiles } from '#lib/stores/profiles.ts';
 	import UserSearch from './UserSearch.svelte';
-	import type { SearchResult } from '$lib/wasm';
-	import type { Conversation } from '$lib/tauri';
+	import type { SearchResult } from '#lib/wasm.ts';
+	import type { Conversation } from '#lib/tauri.ts';
 
 	let {
 		collapsed = false,

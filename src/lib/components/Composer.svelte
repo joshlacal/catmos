@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onDestroy } from 'svelte';
-	import type { PreparedImageUpload } from '$lib/tauri';
-	import { drafts } from '$lib/stores/drafts';
+	import type { PreparedImageUpload } from '#lib/tauri.ts';
+	import { drafts } from '#lib/stores/drafts.ts';
 
 	let {
 		conversationId,
