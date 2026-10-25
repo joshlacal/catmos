@@ -7,7 +7,6 @@ use serde::Deserialize;
 use tauri::{AppHandle, Emitter};
 
 use catbird_mls::orchestrator::types::IncomingEnvelope;
-use catbird_mls::orchestrator::MLSStorageBackend;
 
 use crate::api_client::ReqwestApiClient;
 use crate::recovery::{actionable_error, classify_error, RecoveryCategory};
@@ -53,6 +52,69 @@ fn cbor_bool(map: &[(CborValue, CborValue)], key: &str) -> Option<bool> {
     map.iter().find_map(|(k, v)| match (k, v) {
         (CborValue::Text(k), CborValue::Bool(v)) if k == key => Some(*v),
         _ => None,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatedGroupReset {
+    conversation_id: String,
+    new_group_id_hex: String,
+    new_group_id: Vec<u8>,
+    reset_generation: i32,
+}
+
+fn strict_uuid_v4(value: &str) -> bool {
+    let Ok(parsed) = uuid::Uuid::parse_str(value) else {
+        return false;
+    };
+    parsed.get_version() == Some(uuid::Version::Random)
+        && parsed.get_variant() == uuid::Variant::RFC4122
+        && parsed.to_string() == value
+}
+
+/// Validate all authority coordinates before the reset event can mutate local
+/// lifecycle state. A global (`*`) WebSocket subscription may carry events for
+/// any stable UUID, but `*` is never itself accepted as a payload conversation
+/// ID. A conversation-scoped subscription requires an exact payload match.
+fn validate_group_reset_authority(
+    top: &[(CborValue, CborValue)],
+    subscribed_conversation_id: &str,
+) -> Result<ValidatedGroupReset, String> {
+    let conversation_id =
+        cbor_str(top, "convoId").ok_or_else(|| "groupResetEvent is missing convoId".to_string())?;
+    if !strict_uuid_v4(&conversation_id) {
+        return Err(format!(
+            "groupResetEvent has invalid canonical convoId: {conversation_id}"
+        ));
+    }
+    if subscribed_conversation_id != "*" && subscribed_conversation_id != conversation_id {
+        return Err(format!(
+            "groupResetEvent convoId {conversation_id} does not match subscription {subscribed_conversation_id}"
+        ));
+    }
+
+    let new_group_id_hex = cbor_str(top, "newGroupId")
+        .ok_or_else(|| "groupResetEvent is missing newGroupId".to_string())?;
+    let new_group_id = hex::decode(&new_group_id_hex)
+        .map_err(|_| "groupResetEvent newGroupId is not valid hex".to_string())?;
+    if new_group_id.is_empty() || hex::encode(&new_group_id) != new_group_id_hex {
+        return Err(
+            "groupResetEvent newGroupId must be nonempty canonical lowercase hex".to_string(),
+        );
+    }
+
+    let reset_generation_raw = cbor_int(top, "resetGeneration")
+        .ok_or_else(|| "groupResetEvent is missing resetGeneration".to_string())?;
+    let reset_generation = i32::try_from(reset_generation_raw)
+        .ok()
+        .filter(|generation| *generation >= 0)
+        .ok_or_else(|| "groupResetEvent resetGeneration is out of range".to_string())?;
+
+    Ok(ValidatedGroupReset {
+        conversation_id,
+        new_group_id_hex,
+        new_group_id,
+        reset_generation,
     })
 }
 
@@ -397,12 +459,16 @@ async fn handle_binary_frame(
             let msg_convo_id_owned = msg_convo_id.clone();
 
             let envelope = IncomingEnvelope {
+                // Legacy CBOR frames carry no signed canonical append-log row.
+                // Shared verification must obtain canonical proof for controls.
+                canonical_entry_json: None,
                 conversation_id: msg_convo_id,
                 sender_did: String::new(),
                 ciphertext,
                 timestamp,
                 server_message_id: Some(id.clone()),
                 server_epoch: None,
+                server_sequence: None,
             };
 
             // Decrypt via orchestrator. `decrypt_message` (task #33) no longer
@@ -524,6 +590,7 @@ async fn handle_binary_frame(
                 sender_handle: String::new(),
                 content,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -553,6 +620,7 @@ async fn handle_binary_frame(
                 sender_handle: String::new(),
                 content: info_text,
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -580,6 +648,7 @@ async fn handle_binary_frame(
                 sender_handle: String::new(),
                 content: format!("{} added a new device", short_id(&member_did)),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -604,126 +673,45 @@ async fn handle_binary_frame(
                 .map_err(|e| format!("Failed to decode groupResetEvent CBOR: {}", e))?;
 
             let CborValue::Map(ref top) = payload else {
-                return Ok(cbor_str_from_cbor(&payload, "cursor"));
+                return Err("groupResetEvent payload must be a CBOR map".to_string());
             };
 
             let cursor = cbor_str(top, "cursor");
-            let new_group_id = cbor_str(top, "newGroupId").unwrap_or_default();
-            let reset_generation = cbor_int(top, "resetGeneration").unwrap_or(0) as i32;
+            let authority = validate_group_reset_authority(top, convo_id)?;
+            let payload_conversation_id = authority.conversation_id;
+            let new_group_id = authority.new_group_id_hex;
+            let reset_generation = authority.reset_generation;
             let reset_by = cbor_str(top, "resetBy").unwrap_or_default();
             let reason = cbor_str(top, "reason");
 
             log_ws!(
                 "Group reset: convo={} newGroupId={} gen={} by={}",
-                convo_id,
+                payload_conversation_id,
                 new_group_id,
                 reset_generation,
                 short_id(&reset_by)
             );
 
-            // Spec §8.5: groupReset is a RESET_PENDING trigger — reset the
-            // recovery tracker's attempt counter to 0 so the deferred recovery
-            // treats this as a fresh attempt (no accumulated backoff/cooldown).
-            orchestrator.recovery_tracker().lock().await.clear(convo_id);
-            log_ws!(
-                "Reset recovery tracker for {} (groupReset → fresh attempt)",
-                convo_id
-            );
-
-            // Flag for deferred recovery — External Commits only in deferred
-            // recovery, never inline in event handlers. Recovery dispatch
-            // reads the `needs_rejoin` boolean (recovery.rs), so we keep
-            // marking it; in addition we persist the RESET_PENDING payload
-            // (spec §8.5) so the new group id + reset generation survive a
-            // restart even if the orchestrator's in-memory
-            // `conversation_states` map is empty on next boot.
-            if let Err(e) = orchestrator.storage().mark_needs_rejoin(convo_id).await {
-                log_ws!("Failed to mark_needs_rejoin for {}: {:?}", convo_id, e);
-            }
-
-            let notified_at_ms = chrono::Utc::now().timestamp_millis();
-            if !new_group_id.is_empty() {
-                if let Err(e) = orchestrator
-                    .storage()
-                    .set_conversation_state(
-                        convo_id,
-                        catbird_mls::orchestrator::types::ConversationState::ResetPending {
-                            new_group_id: new_group_id.clone(),
-                            reset_generation,
-                            notified_at_ms,
-                        },
-                    )
-                    .await
-                {
-                    log_ws!("Failed to set ResetPending state for {}: {:?}", convo_id, e);
-                }
-                if let Err(e) = orchestrator
-                    .storage()
-                    .mark_reset_pending(convo_id, &new_group_id, reset_generation, notified_at_ms)
-                    .await
-                {
-                    log_ws!(
-                        "Failed to persist ResetPending payload for {}: {:?}",
-                        convo_id,
-                        e
-                    );
-                } else {
-                    log_ws!(
-                        "Flagged {} for deferred rejoin after group reset (newGroupId={}, gen={})",
-                        convo_id,
-                        new_group_id,
-                        reset_generation
-                    );
-                }
-            } else {
-                // Server didn't send a new group id; fall back to NeedsRejoin
-                // state so the recovery loop still picks this up via the
-                // pre-reset lookup-by-conversation-id heuristic.
-                if let Err(e) = orchestrator
-                    .storage()
-                    .set_conversation_state(
-                        convo_id,
-                        catbird_mls::orchestrator::types::ConversationState::NeedsRejoin,
-                    )
-                    .await
-                {
-                    log_ws!("Failed to set NeedsRejoin state for {}: {:?}", convo_id, e);
-                } else {
-                    log_ws!(
-                        "Flagged {} for deferred rejoin after group reset (no newGroupId in payload)",
-                        convo_id
-                    );
-                }
-            }
-
-            // Adopt the new group id locally so the deferred rejoin targets
-            // the post-reset MLS group. Empty = server didn't send one; fall
-            // back to the pre-reset lookup-by-conversation-id heuristic.
-            if !new_group_id.is_empty() {
-                if let Err(e) = orchestrator
-                    .storage()
-                    .update_conversation_group_id(convo_id, &new_group_id)
-                {
-                    log_ws!(
-                        "Failed to update group_id for {} to {}: {:?}",
-                        convo_id,
-                        new_group_id,
-                        e
-                    );
-                } else {
-                    log_ws!(
-                        "Adopted new group_id {} for convo {}",
-                        new_group_id,
-                        convo_id
-                    );
-                }
-            }
+            // The orchestrator owns the reset transition. Its storage callback
+            // persists the complete ResetPending authority in one transaction;
+            // this handler must not issue split state/rejoin/group-id writes or
+            // replace the current group before target adoption succeeds.
+            orchestrator
+                .record_group_reset(
+                    &payload_conversation_id,
+                    authority.new_group_id,
+                    reset_generation,
+                )
+                .await
+                .map_err(|error| {
+                    format!("Failed to record group reset for {payload_conversation_id}: {error:?}")
+                })?;
 
             // Emit event to frontend
             let _ = app.emit(
                 "mls:group-reset",
                 serde_json::json!({
-                    "convoId": convo_id,
+                    "convoId": payload_conversation_id,
                     "newGroupId": new_group_id,
                     "resetGeneration": reset_generation,
                     "resetBy": reset_by,
@@ -737,11 +725,12 @@ async fn handle_binary_frame(
                 .unwrap_or_default();
             let ui_msg = commands::Message {
                 id: format!("sys-{}", uuid::Uuid::new_v4()),
-                conversation_id: convo_id.to_string(),
+                conversation_id: payload_conversation_id,
                 sender_did: String::new(),
                 sender_handle: String::new(),
                 content: format!("Group was reset by {}{}", short_id(&reset_by), reason_text),
                 timestamp: chrono::Utc::now().to_rfc3339(),
+                sequence_number: 0,
                 status: "delivered".to_string(),
                 message_type: "system".to_string(),
                 image: None,
@@ -863,5 +852,70 @@ fn cbor_str_from_cbor(val: &CborValue, key: &str) -> Option<String> {
     match val {
         CborValue::Map(ref entries) => cbor_str(entries, key),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_group_reset_authority, CborValue};
+
+    fn reset_map(conversation_id: Option<&str>) -> Vec<(CborValue, CborValue)> {
+        let mut values = vec![
+            (
+                CborValue::Text("newGroupId".to_string()),
+                CborValue::Text("deadbeef".to_string()),
+            ),
+            (
+                CborValue::Text("resetGeneration".to_string()),
+                CborValue::Integer(7_i64.into()),
+            ),
+        ];
+        if let Some(conversation_id) = conversation_id {
+            values.push((
+                CborValue::Text("convoId".to_string()),
+                CborValue::Text(conversation_id.to_string()),
+            ));
+        }
+        values
+    }
+
+    #[test]
+    fn reset_payload_requires_stable_conversation_id_even_on_global_socket() {
+        let stable = "00000000-0000-4000-8000-000000000001";
+        let authority = validate_group_reset_authority(&reset_map(Some(stable)), "*")
+            .expect("global socket should admit a stable payload UUID");
+        assert_eq!(authority.conversation_id, stable);
+        assert_eq!(authority.new_group_id, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(authority.reset_generation, 7);
+
+        assert!(validate_group_reset_authority(&reset_map(None), "*").is_err());
+        assert!(validate_group_reset_authority(&reset_map(Some("*")), "*").is_err());
+        assert!(validate_group_reset_authority(&reset_map(Some("deadbeef")), "*").is_err());
+    }
+
+    #[test]
+    fn scoped_reset_payload_must_match_subscription_exactly() {
+        let subscribed = "00000000-0000-4000-8000-000000000001";
+        let other = "00000000-0000-4000-8000-000000000002";
+        assert!(validate_group_reset_authority(&reset_map(Some(subscribed)), subscribed).is_ok());
+        assert!(validate_group_reset_authority(&reset_map(Some(other)), subscribed).is_err());
+    }
+
+    #[test]
+    fn reset_payload_requires_complete_canonical_target_authority() {
+        let stable = "00000000-0000-4000-8000-000000000001";
+        let mut missing_generation = reset_map(Some(stable));
+        missing_generation.retain(
+            |(key, _)| !matches!(key, CborValue::Text(value) if value == "resetGeneration"),
+        );
+        assert!(validate_group_reset_authority(&missing_generation, "*").is_err());
+
+        let mut uppercase_group = reset_map(Some(stable));
+        for (key, value) in &mut uppercase_group {
+            if matches!(key, CborValue::Text(name) if name == "newGroupId") {
+                *value = CborValue::Text("DEADBEEF".to_string());
+            }
+        }
+        assert!(validate_group_reset_authority(&uppercase_group, "*").is_err());
     }
 }

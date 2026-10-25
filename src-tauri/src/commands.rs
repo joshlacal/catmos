@@ -392,8 +392,7 @@ async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Re
 }
 
 async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     let resp = reqwest::Client::new()
         .get(format!("{}/auth/session", nest_url))
@@ -453,6 +452,8 @@ pub struct Message {
     pub sender_handle: String,
     pub content: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub sequence_number: u64,
     pub status: String,
     #[serde(default = "default_message_type")]
     pub message_type: String,
@@ -530,6 +531,7 @@ pub(crate) fn ui_message_from_orchestrator(message: OrchestratorMessage) -> Mess
         sender_handle: String::new(),
         content,
         timestamp: message.timestamp.to_rfc3339(),
+        sequence_number: message.sequence_number,
         status: ui_status_for_delivery(message.is_own, message.delivery_status.as_ref()),
         message_type,
         image,
@@ -640,8 +642,7 @@ pub struct GroupMember {
 
 #[tauri::command]
 pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     // Bind a temporary HTTP server on a random localhost port
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -1484,8 +1485,7 @@ pub async fn subscribe_conversation(
         .get_auth_token()
         .ok_or("Not authenticated")?;
 
-    let base_url =
-        crate::nest_url();
+    let base_url = crate::nest_url();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
@@ -1564,8 +1564,7 @@ pub async fn subscribe_all_events(
         .get_auth_token()
         .ok_or("Not authenticated")?;
 
-    let base_url =
-        crate::nest_url();
+    let base_url = crate::nest_url();
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let owner = shutdown_tx.clone();
@@ -1860,7 +1859,10 @@ pub async fn check_opt_in_status(
         "blue.catbird.chat.getDevices",
     );
     let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
-    let query_params: Vec<(&str, &str)> = parsed_dids.iter().map(|d| ("userDids", d.as_str())).collect();
+    let query_params: Vec<(&str, &str)> = parsed_dids
+        .iter()
+        .map(|d| ("userDids", d.as_str()))
+        .collect();
 
     let client = reqwest::Client::new();
     let resp = crate::mls_proxy::with_mls_proxy_header(client.get(&url).query(&query_params))
@@ -1874,23 +1876,18 @@ pub async fn check_opt_in_status(
     }
 
     let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let output =
-        parse_lexicon_json::<catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>>(body.as_ref())?;
+    let output = parse_lexicon_json::<
+        catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>,
+    >(body.as_ref())?;
 
-    let active_dids: std::collections::HashSet<&str> = output
-        .devices
-        .iter()
-        .map(|d| d.user_did.as_str())
-        .collect();
+    let active_dids: std::collections::HashSet<&str> =
+        output.devices.iter().map(|d| d.user_did.as_str()).collect();
 
     Ok(dids
         .into_iter()
         .map(|did| {
             let opted_in = active_dids.contains(did.as_str());
-            OptInStatusResult {
-                did,
-                opted_in,
-            }
+            OptInStatusResult { did, opted_in }
         })
         .collect())
 }
@@ -2766,8 +2763,7 @@ pub async fn create_block(
         .await
         .ok_or("Not authenticated")?;
 
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     let body = serde_json::json!({
         "repo": did,
@@ -2831,8 +2827,7 @@ pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, 
 
     log_catmos!("list_own_blocks: did={}", did);
 
-    let nest_url =
-        crate::nest_url();
+    let nest_url = crate::nest_url();
 
     let client = reqwest::Client::new();
     let mut blocked: Vec<String> = Vec::new();
@@ -2971,6 +2966,29 @@ mod tests {
     use catbird_mls::{KeychainAccess, MLSContext, MLSError};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn message_ui_projection_preserves_canonical_sequence_in_json() {
+        let message = super::OrchestratorMessage {
+            id: "fixture-message".to_string(),
+            conversation_id: "00000000-0000-4000-8000-000000000001".to_string(),
+            sender_did: "did:web:peer.example.com".to_string(),
+            text: "fixture".to_string(),
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-09-05T12:00:02Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+            epoch: 3,
+            sequence_number: 100,
+            is_own: true,
+            delivery_status: None,
+            payload_json: None,
+        };
+        let projected = super::ui_message_from_orchestrator(message);
+        let json = serde_json::to_value(projected).unwrap();
+        assert_eq!(json["sequenceNumber"], 100);
+        assert_eq!(json["timestamp"], "2026-09-05T12:00:02+00:00");
+        assert_eq!(json["id"], "fixture-message");
+    }
 
     struct TestKeychain {
         values: Mutex<HashMap<String, Vec<u8>>>,

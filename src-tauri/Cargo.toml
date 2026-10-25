@@ -17,7 +17,7 @@ tauri-plugin-shell = "2.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["full"] }
-reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["query", "json", "rustls"] }
 keyring = { package = "keyring-core", version = "1.0.1" }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 futures-util = "0.3.34"
@@ -32,7 +32,7 @@ bytes = "1.12.1"
 dirs = "7.0.0"
 ciborium = "0.2.2"
 catbird_mls = { path = "../../catbird-mls" }
-catbird-atproto = { path = "../../catbird-atproto" }
+catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671" }
 
 urlencoding = "2.1.3"
 httparse = "1.10.1"

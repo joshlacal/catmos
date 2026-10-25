@@ -7,6 +7,23 @@ use catbird_mls::orchestrator::storage::MLSStorageBackend;
 use catbird_mls::orchestrator::types::*;
 use catbird_mls::MLSContext;
 
+fn sql_u64(value: u64) -> Result<i64> {
+    i64::try_from(value).map_err(|error| {
+        OrchestratorError::Storage(format!("unsigned value exceeds SQLite INTEGER: {error}"))
+    })
+}
+
+fn read_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value: i64 = row.get(index)?;
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
 /// Locally cached encrypted-metadata snapshot for a conversation. Mirrors
 /// what `bootstrap_group_metadata` writes after a successful blob fetch +
 /// decrypt: the JSON-serialized `GroupMetadataV1` payload, the bound
@@ -56,11 +73,14 @@ impl SqliteStorage {
     pub fn new(db_path: &str, encryption_key: &str) -> std::result::Result<Self, rusqlite::Error> {
         let conn = Connection::open(db_path)?;
         // Set SQLCipher key (required even for unencrypted use with bundled-sqlcipher)
-        conn.execute_batch(&format!("PRAGMA key = '{}';", encryption_key))?;
+        conn.execute_batch(&format!(
+            "PRAGMA key = '{}';",
+            encryption_key.replace('\'', "''")
+        ))?;
         #[cfg(target_os = "android")]
         {
             let version: String =
-                conn.pragma_query_value(None, "cipher_version", |row| row.get(0))?;
+                conn.query_row("PRAGMA cipher_version", [], |row| row.get(0))?;
             if version.is_empty() {
                 tracing::error!("Android SQLCipher probe returned empty cipher_version");
                 return Err(rusqlite::Error::InvalidQuery);
@@ -718,7 +738,7 @@ impl MLSStorageBackend for SqliteStorage {
         conn.execute(
             "UPDATE conversations SET join_method = ?1, join_epoch = ?2
              WHERE conversation_id = ?3 AND user_did = ?4",
-            rusqlite::params![method_str, join_epoch, conversation_id, user_did],
+            rusqlite::params![method_str, sql_u64(join_epoch)?, conversation_id, user_did],
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
@@ -741,7 +761,7 @@ impl MLSStorageBackend for SqliteStorage {
             .query_row(rusqlite::params![conversation_id, user_did], |row| {
                 let conversation_id: String = row.get(0)?;
                 let group_id: String = row.get(1)?;
-                let epoch: u64 = row.get(2)?;
+                let epoch = read_u64(row, 2)?;
                 let members_json: String = row.get(3)?;
                 let metadata_json: Option<String> = row.get(4)?;
                 let created_at: Option<String> = row.get(5)?;
@@ -764,6 +784,7 @@ impl MLSStorageBackend for SqliteStorage {
                     created_at: created,
                     updated_at: updated,
                     sequencer_did,
+                    canonical_state: None,
                 })
             })
             .ok();
@@ -784,7 +805,7 @@ impl MLSStorageBackend for SqliteStorage {
             .query_map(rusqlite::params![user_did], |row| {
                 let conversation_id: String = row.get(0)?;
                 let group_id: String = row.get(1)?;
-                let epoch: u64 = row.get(2)?;
+                let epoch = read_u64(row, 2)?;
                 let members_json: String = row.get(3)?;
                 let metadata_json: Option<String> = row.get(4)?;
                 let created_at: Option<String> = row.get(5)?;
@@ -806,6 +827,7 @@ impl MLSStorageBackend for SqliteStorage {
                     created_at: created,
                     updated_at: updated,
                     sequencer_did,
+                    canonical_state: None,
                 })
             })
             .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -838,11 +860,194 @@ impl MLSStorageBackend for SqliteStorage {
         let state_str =
             serde_json::to_string(&state).map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         conn.execute(
-            "UPDATE conversations SET state = ?1 WHERE conversation_id = ?2",
+            "UPDATE conversations SET state = ?1 WHERE conversation_id = ?2
+             AND state NOT IN ('\"Closed\"', '\"DeviceRemoved\"')",
             rusqlite::params![state_str, conversation_id],
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    async fn clear_device_removal_after_verified_welcome(
+        &self,
+        conversation_id: &str,
+    ) -> Result<()> {
+        let error = |error: rusqlite::Error| OrchestratorError::Storage(error.to_string());
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(error)?;
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(error)?;
+        if count != 1 {
+            return Err(OrchestratorError::Storage(
+                "Verified Welcome has no unambiguous conversation".into(),
+            ));
+        }
+        let (state, target, notified): (String, Option<String>, Option<i64>) = tx.query_row(
+            "SELECT state, reset_new_group_id, reset_notified_at_ms FROM conversations WHERE conversation_id = ?1",
+            [conversation_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        ).map_err(error)?;
+        let state = if state == "Active" {
+            ConversationState::Active
+        } else {
+            serde_json::from_str(&state)
+                .map_err(|error| OrchestratorError::Storage(error.to_string()))?
+        };
+        if matches!(
+            state,
+            ConversationState::Closed | ConversationState::ResetPending { .. }
+        ) || target.is_some()
+            || notified.is_some()
+        {
+            return Err(OrchestratorError::Storage(
+                "Newer lifecycle authority prevents Welcome activation".into(),
+            ));
+        }
+        tx.execute("UPDATE conversations SET state = '\"Active\"', needs_rejoin = 0 WHERE conversation_id = ?1", [conversation_id]).map_err(error)?;
+        tx.commit().map_err(error)?;
+        Ok(())
+    }
+
+    async fn complete_account_exit(
+        &self,
+        conversation_id: &str,
+        expected_group_id_hex: &str,
+        expected_reset_generation: Option<i32>,
+        terminal_epoch: u64,
+        terminal_state: ConversationState,
+    ) -> Result<bool> {
+        if !matches!(
+            terminal_state,
+            ConversationState::Closed | ConversationState::DeviceRemoved
+        ) || catbird_mls::chat_v2::ids::CanonicalUuid::parse(conversation_id).is_err()
+            || expected_group_id_hex.len() != 64
+            || !expected_group_id_hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || terminal_epoch > 9_007_199_254_740_991
+            || expected_reset_generation.is_some_and(|generation| generation <= 0)
+        {
+            return Err(OrchestratorError::Storage(
+                "Invalid account exit projection".into(),
+            ));
+        }
+        let storage_error = |error: rusqlite::Error| OrchestratorError::Storage(error.to_string());
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(storage_error)?;
+        // This callback has no account argument. Never choose between two
+        // account-scoped rows sharing a CID, even if one happens to match.
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE conversation_id = ?1",
+                [conversation_id],
+                |row| row.get(0),
+            )
+            .map_err(storage_error)?;
+        if count != 1 {
+            return Ok(false);
+        }
+        let (user_did, group_id, epoch, state, target, generation, notified, needs_rejoin):
+            (String, String, u64, String, Option<String>, Option<i32>, Option<i64>, i32) =
+            tx.query_row(
+                "SELECT user_did, group_id, epoch, state, reset_new_group_id, reset_generation, reset_notified_at_ms, needs_rejoin
+                 FROM conversations WHERE conversation_id = ?1",
+                [conversation_id], |row| Ok((row.get(0)?, row.get(1)?, read_u64(row, 2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+            ).map_err(storage_error)?;
+        if generation.is_some_and(|generation| generation < 0) {
+            return Ok(false);
+        }
+        let state: ConversationState = if state == "Active" {
+            ConversationState::Active
+        } else {
+            serde_json::from_str(&state)
+                .map_err(|error| OrchestratorError::Storage(error.to_string()))?
+        };
+        // Closed is permanent. DeviceRemoved only describes this device's
+        // access: a new, durably accepted account exit can still advance it.
+        // Native validates that proof and its incarnation before this callback.
+        let matches = if state == ConversationState::Closed {
+            state == terminal_state
+                && group_id == expected_group_id_hex
+                && epoch == terminal_epoch
+                && target.is_none()
+                && notified.is_none()
+                && needs_rejoin == 0
+                && expected_reset_generation.is_none_or(|expected| generation == Some(expected))
+        } else {
+            match (&state, expected_reset_generation) {
+                (
+                    ConversationState::ResetPending {
+                        new_group_id,
+                        reset_generation,
+                        notified_at_ms,
+                    },
+                    Some(expected),
+                ) => {
+                    new_group_id == expected_group_id_hex
+                        && *reset_generation == expected
+                        && target.as_deref() == Some(expected_group_id_hex)
+                        && generation == Some(expected)
+                        && notified == Some(*notified_at_ms)
+                        && (group_id != expected_group_id_hex || epoch <= terminal_epoch)
+                }
+                (ConversationState::ResetPending { .. }, None) => false,
+                (ConversationState::DeviceRemoved, Some(expected)) => {
+                    generation == Some(expected)
+                        && target.is_none()
+                        && notified.is_none()
+                        && group_id == expected_group_id_hex
+                        && epoch == terminal_epoch
+                        && state == terminal_state
+                        && needs_rejoin == 0
+                }
+                (_, Some(_)) => false,
+                (_, None) => {
+                    group_id == expected_group_id_hex
+                        && epoch <= terminal_epoch
+                        && target.is_none()
+                        && notified.is_none()
+                }
+            }
+        };
+        if !matches {
+            return Ok(false);
+        }
+        if state == terminal_state
+            && group_id == expected_group_id_hex
+            && epoch == terminal_epoch
+            && target.is_none()
+            && notified.is_none()
+            && needs_rejoin == 0
+        {
+            return Ok(true);
+        }
+        let state = serde_json::to_string(&terminal_state)
+            .map_err(|error| OrchestratorError::Storage(error.to_string()))?;
+        tx.execute(
+            "UPDATE conversations SET group_id = ?1, epoch = ?2, state = ?3,
+             needs_rejoin = 0, reset_new_group_id = NULL, reset_notified_at_ms = NULL
+             WHERE conversation_id = ?4 AND user_did = ?5",
+            rusqlite::params![
+                expected_group_id_hex,
+                sql_u64(terminal_epoch)?,
+                state,
+                conversation_id,
+                user_did
+            ],
+        )
+        .map_err(storage_error)?;
+        // reset_generation is the retained high-water; message/MLS rows are
+        // untouched. Native durable evidence precedes this projection.
+        tx.commit().map_err(storage_error)?;
+        Ok(true)
     }
 
     /// Read the persisted conversation state (spec §8.2). The `state` column
@@ -883,7 +1088,8 @@ impl MLSStorageBackend for SqliteStorage {
     async fn mark_needs_rejoin(&self, conversation_id: &str) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE conversations SET needs_rejoin = 1 WHERE conversation_id = ?1",
+            "UPDATE conversations SET needs_rejoin = 1 WHERE conversation_id = ?1
+             AND state NOT IN ('\"Closed\"', '\"DeviceRemoved\"')",
             rusqlite::params![conversation_id],
         )
         .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
@@ -1038,8 +1244,8 @@ impl MLSStorageBackend for SqliteStorage {
                         // constraint forces an empty string here, not NULL.
                         "",
                         message.timestamp.to_rfc3339(),
-                        message.epoch,
-                        message.sequence_number,
+                        sql_u64(message.epoch)?,
+                        sql_u64(message.sequence_number)?,
                         message.is_own as i32,
                         delivery_status_json,
                         Option::<String>::None,
@@ -1065,8 +1271,8 @@ impl MLSStorageBackend for SqliteStorage {
                         message.sender_did,
                         message.text,
                         message.timestamp.to_rfc3339(),
-                        message.epoch,
-                        message.sequence_number,
+                        sql_u64(message.epoch)?,
+                        sql_u64(message.sequence_number)?,
                         message.is_own as i32,
                         delivery_status_json,
                         message.payload_json,
@@ -1098,9 +1304,10 @@ impl MLSStorageBackend for SqliteStorage {
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
             let rows = stmt
-                .query_map(rusqlite::params![conversation_id, before, limit], |row| {
-                    row_to_message(row, mls_ctx.as_deref())
-                })
+                .query_map(
+                    rusqlite::params![conversation_id, sql_u64(before)?, limit],
+                    |row| row_to_message(row, mls_ctx.as_deref()),
+                )
                 .map_err(|e| OrchestratorError::Storage(e.to_string()))?;
 
             for row in rows {
@@ -1184,7 +1391,7 @@ impl MLSStorageBackend for SqliteStorage {
             rusqlite::params![
                 state.group_id,
                 state.conversation_id,
-                state.epoch,
+                sql_u64(state.epoch)?,
                 members_json
             ],
         )
@@ -1201,7 +1408,7 @@ impl MLSStorageBackend for SqliteStorage {
                 |row| {
                     let group_id: String = row.get(0)?;
                     let conversation_id: String = row.get(1)?;
-                    let epoch: u64 = row.get(2)?;
+                    let epoch = read_u64(row, 2)?;
                     let members_json: String = row.get(3)?;
                     let members: Vec<String> =
                         serde_json::from_str(&members_json).unwrap_or_default();
@@ -1332,6 +1539,7 @@ impl MLSStorageBackend for SqliteStorage {
     fn implemented_optional_methods(&self) -> &'static [&'static str] {
         &[
             "get_conversation_state",
+            "complete_account_exit",
             "mark_reset_pending",
             "clear_reset_pending_for_delete",
             "set_conversation_sequencer",
@@ -1353,8 +1561,8 @@ fn row_to_message(row: &rusqlite::Row, mls_ctx: Option<&MLSContext>) -> rusqlite
     let sender_did: String = row.get(2)?;
     let legacy_text: String = row.get(3)?;
     let timestamp_str: String = row.get(4)?;
-    let epoch: u64 = row.get(5)?;
-    let sequence_number: u64 = row.get(6)?;
+    let epoch = read_u64(row, 5)?;
+    let sequence_number = read_u64(row, 6)?;
     let is_own: i32 = row.get(7)?;
     let delivery_status_json: Option<String> = row.get(8)?;
     let legacy_payload_json: Option<String> = row.get(9)?;
@@ -1484,6 +1692,476 @@ mod field_encryption_tests {
         let storage =
             SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("open SqliteStorage");
         (tmp, storage)
+    }
+
+    #[tokio::test]
+    async fn account_exit_cas_retires_only_exact_reset_and_preserves_history() {
+        let (tmp, storage) = new_temp_storage();
+        let old = "11".repeat(32);
+        let target = "22".repeat(32);
+        storage
+            .ensure_conversation_exists(
+                "did:plc:alice",
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &old,
+            )
+            .await
+            .unwrap();
+        let reset = ConversationState::ResetPending {
+            new_group_id: target.clone(),
+            reset_generation: 4,
+            notified_at_ms: 123,
+        };
+        storage
+            .set_conversation_state("9cf78d05-d9e1-4a20-b501-80e6d3d1b764", reset.clone())
+            .await
+            .unwrap();
+        storage
+            .mark_reset_pending("9cf78d05-d9e1-4a20-b501-80e6d3d1b764", &target, 4, 123)
+            .await
+            .unwrap();
+        storage
+            .mark_needs_rejoin("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+            .await
+            .unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute("INSERT INTO messages (id, conversation_id, sender_did, text, timestamp, epoch, sequence_number, is_own, payload_encrypted, entry_hmac)
+                VALUES ('retained', '9cf78d05-d9e1-4a20-b501-80e6d3d1b764', 'did:plc:alice', '', '2026-09-05T00:00:00.000Z', 3, 7, 1, x'010203', x'040506')", []).unwrap();
+        }
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(3),
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &old,
+                Some(4),
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                None,
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            storage
+                .get_conversation_state("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+                .await
+                .unwrap(),
+            Some(reset)
+        );
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations SET group_id = ?1, epoch = 20",
+                [&target],
+            )
+            .unwrap();
+        }
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(4),
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute("UPDATE conversations SET group_id = ?1, epoch = 3", [&old])
+                .unwrap();
+        }
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(4),
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        drop(storage);
+        let storage = SqliteStorage::new(
+            tmp.path().join("catmos-test.db").to_str().unwrap(),
+            TEST_DB_KEY,
+        )
+        .unwrap();
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(4),
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(5),
+                5,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(4),
+                4,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &target,
+                Some(4),
+                5,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            storage
+                .get_conversation_state("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+                .await
+                .unwrap(),
+            Some(ConversationState::Closed)
+        );
+        assert!(!storage
+            .needs_rejoin("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+            .await
+            .unwrap());
+        let conn = storage.conn.lock().unwrap();
+        let proof: (String, i64, Option<String>, Option<i64>, i64) = conn.query_row(
+            "SELECT group_id, reset_generation, reset_new_group_id, reset_notified_at_ms, epoch FROM conversations WHERE conversation_id = '9cf78d05-d9e1-4a20-b501-80e6d3d1b764'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(proof, (target, 4, None, None, 5));
+        let history: (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT payload_encrypted, entry_hmac FROM messages WHERE id = 'retained'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(history, (vec![1, 2, 3], vec![4, 5, 6]));
+    }
+
+    #[tokio::test]
+    async fn account_exit_cas_fences_ambiguity_and_preserves_old_reset_high_water() {
+        let (_tmp, storage) = new_temp_storage();
+        let group = "33".repeat(32);
+        storage
+            .ensure_conversation_exists(
+                "did:plc:alice",
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+            )
+            .await
+            .unwrap();
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE conversations SET reset_generation = 9, epoch = 12",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                11,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                12,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                12,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                Some(9),
+                13,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                Some(9),
+                12,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        storage
+            .set_conversation_state(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                ConversationState::Active,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_conversation_state("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+                .await
+                .unwrap(),
+            Some(ConversationState::DeviceRemoved)
+        );
+        storage
+            .clear_device_removal_after_verified_welcome("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_conversation_state("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+                .await
+                .unwrap(),
+            Some(ConversationState::Active)
+        );
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                12,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                13,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                12,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                13,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                14,
+                ConversationState::Closed
+            )
+            .await
+            .unwrap());
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                13,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        storage
+            .set_conversation_state(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                ConversationState::Active,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .get_conversation_state("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+                .await
+                .unwrap(),
+            Some(ConversationState::Closed)
+        );
+        assert!(storage
+            .clear_device_removal_after_verified_welcome("9cf78d05-d9e1-4a20-b501-80e6d3d1b764")
+            .await
+            .is_err());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                12,
+                ConversationState::Active
+            )
+            .await
+            .is_err());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                "invalid",
+                None,
+                12,
+                ConversationState::Closed
+            )
+            .await
+            .is_err());
+        assert!(storage
+            .complete_account_exit(
+                "not-a-canonical-cid",
+                &group,
+                None,
+                12,
+                ConversationState::Closed
+            )
+            .await
+            .is_err());
+        assert!(storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                Some(0),
+                12,
+                ConversationState::Closed
+            )
+            .await
+            .is_err());
+        storage
+            .ensure_conversation_exists(
+                "did:plc:bob",
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+            )
+            .await
+            .unwrap();
+        assert!(!storage
+            .complete_account_exit(
+                "9cf78d05-d9e1-4a20-b501-80e6d3d1b764",
+                &group,
+                None,
+                12,
+                ConversationState::DeviceRemoved
+            )
+            .await
+            .unwrap());
+        let conn = storage.conn.lock().unwrap();
+        let generation: i32 = conn
+            .query_row(
+                "SELECT reset_generation FROM conversations WHERE user_did = 'did:plc:alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation, 9);
+        let other: String = conn
+            .query_row(
+                "SELECT state FROM conversations WHERE user_did = 'did:plc:bob'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(other, "Active");
+    }
+
+    #[tokio::test]
+    async fn account_exit_exact_removed_retry_is_read_only_and_rejects_torn_reset() {
+        let (_tmp, storage) = new_temp_storage();
+        let cid = "16e7956b-695e-4148-a1b4-bfd2d4efad05";
+        let group = "44".repeat(32);
+        storage
+            .ensure_conversation_exists("did:plc:alice", cid, &group)
+            .await
+            .unwrap();
+        assert!(storage
+            .complete_account_exit(cid, &group, None, 0, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch("CREATE TRIGGER reject_terminal_retry BEFORE UPDATE ON conversations BEGIN SELECT RAISE(ABORT, 'exact terminal retry wrote a row'); END;").unwrap();
+        }
+        assert!(storage
+            .complete_account_exit(cid, &group, None, 0, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch("DROP TRIGGER reject_terminal_retry;")
+                .unwrap();
+            conn.execute("UPDATE conversations SET reset_new_group_id = ?1, reset_generation = 3, reset_notified_at_ms = 123", [&group]).unwrap();
+        }
+        // Live columns without committed typed ResetPending are not reset authority.
+        assert!(!storage
+            .complete_account_exit(cid, &group, Some(3), 0, ConversationState::Closed)
+            .await
+            .unwrap());
+        {
+            let conn = storage.conn.lock().unwrap();
+            conn.execute_batch("UPDATE conversations SET reset_new_group_id = NULL, reset_notified_at_ms = NULL, reset_generation = -1;").unwrap();
+        }
+        assert!(!storage
+            .complete_account_exit(cid, &group, None, 0, ConversationState::DeviceRemoved)
+            .await
+            .unwrap());
     }
 
     /// Smoke-test the schema migration: after `SqliteStorage::new` the new

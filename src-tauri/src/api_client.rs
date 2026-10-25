@@ -26,6 +26,33 @@ where
     Ok(parsed.into_static())
 }
 
+fn canonical_conversation_view(
+    state: &catbird_atproto::blue_catbird::chat::ConversationState,
+) -> ConversationView {
+    ConversationView {
+        canonical_state: Some(state.clone()),
+        group_id: hex::encode(state.coordinates.group_id.as_ref()),
+        conversation_id: state.coordinates.conversation_id.to_string(),
+        epoch: state.coordinates.epoch as u64,
+        members: state
+            .participants
+            .iter()
+            .map(|participant| MemberView {
+                did: participant.user_did.to_string(),
+                role: if participant.role == "admin" {
+                    MemberRole::Admin
+                } else {
+                    MemberRole::Member
+                },
+            })
+            .collect(),
+        metadata: None,
+        created_at: None,
+        updated_at: None,
+        sequencer_did: None,
+    }
+}
+
 fn decode_hex_bytes(input: &str) -> std::result::Result<Vec<u8>, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
     if trimmed.len() % 2 != 0 {
@@ -42,19 +69,27 @@ fn decode_hex_bytes(input: &str) -> std::result::Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Resolve one server-minted device ID from the client-generated UUID.
-///
-/// A UUID is only a correlation key: it is not itself accepted as the
-/// device authority. Zero matches, duplicate matches, or an empty server ID
-/// are all ambiguous and fail closed.
+/// Resolve the one registered `deviceId` matching the durable client UUID.
+/// The canonical device contract uses the client-generated UUIDv4 as
+/// `deviceId`; `keyId` is a signing-key thumbprint and is never an identity
+/// correlation field. Zero or duplicate matches fail closed.
+fn is_strict_uuid_v4(value: &str) -> bool {
+    let Ok(parsed) = uuid::Uuid::parse_str(value) else {
+        return false;
+    };
+    parsed.get_version() == Some(uuid::Version::Random)
+        && parsed.get_variant() == uuid::Variant::RFC4122
+        && parsed.to_string() == value
+}
+
 fn resolve_unique_server_device_id(
     devices: &[DeviceInfo],
     local_device_uuid: &str,
 ) -> Result<String> {
     let local_device_uuid = local_device_uuid.trim();
-    if local_device_uuid.is_empty() {
+    if !is_strict_uuid_v4(local_device_uuid) {
         return Err(OrchestratorError::Api(
-            "cannot resolve server device ID without a local device UUID".to_string(),
+            "cannot resolve device identity without a canonical local UUIDv4".to_string(),
         ));
     }
 
@@ -193,17 +228,9 @@ pub(crate) enum ChatAuthError {
     MissingLocalDeviceUuid,
     MissingDevice,
     MissingDeviceBinding,
-    MissingDpopJkt,
     MissingAuthGeneration,
-    AuthGenerationMismatch {
-        expected: u64,
-        observed: u64,
-    },
+    AuthGenerationMismatch { expected: u64, observed: u64 },
     DeviceBindingMismatch,
-    DpopJktMismatch,
-    #[allow(dead_code)]
-    MissingDpopProof,
-    MissingSigner,
 }
 
 impl std::fmt::Display for ChatAuthError {
@@ -214,7 +241,6 @@ impl std::fmt::Display for ChatAuthError {
             Self::MissingLocalDeviceUuid => "local chat device UUID is missing",
             Self::MissingDevice => "registered chat device is missing",
             Self::MissingDeviceBinding => "completed chat device binding is missing",
-            Self::MissingDpopJkt => "observed chat DPoP JKT is missing",
             Self::MissingAuthGeneration => "current chat auth generation is missing",
             Self::AuthGenerationMismatch { expected, observed } => {
                 return write!(
@@ -223,9 +249,6 @@ impl std::fmt::Display for ChatAuthError {
                 )
             }
             Self::DeviceBindingMismatch => "chat device binding does not match the server device",
-            Self::DpopJktMismatch => "observed chat DPoP JKT does not match the completed binding",
-            Self::MissingDpopProof => "real chat DPoP proof is unavailable",
-            Self::MissingSigner => "clean-chat application signer is unavailable",
         };
         f.write_str(message)
     }
@@ -233,17 +256,14 @@ impl std::fmt::Display for ChatAuthError {
 
 /// Headers needed by canonical reads. Nest authenticates these reads with
 /// Authorization plus the registered server device ID. The provider admits
-/// the completed binding/JKT/generation before constructing this context; no
-/// client-side proof is fabricated here.
+/// the completed device/generation binding before constructing this context.
+/// Standard AppView service authentication remains opaque to this adapter.
 pub(crate) struct CanonicalReadContext {
     /// Actor DID captured with the immutable authority snapshot. This is used
     /// only to reject late responses after an account switch.
     actor_did: String,
     pub(crate) authorization: String,
     pub(crate) device_id: String,
-    #[allow(dead_code)]
-    pub(crate) dpop_jkt: String,
-    #[allow(dead_code)]
     pub(crate) auth_generation: u64,
     session: ChatSessionSnapshot,
 }
@@ -259,28 +279,19 @@ impl std::fmt::Debug for CanonicalReadContext {
     }
 }
 
-/// Evidence returned by a completed device-auth binding operation.
-///
-/// The evidence is deliberately data-only. Catmos does not construct a
-/// DPoP proof or an MLS/device signature here; a future Nest binding flow
-/// must supply the server-issued device ID, observed JKT, generation, and
-/// binding version after it has verified those cryptographic operations.
-#[cfg(test)]
+/// Evidence extracted from one immutable, session-fenced getOwnDevices
+/// response after its row and durable signer agree.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct DeviceAuthorityEvidence {
     pub(crate) local_device_uuid: String,
     pub(crate) server_device_id: String,
-    pub(crate) dpop_jkt: String,
     pub(crate) auth_generation: u64,
-    pub(crate) binding_version: u16,
 }
 
 #[derive(Clone, PartialEq, Eq)]
 struct CompletedDeviceBinding {
     server_device_id: String,
-    dpop_jkt: String,
     auth_generation: u64,
-    binding_version: u16,
 }
 
 impl std::fmt::Debug for CompletedDeviceBinding {
@@ -289,7 +300,6 @@ impl std::fmt::Debug for CompletedDeviceBinding {
             .debug_struct("CompletedDeviceBinding")
             .field("server_device_id", &self.server_device_id)
             .field("auth_generation", &self.auth_generation)
-            .field("binding_version", &self.binding_version)
             .finish_non_exhaustive()
     }
 }
@@ -301,7 +311,6 @@ struct ChatAuthSnapshot {
     local_device_uuid: Option<String>,
     server_device_id: Option<String>,
     binding: Option<CompletedDeviceBinding>,
-    observed_dpop_jkt: Option<String>,
 }
 
 impl Default for ChatAuthSnapshot {
@@ -313,7 +322,6 @@ impl Default for ChatAuthSnapshot {
             local_device_uuid: None,
             server_device_id: None,
             binding: None,
-            observed_dpop_jkt: None,
         }
     }
 }
@@ -342,10 +350,9 @@ impl std::fmt::Debug for ChatSessionSnapshot {
 
 /// Runtime-owned clean-chat capabilities.
 ///
-/// Session tokens and the DPoP binding are intentionally kept behind this
-/// provider. Callers receive only a transport context or an opaque signer
-/// capability; neither capability exposes persisted secret material through
-/// `Debug` or log formatting.
+/// Session tokens are intentionally kept behind this provider. Callers receive
+/// only a transport context, and `Debug` never exposes persisted secret
+/// material.
 pub(crate) struct ChatAuthProvider {
     /// One lock protects the actor DID, bearer, local UUID, server ID, and
     /// completed binding. Every read clones one immutable snapshot, so an
@@ -360,13 +367,6 @@ impl Default for ChatAuthProvider {
         }
     }
 }
-/// Opaque marker for the application signer. The current catbird-mls FFI does
-/// not expose clean-chat application signing, so no instance can be issued.
-#[derive(Debug)]
-pub(crate) struct ChatSigningCapability {
-    _private: (),
-}
-
 impl ChatAuthProvider {
     pub(crate) fn set_session(&self, did: String, session_token: String) {
         let mut state = self.state.write().unwrap();
@@ -377,7 +377,7 @@ impl ChatAuthProvider {
         } else if state.session_token.as_deref() != Some(session_token.as_str()) {
             // A fresh session for the same DID may have a different gateway
             // binding. Keep durable identity for reconciliation, but do not
-            // reuse proof/JKT authority across token generations.
+            // reuse authority across opaque gateway-session generations.
             let revision = state.session_revision.saturating_add(1).max(1);
             Self::clear_runtime_state(&mut state);
             state.session_revision = revision;
@@ -439,7 +439,6 @@ impl ChatAuthProvider {
         if state.local_device_uuid.as_deref() != Some(local_device_uuid.as_str()) {
             state.server_device_id = None;
             state.binding = None;
-            state.observed_dpop_jkt = None;
         }
         state.local_device_uuid = Some(local_device_uuid);
         Ok(())
@@ -464,7 +463,6 @@ impl ChatAuthProvider {
         if state.local_device_uuid.as_deref() != Some(local_device_uuid.as_str()) {
             state.server_device_id = None;
             state.binding = None;
-            state.observed_dpop_jkt = None;
         }
         state.local_device_uuid = Some(local_device_uuid);
         Ok(())
@@ -489,7 +487,6 @@ impl ChatAuthProvider {
         state.server_device_id = Some(server_device_id);
         if changed {
             state.binding = None;
-            state.observed_dpop_jkt = None;
         }
         Ok(())
     }
@@ -514,46 +511,18 @@ impl ChatAuthProvider {
         state.server_device_id = Some(server_device_id);
         if changed {
             state.binding = None;
-            state.observed_dpop_jkt = None;
         }
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn observe_dpop_jkt(
-        &self,
-        actor_did: &str,
-        jkt: String,
-    ) -> std::result::Result<(), ChatAuthError> {
-        let jkt = jkt.trim().to_string();
-        if jkt.is_empty() {
-            return Err(ChatAuthError::MissingDpopJkt);
-        }
-        let mut state = self.state.write().unwrap();
-        if state.actor_did.as_deref() != Some(actor_did) || state.session_token.is_none() {
-            return Err(ChatAuthError::SessionChanged);
-        }
-        if state
-            .binding
-            .as_ref()
-            .is_some_and(|binding| binding.dpop_jkt != jkt)
-        {
-            Self::clear_runtime_state(&mut state);
-            return Err(ChatAuthError::DpopJktMismatch);
-        }
-        state.observed_dpop_jkt = Some(jkt);
-        Ok(())
-    }
-
-    pub(crate) fn observe_dpop_jkt_for_session(
+    /// Atomically publish a completed binding after one immutable
+    /// getOwnDevices response has matched the local signer. Device identity
+    /// is not made visible piecemeal while that response is in flight.
+    pub(crate) fn admit_device_authority_for_session(
         &self,
         session: &ChatSessionSnapshot,
-        jkt: String,
+        evidence: DeviceAuthorityEvidence,
     ) -> std::result::Result<(), ChatAuthError> {
-        let jkt = jkt.trim().to_string();
-        if jkt.is_empty() {
-            return Err(ChatAuthError::MissingDpopJkt);
-        }
         let mut state = self.state.write().unwrap();
         if state.session_revision != session.revision
             || state.actor_did.as_deref() != Some(session.actor_did.as_str())
@@ -561,76 +530,41 @@ impl ChatAuthProvider {
         {
             return Err(ChatAuthError::SessionChanged);
         }
-        if state
-            .binding
-            .as_ref()
-            .is_some_and(|binding| binding.dpop_jkt != jkt)
-        {
-            Self::clear_runtime_state(&mut state);
-            return Err(ChatAuthError::DpopJktMismatch);
-        }
-        state.observed_dpop_jkt = Some(jkt);
-        Ok(())
-    }
-
-    /// Admit a completed binding only when it is anchored to the local UUID
-    /// and the exact server ID already resolved from `listDevices`.
-    #[cfg(test)]
-    pub(crate) fn admit_device_authority(
-        &self,
-        evidence: DeviceAuthorityEvidence,
-    ) -> std::result::Result<(), ChatAuthError> {
-        let mut state = self.state.write().unwrap();
-        if state.session_token.is_none() {
-            return Err(ChatAuthError::MissingSession);
-        }
-        let local_device_uuid = evidence.local_device_uuid.trim();
-        if local_device_uuid.is_empty() {
+        let local_device_uuid = evidence.local_device_uuid.trim().to_string();
+        if !is_strict_uuid_v4(&local_device_uuid) {
             return Err(ChatAuthError::MissingLocalDeviceUuid);
         }
-        let configured_local = state
+        if state
             .local_device_uuid
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ChatAuthError::MissingLocalDeviceUuid)?;
-        if configured_local != local_device_uuid {
+            .as_ref()
+            .is_some_and(|configured| configured != &local_device_uuid)
+        {
             return Err(ChatAuthError::DeviceBindingMismatch);
         }
 
         let server_device_id = evidence.server_device_id.trim().to_string();
-        if server_device_id.is_empty() {
+        if !is_strict_uuid_v4(&server_device_id) {
             return Err(ChatAuthError::MissingDevice);
         }
-        let configured_server = state
-            .server_device_id
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ChatAuthError::MissingDevice)?;
-        if configured_server != server_device_id {
+        if local_device_uuid != server_device_id
+            || state
+                .server_device_id
+                .as_ref()
+                .is_some_and(|configured| configured != &server_device_id)
+        {
             return Err(ChatAuthError::DeviceBindingMismatch);
         }
 
-        let dpop_jkt = evidence.dpop_jkt.trim().to_string();
-        if dpop_jkt.is_empty() {
-            return Err(ChatAuthError::MissingDpopJkt);
-        }
         if evidence.auth_generation == 0 {
             return Err(ChatAuthError::MissingAuthGeneration);
         }
-        if evidence.binding_version == 0 {
-            return Err(ChatAuthError::MissingDeviceBinding);
-        }
-
         let binding = CompletedDeviceBinding {
             server_device_id,
-            dpop_jkt: dpop_jkt.clone(),
             auth_generation: evidence.auth_generation,
-            binding_version: evidence.binding_version,
         };
+        state.local_device_uuid = Some(local_device_uuid);
+        state.server_device_id = Some(binding.server_device_id.clone());
         state.binding = Some(binding);
-        // The binding response is the observed JKT evidence. No proof or
-        // signature is generated by this admission step.
-        state.observed_dpop_jkt = Some(dpop_jkt);
         Ok(())
     }
 
@@ -644,7 +578,6 @@ impl ChatAuthProvider {
 
     fn clear_runtime_state(state: &mut ChatAuthSnapshot) {
         state.binding = None;
-        state.observed_dpop_jkt = None;
     }
 
     pub(crate) fn clear_runtime_state_for_session(
@@ -689,34 +622,6 @@ impl ChatAuthProvider {
         Ok(())
     }
 
-    pub(crate) fn invalidate_for_generation_for_session(
-        &self,
-        session: &ChatSessionSnapshot,
-        observed_generation: u64,
-    ) -> std::result::Result<(), ChatAuthError> {
-        let mut state = self.state.write().unwrap();
-        if state.session_revision != session.revision
-            || state.actor_did.as_deref() != Some(session.actor_did.as_str())
-            || state.session_token.as_deref() != Some(session.token.as_str())
-        {
-            return Err(ChatAuthError::SessionChanged);
-        }
-        let expected = state
-            .binding
-            .as_ref()
-            .map(|binding| binding.auth_generation);
-        if let Some(expected) = expected {
-            if observed_generation != expected {
-                Self::clear_runtime_state(&mut state);
-                return Err(ChatAuthError::AuthGenerationMismatch {
-                    expected,
-                    observed: observed_generation,
-                });
-            }
-        }
-        Ok(())
-    }
-
     pub(crate) fn clear(&self) {
         let mut state = self.state.write().unwrap();
         let revision = state.session_revision.saturating_add(1).max(1);
@@ -725,7 +630,8 @@ impl ChatAuthProvider {
     }
 
     /// Build canonical-read headers only after the exact device has completed
-    /// binding and its observed JKT/generation still agree with that binding.
+    /// service-auth admission and its positive generation still agrees with
+    /// that binding.
     pub(crate) fn canonical_read_context(
         &self,
     ) -> std::result::Result<CanonicalReadContext, ChatAuthError> {
@@ -757,19 +663,12 @@ impl ChatAuthProvider {
             .binding
             .clone()
             .ok_or(ChatAuthError::MissingDeviceBinding)?;
-        if binding.server_device_id != device_id || local_device_uuid.trim().is_empty() {
+        if !is_strict_uuid_v4(&local_device_uuid)
+            || !is_strict_uuid_v4(&device_id)
+            || local_device_uuid != device_id
+            || binding.server_device_id != device_id
+        {
             return Err(ChatAuthError::DeviceBindingMismatch);
-        }
-        if binding.binding_version == 0 {
-            return Err(ChatAuthError::MissingDeviceBinding);
-        }
-        let dpop_jkt = state
-            .observed_dpop_jkt
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or(ChatAuthError::MissingDpopJkt)?;
-        if dpop_jkt != binding.dpop_jkt {
-            return Err(ChatAuthError::DpopJktMismatch);
         }
         if binding.auth_generation == 0 {
             return Err(ChatAuthError::MissingAuthGeneration);
@@ -778,25 +677,9 @@ impl ChatAuthProvider {
             actor_did,
             authorization: format!("Bearer {session_token}"),
             device_id,
-            dpop_jkt,
             auth_generation: binding.auth_generation,
             session,
         })
-    }
-
-    /// Build a proof-required Rust context only when all material is real.
-    #[allow(dead_code)]
-    pub(crate) fn canonical_context(
-        &self,
-    ) -> std::result::Result<catbird_mls::orchestrator::CleanChatAuthContext, ChatAuthError> {
-        let _ = self.canonical_read_context()?;
-        Err(ChatAuthError::MissingDpopProof)
-    }
-
-    pub(crate) fn signing_capability(
-        &self,
-    ) -> std::result::Result<ChatSigningCapability, ChatAuthError> {
-        Err(ChatAuthError::MissingSigner)
     }
 
     #[cfg(test)]
@@ -831,19 +714,10 @@ impl ChatAuthProvider {
     }
 
     #[cfg(test)]
-    fn set_jkt_for_tests(&self, jkt: &str) {
-        let actor_did = self
-            .state
-            .read()
-            .unwrap()
-            .actor_did
-            .clone()
-            .expect("test session must be set before JKT");
-        let _ = self.observe_dpop_jkt(&actor_did, jkt.to_string());
-    }
-
-    #[cfg(test)]
     fn admit_for_tests(&self, generation: u64) {
+        let session = self
+            .session_snapshot()
+            .expect("test session must be current before admission");
         let state = self.state.read().unwrap();
         let local_device_uuid = state
             .local_device_uuid
@@ -854,15 +728,26 @@ impl ChatAuthProvider {
             .clone()
             .expect("test server device ID must be configured before admission");
         drop(state);
-        let _ = self.admit_device_authority(DeviceAuthorityEvidence {
-            local_device_uuid,
-            server_device_id,
-            dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-            auth_generation: generation,
-            binding_version: 1,
-        });
+        self.admit_device_authority_for_session(
+            &session,
+            DeviceAuthorityEvidence {
+                local_device_uuid,
+                server_device_id,
+                auth_generation: generation,
+            },
+        )
+        .expect("test device authority should admit");
     }
 }
+
+struct OwnDevicesSnapshot {
+    devices: Vec<DeviceInfo>,
+}
+
+#[cfg(test)]
+const TEST_AUTH_DEVICE_A: &str = "00000000-0000-4000-8000-000000000001";
+#[cfg(test)]
+const TEST_AUTH_DEVICE_B: &str = "00000000-0000-4000-8000-000000000002";
 
 pub struct ReqwestApiClient {
     client: Client,
@@ -944,12 +829,6 @@ impl ReqwestApiClient {
         }
     }
 
-    pub(crate) fn require_signing_capability(
-        &self,
-    ) -> std::result::Result<ChatSigningCapability, ChatAuthError> {
-        self.chat_auth.signing_capability()
-    }
-
     pub(crate) fn chat_auth_provider(&self) -> std::sync::Arc<ChatAuthProvider> {
         self.chat_auth.clone()
     }
@@ -1027,49 +906,107 @@ impl ReqwestApiClient {
     pub(crate) async fn resolve_server_device_id_for_local_uuid(
         &self,
         local_device_uuid: &str,
+        expected_public_key: &[u8],
     ) -> Result<String> {
         let session = self
             .current_session()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        self.resolve_server_device_id_for_local_uuid_with_session(&session, local_device_uuid)
-            .await
+        self.resolve_server_device_id_for_local_uuid_with_session(
+            &session,
+            local_device_uuid,
+            expected_public_key,
+        )
+        .await
     }
 
     pub(crate) async fn resolve_server_device_id_for_local_uuid_with_session(
         &self,
         session: &ChatSessionSnapshot,
         local_device_uuid: &str,
+        expected_public_key: &[u8],
     ) -> Result<String> {
-        self.ensure_session_current(session)?;
-        let devices = match self.list_devices_for_session(session).await {
-            Ok(devices) => devices,
-            Err(error) => {
-                self.invalidate_device_authority_for_session(session).await;
-                return Err(error);
+        let result = async {
+            self.ensure_session_current(session)?;
+            if !is_strict_uuid_v4(local_device_uuid) {
+                return Err(OrchestratorError::Api(
+                    "device reconciliation requires a canonical local UUIDv4".to_string(),
+                ));
             }
-        };
-        let server_device_id = match resolve_unique_server_device_id(&devices, local_device_uuid) {
-            Ok(server_device_id) => server_device_id,
-            Err(error) => {
-                self.invalidate_device_authority_for_session(session).await;
-                return Err(error);
+            let expected_public_key = <[u8; 32]>::try_from(expected_public_key).map_err(|_| {
+                OrchestratorError::Api(
+                    "durable Ed25519 signer must expose a 32-byte public key".to_string(),
+                )
+            })?;
+            let snapshot = self
+                .list_devices_for_session(session, local_device_uuid)
+                .await?;
+            let server_device_id =
+                resolve_unique_server_device_id(&snapshot.devices, local_device_uuid)?;
+            let matching_rows = snapshot
+                .devices
+                .iter()
+                .filter(|row| row.device_id == server_device_id)
+                .collect::<Vec<_>>();
+            if matching_rows.len() != 1 {
+                return Err(OrchestratorError::Api(
+                    "getOwnDevices binding row was not unique".to_string(),
+                ));
             }
-        };
-        let store = crate::credentials::KeyringCredentialStore::try_new()?;
-        self.ensure_session_current(session)?;
-        if let Err(error) = store
-            .store_server_device_id(&session.actor_did, &server_device_id)
-            .await
-        {
-            self.invalidate_device_authority_for_session(session).await;
-            return Err(error);
+            let row = matching_rows[0];
+            if row.status.as_deref() != Some("active") {
+                return Err(OrchestratorError::Api(
+                    "registered device is not active".to_string(),
+                ));
+            }
+            let auth_generation = row
+                .auth_generation
+                .and_then(|value| u64::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    OrchestratorError::Api(
+                        "registered device has no positive authGeneration".to_string(),
+                    )
+                })?;
+            if row.signature_public_key.as_deref() != Some(expected_public_key.as_slice()) {
+                return Err(OrchestratorError::Api(
+                    "registered device public key does not match durable local signer".to_string(),
+                ));
+            }
+            let key_id = row.key_id.as_deref().ok_or_else(|| {
+                OrchestratorError::Api("registered device omitted keyId".to_string())
+            })?;
+            let parsed_key_id = catbird_mls::chat_v2::ids::KeyId::parse(key_id)
+                .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+            if !parsed_key_id.matches_public_key(&expected_public_key) {
+                return Err(OrchestratorError::Api(
+                    "registered device keyId does not match durable local signer".to_string(),
+                ));
+            }
+            self.ensure_session_current(session)?;
+            self.chat_auth
+                .admit_device_authority_for_session(
+                    session,
+                    DeviceAuthorityEvidence {
+                        local_device_uuid: local_device_uuid.to_string(),
+                        server_device_id: server_device_id.clone(),
+                        auth_generation,
+                    },
+                )
+                .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+            self.ensure_session_current(session)?;
+
+            let store = crate::credentials::KeyringCredentialStore::try_new()?;
+            store
+                .store_server_device_id(&session.actor_did, &server_device_id)
+                .await?;
+            self.ensure_session_current(session)?;
+            Ok(server_device_id)
         }
-        self.ensure_session_current(session)?;
-        self.chat_auth
-            .set_resolved_server_device_id_for_session(session, server_device_id.clone())
-            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        self.ensure_session_current(session)?;
-        Ok(server_device_id)
+        .await;
+        if result.is_err() {
+            self.invalidate_device_authority_for_session(session).await;
+        }
+        result
     }
 
     /// Check if the current user is opted into MLS chat.
@@ -1094,9 +1031,9 @@ impl ReqwestApiClient {
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        let output = parse_lexicon_json::<
-            blue_catbird::chat::get_devices::GetDevicesOutput<String>,
-        >(body.as_ref())?;
+        let output = parse_lexicon_json::<blue_catbird::chat::get_devices::GetDevicesOutput<String>>(
+            body.as_ref(),
+        )?;
 
         Ok(output
             .devices
@@ -1163,7 +1100,12 @@ impl ReqwestApiClient {
         let route = catbird_mls::orchestrator::canonical_route(
             catbird_mls::orchestrator::CanonicalOperation::GetBlob,
         );
-        let path = format!("{}?blobId={}", route.path, urlencoding::encode(blob_id));
+        let path = format!(
+            "{}?actorDeviceId={}&blobId={}",
+            route.path,
+            urlencoding::encode(&auth.device_id),
+            urlencoding::encode(blob_id)
+        );
         let resp = self
             .client
             .get(self.canonical_url(&path))
@@ -1172,12 +1114,6 @@ impl ReqwestApiClient {
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if let Err(error) = self.observe_chat_binding(&resp, &auth.session) {
-            self.invalidate_device_authority_for_session(&auth.session)
-                .await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
 
         if !resp.status().is_success() {
             return Err(self.handle_error_for_session(resp, &auth.session).await);
@@ -1204,10 +1140,22 @@ impl ReqwestApiClient {
     async fn list_devices_for_session(
         &self,
         session: &ChatSessionSnapshot,
-    ) -> Result<Vec<DeviceInfo>> {
+        actor_device_id: &str,
+    ) -> Result<OwnDevicesSnapshot> {
+        if !is_strict_uuid_v4(actor_device_id) {
+            return Err(OrchestratorError::Api(
+                "getOwnDevices requires the exact canonical actorDeviceId UUIDv4".to_string(),
+            ));
+        }
+        let params = blue_catbird::chat::get_own_devices::GetOwnDevices::<String> {
+            actor_device_id: actor_device_id.to_string(),
+            limit: Some(100),
+            page_cursor: None,
+        };
         let resp = self
             .client
             .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
+            .query(&params)
             .bearer_auth(&session.token)
             .send()
             .await
@@ -1226,16 +1174,31 @@ impl ReqwestApiClient {
         >(body.as_ref())?;
         self.ensure_session_current(session)?;
 
-        Ok(output
+        let devices = output
             .items
             .iter()
-            .map(|d| DeviceInfo {
-                device_id: d.device.device_id.to_string(),
-                mls_did: session.actor_did.clone(),
-                device_uuid: d.device.key_id.to_string(),
-                created_at: None,
+            .map(|item| -> Result<DeviceInfo> {
+                let device_id = item.device.device_id.to_string();
+                Ok(DeviceInfo {
+                    device_id: device_id.clone(),
+                    // MLS device identity is scoped to one registered
+                    // device, never the actor's bare DID.
+                    mls_did: format!("{}#{}", session.actor_did, device_id),
+                    // deviceId is the client-generated UUIDv4 used to
+                    // reconcile a durable local signer with this row.
+                    device_uuid: device_id,
+                    created_at: item.device.created_at.to_string().parse().ok(),
+                    key_id: Some(item.device.key_id.to_string()),
+                    signature_public_key: Some(item.device.signature_public_key.to_vec()),
+                    auth_generation: Some(item.device.auth_generation),
+                    status: Some(item.device.status.to_string()),
+                    available_package_count: u32::try_from(item.device.available_package_count)
+                        .ok(),
+                    reserved_package_count: u32::try_from(item.device.reserved_package_count).ok(),
+                })
             })
-            .collect())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(OwnDevicesSnapshot { devices })
     }
 
     async fn send_message_request(
@@ -1286,11 +1249,6 @@ impl ReqwestApiClient {
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if let Err(error) = self.observe_chat_binding(&resp, &session) {
-            self.invalidate_device_authority_for_session(&session).await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
 
         let status = resp.status();
         if status.is_success() {
@@ -1352,11 +1310,6 @@ impl ReqwestApiClient {
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
-        if let Err(error) = self.observe_chat_binding(&resp, &session) {
-            self.invalidate_device_authority_for_session(&session).await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
-
         if !resp.status().is_success() {
             return Err(self.handle_error_for_session(resp, &session).await);
         }
@@ -1381,28 +1334,6 @@ impl ReqwestApiClient {
         format!("{}{}", self.base_url, path)
     }
 
-    fn observe_chat_binding(
-        &self,
-        response: &reqwest::Response,
-        session: &ChatSessionSnapshot,
-    ) -> std::result::Result<(), ChatAuthError> {
-        if let Some(value) = response.headers().get("x-catbird-chat-dpop-jkt") {
-            if let Ok(jkt) = value.to_str() {
-                self.chat_auth
-                    .observe_dpop_jkt_for_session(session, jkt.to_string())?;
-            }
-        }
-        if let Some(value) = response.headers().get("x-catbird-chat-auth-generation") {
-            let generation = value
-                .to_str()
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .ok_or(ChatAuthError::MissingAuthGeneration)?;
-            self.chat_auth
-                .invalidate_for_generation_for_session(session, generation)?;
-        }
-        Ok(())
-    }
     async fn canonical_get_conversations(
         &self,
         limit: u32,
@@ -1415,7 +1346,11 @@ impl ReqwestApiClient {
         let route = catbird_mls::orchestrator::canonical_route(
             catbird_mls::orchestrator::CanonicalOperation::GetConversations,
         );
-        let mut path = format!("{}?limit={limit}", route.path);
+        let mut path = format!(
+            "{}?actorDeviceId={}&limit={limit}",
+            route.path,
+            urlencoding::encode(&auth.device_id)
+        );
         if let Some(cursor) = cursor {
             path.push_str("&pageCursor=");
             path.push_str(&urlencoding::encode(cursor));
@@ -1429,11 +1364,6 @@ impl ReqwestApiClient {
             .send()
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        if let Err(error) = self.observe_chat_binding(&response, &auth.session) {
-            self.invalidate_device_authority_for_session(&auth.session)
-                .await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
         if !response.status().is_success() {
             return Err(self.handle_error_for_session(response, &auth.session).await);
         }
@@ -1442,37 +1372,18 @@ impl ReqwestApiClient {
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
         self.ensure_session_current(&auth.session)?;
-        let output = parse_lexicon_json::<
-            catbird_atproto::blue_catbird::chat::get_conversations::GetConversationsOutput<String>,
-        >(body.as_ref())?;
+        let output =
+            catbird_mls::orchestrator::canonical_transport::decode_conversations_inventory(&body)
+                .map_err(|error| {
+                OrchestratorError::Api(format!("Canonical getConversations decode: {error}"))
+            })?;
 
         let conversations = output
             .items
             .into_iter()
             .filter_map(|item| match item {
                 catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(state) => {
-                    let state = state.state;
-                    Some(ConversationView {
-                        group_id: hex::encode(&state.coordinates.group_id),
-                        conversation_id: state.coordinates.conversation_id.to_string(),
-                        epoch: state.coordinates.epoch.max(0) as u64,
-                        members: state
-                            .participants
-                            .into_iter()
-                            .map(|member| MemberView {
-                                did: member.user_did.to_string(),
-                                role: if member.role.to_string() == "admin" {
-                                    MemberRole::Admin
-                                } else {
-                                    MemberRole::Member
-                                },
-                            })
-                            .collect(),
-                        metadata: None,
-                        created_at: None,
-                        updated_at: None,
-                        sequencer_did: None,
-                    })
+                    Some(canonical_conversation_view(&state.state))
                 }
                 _ => None,
             })
@@ -1502,8 +1413,9 @@ impl ReqwestApiClient {
             catbird_mls::orchestrator::CanonicalOperation::GetEntries,
         );
         let path = format!(
-            "{}?afterSeq={after_seq}&conversationId={}&limit={limit}",
+            "{}?actorDeviceId={}&afterSeq={after_seq}&conversationId={}&limit={limit}",
             route.path,
+            urlencoding::encode(&auth.device_id),
             urlencoding::encode(convo_id)
         );
         let response = self
@@ -1514,11 +1426,6 @@ impl ReqwestApiClient {
             .send()
             .await
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        if let Err(error) = self.observe_chat_binding(&response, &auth.session) {
-            self.invalidate_device_authority_for_session(&auth.session)
-                .await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
         if !response.status().is_success() {
             return Err(self.handle_error_for_session(response, &auth.session).await);
         }
@@ -1534,7 +1441,10 @@ impl ReqwestApiClient {
             .entries
             .into_iter()
             .filter(|entry| canonical_entry_matches_type(entry, message_type))
-            .filter_map(map_canonical_entry)
+            .map(|entry| map_canonical_entry(entry, convo_id))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
             .collect();
         let next = if output.has_more {
             Some(output.next_after_seq.to_string())
@@ -1578,6 +1488,8 @@ fn canonical_entry_matches_type(
         Some("commit") => matches!(
             entry,
             catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(_)
+                | catbird_atproto::blue_catbird::chat::ConversationEntry::LeafRecoveryFulfillmentEntry(_)
+                | catbird_atproto::blue_catbird::chat::ConversationEntry::LeaveCommitFulfillmentEntry(_)
         ),
         Some("app") => matches!(
             entry,
@@ -1587,58 +1499,22 @@ fn canonical_entry_matches_type(
             entry,
             catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(_)
                 | catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(_)
+                | catbird_atproto::blue_catbird::chat::ConversationEntry::LeafRecoveryFulfillmentEntry(_)
+                | catbird_atproto::blue_catbird::chat::ConversationEntry::LeaveCommitFulfillmentEntry(_)
         ),
         _ => true,
     }
 }
 
-fn map_commit_entry(
-    conversation_id: String,
-    entry_id: String,
-    sender_did: String,
-    received_at: String,
-    ciphertext: Vec<u8>,
-    epoch: i64,
-) -> Option<IncomingEnvelope> {
-    Some(IncomingEnvelope {
-        conversation_id,
-        sender_did,
-        ciphertext,
-        timestamp: received_at.parse().ok()?,
-        server_message_id: Some(entry_id),
-        server_epoch: Some(epoch.max(0) as u64),
-    })
-}
-
 fn map_canonical_entry(
     entry: catbird_atproto::blue_catbird::chat::ConversationEntry<String>,
-) -> Option<IncomingEnvelope> {
-    match entry {
-        catbird_atproto::blue_catbird::chat::ConversationEntry::ApplicationEntry(application) => {
-            let body = application.signed_request.body;
-            Some(IncomingEnvelope {
-                conversation_id: application.conversation_id.to_string(),
-                sender_did: body.actor_did.to_string(),
-                ciphertext: body.application_message.bytes.to_vec(),
-                timestamp: application.received_at.as_ref().to_string().parse().ok()?,
-                server_message_id: Some(application.entry_id.to_string()),
-                server_epoch: Some(body.prior.epoch.max(0) as u64),
-            })
-        }
-        catbird_atproto::blue_catbird::chat::ConversationEntry::CommitEntry(commit) => {
-            let body = commit.signed_request.body;
-            map_commit_entry(
-                commit.conversation_id.to_string(),
-                commit.entry_id.to_string(),
-                body.actor_did.to_string(),
-                commit.received_at.as_ref().to_string(),
-                body.commit.bytes.to_vec(),
-                body.next.epoch,
-            )
-        }
-        _ => None,
-    }
+    expected_conversation_id: &str,
+) -> Result<Option<IncomingEnvelope>> {
+    let row =
+        serde_json::to_value(entry).map_err(|error| OrchestratorError::Api(error.to_string()))?;
+    IncomingEnvelope::from_canonical_entry(&row, expected_conversation_id)
 }
+
 #[async_trait]
 impl MLSAPIClient for ReqwestApiClient {
     async fn is_authenticated_as(&self, did: &str) -> bool {
@@ -1658,20 +1534,56 @@ impl MLSAPIClient for ReqwestApiClient {
         &self,
         request: catbird_mls::orchestrator::canonical_transport::PreparedRequest,
     ) -> Result<catbird_mls::orchestrator::canonical_transport::GatewayResponse> {
-        let session = self
-            .current_session()
+        let auth = self
+            .chat_auth
+            .canonical_read_context()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
+        let session = auth.session.clone();
         self.ensure_session_current(&session)?;
+
+        use catbird_mls::orchestrator::canonical_transport::CanonicalOperation;
+        let expected_path = request.operation.path();
+        let request_base_path = request.path.split('?').next().unwrap_or_default();
+        if request_base_path != expected_path {
+            return Err(OrchestratorError::Api(format!(
+                "prepared clean-chat route mismatch: operation {:?} requires {expected_path}, got {}",
+                request.operation, request.path
+            )));
+        }
+        let expected_method = match request.operation {
+            CanonicalOperation::GetConversations
+            | CanonicalOperation::GetBlob
+            | CanonicalOperation::GetBlobUsage
+            | CanonicalOperation::GetConversationState
+            | CanonicalOperation::GetDeviceKey
+            | CanonicalOperation::GetDevices
+            | CanonicalOperation::GetDirectRequestOutcome
+            | CanonicalOperation::GetEntries
+            | CanonicalOperation::GetLeafRecoveryInbox
+            | CanonicalOperation::GetOwnDevices
+            | CanonicalOperation::GetPendingWelcomes => "GET",
+            CanonicalOperation::UploadBlob | CanonicalOperation::SubscribeEvents => {
+                return Err(OrchestratorError::Api(
+                    "blob upload and event subscription require their dedicated binary/WebSocket transports".into(),
+                ));
+            }
+            _ => "POST",
+        };
+        if request.method != expected_method {
+            return Err(OrchestratorError::Api(format!(
+                "prepared clean-chat method mismatch: operation {:?} requires {expected_method}, got {}",
+                request.operation, request.method
+            )));
+        }
 
         let url = self.canonical_url(&request.path);
         let mut builder = match request.method.as_str() {
             "POST" => self.client.post(&url),
             "GET" => self.client.get(&url),
-            "PUT" => self.client.put(&url),
-            "DELETE" => self.client.delete(&url),
-            _ => self.client.post(&url),
+            _ => unreachable!("method was checked against canonical operation"),
         };
         builder = builder.bearer_auth(&session.token);
+        builder = builder.header("x-catbird-chat-device-id", &auth.device_id);
         if let Some(body) = request.body {
             builder = builder
                 .body(body)
@@ -1682,11 +1594,6 @@ impl MLSAPIClient for ReqwestApiClient {
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if let Err(error) = self.observe_chat_binding(&resp, &session) {
-            self.invalidate_device_authority_for_session(&session).await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
 
         let status = resp.status().as_u16();
         let content_type = resp
@@ -1707,11 +1614,13 @@ impl MLSAPIClient for ReqwestApiClient {
 
         self.ensure_session_current(&session)?;
 
-        Ok(catbird_mls::orchestrator::canonical_transport::GatewayResponse {
-            status,
-            content_type,
-            body,
-        })
+        Ok(
+            catbird_mls::orchestrator::canonical_transport::GatewayResponse {
+                status,
+                content_type,
+                body,
+            },
+        )
     }
 
     async fn get_conversations(
@@ -1749,10 +1658,16 @@ impl MLSAPIClient for ReqwestApiClient {
         actor_device_id: &str,
         dids: &[String],
     ) -> Result<Vec<KeyPackageRef>> {
-        let session = self
-            .current_session()
+        let authority = self
+            .chat_auth
+            .canonical_read_context()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        self.ensure_session_current(&session)?;
+        if actor_device_id != authority.device_id {
+            return Err(OrchestratorError::Api(
+                "getDevices actorDeviceId does not match admitted device authority".to_string(),
+            ));
+        }
+        self.ensure_session_current(&authority.session)?;
 
         let mut query_params: Vec<(&str, &str)> = vec![("actorDeviceId", actor_device_id)];
         for did in dids {
@@ -1764,28 +1679,26 @@ impl MLSAPIClient for ReqwestApiClient {
             .client
             .get(&url)
             .query(&query_params)
-            .bearer_auth(&session.token)
+            .header(reqwest::header::AUTHORIZATION, &authority.authorization)
+            .header("x-catbird-chat-device-id", &authority.device_id)
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
-        if let Err(error) = self.observe_chat_binding(&resp, &session) {
-            self.invalidate_device_authority_for_session(&session).await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
-
         if !resp.status().is_success() {
-            return Err(self.handle_error_for_session(resp, &session).await);
+            return Err(self
+                .handle_error_for_session(resp, &authority.session)
+                .await);
         }
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        self.ensure_session_current(&session)?;
-        let output = parse_lexicon_json::<
-            blue_catbird::chat::get_devices::GetDevicesOutput<String>,
-        >(body.as_ref())?;
+        self.ensure_session_current(&authority.session)?;
+        let output = parse_lexicon_json::<blue_catbird::chat::get_devices::GetDevicesOutput<String>>(
+            body.as_ref(),
+        )?;
 
         Ok(output
             .devices
@@ -1800,41 +1713,18 @@ impl MLSAPIClient for ReqwestApiClient {
     }
 
     async fn get_key_package_stats(&self) -> Result<KeyPackageStats> {
-        let session = self
-            .current_session()
+        let authority = self
+            .chat_auth
+            .canonical_read_context()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        self.ensure_session_current(&session)?;
-
-        let resp = self
-            .client
-            .get(self.xrpc_url("blue.catbird.chat.getOwnDevices"))
-            .bearer_auth(&session.token)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if let Err(error) = self.observe_chat_binding(&resp, &session) {
-            self.invalidate_device_authority_for_session(&session).await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error_for_session(resp, &session).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        self.ensure_session_current(&session)?;
-        let output = parse_lexicon_json::<
-            blue_catbird::chat::get_own_devices::GetOwnDevicesOutput<String>,
-        >(body.as_ref())?;
-
-        let available: u32 = output
-            .items
+        let snapshot = self
+            .list_devices_for_session(&authority.session, &authority.device_id)
+            .await?;
+        let available: u32 = snapshot
+            .devices
             .iter()
-            .map(|item| item.device.available_package_count.max(0) as u32)
+            .filter(|row| row.device_id == authority.device_id)
+            .filter_map(|row| row.available_package_count)
             .sum();
         Ok(KeyPackageStats {
             available,
@@ -1853,43 +1743,44 @@ impl MLSAPIClient for ReqwestApiClient {
         })
     }
 
-    async fn list_devices(&self, _actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
+    async fn list_devices(&self, actor_device_id: &str) -> Result<Vec<DeviceInfo>> {
         let session = self
             .current_session()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
         self.ensure_session_current(&session)?;
-        self.list_devices_for_session(&session).await
+        self.list_devices_for_session(&session, actor_device_id)
+            .await
+            .map(|snapshot| snapshot.devices)
     }
 
     async fn get_group_info(&self, convo_id: &str) -> Result<Vec<u8>> {
-        let session = self
-            .current_session()
+        let auth = self
+            .chat_auth
+            .canonical_read_context()
             .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        self.ensure_session_current(&session)?;
 
         let resp = self
             .client
             .get(self.xrpc_url("blue.catbird.chat.getConversationState"))
-            .bearer_auth(&session.token)
-            .query(&[("conversationId", convo_id)])
+            .header(reqwest::header::AUTHORIZATION, &auth.authorization)
+            .header("x-catbird-chat-device-id", &auth.device_id)
+            .query(&[
+                ("actorDeviceId", auth.device_id.as_str()),
+                ("conversationId", convo_id),
+            ])
             .send()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
 
-        if let Err(error) = self.observe_chat_binding(&resp, &session) {
-            self.invalidate_device_authority_for_session(&session).await;
-            return Err(OrchestratorError::Api(error.to_string()));
-        }
-
         if !resp.status().is_success() {
-            return Err(self.handle_error_for_session(resp, &session).await);
+            return Err(self.handle_error_for_session(resp, &auth.session).await);
         }
 
         let body = resp
             .bytes()
             .await
             .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        self.ensure_session_current(&session)?;
+        self.ensure_session_current(&auth.session)?;
         let output = parse_lexicon_json::<
             blue_catbird::chat::get_conversation_state::GetConversationStateOutput<String>,
         >(body.as_ref())?;
@@ -1942,8 +1833,6 @@ mod tests {
     //! is singly-encoded (good) and explicitly check the old double-encoded
     //! output the buggy adapter would have produced (regression protection).
     use super::*;
-    use base64::engine::general_purpose::STANDARD as B64;
-    use base64::Engine;
     use catbird_mls::orchestrator::credentials::CredentialStore;
 
     // -------------------------------------------------------------------
@@ -2118,11 +2007,60 @@ mod tests {
         }
     }
 
-    fn list_devices_body(did: &str, device_id: &str, device_uuid: &str) -> String {
+    const TEST_DEVICE_PUBLIC_KEY: [u8; 32] = [7; 32];
+
+    fn test_device_key_id() -> String {
+        catbird_mls::chat_v2::ids::KeyId::from_public_key(&TEST_DEVICE_PUBLIC_KEY).to_string()
+    }
+
+    fn list_devices_body(did: &str, device_id: &str) -> String {
         let _ = did;
+        let key_id = test_device_key_id();
+        let public_key = base64::engine::general_purpose::STANDARD.encode(TEST_DEVICE_PUBLIC_KEY);
         format!(
-            r#"{{"hasMore":false,"items":[{{"device":{{"authGeneration":1,"availablePackageCount":1,"createdAt":"2026-08-17T00:00:00.000Z","deviceId":"{device_id}","dpopJkt":"jkt-test","keyId":"{device_uuid}","reservedPackageCount":0,"signaturePublicKey":{{"$bytes":"AAECAwQ="}},"status":"active","updatedAt":"2026-08-17T00:00:00.000Z"}}}}],"snapshotExpiresAt":"2026-08-17T00:00:00.000Z"}}"#
+            r#"{{"hasMore":false,"items":[{{"device":{{"authGeneration":1,"availablePackageCount":1,"createdAt":"2026-08-17T00:00:00.000Z","deviceId":"{device_id}","keyId":"{key_id}","reservedPackageCount":0,"signaturePublicKey":{{"$bytes":"{public_key}"}},"status":"active","updatedAt":"2026-08-17T00:00:00.000Z"}}}}],"snapshotExpiresAt":"2026-08-17T00:00:00.000Z"}}"#
         )
+    }
+
+    #[tokio::test]
+    async fn own_device_view_populates_complete_scoped_device_identity() {
+        let did = "did:plc:device-view-owner";
+        let device_id = "00000000-0000-4000-8000-000000000001";
+        let key_id = test_device_key_id();
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            200,
+            list_devices_body(did, device_id),
+            std::time::Duration::ZERO,
+        )]);
+        let client = ReqwestApiClient::new(base_url);
+        client.set_auth(did.to_string(), "device-view-token".to_string());
+        let session = client.current_session().unwrap();
+
+        let snapshot = client
+            .list_devices_for_session(&session, device_id)
+            .await
+            .unwrap();
+        let request = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("getOwnDevices should reach the gateway");
+        assert!(request
+            .path
+            .contains("actorDeviceId=00000000-0000-4000-8000-000000000001"));
+        assert_eq!(snapshot.devices.len(), 1);
+        let device = &snapshot.devices[0];
+        assert_eq!(device.device_id, device_id);
+        assert_eq!(device.mls_did, format!("{did}#{device_id}"));
+        assert_eq!(device.device_uuid, device_id);
+        assert!(device.created_at.is_some());
+        assert_eq!(device.key_id.as_deref(), Some(key_id.as_str()));
+        assert_eq!(
+            device.signature_public_key.as_deref(),
+            Some(TEST_DEVICE_PUBLIC_KEY.as_slice())
+        );
+        assert_eq!(device.auth_generation, Some(1));
+        assert_eq!(device.status.as_deref(), Some("active"));
+        assert_eq!(device.available_package_count, Some(1));
+        assert_eq!(device.reserved_package_count, Some(0));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2139,10 +2077,11 @@ mod tests {
             .clear_all(did_b)
             .await
             .expect("clear account B fixture");
+        let device_id = "00000000-0000-4000-8000-00000000000a";
 
         let (base_url, requests) = spawn_scripted_json_server(vec![(
             200,
-            list_devices_body(did_a, "server-device-a", "local-device-a"),
+            list_devices_body(did_a, device_id),
             std::time::Duration::from_millis(150),
         )]);
         let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
@@ -2150,7 +2089,7 @@ mod tests {
         let task_client = client.clone();
         let task = tokio::spawn(async move {
             task_client
-                .resolve_server_device_id_for_local_uuid("local-device-a")
+                .resolve_server_device_id_for_local_uuid(device_id, &TEST_DEVICE_PUBLIC_KEY)
                 .await
         });
 
@@ -2204,9 +2143,10 @@ mod tests {
         let store = crate::credentials::KeyringCredentialStore::try_new()
             .expect("credential store should initialize");
         store.clear_all(did).await.expect("clear success fixture");
+        let device_id = "00000000-0000-4000-8000-00000000000b";
         let (base_url, requests) = spawn_scripted_json_server(vec![(
             200,
-            list_devices_body(did, "server-device-success", "local-device-success"),
+            list_devices_body(did, device_id),
             std::time::Duration::from_millis(100),
         )]);
         let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
@@ -2214,7 +2154,7 @@ mod tests {
         let task_client = client.clone();
         let task = tokio::spawn(async move {
             task_client
-                .resolve_server_device_id_for_local_uuid("local-device-success")
+                .resolve_server_device_id_for_local_uuid(device_id, &TEST_DEVICE_PUBLIC_KEY)
                 .await
         });
         let request = requests
@@ -2229,7 +2169,7 @@ mod tests {
             task.await
                 .expect("reconciliation task should join")
                 .expect("captured actor should reconcile successfully"),
-            "server-device-success"
+            device_id
         );
         assert_eq!(
             store
@@ -2237,7 +2177,7 @@ mod tests {
                 .await
                 .expect("read reconciled server ID")
                 .as_deref(),
-            Some("server-device-success")
+            Some(device_id)
         );
         store.clear_all(did).await.expect("clear success fixture");
     }
@@ -2253,13 +2193,15 @@ mod tests {
         )]);
         let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
         client.set_auth(did_a.to_string(), "token-a".to_string());
-        client.chat_auth.set_local_device_for_tests("local-a");
-        client.chat_auth.set_device_for_tests("server-a");
+        let device_a = "00000000-0000-4000-8000-00000000000c";
+        let device_b = "00000000-0000-4000-8000-00000000000d";
+        client.chat_auth.set_local_device_for_tests(device_a);
+        client.chat_auth.set_device_for_tests(device_a);
         client.chat_auth.admit_for_tests(1);
         let task_client = client.clone();
         let task = tokio::spawn(async move {
             task_client
-                .resolve_server_device_id_for_local_uuid("local-a")
+                .resolve_server_device_id_for_local_uuid(device_a, &TEST_DEVICE_PUBLIC_KEY)
                 .await
         });
 
@@ -2267,8 +2209,8 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("delayed listDevices request");
         client.set_auth(did_b.to_string(), "token-b".to_string());
-        client.chat_auth.set_local_device_for_tests("local-b");
-        client.chat_auth.set_device_for_tests("server-b");
+        client.chat_auth.set_local_device_for_tests(device_b);
+        client.chat_auth.set_device_for_tests(device_b);
         client.chat_auth.admit_for_tests(1);
 
         let error = task
@@ -2282,176 +2224,157 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(unreachable_code)]
-    async fn delayed_registration_does_not_write_under_switched_account() {
+    fn prepared_reset_request(
+        body: Vec<u8>,
+    ) -> catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+        catbird_mls::orchestrator::canonical_transport::PreparedRequest {
+            operation:
+                catbird_mls::orchestrator::canonical_transport::CanonicalOperation::RequestReset,
+            method: "POST".to_string(),
+            path: "/xrpc/blue.catbird.chat.requestReset".to_string(),
+            body: Some(body),
+        }
+    }
+
+    fn admit_test_client(client: &ReqwestApiClient, actor_did: &str, token: &str) {
+        client.set_auth(actor_did.to_string(), token.to_string());
+        client
+            .chat_auth
+            .set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+        client.chat_auth.set_device_for_tests(TEST_AUTH_DEVICE_A);
+        client.chat_auth.admit_for_tests(1);
+    }
+
+    #[tokio::test]
+    async fn prepared_transport_keeps_gateway_auth_out_of_the_request_value() {
         let (base_url, requests) = spawn_capture_server();
         let client = ReqwestApiClient::new(base_url);
-        client.set_auth(
-            "did:plc:delayed-register-a".to_string(),
-            "token-a".to_string(),
-        );
-        let error = <ReqwestApiClient as MLSAPIClient>::register_device(
-            &client,
-            "local-device-a",
-            "test-device",
-            "did:plc:delayed-register-a",
-            &[],
-            &[],
-        )
-        .await
-        .expect_err("legacy registration must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
+        let bearer = "opaque-session-token";
+        admit_test_client(&client, "did:plc:prepared-owner", bearer);
+        let body = br#"{"convoId":"00000000-0000-4000-8000-000000000001"}"#.to_vec();
+        let request = prepared_reset_request(body.clone());
+
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains(bearer));
+
+        let response = client
+            .submit_prepared_request(request)
+            .await
+            .expect("gateway should submit prepared request");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"{}".to_vec());
+
+        let captured = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server should receive prepared request");
+        assert_eq!(captured.method, "POST");
+        assert_eq!(captured.path, "/xrpc/blue.catbird.chat.requestReset");
+        assert_eq!(captured.body, body);
+        assert!(captured.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == &format!("Bearer {bearer}")
+        }));
+    }
+
+    #[tokio::test]
+    async fn prepared_transport_uses_current_lexicon_methods() {
+        use catbird_mls::orchestrator::canonical_transport::{CanonicalOperation, PreparedRequest};
+        for (operation, method) in [
+            (CanonicalOperation::GetSubscriptionTicket, "POST"),
+            (CanonicalOperation::GetDeviceKey, "GET"),
+            (CanonicalOperation::GetDirectRequestOutcome, "GET"),
+        ] {
+            let (base_url, requests) = spawn_capture_server();
+            let client = ReqwestApiClient::new(base_url);
+            admit_test_client(&client, "did:plc:prepared-method", "opaque-method-token");
+            let path = operation.path().to_string();
+            client
+                .submit_prepared_request(PreparedRequest {
+                    operation,
+                    method: method.to_string(),
+                    path: path.clone(),
+                    body: (method == "POST").then(|| b"{}".to_vec()),
+                })
+                .await
+                .expect("lexicon method should reach transport");
+            let captured = requests
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(captured.method, method);
+            assert_eq!(captured.path, path);
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_transport_rejects_route_or_method_confusion_before_http() {
+        let (base_url, requests) = spawn_capture_server();
+        let client = ReqwestApiClient::new(base_url);
+        admit_test_client(&client, "did:plc:prepared-route", "opaque-route-token");
+
+        let mut wrong_path = prepared_reset_request(b"{}".to_vec());
+        wrong_path.path = "/xrpc/blue.catbird.chat.sendMessage".to_string();
+        assert!(client.submit_prepared_request(wrong_path).await.is_err());
+
+        let mut wrong_method = prepared_reset_request(b"{}".to_vec());
+        wrong_method.method = "PATCH".to_string();
+        assert!(client.submit_prepared_request(wrong_method).await.is_err());
+
         assert!(requests
             .recv_timeout(std::time::Duration::from_millis(100))
             .is_err());
-        return;
-        let did_a = "did:plc:delayed-register-a";
-        let did_b = "did:plc:delayed-register-b";
-        let store = crate::credentials::KeyringCredentialStore::try_new()
-            .expect("credential store should initialize");
-        store
-            .clear_all(did_a)
-            .await
-            .expect("clear account A fixture");
-        store
-            .clear_all(did_b)
-            .await
-            .expect("clear account B fixture");
-        let responses = vec![
-            (
-                200,
-                r#"{"deviceId":"server-device-a","mlsDid":"did:plc:delayed-register-a","autoJoinedConvos":[]}"#
-                    .to_string(),
-                std::time::Duration::from_millis(150),
-            ),
-        ];
-        let (base_url, requests) = spawn_scripted_json_server(responses);
-        let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
-        client.set_auth(did_a.to_string(), "token-a".to_string());
-        let task_client = client.clone();
-        let task = tokio::spawn(async move {
-            <ReqwestApiClient as MLSAPIClient>::register_device(
-                &*task_client,
-                "local-device-a",
-                "test-device",
-                did_a,
-                &[],
-                &[],
-            )
-            .await
-        });
+    }
 
-        let first = requests
+    #[tokio::test]
+    async fn prepared_transport_preserves_non_success_status_content_type_and_body() {
+        let response_body = r#"{"error":"projectionFenceMismatch"}"#.to_string();
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            409,
+            response_body.clone(),
+            std::time::Duration::ZERO,
+        )]);
+        let client = ReqwestApiClient::new(base_url);
+        admit_test_client(&client, "did:plc:prepared-status", "opaque-status-token");
+
+        let response = client
+            .submit_prepared_request(prepared_reset_request(b"{}".to_vec()))
+            .await
+            .expect("gateway response status is data, not a transport error");
+        assert_eq!(response.status, 409);
+        assert_eq!(response.content_type.as_deref(), Some("application/json"));
+        assert_eq!(response.body, response_body.as_bytes());
+        requests
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("delayed registerDevice request");
-        assert!(first.path.contains("registerDevice"));
-        client.set_auth(did_b.to_string(), "token-b".to_string());
-
-        let error = task
-            .await
-            .expect("registration task should join")
-            .expect_err("registration must fail after account switch");
-        assert!(
-            error.to_string().contains("session changed"),
-            "unexpected error: {error}"
-        );
-        assert!(store
-            .get_local_device_uuid(did_a)
-            .await
-            .expect("read account A local UUID")
-            .is_none());
-        assert!(
-            store
-                .get_local_device_uuid(did_b)
-                .await
-                .expect("read account B local UUID")
-                .is_none(),
-            "account B must not receive account A registration identity"
-        );
-        assert!(
-            store
-                .get_server_device_id(did_b)
-                .await
-                .expect("read account B server ID")
-                .is_none(),
-            "account B must not receive account A server device ID"
-        );
-        store
-            .clear_all(did_a)
-            .await
-            .expect("clear account A fixture");
-        store
-            .clear_all(did_b)
-            .await
-            .expect("clear account B fixture");
+            .expect("server should receive prepared request");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[allow(unreachable_code)]
-    async fn delayed_registration_error_does_not_invalidate_new_account() {
-        let (base_url, requests) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth(
-            "did:plc:delayed-registration-error-a".to_string(),
-            "token-a".to_string(),
-        );
-        let error = <ReqwestApiClient as MLSAPIClient>::register_device(
-            &client,
-            "local-a",
-            "test-device",
-            "did:plc:delayed-registration-error-a",
-            &[],
-            &[],
-        )
-        .await
-        .expect_err("legacy registration must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(requests
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-        return;
-        let did_a = "did:plc:delayed-registration-error-a";
-        let did_b = "did:plc:delayed-registration-error-b";
+    async fn delayed_prepared_response_is_rejected_after_account_switch() {
         let (base_url, requests) = spawn_scripted_json_server(vec![(
-            401,
+            200,
             "{}".to_string(),
             std::time::Duration::from_millis(150),
         )]);
         let client = std::sync::Arc::new(ReqwestApiClient::new(base_url));
-        client.set_auth(did_a.to_string(), "token-a".to_string());
-        client.chat_auth.set_local_device_for_tests("local-a");
-        client.chat_auth.set_device_for_tests("server-a");
-        client.chat_auth.admit_for_tests(1);
+        admit_test_client(&client, "did:plc:prepared-a", "token-a");
         let task_client = client.clone();
         let task = tokio::spawn(async move {
-            <ReqwestApiClient as MLSAPIClient>::register_device(
-                &*task_client,
-                "local-a",
-                "test-device",
-                did_a,
-                &[],
-                &[],
-            )
-            .await
+            task_client
+                .submit_prepared_request(prepared_reset_request(b"{}".to_vec()))
+                .await
         });
-        requests
+
+        let captured = requests
             .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("delayed registerDevice request");
-        client.set_auth(did_b.to_string(), "token-b".to_string());
-        client.chat_auth.set_local_device_for_tests("local-b");
-        client.chat_auth.set_device_for_tests("server-b");
-        client.chat_auth.admit_for_tests(1);
+            .expect("account A request should reach gateway");
+        assert!(captured.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer token-a"
+        }));
+        client.set_auth("did:plc:prepared-b".to_string(), "token-b".to_string());
 
         let error = task
             .await
-            .expect("registration task should join")
-            .expect_err("delayed registration 401 must fail");
-        assert!(error.to_string().contains("401"));
-        assert!(
-            client.chat_auth.canonical_read_context().is_ok(),
-            "account B authority must survive account A's delayed registration error"
-        );
+            .expect("prepared request task should join")
+            .expect_err("account A response cannot complete under account B");
+        assert!(error.to_string().contains("session changed"));
     }
 
     #[tokio::test]
@@ -2497,8 +2420,8 @@ mod tests {
             client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
             client
                 .chat_auth
-                .set_local_device_for_tests("local-device-1");
-            client.chat_auth.set_device_for_tests("server-device-1");
+                .set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+            client.chat_auth.set_device_for_tests(TEST_AUTH_DEVICE_A);
             client.chat_auth.admit_for_tests(1);
 
             let error = <ReqwestApiClient as MLSAPIClient>::get_conversations(&client, 10, None)
@@ -2510,57 +2433,10 @@ mod tests {
                 .expect("server received canonical request");
 
             let state = client.chat_auth.state.read().unwrap();
-            assert_eq!(state.local_device_uuid.as_deref(), Some("local-device-1"));
-            assert_eq!(state.server_device_id.as_deref(), Some("server-device-1"));
+            assert_eq!(state.local_device_uuid.as_deref(), Some(TEST_AUTH_DEVICE_A));
+            assert_eq!(state.server_device_id.as_deref(), Some(TEST_AUTH_DEVICE_A));
             assert!(state.binding.is_none());
-            assert!(state.observed_dpop_jkt.is_none());
         }
-    }
-
-    #[tokio::test]
-    async fn publish_key_package_fails_closed_without_signed_adapter() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-        client.set_publish_device_id_for_tests("device-uuid-123");
-
-        let error = client
-            .publish_key_package(
-                b"test-key-package",
-                "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519",
-                "2099-01-01T00:00:00Z",
-                None,
-            )
-            .await
-            .expect_err("legacy key-package publishing must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
-    }
-
-    #[tokio::test]
-    async fn generic_send_message_fails_closed_without_canonical_signed_adapter() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-
-        let error = <ReqwestApiClient as MLSAPIClient>::send_message(
-            &client,
-            "conversation-id",
-            b"cipher",
-            7,
-        )
-        .await
-        .expect_err("generic MLS sends must not use an unsigned legacy route");
-        assert!(error
-            .to_string()
-            .contains("legacy mlsChat sendMessage is disabled"));
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "fail-closed send must not reach the legacy HTTP endpoint"
-        );
     }
 
     #[tokio::test]
@@ -2588,8 +2464,8 @@ mod tests {
         client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
         client
             .chat_auth
-            .set_local_device_for_tests("local-device-1");
-        client.chat_auth.set_device_for_tests("server-device-1");
+            .set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+        client.chat_auth.set_device_for_tests(TEST_AUTH_DEVICE_A);
         client.chat_auth.admit_for_tests(1);
 
         let body = client
@@ -2603,51 +2479,55 @@ mod tests {
             .expect("server received canonical blob request");
         assert_eq!(
             captured.path,
-            "/xrpc/blue.catbird.chat.getBlob?blobId=blob-1"
+            "/xrpc/blue.catbird.chat.getBlob?actorDeviceId=00000000-0000-4000-8000-000000000001&blobId=blob-1"
         );
         let device_header = captured
             .headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("x-catbird-chat-device-id"))
             .expect("canonical blob request must carry the server device ID");
-        assert_eq!(device_header.1, "server-device-1");
+        assert_eq!(device_header.1, TEST_AUTH_DEVICE_A);
     }
 
     #[tokio::test]
-    async fn report_recovery_failure_fails_closed_without_signed_adapter() {
-        let (base_url, rx) = spawn_capture_server();
+    async fn get_devices_binds_exact_admitted_actor_device_before_http() {
+        let (base_url, requests) = spawn_scripted_json_server(vec![(
+            200,
+            r#"{"devices":[]}"#.to_string(),
+            std::time::Duration::ZERO,
+        )]);
         let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
+        admit_test_client(&client, "did:plc:get-devices-owner", "get-devices-token");
 
-        let error = client
-            .report_recovery_failure(
-                "convo-x",
-                "external_commit_exhausted",
-                Some("deadbeefcafe1234"),
-                Some("local_state_loss"),
-            )
-            .await
-            .expect_err("legacy recovery report must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(rx
+        let mismatch = <ReqwestApiClient as MLSAPIClient>::get_key_packages(
+            &client,
+            TEST_AUTH_DEVICE_B,
+            &["did:plc:target".to_string()],
+        )
+        .await
+        .expect_err("a caller-supplied cross-device coordinate must fail before HTTP");
+        assert!(mismatch.to_string().contains("does not match admitted"));
+        assert!(requests
             .recv_timeout(std::time::Duration::from_millis(100))
             .is_err());
-    }
 
-    #[tokio::test]
-    async fn report_recovery_failure_without_fields_fails_closed() {
-        let (base_url, rx) = spawn_capture_server();
-        let client = ReqwestApiClient::new(base_url);
-        client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
-
-        let error = client
-            .report_recovery_failure("convo-y", "remote_data_error", None, None)
-            .await
-            .expect_err("legacy recovery report must fail closed");
-        assert!(error.to_string().contains("canonical signed"));
-        assert!(rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .is_err());
+        let packages = <ReqwestApiClient as MLSAPIClient>::get_key_packages(
+            &client,
+            TEST_AUTH_DEVICE_A,
+            &["did:plc:target".to_string()],
+        )
+        .await
+        .expect("the exact admitted device may reach getDevices");
+        assert!(packages.is_empty());
+        let captured = requests
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("getDevices should reach the gateway once");
+        assert!(captured
+            .path
+            .contains(&format!("actorDeviceId={TEST_AUTH_DEVICE_A}")));
+        assert!(captured.headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-catbird-chat-device-id") && value == TEST_AUTH_DEVICE_A
+        }));
     }
 }
 
@@ -2655,18 +2535,17 @@ mod tests {
 fn canonical_read_requires_session_before_http() {
     let provider = ChatAuthProvider::default();
     let error = provider
-        .canonical_context()
+        .canonical_read_context()
         .expect_err("missing session must fail closed");
     assert_eq!(error, ChatAuthError::MissingSession);
 }
 
 #[test]
-fn canonical_context_debug_redacts_bearer_and_jkt_material() {
+fn canonical_context_debug_redacts_bearer_material() {
     let context = CanonicalReadContext {
         actor_did: "did:plc:redaction".to_string(),
         authorization: "Bearer bearer-secret-for-red-test".to_string(),
         device_id: "server-device-1".to_string(),
-        dpop_jkt: "jkt-secret-for-red-test".to_string(),
         auth_generation: 7,
         session: ChatSessionSnapshot {
             actor_did: "did:plc:redaction".to_string(),
@@ -2679,37 +2558,40 @@ fn canonical_context_debug_redacts_bearer_and_jkt_material() {
         !rendered.contains("bearer-secret-for-red-test"),
         "Debug must not expose bearer material"
     );
-    assert!(
-        !rendered.contains("jkt-secret-for-red-test"),
-        "Debug must not expose DPoP JKT material"
-    );
 }
 
 #[cfg(test)]
-fn test_device_info(device_id: &str, device_uuid: &str) -> DeviceInfo {
+fn test_device_info(device_id: &str, key_id: &str) -> DeviceInfo {
     DeviceInfo {
         device_id: device_id.to_string(),
-        mls_did: "did:plc:catmos".to_string(),
-        device_uuid: device_uuid.to_string(),
+        mls_did: format!("did:plc:catmos#{device_id}"),
+        device_uuid: device_id.to_string(),
         created_at: None,
+        key_id: Some(key_id.to_string()),
+        signature_public_key: Some(vec![1, 2, 3]),
+        auth_generation: Some(1),
+        status: Some("active".to_string()),
+        available_package_count: Some(0),
+        reserved_package_count: Some(0),
     }
 }
 
 #[test]
 fn list_devices_resolution_requires_exactly_one_local_uuid_match() {
-    let devices = vec![test_device_info("server-device-1", "local-device-1")];
+    let device_id = "00000000-0000-4000-8000-000000000010";
+    let devices = vec![test_device_info(device_id, "thumbprint-1")];
     assert_eq!(
-        resolve_unique_server_device_id(&devices, "local-device-1")
+        resolve_unique_server_device_id(&devices, device_id)
             .expect("one matching server row should resolve"),
-        "server-device-1"
+        device_id
     );
     assert!(resolve_unique_server_device_id(&devices, "missing-local-device").is_err());
 
     let duplicate = vec![
-        test_device_info("server-device-1", "local-device-1"),
-        test_device_info("server-device-2", "local-device-1"),
+        test_device_info(device_id, "thumbprint-1"),
+        test_device_info(device_id, "thumbprint-2"),
     ];
-    assert!(resolve_unique_server_device_id(&duplicate, "local-device-1").is_err());
+    assert!(resolve_unique_server_device_id(&duplicate, device_id).is_err());
 }
 
 #[test]
@@ -2727,16 +2609,18 @@ fn local_uuid_cannot_authorize_without_server_id_and_binding() {
 fn authority_lifecycle_clears_on_account_switch_and_generation_mismatch() {
     let provider = ChatAuthProvider::default();
     provider.set_session_for_tests("did:plc:first", "opaque-session");
-    provider.set_local_device_for_tests("local-device-1");
-    provider.set_device_for_tests("server-device-1");
+    provider.set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+    provider.set_device_for_tests(TEST_AUTH_DEVICE_A);
+    let first_session = provider.session_snapshot().unwrap();
     assert!(provider
-        .admit_device_authority(DeviceAuthorityEvidence {
-            local_device_uuid: "local-device-1".to_string(),
-            server_device_id: "server-device-1".to_string(),
-            dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-            auth_generation: 7,
-            binding_version: 1,
-        })
+        .admit_device_authority_for_session(
+            &first_session,
+            DeviceAuthorityEvidence {
+                local_device_uuid: TEST_AUTH_DEVICE_A.to_string(),
+                server_device_id: TEST_AUTH_DEVICE_A.to_string(),
+                auth_generation: 7,
+            },
+        )
         .is_ok());
     assert!(provider.canonical_read_context().is_ok());
 
@@ -2749,16 +2633,18 @@ fn authority_lifecycle_clears_on_account_switch_and_generation_mismatch() {
     );
 
     provider.set_session_for_tests("did:plc:second", "opaque-session");
-    provider.set_local_device_for_tests("local-device-2");
-    provider.set_device_for_tests("server-device-2");
+    provider.set_local_device_for_tests(TEST_AUTH_DEVICE_B);
+    provider.set_device_for_tests(TEST_AUTH_DEVICE_B);
+    let second_session = provider.session_snapshot().unwrap();
     provider
-        .admit_device_authority(DeviceAuthorityEvidence {
-            local_device_uuid: "local-device-2".to_string(),
-            server_device_id: "server-device-2".to_string(),
-            dpop_jkt: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string(),
-            auth_generation: 2,
-            binding_version: 1,
-        })
+        .admit_device_authority_for_session(
+            &second_session,
+            DeviceAuthorityEvidence {
+                local_device_uuid: TEST_AUTH_DEVICE_B.to_string(),
+                server_device_id: TEST_AUTH_DEVICE_B.to_string(),
+                auth_generation: 2,
+            },
+        )
         .expect("test binding should admit");
     let error = provider
         .invalidate_for_generation("did:plc:second", 3)
@@ -2782,9 +2668,10 @@ fn authority_lifecycle_clears_on_account_switch_and_generation_mismatch() {
 fn authority_snapshot_rejects_late_evidence_from_an_old_actor() {
     let provider = ChatAuthProvider::default();
     provider.set_session_for_tests("did:plc:first", "first-token");
-    provider.set_local_device_for_tests("local-device-1");
-    provider.set_device_for_tests("server-device-1");
+    provider.set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+    provider.set_device_for_tests(TEST_AUTH_DEVICE_A);
     provider.admit_for_tests(7);
+    let old_session = provider.session_snapshot().unwrap();
     let first = provider
         .canonical_read_context()
         .expect("first actor should have a complete test snapshot");
@@ -2794,9 +2681,13 @@ fn authority_snapshot_rejects_late_evidence_from_an_old_actor() {
     provider.set_session_for_tests("did:plc:second", "second-token");
     assert_eq!(
         provider
-            .observe_dpop_jkt(
-                "did:plc:first",
-                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            .admit_device_authority_for_session(
+                &old_session,
+                DeviceAuthorityEvidence {
+                    local_device_uuid: TEST_AUTH_DEVICE_A.to_string(),
+                    server_device_id: TEST_AUTH_DEVICE_A.to_string(),
+                    auth_generation: 7,
+                },
             )
             .expect_err("old actor evidence must not mutate the new snapshot"),
         ChatAuthError::SessionChanged
@@ -2887,19 +2778,75 @@ fn session_revision_rejects_late_mutation_after_token_refresh() {
 }
 
 #[test]
+fn admitted_context_survives_login_restore_and_requires_re_admission_on_relogin() {
+    let provider = ChatAuthProvider::default();
+    provider.set_session_for_tests("did:plc:activation", "token-one");
+    let first = provider.session_snapshot().unwrap();
+    provider
+        .admit_device_authority_for_session(
+            &first,
+            DeviceAuthorityEvidence {
+                local_device_uuid: TEST_AUTH_DEVICE_A.to_string(),
+                server_device_id: TEST_AUTH_DEVICE_A.to_string(),
+                auth_generation: 5,
+            },
+        )
+        .expect("login should atomically publish admitted authority");
+    assert_eq!(
+        provider
+            .canonical_read_context()
+            .expect("completed login must retain canonical authority")
+            .auth_generation,
+        5
+    );
+
+    // Restoring the exact same opaque session must be idempotent and must not
+    // clear the tuple that reconciliation just admitted.
+    provider.set_session_for_tests("did:plc:activation", "token-one");
+    assert!(provider.canonical_read_context().is_ok());
+
+    // A new opaque session for the same account revokes runtime authority;
+    // the same exact device row can then be re-admitted under that snapshot.
+    provider.set_session_for_tests("did:plc:activation", "token-two");
+    assert_eq!(
+        provider
+            .canonical_read_context()
+            .expect_err("relogin must not inherit the prior gateway session"),
+        ChatAuthError::MissingDeviceBinding
+    );
+    let second = provider.session_snapshot().unwrap();
+    provider
+        .admit_device_authority_for_session(
+            &second,
+            DeviceAuthorityEvidence {
+                local_device_uuid: TEST_AUTH_DEVICE_A.to_string(),
+                server_device_id: TEST_AUTH_DEVICE_A.to_string(),
+                auth_generation: 6,
+            },
+        )
+        .expect("relogin should re-admit the exact device row");
+    assert_eq!(
+        provider
+            .canonical_read_context()
+            .expect("relogin activation must publish canonical authority")
+            .auth_generation,
+        6
+    );
+}
+
+#[test]
 fn runtime_invalidation_retains_identity_for_exact_reconciliation() {
     let provider = ChatAuthProvider::default();
     provider.set_session_for_tests("did:plc:catmos", "opaque-session");
-    provider.set_local_device_for_tests("local-device-1");
-    provider.set_device_for_tests("server-device-1");
+    provider.set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+    provider.set_device_for_tests(TEST_AUTH_DEVICE_A);
     provider.admit_for_tests(1);
 
     provider.clear_device_authority();
     let state = provider.state.read().unwrap();
-    assert_eq!(state.local_device_uuid.as_deref(), Some("local-device-1"));
-    assert_eq!(state.server_device_id.as_deref(), Some("server-device-1"));
+    assert_eq!(state.local_device_uuid.as_deref(), Some(TEST_AUTH_DEVICE_A));
+    assert_eq!(state.server_device_id.as_deref(), Some(TEST_AUTH_DEVICE_A));
     assert!(state.binding.is_none());
-    assert!(state.observed_dpop_jkt.is_none());
     drop(state);
     assert_eq!(
         provider
@@ -2910,8 +2857,8 @@ fn runtime_invalidation_retains_identity_for_exact_reconciliation() {
 
     provider.set_session_for_tests("did:plc:catmos", "refreshed-session");
     let state = provider.state.read().unwrap();
-    assert_eq!(state.local_device_uuid.as_deref(), Some("local-device-1"));
-    assert_eq!(state.server_device_id.as_deref(), Some("server-device-1"));
+    assert_eq!(state.local_device_uuid.as_deref(), Some(TEST_AUTH_DEVICE_A));
+    assert_eq!(state.server_device_id.as_deref(), Some(TEST_AUTH_DEVICE_A));
     assert!(state.binding.is_none());
 }
 
@@ -2921,28 +2868,11 @@ fn canonical_read_requires_registered_device_before_http() {
     provider.set_session_for_tests("did:plc:catmos", "opaque-session");
     provider.set_local_device_for_tests("00000000-0000-4000-8000-000000000001");
     let error = provider
-        .canonical_context()
+        .canonical_read_context()
         .expect_err("missing device must fail closed");
     assert_eq!(error, ChatAuthError::MissingDevice);
 }
 
-#[test]
-fn canonical_read_requires_observed_jkt_before_http() {
-    let provider = ChatAuthProvider::default();
-    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
-    provider.set_local_device_for_tests("00000000-0000-4000-8000-000000000001");
-    provider.set_device_for_tests("00000000-0000-4000-8000-000000000001");
-    provider.state.write().unwrap().binding = Some(CompletedDeviceBinding {
-        server_device_id: "00000000-0000-4000-8000-000000000001".to_string(),
-        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
-        auth_generation: 1,
-        binding_version: 1,
-    });
-    let error = provider
-        .canonical_context()
-        .expect_err("missing JKT must fail closed");
-    assert_eq!(error, ChatAuthError::MissingDpopJkt);
-}
 #[test]
 fn canonical_read_requires_completed_device_authority_before_http() {
     let provider = ChatAuthProvider::default();
@@ -2959,15 +2889,12 @@ fn canonical_read_requires_completed_device_authority_before_http() {
 fn canonical_read_requires_current_auth_generation_before_http() {
     let provider = ChatAuthProvider::default();
     provider.set_session_for_tests("did:plc:catmos", "opaque-session");
-    provider.set_local_device_for_tests("local-device-1");
-    provider.set_device_for_tests("server-device-1");
+    provider.set_local_device_for_tests(TEST_AUTH_DEVICE_A);
+    provider.set_device_for_tests(TEST_AUTH_DEVICE_A);
     provider.state.write().unwrap().binding = Some(CompletedDeviceBinding {
-        server_device_id: "server-device-1".to_string(),
-        dpop_jkt: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        server_device_id: TEST_AUTH_DEVICE_A.to_string(),
         auth_generation: 0,
-        binding_version: 1,
     });
-    provider.set_jkt_for_tests("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
     let error = provider
         .canonical_read_context()
         .expect_err("missing current generation must fail before HTTP");
@@ -2975,41 +2902,100 @@ fn canonical_read_requires_current_auth_generation_before_http() {
 }
 
 #[test]
-fn canonical_context_rejects_requests_without_real_dpop_proof() {
-    let provider = ChatAuthProvider::default();
-    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
-    provider.set_local_device_for_tests("00000000-0000-4000-8000-000000000001");
-    provider.set_device_for_tests("server-device-1");
-    provider.admit_for_tests(1);
-    let error = provider
-        .canonical_context()
-        .expect_err("canonical proof-required context must fail closed");
-    assert_eq!(error, ChatAuthError::MissingDpopProof);
-}
-
-#[test]
 fn canonical_entries_preserve_commit_epochs() {
-    let envelope = map_commit_entry(
-        "00000000-0000-4000-8000-000000000001".to_owned(),
-        "00000000-0000-4000-8000-000000000002".to_owned(),
-        "did:plc:sender".to_owned(),
-        "2026-08-16T12:00:00.000Z".to_owned(),
-        vec![1, 2],
-        5,
-    )
-    .expect("commit entry should map");
+    let conversation_id = "00000000-0000-4000-8000-000000000001";
+    let envelope = IncomingEnvelope::from_canonical_entry(&serde_json::json!({
+        "$type": "blue.catbird.chat.defs#commitEntry",
+        "conversationId": conversation_id,
+        "entryId": "00000000-0000-4000-8000-000000000002",
+        "seq": 51,
+        "receivedAt": "2026-08-16T12:00:00.000Z",
+        "signedRequest": {"body": {"actorDid": "did:plc:sender",
+            "prior": {"conversationId": conversation_id}, "next": {"conversationId": conversation_id, "epoch": 5},
+            "commit": {"bytes": "AQI="}
+        }}
+    }), conversation_id).unwrap().unwrap();
     assert_eq!(envelope.server_epoch, Some(5));
+    assert_eq!(envelope.server_sequence, Some(51));
     assert_eq!(envelope.ciphertext, vec![1, 2]);
 }
 
-#[test]
-fn signed_mutation_requires_runtime_signer_before_http() {
-    let provider = ChatAuthProvider::default();
-    provider.set_session_for_tests("did:plc:catmos", "opaque-session");
-    provider.set_device_for_tests("00000000-0000-4000-8000-000000000001");
-    provider.set_jkt_for_tests("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
-    let error = provider
-        .signing_capability()
-        .expect_err("missing signer must fail closed");
-    assert_eq!(error, ChatAuthError::MissingSigner);
+#[cfg(test)]
+mod canonical_admission_projection_tests {
+    use super::*;
+    use catbird_mls::orchestrator::canonical_transport::{
+        decode_conversation_state, decode_conversations_inventory, encode_conversation_state,
+    };
+
+    fn inventory(wire: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "items": [{"$type": "blue.catbird.chat.defs#conversationInventoryState", "state": wire}],
+            "hasMore": true, "nextPageCursor": "page-2", "inventorySessionId": "inventory-session",
+            "snapshotEventCursor": "event-fence", "snapshotExpiresAt": "2026-09-05T12:00:00.000Z"
+        })).unwrap()
+    }
+
+    #[test]
+    fn canonical_pending_and_accepted_leafless_views_keep_exact_snapshot() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
+        for (status, version) in [("pending", 41), ("active", 42)] {
+            let mut wire = fixture.clone();
+            wire["participants"][1]["status"] = serde_json::json!(status);
+            wire["coordinates"]["stateVersion"] = serde_json::json!(version);
+            wire["snapshotSeq"] = serde_json::json!(version + 4);
+            let expected = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
+            let mut page = decode_conversations_inventory(&inventory(wire)).unwrap();
+            assert_eq!(page.next_page_cursor.as_deref(), Some("page-2"));
+            assert_eq!(page.inventory_session_id, "inventory-session");
+            assert_eq!(page.snapshot_event_cursor, "event-fence");
+            let catbird_atproto::blue_catbird::chat::ConversationInventoryItem::ConversationInventoryState(item) = page.items.remove(0) else { panic!("missing canonical state") };
+            let state = item.state;
+            assert_eq!(state, expected);
+            let view = canonical_conversation_view(&state);
+            assert_eq!(view.canonical_state.as_ref(), Some(&state));
+            assert_eq!(view.epoch, state.coordinates.epoch as u64);
+            assert_eq!(
+                view.group_id,
+                hex::encode(state.coordinates.group_id.as_ref())
+            );
+            let persisted: ConversationView =
+                serde_json::from_slice(&serde_json::to_vec(&view).unwrap()).unwrap();
+            let retained = persisted.canonical_state.unwrap();
+            assert_eq!(
+                decode_conversation_state(&encode_conversation_state(&retained).unwrap()).unwrap(),
+                state
+            );
+            assert_eq!(retained.participants[1].status, status);
+            assert_eq!(retained.participants[1].leaf_count, 0);
+            assert_eq!(
+                retained.participants[1].invitation_provenance,
+                state.participants[1].invitation_provenance
+            );
+            assert!(view.created_at.is_none());
+            assert!(view.metadata.is_none());
+        }
+    }
+
+    #[test]
+    fn legacy_view_is_unknown_and_malformed_canonical_state_is_rejected() {
+        let mut wire: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/canonical-conversation-state.json"
+        ))
+        .unwrap();
+        let state = decode_conversation_state(wire.to_string().as_bytes()).unwrap();
+        let view = canonical_conversation_view(&state);
+        let mut old_view = serde_json::to_value(view).unwrap();
+        assert!(old_view
+            .as_object_mut()
+            .unwrap()
+            .remove("canonicalState")
+            .is_some());
+        let legacy: ConversationView = serde_json::from_value(old_view).unwrap();
+        assert!(legacy.canonical_state.is_none());
+        wire["participants"][1]["status"] = serde_json::json!("unknown");
+        assert!(decode_conversations_inventory(&inventory(wire)).is_err());
+    }
 }

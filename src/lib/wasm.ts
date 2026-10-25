@@ -98,27 +98,185 @@ function getWorker(): Remote<WorkerApi> {
 }
 
 // ---------------------------------------------------------------------------
-// MLS DB key management (main thread sessionStorage)
-// TODO: Migrate to WebCrypto non-extractable key for proper key protection
+// MLS DB key management: Durable WebCrypto key wrapping with IndexedDB
+//
+// The 32-byte (256-bit) MLS DB encryption key encrypts SQLite state in OPFS.
+// To ensure encrypted OPFS databases persist across tab and session restarts
+// without stranding ciphertext:
+//   - A non-extractable AES-GCM (256-bit) master Key Encryption Key (KEK) is
+//     persisted in IndexedDB ('catbird_mls_keyring', store 'keys').
+//   - Each per-DID MLS DB key is wrapped (encrypted with the KEK + 96-bit IV)
+//     and durably stored in IndexedDB under the namespaced key.
+//   - On session/tab restarts (when sessionStorage is empty), the wrapped key
+//     is retrieved from IndexedDB, decrypted via WebCrypto, and reloaded.
 // ---------------------------------------------------------------------------
 
+const KEYRING_DB_NAME = 'catbird_mls_keyring';
+const KEYRING_STORE_NAME = 'keys';
+const MASTER_KEK_ID = '__mls_master_kek__';
+
+interface WrappedKeyRecord {
+	iv: Uint8Array;
+	ciphertext: Uint8Array;
+}
+
+function openKeyringDb(): Promise<IDBDatabase> {
+	return new Promise((resolve, reject) => {
+		if (typeof indexedDB === 'undefined') {
+			return reject(new Error('IndexedDB unavailable'));
+		}
+		const req = indexedDB.open(KEYRING_DB_NAME, 1);
+		req.onupgradeneeded = () => {
+			const db = req.result;
+			if (!db.objectStoreNames.contains(KEYRING_STORE_NAME)) {
+				db.createObjectStore(KEYRING_STORE_NAME);
+			}
+		};
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error || new Error('Failed to open IndexedDB keyring'));
+	});
+}
+
+function idbGet<T>(db: IDBDatabase, key: string): Promise<T | undefined> {
+	return new Promise((resolve, reject) => {
+		const tx = db.transaction(KEYRING_STORE_NAME, 'readonly');
+		const store = tx.objectStore(KEYRING_STORE_NAME);
+		const req = store.get(key);
+		req.onsuccess = () => resolve(req.result as T | undefined);
+		req.onerror = () => reject(req.error || new Error(`Failed to get key: ${key}`));
+	});
+}
+
+function idbPut(db: IDBDatabase, key: string, value: unknown): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const tx = db.transaction(KEYRING_STORE_NAME, 'readwrite');
+		const store = tx.objectStore(KEYRING_STORE_NAME);
+		const req = store.put(value, key);
+		req.onsuccess = () => resolve();
+		req.onerror = () => reject(req.error || new Error(`Failed to put key: ${key}`));
+	});
+}
+
+async function getOrCreateMasterKek(db: IDBDatabase): Promise<CryptoKey> {
+	const existing = await idbGet<CryptoKey>(db, MASTER_KEK_ID);
+	if (existing) {
+		return existing;
+	}
+	const kek = await crypto.subtle.generateKey(
+		{ name: 'AES-GCM', length: 256 },
+		false, // non-extractable master key encryption key
+		['encrypt', 'decrypt']
+	);
+	await idbPut(db, MASTER_KEK_ID, kek);
+	return kek;
+}
+
 /**
- * Get or create the MLS DB encryption key, namespaced per-DID in sessionStorage.
- * Falls back to an unnamespaced key when no DID is known yet (pre-login init).
+ * Get or create the MLS DB encryption key with durable IndexedDB/WebCrypto key wrapping.
+ * Persists across tab/session restarts so encrypted OPFS databases are not stranded.
  */
-function getOrCreateMlsDbKey(targetDid?: string): string {
+export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
 	const did = targetDid || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
 	const storageKey = did ? didKey(did, 'mls_db_key') : 'catbird_mls_mls_db_key';
-	let key = sessionStorage.getItem(storageKey);
-	if (key) return key;
+	const wrappedStorageKey = did ? didKey(did, 'mls_db_key_wrapped') : 'catbird_mls_mls_db_key_wrapped';
 
-	const bytes = new Uint8Array(32);
-	crypto.getRandomValues(bytes);
-	key = Array.from(bytes)
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
-	sessionStorage.setItem(storageKey, key);
-	return key;
+	// 1. Check in-memory / session storage first
+	if (typeof sessionStorage !== 'undefined') {
+		const sessionKey = sessionStorage.getItem(storageKey);
+		if (sessionKey && sessionKey.length === 64) {
+			// Ensure it is also backed up in IndexedDB with WebCrypto wrapping
+			try {
+				const db = await openKeyringDb();
+				const existing = await idbGet<WrappedKeyRecord>(db, wrappedStorageKey);
+				if (!existing) {
+					const kek = await getOrCreateMasterKek(db);
+					const rawBytes = new Uint8Array(
+						sessionKey.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
+					);
+					const iv = new Uint8Array(12);
+					crypto.getRandomValues(iv);
+					const ciphertextBuffer = await crypto.subtle.encrypt(
+						{ name: 'AES-GCM', iv: iv as BufferSource },
+						kek,
+						rawBytes as BufferSource
+					);
+					await idbPut(db, wrappedStorageKey, {
+						iv,
+						ciphertext: new Uint8Array(ciphertextBuffer)
+					});
+				}
+			} catch (e) {
+				console.warn('[catmos] IndexedDB key wrapping backup notice:', e);
+			}
+			return sessionKey;
+		}
+	}
+
+	// 2. Check IndexedDB for durable wrapped key
+	try {
+		const db = await openKeyringDb();
+		const kek = await getOrCreateMasterKek(db);
+		const wrapped = await idbGet<WrappedKeyRecord>(db, wrappedStorageKey);
+		if (wrapped && wrapped.iv && wrapped.ciphertext) {
+			const decrypted = await crypto.subtle.decrypt(
+				{ name: 'AES-GCM', iv: wrapped.iv as BufferSource },
+				kek,
+				wrapped.ciphertext as BufferSource
+			);
+			const rawBytes = new Uint8Array(decrypted);
+			const keyHex = Array.from(rawBytes)
+				.map((b) => b.toString(16).padStart(2, '0'))
+				.join('');
+			if (typeof sessionStorage !== 'undefined') {
+				sessionStorage.setItem(storageKey, keyHex);
+			}
+			return keyHex;
+		}
+
+		// 3. Generate fresh 32-byte key, wrap with WebCrypto KEK, and store in IndexedDB
+		const rawBytes = new Uint8Array(32);
+		crypto.getRandomValues(rawBytes);
+		const keyHex = Array.from(rawBytes)
+			.map((b) => b.toString(16).padStart(2, '0'))
+			.join('');
+
+		const iv = new Uint8Array(12);
+		crypto.getRandomValues(iv);
+		const ciphertextBuffer = await crypto.subtle.encrypt(
+			{ name: 'AES-GCM', iv: iv as BufferSource },
+			kek,
+			rawBytes as BufferSource
+		);
+		await idbPut(db, wrappedStorageKey, {
+			iv,
+			ciphertext: new Uint8Array(ciphertextBuffer)
+		});
+
+		if (typeof sessionStorage !== 'undefined') {
+			sessionStorage.setItem(storageKey, keyHex);
+		}
+		return keyHex;
+	} catch (e) {
+		console.warn('[catmos] IndexedDB key wrapping failed, falling back to sessionStorage:', e);
+		// Graceful fallback to sessionStorage if IndexedDB is blocked
+		if (typeof sessionStorage !== 'undefined') {
+			let fallbackKey = sessionStorage.getItem(storageKey);
+			if (!fallbackKey) {
+				const bytes = new Uint8Array(32);
+				crypto.getRandomValues(bytes);
+				fallbackKey = Array.from(bytes)
+					.map((b) => b.toString(16).padStart(2, '0'))
+					.join('');
+				sessionStorage.setItem(storageKey, fallbackKey);
+			}
+			return fallbackKey;
+		}
+		const fallbackBytes = new Uint8Array(32);
+		crypto.getRandomValues(fallbackBytes);
+		return Array.from(fallbackBytes)
+			.map((b) => b.toString(16).padStart(2, '0'))
+			.join('');
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -215,16 +373,16 @@ const NEST_URL = (() => {
 
 /**
  * Initialize the WASM Worker with MLS config.
- * Generates/retrieves the MLS DB key from sessionStorage and passes it to the
- * Worker (which has no sessionStorage access).
+ * Generates/retrieves the MLS DB key (with durable WebCrypto key wrapping) and
+ * passes it to the Worker (which has no direct sessionStorage access).
  */
 export async function initWasm(did?: string): Promise<void> {
 	if (isTauri) return;
 	const w = getWorker();
 	const activeDid = did || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
-	const mlsDbKey = getOrCreateMlsDbKey(activeDid || undefined);
-	const db_prefix = activeDid ? `catbird_mls_${activeDid.replace(/[:.]/g, '_')}` : undefined;
-	await w.init({ baseUrl: NEST_URL, mlsDbKey, db_prefix });
+	const mlsDbKey = await getOrCreateMlsDbKey(activeDid || undefined);
+	const dbPrefix = activeDid ? `catbird_mls_${activeDid.replace(/[:.]/g, '_')}` : undefined;
+	await w.init({ baseUrl: NEST_URL, mlsDbKey, dbPrefix });
 }
 
 // ---------------------------------------------------------------------------
