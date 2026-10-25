@@ -23,6 +23,6 @@
     "*.js"
   ],
   "exclude": [
-    "src/service-worker"
+    "src/service-worker/**"
   ]
 }

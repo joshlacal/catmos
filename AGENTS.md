@@ -6,6 +6,10 @@ Catmos is an E2EE group messaging app on AT Protocol, available as both a Tauri 
 
 ## Build & Development
 
+Use Node 24.22.1 LTS and npm 12.2.1 (see `.node-version` and `packageManager`). SvelteKit 3 configuration lives in `vite.config.ts`; `#lib/*` imports are declared in `package.json`. TypeScript stays on 6.0.3 because the current Svelte tooling declares support through version 6.
+
+For an isolated sibling workspace whose brand docs live elsewhere, set `CATBIRD_BRAND_TOKENS` to the absolute `Catbird.pkl` path before running build/dev commands.
+
 ### Desktop (Tauri)
 
 ```bash
@@ -47,7 +51,7 @@ cd ../catbird-mls-web && ./build-dev.sh
 cd catmos && npm run dev
 ```
 
-Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through `vite.config.ts` (bundling) + `svelte.config.js` `kit.alias` (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract.
+Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through `vite.config.ts` (bundling) + the generated TypeScript config (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract.
 
 The SvelteKit frontend auto-detects Tauri vs browser at runtime via `$lib/wasm.ts`.
 
@@ -111,7 +115,7 @@ src/
     └── mls-worker.ts            # Dedicated Worker that owns the WASM instance
 ```
 
-WASM types come from `../catbird-mls-web/pkg/catbird_mls_web.d.ts` via the `kit.alias` in `svelte.config.js`.
+WASM types come from `../catbird-mls-web/pkg/catbird_mls_web.d.ts` via the `kit.alias` in `tsconfig.json`.
 
 ### Runtime Detection
 

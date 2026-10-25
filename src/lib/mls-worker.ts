@@ -18,6 +18,19 @@ const subscriptions = new Map<string, { close(): void }>();
 const plain = (v: any) => (v === undefined || v === null ? v : JSON.parse(JSON.stringify(v)));
 
 const api = {
+	// Keep background orchestration in the worker that owns the WASM instance.
+	runDeferredRecovery: async () => {
+		await wasmReady;
+		return plain(await wasm.catbird_mls_run_deferred_recovery());
+	},
+	startBackgroundTasks: async (intervalMs: number) => {
+		await wasmReady;
+		wasm.catbird_mls_start_background_tasks(intervalMs);
+	},
+	stopBackgroundTasks: async () => {
+		await wasmReady;
+		wasm.catbird_mls_stop_background_tasks();
+	},
 	// Init & auth — void returns, discard WASM internals
 	init: async (config: object) => {
 		await wasmReady;

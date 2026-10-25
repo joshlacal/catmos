@@ -1,3 +1,4 @@
+mod native_keyring;
 mod api_client;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
@@ -32,7 +33,7 @@ use tokio::sync::Mutex;
 fn get_or_create_db_key(label: &str) -> String {
     let service = "blue.catbird.catmos";
     let entry =
-        keyring::Entry::new(service, label).expect("Failed to create keyring entry for DB key");
+        crate::native_keyring::entry(service, label).expect("Failed to create keyring entry for DB key");
 
     // Try to load an existing key
     match entry.get_password() {
@@ -40,7 +41,7 @@ fn get_or_create_db_key(label: &str) -> String {
         Err(keyring::Error::NoEntry) => {
             // Generate a random 32-byte key and hex-encode it
             let mut key_bytes = [0u8; 32];
-            getrandom::getrandom(&mut key_bytes).expect("Failed to generate random DB key");
+            getrandom::fill(&mut key_bytes).expect("Failed to generate random DB key");
             let hex_key: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
             entry
                 .set_password(&hex_key)

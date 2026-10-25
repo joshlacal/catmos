@@ -33,7 +33,7 @@ impl KeyringCredentialStore {
     }
 
     fn entry(key: &str) -> std::result::Result<Entry, keyring::Error> {
-        Entry::new(SERVICE_NAME, key)
+        crate::native_keyring::entry(SERVICE_NAME, key)
     }
 
     fn key_signing(user_did: &str) -> String {

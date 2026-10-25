@@ -12,7 +12,7 @@
 //! message bodies (the threat model the field-level layer addresses).
 
 use anyhow::{anyhow, Context, Result};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -47,7 +47,7 @@ pub fn load_or_create_content_root_key(app_data_dir: &Path, user_did: &str) -> R
     }
 
     let mut buf = vec![0u8; KEY_LEN];
-    rand::thread_rng().fill_bytes(&mut buf);
+    rand::rng().fill_bytes(&mut buf);
     fs::write(&path, &buf).context("write new content root key")?;
 
     #[cfg(unix)]

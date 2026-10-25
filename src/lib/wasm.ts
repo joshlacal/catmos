@@ -16,7 +16,6 @@
 // Re-export all types from tauri.ts (canonical type definitions)
 export type {
 	Conversation,
-	ConversationMember,
 	Message,
 	ImageAttachment,
 	AudioAttachment,

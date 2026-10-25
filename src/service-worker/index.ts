@@ -1,16 +1,13 @@
-/// <reference types="@sveltejs/kit" />
-/// <reference no-default-lib="true"/>
-/// <reference lib="esnext" />
-/// <reference lib="webworker" />
-
-declare const self: ServiceWorkerGlobalScope;
-
-import { build, files, version } from '$service-worker';
+import { assets, immutable } from '$app/manifest';
+import { version } from '$app/env';
+import { self } from '$app/service-worker';
 
 const CACHE_NAME = `catmos-cache-${version}`;
 
 // App shell: built JS/CSS bundles + static assets
-const APP_SHELL = [...build, ...files];
+const APP_SHELL = [...immutable, ...assets].map(({ path }) =>
+  new URL(path, self.registration.scope).href
+);
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
