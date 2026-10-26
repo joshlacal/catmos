@@ -87,12 +87,56 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 // ---------------------------------------------------------------------------
 
 let _worker: Remote<WorkerApi> | null = null;
-let _rawWorker: Worker | null = null;
+let _rawWorker: { terminate(): void } | null = null;
+let _workerDid: string | null = null;
+let _wasmReady: Promise<void> | null = null;
+let _workerFactory: (() => { worker: Remote<WorkerApi>; rawWorker?: { terminate(): void } }) | null = null;
+
+/** Test-only hook allowing Node lifecycle tests to supply a Worker harness. */
+export function __setWorkerFactoryForTests(
+	factory: (() => { worker: Remote<WorkerApi>; rawWorker?: { terminate(): void } }) | null
+): void {
+	_workerFactory = factory;
+}
+
+/** Test-only hook returning the active worker DID and readiness state. */
+export function __getWorkerStateForTests(): {
+	hasWorker: boolean;
+	workerDid: string | null;
+	hasWasmReady: boolean;
+} {
+	return {
+		hasWorker: _worker !== null,
+		workerDid: _workerDid,
+		hasWasmReady: _wasmReady !== null
+	};
+}
+
+function terminateWorkerInstance(): void {
+	if (_rawWorker) {
+		try {
+			_rawWorker.terminate();
+		} catch (e) {
+			console.warn('[catmos] Worker termination notice:', e);
+		}
+		_rawWorker = null;
+	}
+	_worker = null;
+	_workerDid = null;
+	_wasmReady = null;
+}
 
 function getWorker(): Remote<WorkerApi> {
 	if (!_worker) {
-		_rawWorker = new Worker(new URL('./mls-worker.ts', import.meta.url), { type: 'module' });
-		_worker = wrap<WorkerApi>(_rawWorker);
+		if (_workerFactory) {
+			const created = _workerFactory();
+			_worker = created.worker;
+			_rawWorker = created.rawWorker ?? { terminate() {} };
+		} else {
+			const raw = new Worker(new URL('./mls-worker.ts', import.meta.url), { type: 'module' });
+			_rawWorker = raw;
+			_worker = wrap<WorkerApi>(raw);
+		}
 	}
 	return _worker;
 }
@@ -106,21 +150,62 @@ function getWorker(): Remote<WorkerApi> {
 //   - A non-extractable AES-GCM (256-bit) master Key Encryption Key (KEK) is
 //     persisted in IndexedDB ('catbird_mls_keyring', store 'keys').
 //   - Each per-DID MLS DB key is wrapped (encrypted with the KEK + 96-bit IV)
-//     and durably stored in IndexedDB under the namespaced key.
-//   - On session/tab restarts (when sessionStorage is empty), the wrapped key
-//     is retrieved from IndexedDB, decrypted via WebCrypto, and reloaded.
+//     and durably stored in IndexedDB under `mls_db_key_<sanitized_did>`.
+//   - Keyring writes resolve ONLY on `tx.oncomplete` and use atomic
+//     insert-if-absent (`idbPutIfAbsent`) + readback inside an exclusive Web
+//     Lock (`catmos_mls_keyring_lock`) so concurrent tabs can never clobber
+//     either the master KEK or a per-DID wrapped key.
+//   - Key restoration failures (IDB open/read/write error, transaction abort,
+//     corrupt record shape, or AES-GCM authentication failure) fail closed and
+//     NEVER generate an unretained session-only key.
 // ---------------------------------------------------------------------------
 
-const KEYRING_DB_NAME = 'catbird_mls_keyring';
-const KEYRING_STORE_NAME = 'keys';
-const MASTER_KEK_ID = '__mls_master_kek__';
+export const KEYRING_DB_NAME = 'catbird_mls_keyring';
+export const KEYRING_STORE_NAME = 'keys';
+export const MASTER_KEK_ID = '__mls_master_kek__';
+export const KEYRING_LOCK_NAME = 'catmos_mls_keyring_lock';
 
-interface WrappedKeyRecord {
+export interface WrappedKeyRecord {
 	iv: Uint8Array;
 	ciphertext: Uint8Array;
 }
 
-function openKeyringDb(): Promise<IDBDatabase> {
+/** Sanitize a DID for deterministic storage keys and database filenames. */
+export function sanitizeDid(did: string): string {
+	const trimmed = (did ?? '').trim();
+	if (!trimmed) {
+		throw new Error('Cannot derive MLS storage identity from an empty DID');
+	}
+	return trimmed.replace(/[:.]/g, '_');
+}
+
+/** Return the per-DID `dbPrefix` (`catbird_mls_<sanitized_did>`). */
+export function mlsDbPrefixForDid(did: string): string {
+	return `catbird_mls_${sanitizeDid(did)}`;
+}
+
+/** Return the per-DID SQLite database filename (`catbird_mls_<sanitized_did>-app.db`). */
+export function mlsDbFileNameForDid(did: string): string {
+	return `${mlsDbPrefixForDid(did)}-app.db`;
+}
+
+/** Return the per-DID keyring key ID (`mls_db_key_<sanitized_did>`). */
+export function mlsKeyIdForDid(did: string): string {
+	return `mls_db_key_${sanitizeDid(did)}`;
+}
+
+async function withKeyringLock<T>(fn: () => Promise<T>): Promise<T> {
+	if (
+		typeof navigator !== 'undefined' &&
+		navigator.locks &&
+		typeof navigator.locks.request === 'function'
+	) {
+		return navigator.locks.request(KEYRING_LOCK_NAME, { mode: 'exclusive' }, async () => fn());
+	}
+	return fn();
+}
+
+export function openKeyringDb(): Promise<IDBDatabase> {
 	return new Promise((resolve, reject) => {
 		if (typeof indexedDB === 'undefined') {
 			return reject(new Error('IndexedDB unavailable'));
@@ -134,149 +219,333 @@ function openKeyringDb(): Promise<IDBDatabase> {
 		};
 		req.onsuccess = () => resolve(req.result);
 		req.onerror = () => reject(req.error || new Error('Failed to open IndexedDB keyring'));
+		req.onblocked = () => reject(new Error('IndexedDB keyring open blocked'));
 	});
 }
 
-function idbGet<T>(db: IDBDatabase, key: string): Promise<T | undefined> {
+export function idbGet<T>(db: IDBDatabase, key: string): Promise<T | undefined> {
 	return new Promise((resolve, reject) => {
-		const tx = db.transaction(KEYRING_STORE_NAME, 'readonly');
+		let settled = false;
+		let result: T | undefined = undefined;
+		let hasResult = false;
+		const fail = (err: unknown) => {
+			if (settled) return;
+			settled = true;
+			reject(err instanceof Error ? err : new Error(String(err || `Failed to get key: ${key}`)));
+		};
+
+		let tx: IDBTransaction;
+		try {
+			tx = db.transaction(KEYRING_STORE_NAME, 'readonly');
+		} catch (err) {
+			fail(err);
+			return;
+		}
+
 		const store = tx.objectStore(KEYRING_STORE_NAME);
 		const req = store.get(key);
-		req.onsuccess = () => resolve(req.result as T | undefined);
-		req.onerror = () => reject(req.error || new Error(`Failed to get key: ${key}`));
+		req.onsuccess = () => {
+			result = req.result as T | undefined;
+			hasResult = true;
+		};
+		req.onerror = () => fail(req.error || new Error(`Failed to get key: ${key}`));
+		tx.onabort = () =>
+			fail(tx.error || req.error || new Error(`IndexedDB read transaction aborted for key: ${key}`));
+		tx.onerror = () =>
+			fail(tx.error || req.error || new Error(`IndexedDB read transaction error for key: ${key}`));
+		tx.oncomplete = () => {
+			if (settled) return;
+			if (!hasResult) {
+				fail(new Error(`IndexedDB read transaction completed without result for key: ${key}`));
+				return;
+			}
+			settled = true;
+			resolve(result);
+		};
 	});
 }
 
-function idbPut(db: IDBDatabase, key: string, value: unknown): Promise<void> {
+export function idbPut(db: IDBDatabase, key: string, value: unknown): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const tx = db.transaction(KEYRING_STORE_NAME, 'readwrite');
+		let settled = false;
+		let requestSucceeded = false;
+		const fail = (err: unknown) => {
+			if (settled) return;
+			settled = true;
+			reject(err instanceof Error ? err : new Error(String(err || `Failed to put key: ${key}`)));
+		};
+
+		let tx: IDBTransaction;
+		try {
+			tx = db.transaction(KEYRING_STORE_NAME, 'readwrite');
+		} catch (err) {
+			fail(err);
+			return;
+		}
+
 		const store = tx.objectStore(KEYRING_STORE_NAME);
 		const req = store.put(value, key);
-		req.onsuccess = () => resolve();
-		req.onerror = () => reject(req.error || new Error(`Failed to put key: ${key}`));
+		req.onsuccess = () => {
+			requestSucceeded = true;
+		};
+		req.onerror = () => fail(req.error || new Error(`Failed to put key: ${key}`));
+		tx.onabort = () =>
+			fail(tx.error || req.error || new Error(`IndexedDB write transaction aborted for key: ${key}`));
+		tx.onerror = () =>
+			fail(tx.error || req.error || new Error(`IndexedDB write transaction error for key: ${key}`));
+		tx.oncomplete = () => {
+			if (settled) return;
+			if (!requestSucceeded) {
+				fail(new Error(`IndexedDB write transaction completed before request succeeded for key: ${key}`));
+				return;
+			}
+			settled = true;
+			resolve();
+		};
 	});
+}
+
+/**
+ * Atomically insert `value` under `key` only if `key` is currently absent in a
+ * single `readwrite` transaction, waiting for `tx.oncomplete`, and then reading
+ * back the committed record. Never overwrites an existing key.
+ */
+export async function idbPutIfAbsent<T>(
+	db: IDBDatabase,
+	key: string,
+	value: T
+): Promise<{ value: T; inserted: boolean }> {
+	const inserted = await new Promise<boolean>((resolve, reject) => {
+		let settled = false;
+		let didInsert = false;
+		let opDone = false;
+		const fail = (err: unknown) => {
+			if (settled) return;
+			settled = true;
+			reject(
+				err instanceof Error
+					? err
+					: new Error(String(err || `Failed atomic insert-if-absent for key: ${key}`))
+			);
+		};
+
+		let tx: IDBTransaction;
+		try {
+			tx = db.transaction(KEYRING_STORE_NAME, 'readwrite');
+		} catch (err) {
+			fail(err);
+			return;
+		}
+
+		const store = tx.objectStore(KEYRING_STORE_NAME);
+		const getReq = store.get(key);
+		getReq.onerror = () => fail(getReq.error || new Error(`Failed to inspect key: ${key}`));
+		getReq.onsuccess = () => {
+			if (getReq.result !== undefined) {
+				didInsert = false;
+				opDone = true;
+				return;
+			}
+			const addReq = store.add(value, key);
+			addReq.onsuccess = () => {
+				didInsert = true;
+				opDone = true;
+			};
+			addReq.onerror = () => fail(addReq.error || new Error(`Failed to add key: ${key}`));
+		};
+
+		tx.onabort = () =>
+			fail(
+				tx.error ||
+					getReq.error ||
+					new Error(`IndexedDB atomic transaction aborted for key: ${key}`)
+			);
+		tx.onerror = () =>
+			fail(
+				tx.error ||
+					getReq.error ||
+					new Error(`IndexedDB atomic transaction error for key: ${key}`)
+			);
+		tx.oncomplete = () => {
+			if (settled) return;
+			if (!opDone) {
+				fail(new Error(`IndexedDB atomic transaction completed before operation finished for key: ${key}`));
+				return;
+			}
+			settled = true;
+			resolve(didInsert);
+		};
+	});
+
+	const committed = await idbGet<T>(db, key);
+	if (committed === undefined) {
+		throw new Error(`IndexedDB readback after commit returned undefined for key: ${key}`);
+	}
+	return { value: committed, inserted };
+}
+
+function isValidCryptoKey(value: unknown): value is CryptoKey {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		'type' in value &&
+		'extractable' in value &&
+		'algorithm' in value &&
+		'usages' in value
+	);
+}
+
+function toUint8Array(input: unknown): Uint8Array | null {
+	if (input instanceof Uint8Array) {
+		return input;
+	}
+	if (input instanceof ArrayBuffer) {
+		return new Uint8Array(input);
+	}
+	if (ArrayBuffer.isView(input)) {
+		return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+	}
+	return null;
+}
+
+function parseValidatedWrappedRecord(record: unknown, keyId: string): WrappedKeyRecord {
+	if (typeof record !== 'object' || record === null) {
+		throw new Error(`Corrupt wrapped key record for ${keyId}: expected object`);
+	}
+	const candidate = record as Record<string, unknown>;
+	const iv = toUint8Array(candidate.iv);
+	const ciphertext = toUint8Array(candidate.ciphertext);
+	if (!iv || iv.byteLength !== 12) {
+		throw new Error(`Corrupt wrapped key record for ${keyId}: invalid 12-byte AES-GCM IV`);
+	}
+	if (!ciphertext || ciphertext.byteLength !== 48) {
+		throw new Error(
+			`Corrupt wrapped key record for ${keyId}: invalid AES-GCM ciphertext length (${ciphertext?.byteLength ?? 0})`
+		);
+	}
+	return {
+		iv: new Uint8Array(iv),
+		ciphertext: new Uint8Array(ciphertext)
+	};
 }
 
 async function getOrCreateMasterKek(db: IDBDatabase): Promise<CryptoKey> {
-	const existing = await idbGet<CryptoKey>(db, MASTER_KEK_ID);
-	if (existing) {
+	const existing = await idbGet<unknown>(db, MASTER_KEK_ID);
+	if (existing !== undefined) {
+		if (!isValidCryptoKey(existing)) {
+			throw new Error('Corrupt master KEK record in IndexedDB keyring');
+		}
 		return existing;
 	}
-	const kek = await crypto.subtle.generateKey(
+
+	const candidateKek = await crypto.subtle.generateKey(
 		{ name: 'AES-GCM', length: 256 },
 		false, // non-extractable master key encryption key
 		['encrypt', 'decrypt']
 	);
-	await idbPut(db, MASTER_KEK_ID, kek);
-	return kek;
+	const { value: committedKek } = await idbPutIfAbsent<CryptoKey>(db, MASTER_KEK_ID, candidateKek);
+	if (!isValidCryptoKey(committedKek)) {
+		throw new Error('Corrupt committed master KEK record in IndexedDB keyring');
+	}
+	return committedKek;
 }
 
 /**
- * Get or create the MLS DB encryption key with durable IndexedDB/WebCrypto key wrapping.
- * Persists across tab/session restarts so encrypted OPFS databases are not stranded.
+ * Get or create the per-DID MLS DB encryption key with durable IndexedDB/WebCrypto
+ * key wrapping.
+ *
+ * Distinguishes key absence (`wrapped === undefined` on a healthy transaction)
+ * from key restoration or persistence failures (IndexedDB open/read/write error,
+ * transaction abort, corrupt record shape, or AES-GCM authentication error).
+ * Any failure throws and NEVER falls back to an unpersisted session key.
  */
 export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
-	const did = targetDid || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
-	const storageKey = did ? didKey(did, 'mls_db_key') : 'catbird_mls_mls_db_key';
-	const wrappedStorageKey = did ? didKey(did, 'mls_db_key_wrapped') : 'catbird_mls_mls_db_key_wrapped';
-
-	// 1. Check in-memory / session storage first
-	if (typeof sessionStorage !== 'undefined') {
-		const sessionKey = sessionStorage.getItem(storageKey);
-		if (sessionKey && sessionKey.length === 64) {
-			// Ensure it is also backed up in IndexedDB with WebCrypto wrapping
-			try {
-				const db = await openKeyringDb();
-				const existing = await idbGet<WrappedKeyRecord>(db, wrappedStorageKey);
-				if (!existing) {
-					const kek = await getOrCreateMasterKek(db);
-					const rawBytes = new Uint8Array(
-						sessionKey.match(/.{1,2}/g)!.map((byte) => parseInt(byte, 16))
-					);
-					const iv = new Uint8Array(12);
-					crypto.getRandomValues(iv);
-					const ciphertextBuffer = await crypto.subtle.encrypt(
-						{ name: 'AES-GCM', iv: iv as BufferSource },
-						kek,
-						rawBytes as BufferSource
-					);
-					await idbPut(db, wrappedStorageKey, {
-						iv,
-						ciphertext: new Uint8Array(ciphertextBuffer)
-					});
-				}
-			} catch (e) {
-				console.warn('[catmos] IndexedDB key wrapping backup notice:', e);
-			}
-			return sessionKey;
-		}
+	const resolvedDid = (
+		targetDid ??
+		(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null) ??
+		''
+	).trim();
+	if (!resolvedDid) {
+		throw new Error('getOrCreateMlsDbKey requires a valid authenticated DID');
 	}
 
-	// 2. Check IndexedDB for durable wrapped key
-	try {
+	const keyId = mlsKeyIdForDid(resolvedDid);
+	const legacySessionKey = didKey(resolvedDid, 'mls_db_key');
+
+	return withKeyringLock(async () => {
 		const db = await openKeyringDb();
-		const kek = await getOrCreateMasterKek(db);
-		const wrapped = await idbGet<WrappedKeyRecord>(db, wrappedStorageKey);
-		if (wrapped && wrapped.iv && wrapped.ciphertext) {
-			const decrypted = await crypto.subtle.decrypt(
-				{ name: 'AES-GCM', iv: wrapped.iv as BufferSource },
-				kek,
-				wrapped.ciphertext as BufferSource
-			);
+		try {
+			const kek = await getOrCreateMasterKek(db);
+			let wrappedRaw = await idbGet<unknown>(db, keyId);
+
+			if (wrappedRaw === undefined) {
+				// Key is genuinely absent on a healthy transaction: generate a fresh
+				// 32-byte key, wrap under the committed master KEK, and atomically
+				// insert-if-absent + read back.
+				const rawBytes = new Uint8Array(32);
+				crypto.getRandomValues(rawBytes);
+
+				const iv = new Uint8Array(12);
+				crypto.getRandomValues(iv);
+				const ciphertextBuffer = await crypto.subtle.encrypt(
+					{ name: 'AES-GCM', iv: iv as BufferSource },
+					kek,
+					rawBytes as BufferSource
+				);
+				const candidateWrapped: WrappedKeyRecord = {
+					iv,
+					ciphertext: new Uint8Array(ciphertextBuffer)
+				};
+
+				const { value: committedWrapped } = await idbPutIfAbsent<WrappedKeyRecord>(
+					db,
+					keyId,
+					candidateWrapped
+				);
+				wrappedRaw = committedWrapped;
+			}
+
+			const wrapped = parseValidatedWrappedRecord(wrappedRaw, keyId);
+			let decrypted: ArrayBuffer;
+			try {
+				decrypted = await crypto.subtle.decrypt(
+					{ name: 'AES-GCM', iv: wrapped.iv as BufferSource },
+					kek,
+					wrapped.ciphertext as BufferSource
+				);
+			} catch (err) {
+				throw new Error(
+					`Failed to unwrap durable MLS DB key for ${keyId} (AES-GCM authentication failed): ${
+						err instanceof Error ? err.message : String(err)
+					}`
+				);
+			}
+
 			const rawBytes = new Uint8Array(decrypted);
+			if (rawBytes.byteLength !== 32) {
+				throw new Error(
+					`Unwrapped MLS DB key for ${keyId} has invalid length: ${rawBytes.byteLength}`
+				);
+			}
+
 			const keyHex = Array.from(rawBytes)
 				.map((b) => b.toString(16).padStart(2, '0'))
 				.join('');
+
 			if (typeof sessionStorage !== 'undefined') {
-				sessionStorage.setItem(storageKey, keyHex);
+				sessionStorage.setItem(keyId, keyHex);
+				sessionStorage.setItem(legacySessionKey, keyHex);
 			}
+
 			return keyHex;
-		}
-
-		// 3. Generate fresh 32-byte key, wrap with WebCrypto KEK, and store in IndexedDB
-		const rawBytes = new Uint8Array(32);
-		crypto.getRandomValues(rawBytes);
-		const keyHex = Array.from(rawBytes)
-			.map((b) => b.toString(16).padStart(2, '0'))
-			.join('');
-
-		const iv = new Uint8Array(12);
-		crypto.getRandomValues(iv);
-		const ciphertextBuffer = await crypto.subtle.encrypt(
-			{ name: 'AES-GCM', iv: iv as BufferSource },
-			kek,
-			rawBytes as BufferSource
-		);
-		await idbPut(db, wrappedStorageKey, {
-			iv,
-			ciphertext: new Uint8Array(ciphertextBuffer)
-		});
-
-		if (typeof sessionStorage !== 'undefined') {
-			sessionStorage.setItem(storageKey, keyHex);
-		}
-		return keyHex;
-	} catch (e) {
-		console.warn('[catmos] IndexedDB key wrapping failed, falling back to sessionStorage:', e);
-		// Graceful fallback to sessionStorage if IndexedDB is blocked
-		if (typeof sessionStorage !== 'undefined') {
-			let fallbackKey = sessionStorage.getItem(storageKey);
-			if (!fallbackKey) {
-				const bytes = new Uint8Array(32);
-				crypto.getRandomValues(bytes);
-				fallbackKey = Array.from(bytes)
-					.map((b) => b.toString(16).padStart(2, '0'))
-					.join('');
-				sessionStorage.setItem(storageKey, fallbackKey);
+		} finally {
+			try {
+				db.close();
+			} catch {
+				// Ignore close errors
 			}
-			return fallbackKey;
 		}
-		const fallbackBytes = new Uint8Array(32);
-		crypto.getRandomValues(fallbackBytes);
-		return Array.from(fallbackBytes)
-			.map((b) => b.toString(16).padStart(2, '0'))
-			.join('');
-	}
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -367,22 +636,70 @@ const NEST_URL = (() => {
 	return 'https://api.catbird.blue';
 })();
 
+export async function bffFetch(
+	path: string,
+	init: RequestInit = {},
+	sessionId?: string
+): Promise<Response> {
+	const headers = new Headers(init.headers ?? {});
+	if (sessionId) {
+		headers.set('Authorization', `Bearer ${sessionId}`);
+	}
+	return fetch(`${NEST_URL}${path}`, {
+		...init,
+		headers
+	});
+}
+
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize the WASM Worker with MLS config.
- * Generates/retrieves the MLS DB key (with durable WebCrypto key wrapping) and
- * passes it to the Worker (which has no direct sessionStorage access).
+ * Initialize the WASM Worker with per-DID MLS config.
+ *
+ * Requires a non-empty authenticated `did` — never opens a generic
+ * `catbird-mls-app.db` with a generic key. If a Worker was already running for
+ * a different DID, terminates it and reinitializes for `did` so the Worker
+ * opens `catbird_mls_<sanitized_did>-app.db` with `mls_db_key_<sanitized_did>`.
  */
 export async function initWasm(did?: string): Promise<void> {
 	if (isTauri) return;
-	const w = getWorker();
-	const activeDid = did || (typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
-	const mlsDbKey = await getOrCreateMlsDbKey(activeDid || undefined);
-	const dbPrefix = activeDid ? `catbird_mls_${activeDid.replace(/[:.]/g, '_')}` : undefined;
-	await w.init({ baseUrl: NEST_URL, mlsDbKey, dbPrefix });
+
+	const resolvedDid = (
+		did ??
+		(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null) ??
+		''
+	).trim();
+	if (!resolvedDid) {
+		throw new Error(
+			'initWasm requires a non-empty authenticated DID; refusing to open generic un-namespaced storage'
+		);
+	}
+
+	if (_workerDid && _workerDid !== resolvedDid) {
+		terminateWorkerInstance();
+	}
+
+	if (_worker && _workerDid === resolvedDid && _wasmReady) {
+		return _wasmReady;
+	}
+
+	const runInit = (async () => {
+		try {
+			const mlsDbKey = await getOrCreateMlsDbKey(resolvedDid);
+			const dbPrefix = mlsDbPrefixForDid(resolvedDid);
+			const w = getWorker();
+			await w.init({ baseUrl: NEST_URL, mlsDbKey, dbPrefix });
+			_workerDid = resolvedDid;
+		} catch (err) {
+			terminateWorkerInstance();
+			throw err;
+		}
+	})();
+
+	_wasmReady = runInit;
+	return runInit;
 }
 
 // ---------------------------------------------------------------------------
@@ -437,13 +754,14 @@ function didKey(did: string, suffix: string): string {
 }
 
 /** Persist auth credentials in sessionStorage, namespaced by DID. */
-function persistBrowserAuth(did: string, sessionId: string): void {
+export function persistBrowserAuth(did: string, sessionId: string): void {
 	sessionStorage.setItem(SS_ACTIVE_DID, did);
 	sessionStorage.setItem(didKey(did, 'session_id'), sessionId);
 }
 
 /** Read stored session for the active DID. Returns null if nothing saved. */
-function readBrowserAuth(): { did: string; sessionId: string } | null {
+export function readBrowserAuth(): { did: string; sessionId: string } | null {
+	if (typeof sessionStorage === 'undefined') return null;
 	const did = sessionStorage.getItem(SS_ACTIVE_DID);
 	if (!did) return null;
 	const sessionId = sessionStorage.getItem(didKey(did, 'session_id'));
@@ -452,7 +770,8 @@ function readBrowserAuth(): { did: string; sessionId: string } | null {
 }
 
 /** Clear the active DID's credentials from sessionStorage. */
-function clearBrowserAuth(): void {
+export function clearBrowserAuth(): void {
+	if (typeof sessionStorage === 'undefined') return;
 	const did = sessionStorage.getItem(SS_ACTIVE_DID);
 	if (did) {
 		sessionStorage.removeItem(didKey(did, 'session_id'));
@@ -518,17 +837,22 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 	if (isTauri) {
 		return tauriInvoke('complete_login', { sessionId });
 	}
-	const resp = await fetch(`${NEST_URL}/auth/session`, {
-		headers: { Authorization: `Bearer ${sessionId}` }
-	});
+	const resp = await bffFetch('/auth/session', { method: 'GET' }, sessionId);
 	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
 	const info = await resp.json();
-	const did: string = info.did;
+	const did: string = typeof info?.did === 'string' ? info.did.trim() : '';
+	if (!did) {
+		throw new Error('Invalid session response from auth gateway: missing did');
+	}
 	const handle: string = info.handle ?? did;
 
-	// Push credentials to Worker and complete MLS activation before persisting auth
-	const w = getWorker();
 	try {
+		// 1. Persist browser auth first so active DID is established
+		persistBrowserAuth(did, sessionId);
+		// 2. Initialize WASM Worker for `did` (terminating any Worker bound to a different DID)
+		await initWasm(did);
+		// 3. Push credentials and complete MLS setup on the DID-scoped Worker
+		const w = getWorker();
 		await w.setAuth(did, sessionId);
 		// Install the per-DID content root key BEFORE setup() so the field-
 		// level encryption layer is ready for the very first message that
@@ -539,9 +863,6 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 		// Ensure key packages are available for other clients to send us Welcomes
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
-
-		// Final commit: persist session on main thread only after successful activation
-		persistBrowserAuth(did, sessionId);
 
 		return { did, handle };
 	} catch (error) {
@@ -564,11 +885,7 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 				await _worker.clearAuth();
 			}
 		} finally {
-			if (_rawWorker) {
-				_rawWorker.terminate();
-				_rawWorker = null;
-			}
-			_worker = null;
+			terminateWorkerInstance();
 		}
 		throw error;
 	}
@@ -579,13 +896,14 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
  */
 export async function setAuth(did: string, token: string): Promise<void> {
 	if (isTauri) return;
-	const w = getWorker();
 	try {
+		persistBrowserAuth(did, token);
+		await initWasm(did);
+		const w = getWorker();
 		await w.setAuth(did, token);
 		// Install the per-DID content root key after auth so the field-level
 		// encryption layer is bound before any subsequent message flow.
 		await installContentRootKey(did);
-		persistBrowserAuth(did, token);
 	} catch (error) {
 		clearBrowserAuth();
 		try {
@@ -600,11 +918,7 @@ export async function setAuth(did: string, token: string): Promise<void> {
 				await _worker.clearAuth();
 			}
 		} finally {
-			if (_rawWorker) {
-				_rawWorker.terminate();
-				_rawWorker = null;
-			}
-			_worker = null;
+			terminateWorkerInstance();
 		}
 		throw error;
 	}
@@ -746,7 +1060,8 @@ export async function submitPreparedRequest(
 export async function clearAuth(): Promise<void> {
 	if (isTauri) return;
 	clearBrowserAuth();
-	const w = getWorker();
+	if (!_worker) return;
+	const w = _worker;
 	// Drop the in-memory content root key from the WASM layer first; the
 	// localStorage entry is intentionally preserved so re-login from the
 	// same browser profile resumes the same HMAC chain seed.
@@ -766,35 +1081,41 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return null;
-	const { did, sessionId } = saved;
+	const { sessionId } = saved;
 
 	try {
-		const resp = await fetch(`${NEST_URL}/auth/session`, {
-			headers: { Authorization: `Bearer ${sessionId}` }
-		});
+		const resp = await bffFetch('/auth/session', { method: 'GET' }, sessionId);
 		if (!resp.ok) {
 			if (resp.status === 401 || resp.status === 403) {
 				clearBrowserAuth();
+				terminateWorkerInstance();
 				return null;
 			}
 			throw new Error(`Failed to restore session: ${resp.status}`);
 		}
 		const info = await resp.json();
+		const restoredDid: string = typeof info?.did === 'string' ? info.did.trim() : '';
+		if (!restoredDid) {
+			throw new Error('Invalid restored session response: missing did');
+		}
+
+		persistBrowserAuth(restoredDid, sessionId);
+		await initWasm(restoredDid);
 
 		// Push restored credentials to Worker
 		const w = getWorker();
-		await w.setAuth(info.did, sessionId);
+		await w.setAuth(restoredDid, sessionId);
 		// Restore the per-DID content root key from localStorage (or
 		// generate one if first restore on this profile) so the field-
 		// level encryption layer can read pre-existing sealed rows.
-		await installContentRootKey(info.did);
+		await installContentRootKey(restoredDid);
 		await w.setup();
 
 		// Replenish key packages (setup skips upload on returning sessions)
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
 
-		return { did: info.did, handle: info.handle ?? info.did };
+		return { did: restoredDid, handle: info.handle ?? restoredDid };
 	} catch (error) {
 		if (_replenishInterval) {
 			clearInterval(_replenishInterval);
@@ -813,11 +1134,7 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 				await _worker.clearAuth();
 			}
 		} finally {
-			if (_rawWorker) {
-				_rawWorker.terminate();
-				_rawWorker = null;
-			}
-			_worker = null;
+			terminateWorkerInstance();
 		}
 		throw error;
 	}
@@ -835,7 +1152,7 @@ export async function logout(): Promise<void> {
 		_replenishInterval = null;
 	}
 
-	// Clear auth in worker, then terminate it
+	// Clear auth in worker, then terminate it and reset wasmReady/worker state
 	try {
 		if (_worker) {
 			try {
@@ -848,11 +1165,7 @@ export async function logout(): Promise<void> {
 			await _worker.clearAuth();
 		}
 	} finally {
-		if (_rawWorker) {
-			_rawWorker.terminate();
-			_rawWorker = null;
-		}
-		_worker = null;
+		terminateWorkerInstance();
 	}
 }
 

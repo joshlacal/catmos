@@ -1,157 +1,627 @@
 import assert from 'node:assert';
 import crypto from 'node:crypto';
 
-// Test the WebCrypto non-extractable KEK and IndexedDB-backed durable key wrapping
-// architecture implemented in catmos/src/lib/wasm.ts to ensure encrypted OPFS
-// databases persist across tab/session restarts without stranding ciphertext.
-
-async function runPersistenceSuite() {
-	console.log('--- Running Browser Worker/OPFS Key Lifecycle Persistence Tests ---');
-
-	const subtle = crypto.webcrypto.subtle;
-
-	// In-memory simulated durable IndexedDB keyring store
-	const indexedDbStorage = new Map();
-	// In-memory simulated ephemeral sessionStorage (wiped on restart)
-	let sessionStorage = new Map();
-
-	const MASTER_KEK_ID = '__mls_master_kek__';
-
-	async function getOrCreateMasterKek() {
-		if (indexedDbStorage.has(MASTER_KEK_ID)) {
-			return indexedDbStorage.get(MASTER_KEK_ID);
-		}
-		const kek = await subtle.generateKey(
-			{ name: 'AES-GCM', length: 256 },
-			false, // non-extractable
-			['encrypt', 'decrypt']
-		);
-		indexedDbStorage.set(MASTER_KEK_ID, kek);
-		return kek;
-	}
-
-	async function getOrCreateMlsDbKey(targetDid) {
-		const storageKey = targetDid ? `catbird_mls_${targetDid}_mls_db_key` : 'catbird_mls_mls_db_key';
-		const wrappedStorageKey = targetDid ? `catbird_mls_${targetDid}_mls_db_key_wrapped` : 'catbird_mls_mls_db_key_wrapped';
-
-		// 1. Check ephemeral sessionStorage
-		if (sessionStorage.has(storageKey)) {
-			const sessionKey = sessionStorage.get(storageKey);
-			if (sessionKey && sessionKey.length === 64) {
-				return sessionKey;
-			}
-		}
-
-		// 2. Check durable storage for wrapped key
-		const kek = await getOrCreateMasterKek();
-		if (indexedDbStorage.has(wrappedStorageKey)) {
-			const wrapped = indexedDbStorage.get(wrappedStorageKey);
-			const decrypted = await subtle.decrypt(
-				{ name: 'AES-GCM', iv: wrapped.iv },
-				kek,
-				wrapped.ciphertext
-			);
-			const rawBytes = new Uint8Array(decrypted);
-			const keyHex = Array.from(rawBytes)
-				.map((b) => b.toString(16).padStart(2, '0'))
-				.join('');
-			sessionStorage.set(storageKey, keyHex);
-			return keyHex;
-		}
-
-		// 3. Generate fresh 32-byte key, wrap with non-extractable WebCrypto KEK, and store in durable storage
-		const rawBytes = new Uint8Array(32);
-		crypto.webcrypto.getRandomValues(rawBytes);
-		const keyHex = Array.from(rawBytes)
-			.map((b) => b.toString(16).padStart(2, '0'))
-			.join('');
-
-		const iv = new Uint8Array(12);
-		crypto.webcrypto.getRandomValues(iv);
-		const ciphertextBuffer = await subtle.encrypt(
-			{ name: 'AES-GCM', iv },
-			kek,
-			rawBytes
-		);
-		indexedDbStorage.set(wrappedStorageKey, {
-			iv,
-			ciphertext: new Uint8Array(ciphertextBuffer)
-		});
-
-		sessionStorage.set(storageKey, keyHex);
-		return keyHex;
-	}
-
-	// Test Case 1: First session initializes key and writes wrapped record
-	const didAlice = 'did:plc:alice1234';
-	const aliceKeySession1 = await getOrCreateMlsDbKey(didAlice);
-	assert.strictEqual(aliceKeySession1.length, 64, 'Generated key must be 64 hex characters (32 bytes / 256 bits)');
-	assert.strictEqual(typeof aliceKeySession1, 'string');
-	assert.strictEqual(sessionStorage.get(`catbird_mls_${didAlice}_mls_db_key`), aliceKeySession1, 'Plaintext key cached in sessionStorage for Worker handover');
-	assert(indexedDbStorage.has(`catbird_mls_${didAlice}_mls_db_key_wrapped`), 'Wrapped key record must exist in durable storage');
-
-	const wrappedRecord = indexedDbStorage.get(`catbird_mls_${didAlice}_mls_db_key_wrapped`);
-	assert.strictEqual(wrappedRecord.iv.length, 12, 'AES-GCM IV must be 12 bytes');
-	assert.strictEqual(wrappedRecord.ciphertext.length, 32 + 16, 'AES-GCM ciphertext must be 32 bytes + 16 bytes auth tag');
-
-	// Verify master KEK is non-extractable
-	const kek = indexedDbStorage.get(MASTER_KEK_ID);
-	assert.strictEqual(kek.extractable, false, 'Master KEK must be non-extractable');
-	let exportFailed = false;
-	try {
-		await subtle.exportKey('raw', kek);
-	} catch (e) {
-		exportFailed = true;
-	}
-	assert(exportFailed, 'Attempt to export non-extractable Master KEK must throw an error');
-	console.log('✓ Test 1: First session generated 256-bit key, wrapped with non-extractable KEK, and saved to durable store.');
-
-	// Test Case 2: Simulate Browser / Tab Restart (sessionStorage is cleared, durable storage remains)
-	sessionStorage = new Map(); // Simulate restart
-	assert.strictEqual(sessionStorage.size, 0, 'sessionStorage must be empty after restart');
-
-	const aliceKeySession2 = await getOrCreateMlsDbKey(didAlice);
-	assert.strictEqual(aliceKeySession2, aliceKeySession1, 'Session 2 MUST recover the exact same key as Session 1 across restart');
-	console.log('✓ Test 2: Simulated browser restart restored identical key from durable storage without stranding ciphertext.');
-
-	// Test Case 3: Per-DID Isolation
-	const didBob = 'did:plc:bob5678';
-	const bobKeySession1 = await getOrCreateMlsDbKey(didBob);
-	assert.strictEqual(bobKeySession1.length, 64);
-	assert.notStrictEqual(bobKeySession1, aliceKeySession1, 'Bob and Alice MUST have distinct isolated encryption keys');
-	console.log('✓ Test 3: Multiple DIDs have isolated, non-colliding keys.');
-
-	// Test Case 4: Re-simulating restart for Bob recovers Bob key
-	sessionStorage = new Map();
-	const bobKeySession2 = await getOrCreateMlsDbKey(didBob);
-	assert.strictEqual(bobKeySession2, bobKeySession1, 'Bob key recovered across restart');
-	const aliceKeySession3 = await getOrCreateMlsDbKey(didAlice);
-	assert.strictEqual(aliceKeySession3, aliceKeySession1, 'Alice key recovered across restart');
-	console.log('✓ Test 4: Both Bob and Alice keys recover independently after restart.');
-
-	// Test Case 5: Tampered ciphertext fails decryption
-	const tamperedRecord = {
-		iv: wrappedRecord.iv,
-		ciphertext: new Uint8Array(wrappedRecord.ciphertext)
-	};
-	tamperedRecord.ciphertext[0] ^= 0xff; // Flip bits
-	let decryptFailed = false;
-	try {
-		await subtle.decrypt(
-			{ name: 'AES-GCM', iv: tamperedRecord.iv },
-			kek,
-			tamperedRecord.ciphertext
-		);
-	} catch (e) {
-		decryptFailed = true;
-	}
-	assert(decryptFailed, 'Decryption of tampered ciphertext must fail authentication');
-	console.log('✓ Test 5: AES-GCM authentication prevents tampering or corrupted key restoration.');
-
-	console.log('\nAll 5 browser Worker/OPFS key lifecycle persistence tests PASSED successfully.');
+if (!globalThis.crypto) {
+	globalThis.crypto = crypto.webcrypto;
 }
 
-runPersistenceSuite().catch((err) => {
-	console.error('Persistence test failed:', err);
+// ---------------------------------------------------------------------------
+// Spec-accurate IndexedDB + WebStorage + Web Locks test harness for Node.js
+// Exercises the ACTUAL production functions imported from ../src/lib/wasm.ts
+// and ../src/lib/stores/tab-lock.ts (not reimplemented copies).
+// ---------------------------------------------------------------------------
+
+class MemoryStorage {
+	#map = new Map();
+	getItem(k) {
+		return this.#map.has(k) ? this.#map.get(k) : null;
+	}
+	setItem(k, v) {
+		this.#map.set(String(k), String(v));
+	}
+	removeItem(k) {
+		this.#map.delete(String(k));
+	}
+	clear() {
+		this.#map.clear();
+	}
+	get size() {
+		return this.#map.size;
+	}
+}
+
+function createIndexedDbHarness() {
+	/** @type {Map<string, Map<string, Map<string, any>>>} */
+	const databases = new Map();
+	/** @type {Promise<void>} */
+	let writeQueue = Promise.resolve();
+	let abortNextWriteAfterReqSuccess = false;
+	let failOpen = false;
+
+	function makeRequest() {
+		return {
+			result: undefined,
+			error: null,
+			onsuccess: null,
+			onerror: null
+		};
+	}
+
+	const indexedDB = {
+		open(dbName, _version) {
+			const req = {
+				result: undefined,
+				error: null,
+				onupgradeneeded: null,
+				onsuccess: null,
+				onerror: null,
+				onblocked: null
+			};
+
+			queueMicrotask(() => {
+				if (failOpen) {
+					req.error = new Error('Simulated IndexedDB open failure');
+					req.onerror?.();
+					return;
+				}
+
+				let isNew = false;
+				if (!databases.has(dbName)) {
+					databases.set(dbName, new Map());
+					isNew = true;
+				}
+				const stores = databases.get(dbName);
+
+				const db = {
+					objectStoreNames: {
+						contains(name) {
+							return stores.has(name);
+						}
+					},
+					createObjectStore(name) {
+						if (!stores.has(name)) {
+							stores.set(name, new Map());
+						}
+						return {};
+					},
+					close() {},
+					transaction(storeName, mode = 'readonly') {
+						if (!stores.has(storeName)) {
+							throw new Error(`Object store ${storeName} not found`);
+						}
+						const backingStore = stores.get(storeName);
+						const tx = {
+							mode,
+							error: null,
+							oncomplete: null,
+							onabort: null,
+							onerror: null,
+							objectStore(_name) {
+								return storeApi;
+							}
+						};
+
+						/** @type {Array<() => void>} */
+						const ops = [];
+						let scheduled = false;
+
+						function scheduleTx() {
+							if (scheduled) return;
+							scheduled = true;
+
+							const runTx = async () => {
+								// Allow synchronous request setup inside the caller before running ops
+								await new Promise((r) => queueMicrotask(r));
+								const stagedWrites = new Map();
+								let aborted = false;
+								let shouldAbortAfterSuccess =
+									mode === 'readwrite' && abortNextWriteAfterReqSuccess;
+								if (shouldAbortAfterSuccess) {
+									abortNextWriteAfterReqSuccess = false;
+								}
+
+								for (let i = 0; i < ops.length; i++) {
+									ops[i]({
+										backingStore,
+										stagedWrites,
+										abort(err) {
+											aborted = true;
+											tx.error = err;
+										}
+									});
+									await new Promise((r) => queueMicrotask(r));
+									if (aborted) break;
+								}
+
+								if (aborted) {
+									tx.onabort?.();
+									return;
+								}
+
+								if (shouldAbortAfterSuccess) {
+									tx.error = new Error('Simulated QuotaExceededError on transaction commit');
+									tx.onabort?.();
+									return;
+								}
+
+								for (const [k, v] of stagedWrites.entries()) {
+									backingStore.set(k, v);
+								}
+								tx.oncomplete?.();
+							};
+
+							if (mode === 'readwrite') {
+								writeQueue = writeQueue.then(runTx, runTx);
+							} else {
+								void runTx();
+							}
+						}
+
+						const storeApi = {
+							get(key) {
+								const r = makeRequest();
+								ops.push(({ backingStore: bs, stagedWrites }) => {
+									r.result = stagedWrites.has(key) ? stagedWrites.get(key) : bs.get(key);
+									r.onsuccess?.();
+								});
+								scheduleTx();
+								return r;
+							},
+							put(value, key) {
+								const r = makeRequest();
+								ops.push(({ stagedWrites }) => {
+									stagedWrites.set(key, value);
+									r.result = key;
+									r.onsuccess?.();
+								});
+								scheduleTx();
+								return r;
+							},
+							add(value, key) {
+								const r = makeRequest();
+								ops.push(({ backingStore: bs, stagedWrites, abort }) => {
+									const exists = stagedWrites.has(key) || bs.has(key);
+									if (exists) {
+										const err = new Error(`ConstraintError: Key already exists: ${key}`);
+										r.error = err;
+										r.onerror?.();
+										abort(err);
+										return;
+									}
+									stagedWrites.set(key, value);
+									r.result = key;
+									r.onsuccess?.();
+								});
+								scheduleTx();
+								return r;
+							}
+						};
+
+						return tx;
+					}
+				};
+
+				req.result = db;
+				if (isNew) {
+					req.onupgradeneeded?.();
+				}
+				req.onsuccess?.();
+			});
+
+			return req;
+		}
+	};
+
+	return {
+		indexedDB,
+		databases,
+		getRawStore(dbName, storeName) {
+			return databases.get(dbName)?.get(storeName);
+		},
+		setAbortNextWriteAfterReqSuccess(v) {
+			abortNextWriteAfterReqSuccess = v;
+		},
+		setFailOpen(v) {
+			failOpen = v;
+		}
+	};
+}
+
+function createWebLocksHarness() {
+	/** @type {Map<string, Promise<void>>} */
+	const heldLocks = new Map();
+
+	return {
+		async request(name, optionsOrCallback, maybeCallback) {
+			const options = typeof optionsOrCallback === 'function' ? {} : optionsOrCallback;
+			const callback =
+				typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback;
+
+			if (options.ifAvailable) {
+				if (heldLocks.has(name)) {
+					return callback(null);
+				}
+				let release;
+				const held = new Promise((r) => {
+					release = r;
+				});
+				heldLocks.set(name, held);
+				try {
+					return await callback({ name, mode: 'exclusive' });
+				} finally {
+					heldLocks.delete(name);
+					release();
+				}
+			}
+
+			while (heldLocks.has(name) && !options.steal) {
+				await heldLocks.get(name);
+			}
+			let release;
+			const held = new Promise((r) => {
+				release = r;
+			});
+			heldLocks.set(name, held);
+			try {
+				return await callback({ name, mode: 'exclusive' });
+			} finally {
+				if (heldLocks.get(name) === held) {
+					heldLocks.delete(name);
+				}
+				release();
+			}
+		}
+	};
+}
+
+async function runSuite() {
+	console.log('--- Running Production Browser Worker/OPFS Key & Lifecycle Verification ---');
+
+	const idbHarness = createIndexedDbHarness();
+	globalThis.indexedDB = idbHarness.indexedDB;
+	globalThis.sessionStorage = new MemoryStorage();
+	globalThis.localStorage = new MemoryStorage();
+
+	const wasm = await import('../src/lib/wasm.ts');
+	const { acquireTabLock } = await import('../src/lib/stores/tab-lock.ts');
+
+	const didAlice = 'did:plc:alice1234';
+	const didBob = 'did:plc:bob5678';
+
+	// -----------------------------------------------------------------------
+	// Test 1: F9 — idbPut & idbPutIfAbsent wait for tx.oncomplete and reject on tx.onabort
+	// -----------------------------------------------------------------------
+	{
+		const db = await wasm.openKeyringDb();
+		let putResolvedBeforeComplete = true;
+		idbHarness.setAbortNextWriteAfterReqSuccess(true);
+		await assert.rejects(
+			async () => {
+				await wasm.idbPut(db, 'test_abort_key', { hello: 'world' });
+				putResolvedBeforeComplete = false;
+			},
+			/Simulated QuotaExceededError|aborted/,
+			'idbPut must reject when transaction aborts after req.onsuccess'
+		);
+		assert.strictEqual(putResolvedBeforeComplete, true);
+		assert.strictEqual(
+			await wasm.idbGet(db, 'test_abort_key'),
+			undefined,
+			'Aborted transaction must not commit key'
+		);
+
+		idbHarness.setAbortNextWriteAfterReqSuccess(true);
+		await assert.rejects(
+			async () => {
+				await wasm.idbPutIfAbsent(db, 'test_abort_atomic_key', { hello: 'atomic' });
+			},
+			/Simulated QuotaExceededError|aborted/,
+			'idbPutIfAbsent must reject when transaction aborts after req.onsuccess'
+		);
+		db.close();
+		console.log('✓ Test 1 (F9): idbPut and idbPutIfAbsent resolve only on tx.oncomplete and reject on tx.onabort.');
+	}
+
+	// -----------------------------------------------------------------------
+	// Test 2: F6 — Concurrent two-tab initialization does not overwrite MASTER_KEK_ID or per-DID key
+	// -----------------------------------------------------------------------
+	{
+		// First test direct IndexedDB transaction concurrency WITHOUT navigator.locks
+		// so both callers race directly into idbPutIfAbsent.
+		delete globalThis.navigator;
+		const [tab1Key, tab2Key] = await Promise.all([
+			wasm.getOrCreateMlsDbKey(didAlice),
+			wasm.getOrCreateMlsDbKey(didAlice)
+		]);
+		assert.strictEqual(tab1Key.length, 64, 'Generated key must be 64 hex chars');
+		assert.strictEqual(
+			tab1Key,
+			tab2Key,
+			'Concurrent tabs racing on empty keyring must converge on the exact same MLS DB key'
+		);
+
+		const store = idbHarness.getRawStore(wasm.KEYRING_DB_NAME, wasm.KEYRING_STORE_NAME);
+		const kekAfterRace = store.get(wasm.MASTER_KEK_ID);
+		const wrappedAfterRace = store.get(wasm.mlsKeyIdForDid(didAlice));
+		assert(kekAfterRace, 'Master KEK must be durably stored');
+		assert.strictEqual(kekAfterRace.extractable, false, 'Master KEK must be non-extractable');
+		assert(wrappedAfterRace, 'Wrapped per-DID key must be durably stored under mls_db_key_<sanitized_did>');
+
+		// Now enable Web Locks and verify concurrent calls with navigator.locks also preserve the exact key
+		globalThis.navigator = { locks: createWebLocksHarness() };
+		globalThis.sessionStorage.clear();
+		const [lockedTab1Key, lockedTab2Key] = await Promise.all([
+			wasm.getOrCreateMlsDbKey(didAlice),
+			wasm.getOrCreateMlsDbKey(didAlice)
+		]);
+		assert.strictEqual(lockedTab1Key, tab1Key, 'Reopened tabs must unwrap the original durable key');
+		assert.strictEqual(lockedTab2Key, tab1Key, 'Second locked tab must unwrap the original durable key');
+		assert.strictEqual(
+			store.get(wasm.MASTER_KEK_ID),
+			kekAfterRace,
+			'Master KEK must never be overwritten by subsequent tabs'
+		);
+		console.log('✓ Test 2 (F6): Concurrent two-tab initialization atomically preserves MASTER_KEK_ID and per-DID wrapped key.');
+	}
+
+	// -----------------------------------------------------------------------
+	// Test 3: F8 — Tampered ciphertext, corrupt record, or IDB failure fails closed (no temporary key fallback)
+	// -----------------------------------------------------------------------
+	{
+		const store = idbHarness.getRawStore(wasm.KEYRING_DB_NAME, wasm.KEYRING_STORE_NAME);
+		const keyId = wasm.mlsKeyIdForDid(didAlice);
+		const originalRecord = store.get(keyId);
+
+		// Tamper with ciphertext even while sessionStorage still has the valid cached key
+		const tamperedCiphertext = new Uint8Array(originalRecord.ciphertext);
+		tamperedCiphertext[0] ^= 0xff;
+		store.set(keyId, {
+			iv: new Uint8Array(originalRecord.iv),
+			ciphertext: tamperedCiphertext
+		});
+
+		await assert.rejects(
+			() => wasm.getOrCreateMlsDbKey(didAlice),
+			/AES-GCM authentication failed/,
+			'Tampered ciphertext must reject and never return a cached or temporary session key'
+		);
+
+		// Corrupt record shape
+		store.set(keyId, { iv: new Uint8Array(4), ciphertext: new Uint8Array(10) });
+		await assert.rejects(
+			() => wasm.getOrCreateMlsDbKey(didAlice),
+			/Corrupt wrapped key record/,
+			'Corrupt wrapped key record shape must reject'
+		);
+
+		// Restore valid record and test IndexedDB open failure
+		store.set(keyId, originalRecord);
+		idbHarness.setFailOpen(true);
+		await assert.rejects(
+			() => wasm.getOrCreateMlsDbKey(didAlice),
+			/Simulated IndexedDB open failure/,
+			'IndexedDB failure must reject and never generate an unretained random session key'
+		);
+		idbHarness.setFailOpen(false);
+		console.log('✓ Test 3 (F8): Tampered ciphertext, corrupt records, and IDB errors fail closed without generating temporary keys.');
+	}
+
+	// -----------------------------------------------------------------------
+	// Test 4: F5 — Tab lock gating & OPFS sahpool init failure fail-closed behavior
+	// -----------------------------------------------------------------------
+	{
+		globalThis.navigator = { locks: createWebLocksHarness() };
+		const statusesTab1 = [];
+		const statusesTab2 = [];
+
+		const lock1 = acquireTabLock((s) => statusesTab1.push(s));
+		const status1 = await lock1.ready;
+		assert.strictEqual(status1, 'granted', 'First tab must acquire the exclusive tab lock');
+
+		const lock2 = acquireTabLock((s) => statusesTab2.push(s));
+		const status2 = await lock2.ready;
+		assert.strictEqual(status2, 'blocked', 'Second concurrent tab must be blocked before WASM init');
+
+		// Unauthenticated initWasm() without DID must fail closed
+		globalThis.sessionStorage.clear();
+		await assert.rejects(
+			() => wasm.initWasm(),
+			/requires a non-empty authenticated DID/,
+			'Unauthenticated initWasm() must reject instead of opening generic catbird-mls-app.db'
+		);
+
+		// Simulate OPFS sahpool failure inside Worker.init
+		wasm.__setWorkerFactoryForTests(() => ({
+			worker: /** @type {any} */ ({
+				async init() {
+					throw new Error(
+						'OPFS sahpool initialization failed (persistent storage unavailable or locked by another tab)'
+					);
+				}
+			}),
+			rawWorker: { terminate() {} }
+		}));
+
+		await assert.rejects(
+			() => wasm.initWasm(didAlice),
+			/OPFS sahpool initialization failed/,
+			'OPFS sahpool failure must reject initWasm and never fall back to volatile memvfs'
+		);
+		assert.strictEqual(
+			wasm.__getWorkerStateForTests().hasWorker,
+			false,
+			'Failed initWasm must terminate Worker and reset readiness state'
+		);
+		console.log('✓ Test 4 (F5): Tab lock blocks second tab, unauthenticated initWasm rejects, and OPFS sahpool failure fails closed.');
+	}
+
+	// -----------------------------------------------------------------------
+	// Test 5: F7 — Login -> Reload -> Logout -> Re-login -> Account Switch
+	// Verifies identical DB filename (catbird_mls_<sanitized_did>-app.db),
+	// identical key ID (mls_db_key_<sanitized_did>), and persistent OPFS data survival.
+	// -----------------------------------------------------------------------
+	{
+		globalThis.sessionStorage.clear();
+		globalThis.localStorage.clear();
+
+		/** Simulated OPFS persistent encrypted SQLite store keyed by dbFileName */
+		const opfsDatabases = new Map();
+		/** @type {Array<{ dbFileName: string; mlsDbKey: string; did: string | null }>} */
+		const workerInitLog = [];
+		let activeSessionDid = didAlice;
+		let workerTerminatedCount = 0;
+
+		globalThis.fetch = async (url, init) => {
+			const urlStr = String(url);
+			if (urlStr.endsWith('/auth/session')) {
+				const authHeader = new Headers(init?.headers).get('Authorization');
+				if (!authHeader || !authHeader.startsWith('Bearer ')) {
+					return new Response('Unauthorized', { status: 401 });
+				}
+				return new Response(
+					JSON.stringify({
+						did: activeSessionDid,
+						handle: activeSessionDid === didAlice ? 'alice.bsky.social' : 'bob.bsky.social'
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			}
+			return new Response('{}', { status: 200 });
+		};
+
+		wasm.__setWorkerFactoryForTests(() => {
+			let currentDbFile = null;
+			let currentDbKey = null;
+			let currentDid = null;
+
+			return {
+				worker: /** @type {any} */ ({
+					async init(cfg) {
+						currentDbFile = `${cfg.dbPrefix}-app.db`;
+						currentDbKey = cfg.mlsDbKey;
+						if (!opfsDatabases.has(currentDbFile)) {
+							opfsDatabases.set(currentDbFile, {
+								key: currentDbKey,
+								credentials: null,
+								groups: []
+							});
+						} else {
+							const existingDb = opfsDatabases.get(currentDbFile);
+							assert.strictEqual(
+								existingDb.key,
+								currentDbKey,
+								`Reopened OPFS DB ${currentDbFile} must receive the exact same encryption key`
+							);
+						}
+						workerInitLog.push({
+							dbFileName: currentDbFile,
+							mlsDbKey: currentDbKey,
+							did: currentDid
+						});
+					},
+					async setAuth(did, _token) {
+						currentDid = did;
+						const expectedDbFile = wasm.mlsDbFileNameForDid(did);
+						assert.strictEqual(
+							currentDbFile,
+							expectedDbFile,
+							`setAuth(${did}) must run against ${expectedDbFile}, got ${currentDbFile}`
+						);
+					},
+					async setContentRootKey(_key) {},
+					async clearContentRootKey() {},
+					async clearAuth() {
+						currentDid = null;
+					},
+					async setup() {
+						const db = opfsDatabases.get(currentDbFile);
+						assert(db, 'OPFS DB must be initialized before setup()');
+						if (!db.credentials) {
+							db.credentials = `cred:${currentDid}`;
+							db.groups.push(`group:welcome:${currentDid}`);
+						}
+					},
+					async replenishKeyPackages() {}
+				}),
+				rawWorker: {
+					terminate() {
+						workerTerminatedCount += 1;
+					}
+				}
+			};
+		});
+
+		const expectedAliceDb = 'catbird_mls_did_plc_alice1234-app.db';
+		const expectedAliceKeyId = 'mls_db_key_did_plc_alice1234';
+		assert.strictEqual(wasm.mlsDbFileNameForDid(didAlice), expectedAliceDb);
+		assert.strictEqual(wasm.mlsKeyIdForDid(didAlice), expectedAliceKeyId);
+
+		// Step A: First login on fresh browser tab (no prior sessionStorage)
+		const loginUser = await wasm.completeLogin('session-alice-1');
+		assert.strictEqual(loginUser.did, didAlice);
+		assert.strictEqual(workerInitLog.length, 1);
+		assert.strictEqual(workerInitLog[0].dbFileName, expectedAliceDb);
+		const aliceKey1 = workerInitLog[0].mlsDbKey;
+		assert.strictEqual(globalThis.sessionStorage.getItem(expectedAliceKeyId), aliceKey1);
+		assert.deepStrictEqual(opfsDatabases.get(expectedAliceDb).groups, [`group:welcome:${didAlice}`]);
+
+		// Step B: Simulate page reload (Worker is recreated, sessionStorage retains active auth)
+		await wasm.logout(); // terminate worker to simulate page unload, then restore sessionStorage
+		wasm.persistBrowserAuth(didAlice, 'session-alice-1');
+		// Simulate +layout.svelte on reload: savedAuth.did is present -> initWasm(savedAuth.did) -> tryRestoreSession()
+		await wasm.initWasm(didAlice);
+		const restoredUser = await wasm.tryRestoreSession();
+		assert.strictEqual(restoredUser?.did, didAlice);
+		assert.strictEqual(workerInitLog.length, 2, 'initWasm + tryRestoreSession on reload must initialize Worker once for Alice');
+		assert.strictEqual(workerInitLog[1].dbFileName, expectedAliceDb);
+		assert.strictEqual(workerInitLog[1].mlsDbKey, aliceKey1);
+		assert.strictEqual(
+			opfsDatabases.get(expectedAliceDb).credentials,
+			`cred:${didAlice}`,
+			'Credentials written on first login must survive reload in the same DB'
+		);
+
+		// Step C: Logout -> Worker terminated and sessionStorage cleared
+		const termBeforeLogout = workerTerminatedCount;
+		await wasm.logout();
+		assert.strictEqual(workerTerminatedCount, termBeforeLogout + 1, 'logout() must terminate active Worker');
+		assert.strictEqual(wasm.readBrowserAuth(), null, 'logout() must clear browser auth');
+		assert.strictEqual(wasm.__getWorkerStateForTests().hasWorker, false);
+
+		// Step D: Re-login as Alice -> opens identical DB and key
+		const reloginUser = await wasm.completeLogin('session-alice-2');
+		assert.strictEqual(reloginUser.did, didAlice);
+		assert.strictEqual(workerInitLog.length, 3);
+		assert.strictEqual(workerInitLog[2].dbFileName, expectedAliceDb);
+		assert.strictEqual(workerInitLog[2].mlsDbKey, aliceKey1);
+		assert.deepStrictEqual(
+			opfsDatabases.get(expectedAliceDb).groups,
+			[`group:welcome:${didAlice}`],
+			'Group history must survive logout and re-login'
+		);
+
+		// Step E: Login as Bob while Alice Worker was active -> terminates Alice Worker and opens Bob DB
+		activeSessionDid = didBob;
+		const expectedBobDb = 'catbird_mls_did_plc_bob5678-app.db';
+		const bobUser = await wasm.completeLogin('session-bob-1');
+		assert.strictEqual(bobUser.did, didBob);
+		assert.strictEqual(workerInitLog.length, 4);
+		assert.strictEqual(workerInitLog[3].dbFileName, expectedBobDb);
+		assert.notStrictEqual(workerInitLog[3].mlsDbKey, aliceKey1, 'Bob must use an isolated per-DID key');
+		assert(
+			!opfsDatabases.has('catbird-mls-app.db'),
+			'Generic un-namespaced catbird-mls-app.db must NEVER be opened'
+		);
+
+		await wasm.logout();
+		wasm.__setWorkerFactoryForTests(null);
+		console.log('✓ Test 5 (F7): First login, reload, logout/re-login, and account switch all use catbird_mls_<DID>-app.db and mls_db_key_<DID>.');
+	}
+
+	console.log('\nAll 5 production browser Worker/OPFS key & lifecycle verification suites PASSED.');
+}
+
+runSuite().catch((err) => {
+	console.error('Verification suite failed:', err);
 	process.exit(1);
 });

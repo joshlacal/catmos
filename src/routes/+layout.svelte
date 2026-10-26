@@ -5,7 +5,7 @@
 	import TabBlockedMessage from '#lib/components/TabBlockedMessage.svelte';
 	import { auth } from '#lib/stores/auth.ts';
 	import { selectedConversation } from '#lib/stores/conversations.ts';
-	import { isTauri, initWasm } from '#lib/wasm.ts';
+	import { isTauri, initWasm, readBrowserAuth } from '#lib/wasm.ts';
 	import { acquireTabLock, type TabLockStatus } from '#lib/stores/tab-lock.ts';
 
 	let { children } = $props();
@@ -57,6 +57,22 @@
 		}
 	}
 
+	let tabSessionBootstrapped = false;
+
+	async function bootstrapTabSession() {
+		if (tabSessionBootstrapped) return;
+		tabSessionBootstrapped = true;
+
+		if (!isTauri) {
+			const savedAuth = readBrowserAuth();
+			if (savedAuth?.did) {
+				await initWasm(savedAuth.did);
+			}
+		}
+
+		await auth.tryRestore();
+	}
+
 	onMount(async () => {
 		// Restore theme preference
 		const saved = localStorage.getItem('catmos-theme') as 'light' | 'dark' | null;
@@ -74,19 +90,28 @@
 		window.addEventListener('keydown', handleGlobalKeydown);
 		cleanupKeydown = () => window.removeEventListener('keydown', handleGlobalKeydown);
 
-		// Single-tab enforcement (web only — Tauri handles this natively)
+		// Single-tab enforcement (web only — Tauri handles this natively).
+		// Acquire the tab lock BEFORE any WASM initialization. If tabConflict is
+		// true (another tab owns the lock) or no authenticated DID is saved yet,
+		// do NOT call initWasm().
 		if (!isTauri) {
-			const { steal } = acquireTabLock((status) => {
+			const { steal, ready } = acquireTabLock((status) => {
 				tabLockStatus = status;
+				if (status === 'granted') {
+					void bootstrapTabSession();
+				}
 			});
 			stealLock = steal;
 
-			await initWasm();
+			const initialStatus = await ready;
+			const tabConflict = initialStatus === 'blocked';
+			if (!tabConflict && initialStatus === 'granted') {
+				await bootstrapTabSession();
+			}
 		} else {
 			tabLockStatus = 'granted';
+			await bootstrapTabSession();
 		}
-
-		auth.tryRestore();
 	});
 
 	onDestroy(() => {
