@@ -9,6 +9,7 @@ import {
 	evaluateSpacesGateForUi,
 	isMlsOptedInForDid,
 	mapWebAuthnErrorToMessage,
+	REQUIRED_LABYRINTH_OAUTH_SCOPES,
 	setMlsOptedInForDid
 } from '../src/lib/labyrinth-ui.ts';
 
@@ -34,24 +35,21 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.equal(isMlsOptedInForDid('did:plc:alice123', store), false);
 	});
 
-	it('enforces I15 Spaces-required gate and required OAuth scopes', () => {
-		const blockedPds = evaluateSpacesGateForUi(false, [
-			'atproto',
-			'space:blob',
-			'repo:blue.catbird.mlsChat.device'
-		]);
+	it('enforces I15 Spaces-required gate and required Spec §6.7 OAuth scopes', () => {
+		const blockedPds = evaluateSpacesGateForUi(false, [...REQUIRED_LABYRINTH_OAUTH_SCOPES]);
 		assert.equal(blockedPds.eligible, false);
 		assert.match(blockedPds.message, /Spaces/i);
 
 		const blockedScopes = evaluateSpacesGateForUi(true, ['atproto']);
 		assert.equal(blockedScopes.eligible, false);
-		assert.ok(blockedScopes.missingScopes.includes('space:blob'));
+		assert.ok(blockedScopes.missingScopes.includes('blob:*/*'));
+		assert.ok(
+			blockedScopes.missingScopes.includes(
+				'space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete'
+			)
+		);
 
-		const eligible = evaluateSpacesGateForUi(true, [
-			'atproto',
-			'space:blob',
-			'repo:blue.catbird.mlsChat.device'
-		]);
+		const eligible = evaluateSpacesGateForUi(true, [...REQUIRED_LABYRINTH_OAUTH_SCOPES]);
 		assert.equal(eligible.eligible, true);
 		assert.equal(eligible.missingScopes.length, 0);
 	});

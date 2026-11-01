@@ -310,14 +310,22 @@ const api = {
 		dbKeyHex: string;
 	}) => {
 		await wasmReady;
+		const normalizedTarget = params.accountDid.trim().toLowerCase();
+		if (unifiedClient && unifiedClient.accountDid() === normalizedTarget) {
+			return {
+				accountDid: unifiedClient.accountDid(),
+				accountDidHash: unifiedClient.accountDidHash()
+			};
+		}
 		if (unifiedClient) {
 			try {
 				unifiedClient.close();
 			} catch {
 				// Ignore prior handle close
 			}
+			unifiedClient = null;
 		}
-		unifiedClient = new wasm.WasmMlsClient(
+		unifiedClient = await wasm.WasmMlsClient.openAsync(
 			params.accountDid,
 			params.deviceId,
 			params.homeDsDid,

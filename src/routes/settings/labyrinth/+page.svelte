@@ -647,6 +647,7 @@
 	}
 
 	dialog {
+		margin: auto;
 		max-width: 440px;
 		padding: 24px;
 		border-radius: var(--radius-md);

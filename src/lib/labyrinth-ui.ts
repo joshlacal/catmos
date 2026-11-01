@@ -10,8 +10,11 @@
 
 export const REQUIRED_LABYRINTH_OAUTH_SCOPES = [
 	'atproto',
-	'space:blob',
-	'repo:blue.catbird.mlsChat.device'
+	'blob:*/*',
+	'repo:blue.catbird.labyrinth.mailboxKeys',
+	'repo:blue.catbird.mlsChat.device',
+	'space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete',
+	'space:blue.catbird.labyrinth.conversation?authority=*'
 ] as const;
 
 export interface KeyValueStorageLike {

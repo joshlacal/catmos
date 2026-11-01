@@ -170,10 +170,37 @@ impl PlatformKeyStore for TauriKeyStore {
     }
 }
 
+type SpaceRecordKey = (String, String, String);
+
+fn percent_decode_query_param(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex_str) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex_str, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 pub struct TauriTransport {
     client: reqwest::Client,
     session_token: RwLock<Option<String>>,
     offline_pds_spaces_override: RwLock<Option<bool>>,
+    offline_space_records: Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>,
 }
 
 impl TauriTransport {
@@ -186,6 +213,7 @@ impl TauriTransport {
             client,
             session_token: RwLock::new(None),
             offline_pds_spaces_override: RwLock::new(offline_pds_spaces_override),
+            offline_space_records: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -200,23 +228,127 @@ impl TauriTransport {
             *guard = value;
         }
     }
+
+    fn handle_offline_xrpc(
+        &self,
+        supports: bool,
+        request: &PlatformHttpRequest,
+    ) -> Result<PlatformHttpResponse, MLSError> {
+        if !supports {
+            return Ok(PlatformHttpResponse {
+                status: 501,
+                headers: Vec::new(),
+                body: b"{\"error\":\"XRPCNotSupported\"}".to_vec(),
+            });
+        }
+
+        let (path_part, query_opt) = match request.url.split_once('?') {
+            Some((p, q)) => (p, Some(q)),
+            None => (request.url.as_str(), None),
+        };
+        let nsid = path_part
+            .rsplit_once("/xrpc/")
+            .map(|(_, n)| n)
+            .unwrap_or("");
+
+        match nsid {
+            "com.atproto.space.getSpace" if query_opt.is_none() => Ok(PlatformHttpResponse {
+                status: 401,
+                headers: Vec::new(),
+                body: b"{\"error\":\"AuthMissing\"}".to_vec(),
+            }),
+            "com.atproto.space.applyWrites" => {
+                let parsed: serde_json::Value = serde_json::from_slice(
+                    request.body.as_deref().unwrap_or(b"{}"),
+                )
+                .map_err(|e| MLSError::Internal(format!("offline applyWrites JSON: {e}")))?;
+                let space = parsed
+                    .get("space")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Some(writes) = parsed.get("writes").and_then(|v| v.as_array()) {
+                    let mut store = self.offline_space_records.lock().map_err(|_| {
+                        MLSError::Internal("offline space store poisoned".to_string())
+                    })?;
+                    for w in writes {
+                        let op = w.get("$type").and_then(|v| v.as_str()).unwrap_or_default();
+                        let col = w
+                            .get("collection")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let rkey = w
+                            .get("rkey")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        if op.ends_with("#delete") {
+                            store.remove(&(space.clone(), col, rkey));
+                        } else if let Some(val) = w.get("value") {
+                            store.insert((space.clone(), col, rkey), val.clone());
+                        }
+                    }
+                }
+                Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"{\"results\":[]}".to_vec(),
+                })
+            }
+            "com.atproto.space.listRecords" => {
+                let mut space = String::new();
+                let mut collection = String::new();
+                if let Some(q) = query_opt {
+                    for pair in q.split('&').filter(|s| !s.is_empty()) {
+                        if let Some((k, v)) = pair.split_once('=') {
+                            let dk = percent_decode_query_param(k);
+                            let dv = percent_decode_query_param(v);
+                            if dk == "space" {
+                                space = dv;
+                            } else if dk == "collection" {
+                                collection = dv;
+                            }
+                        }
+                    }
+                }
+                let store = self
+                    .offline_space_records
+                    .lock()
+                    .map_err(|_| MLSError::Internal("offline space store poisoned".to_string()))?;
+                let records: Vec<serde_json::Value> = store
+                    .iter()
+                    .filter(|((s, c, _), _)| s == &space && c == &collection)
+                    .map(|((_, c, rkey), val)| {
+                        serde_json::json!({
+                            "uri": format!("{space}/{c}/{rkey}"),
+                            "cid": "bafyreiofflinetest00000000000000000000000000000000000000000",
+                            "value": val,
+                        })
+                    })
+                    .collect();
+                let body = serde_json::to_vec(&serde_json::json!({ "records": records }))
+                    .map_err(|e| MLSError::Internal(format!("offline listRecords JSON: {e}")))?;
+                Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body,
+                })
+            }
+            _ => Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{}".to_vec(),
+            }),
+        }
+    }
 }
 
 impl PlatformTransport for TauriTransport {
     fn execute_http(&self, request: PlatformHttpRequest) -> Result<PlatformHttpResponse, MLSError> {
         if let Ok(guard) = self.offline_pds_spaces_override.read() {
             if let Some(supports) = *guard {
-                if request.url.ends_with("/xrpc/com.atproto.space.getSpace") {
-                    return Ok(PlatformHttpResponse {
-                        status: if supports { 401 } else { 501 },
-                        headers: Vec::new(),
-                        body: if supports {
-                            b"{\"error\":\"AuthMissing\"}".to_vec()
-                        } else {
-                            b"{\"error\":\"XRPCNotSupported\"}".to_vec()
-                        },
-                    });
-                }
+                return self.handle_offline_xrpc(supports, &request);
             }
         }
 
@@ -338,7 +470,7 @@ impl TauriMlsManager {
         Self {
             data_dir,
             keystore: Arc::new(TauriKeyStore::new_os_keyring()),
-            transport: Arc::new(TauriTransport::new(Some(true))),
+            transport: Arc::new(TauriTransport::new(None)),
             observer: Arc::new(TauriChangeObserver::new()),
             clients: Mutex::new(HashMap::new()),
         }

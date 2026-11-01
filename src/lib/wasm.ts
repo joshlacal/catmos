@@ -1856,15 +1856,16 @@ export async function enableMlsAndEnroll(
 	pdsSupportsSpaces = true,
 	grantedScopes: string[] = [...REQUIRED_LABYRINTH_OAUTH_SCOPES]
 ): Promise<LabyrinthBackupStatusView> {
+	const plainScopes = Array.from(grantedScopes, (s) => String(s));
 	if (isTauri) {
 		return tauriInvoke('labyrinth_enable_and_enroll', {
 			did,
-			grantedScopes
+			grantedScopes: plainScopes
 		});
 	}
 	setMlsOptedInForDid(did, true);
 	const w = await ensureUnifiedBrowserClientOpen(did);
-	await w.enrollUnifiedDevice(pdsSupportsSpaces, grantedScopes);
+	await w.enrollUnifiedDevice(Boolean(pdsSupportsSpaces), plainScopes);
 	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
 }
 
