@@ -97,4 +97,25 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.ok(markup.includes('method="dialog"'), 'must use <form method="dialog"> inside <dialog>');
 		assert.ok(markup.includes('.showModal()'), 'must open confirmation modal via .showModal()');
 	});
+
+	it('routes browser chat XRPC directly to chat.catbird.blue with getServiceAuth and canonical UUIDv4 deviceId (D1, G3)', () => {
+		const wasmTsPath = path.join(CATMOS_ROOT, 'src/lib/wasm.ts');
+		const wasmTs = fs.readFileSync(wasmTsPath, 'utf8');
+		assert.ok(
+			!wasmTs.includes('#atproto_mls'),
+			'wasm.ts must never send legacy #atproto_mls proxy headers through nest (D1)'
+		);
+		assert.ok(
+			!wasmTs.includes('mlschat.catbird.blue'),
+			'wasm.ts must target canonical chat.catbird.blue, never legacy mlschat.catbird.blue'
+		);
+		assert.ok(
+			wasmTs.includes('com.atproto.server.getServiceAuth'),
+			'wasm.ts must mint getServiceAuth JWTs for blue.catbird.chat.* calls'
+		);
+		assert.ok(
+			wasmTs.includes('crypto.randomUUID().toLowerCase()'),
+			'wasm.ts must generate canonical lowercase UUIDv4 deviceId'
+		);
+	});
 });

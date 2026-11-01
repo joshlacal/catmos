@@ -196,9 +196,33 @@ fn percent_decode_query_param(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn origin_key(url_str: &str) -> Option<(String, String, Option<u16>)> {
+    let parsed = reqwest::Url::parse(url_str).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    Some((
+        parsed.scheme().to_ascii_lowercase(),
+        host,
+        parsed.port_or_known_default(),
+    ))
+}
+
+fn extract_xrpc_nsid(url_str: &str) -> Option<String> {
+    let path_part = url_str.split('?').next().unwrap_or(url_str);
+    let (_, nsid) = path_part.rsplit_once("/xrpc/")?;
+    let trimmed = nsid.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub struct TauriTransport {
     client: reqwest::Client,
     session_token: RwLock<Option<String>>,
+    pds_endpoint: RwLock<String>,
+    home_ds_endpoint: RwLock<String>,
+    home_ds_did: RwLock<String>,
     offline_pds_spaces_override: RwLock<Option<bool>>,
     offline_space_records: Mutex<std::collections::BTreeMap<SpaceRecordKey, serde_json::Value>>,
 }
@@ -212,8 +236,32 @@ impl TauriTransport {
         Self {
             client,
             session_token: RwLock::new(None),
+            pds_endpoint: RwLock::new(crate::nest_url()),
+            home_ds_endpoint: RwLock::new("https://chat.catbird.blue".to_string()),
+            home_ds_did: RwLock::new("did:web:chat.catbird.blue".to_string()),
             offline_pds_spaces_override: RwLock::new(offline_pds_spaces_override),
             offline_space_records: Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+
+    pub fn configure_endpoints(
+        &self,
+        pds_endpoint: &str,
+        home_ds_endpoint: &str,
+        home_ds_did: &str,
+    ) {
+        if let Ok(mut g) = self.pds_endpoint.write() {
+            *g = pds_endpoint.trim_end_matches('/').to_string();
+        }
+        if let Ok(mut g) = self.home_ds_endpoint.write() {
+            *g = home_ds_endpoint.trim_end_matches('/').to_string();
+        }
+        if let Ok(mut g) = self.home_ds_did.write() {
+            *g = home_ds_did
+                .split('#')
+                .next()
+                .unwrap_or(home_ds_did)
+                .to_string();
         }
     }
 
@@ -354,6 +402,21 @@ impl PlatformTransport for TauriTransport {
 
         let client = self.client.clone();
         let bearer = self.session_token.read().ok().and_then(|g| g.clone());
+        let pds_endpoint = self
+            .pds_endpoint
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| crate::nest_url());
+        let home_ds_endpoint = self
+            .home_ds_endpoint
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "https://chat.catbird.blue".to_string());
+        let home_ds_did = self
+            .home_ds_did
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -373,7 +436,54 @@ impl PlatformTransport for TauriTransport {
                 }
                 if !has_auth {
                     if let Some(tok) = bearer {
-                        builder = builder.bearer_auth(tok);
+                        let req_origin = origin_key(&request.url);
+                        if req_origin.is_some() && req_origin == origin_key(&pds_endpoint) {
+                            builder = builder.bearer_auth(tok);
+                        } else if req_origin.is_some()
+                            && req_origin == origin_key(&home_ds_endpoint)
+                        {
+                            if let Some(nsid) = extract_xrpc_nsid(&request.url)
+                                .filter(|n| n.starts_with("blue.catbird.chat."))
+                            {
+                                let sa_url = format!(
+                                    "{}/xrpc/com.atproto.server.getServiceAuth",
+                                    pds_endpoint.trim_end_matches('/')
+                                );
+                                let sa_resp = client
+                                    .get(&sa_url)
+                                    .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
+                                    .bearer_auth(&tok)
+                                    .send()
+                                    .await
+                                    .map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "mint getServiceAuth `{nsid}` failed: {e}"
+                                        ))
+                                    })?;
+                                if !sa_resp.status().is_success() {
+                                    let status = sa_resp.status().as_u16();
+                                    let text = sa_resp.text().await.unwrap_or_default();
+                                    return Err(MLSError::Internal(format!(
+                                        "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
+                                    )));
+                                }
+                                let sa_json: serde_json::Value =
+                                    sa_resp.json().await.map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "decode getServiceAuth `{nsid}` JSON: {e}"
+                                        ))
+                                    })?;
+                                let service_jwt = sa_json
+                                    .get("token")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        MLSError::Internal(format!(
+                                            "getServiceAuth `{nsid}` response missing token"
+                                        ))
+                                    })?;
+                                builder = builder.bearer_auth(service_jwt);
+                            }
+                        }
                     }
                 }
                 if let Some(body) = request.body {
@@ -528,12 +638,14 @@ impl TauriMlsManager {
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("{did_hash}.device"));
         if let Ok(existing) = std::fs::read_to_string(&path) {
-            let trimmed = existing.trim();
-            if !trimmed.is_empty() {
-                return Ok(trimmed.to_string());
+            if let Some(valid) = uuid::Uuid::parse_str(existing.trim())
+                .ok()
+                .filter(|u| u.get_version_num() == 4)
+            {
+                return Ok(valid.hyphenated().to_string());
             }
         }
-        let dev_id = format!("catmos-desktop-{}", uuid::Uuid::new_v4());
+        let dev_id = uuid::Uuid::new_v4().hyphenated().to_string();
         std::fs::write(&path, dev_id.as_bytes()).map_err(|e| e.to_string())?;
         Ok(dev_id)
     }
@@ -551,12 +663,14 @@ impl TauriMlsManager {
         }
 
         let device_id = self.load_or_create_device_id(&did_hash)?;
-        let home_ds_endpoint =
-            std::env::var("CATMOS_MLS_DS_URL").unwrap_or_else(|_| crate::nest_url());
+        let home_ds_endpoint = std::env::var("CATMOS_MLS_DS_URL")
+            .unwrap_or_else(|_| "https://chat.catbird.blue".to_string());
         let home_ds_did = std::env::var("CATMOS_MLS_DS_DID")
-            .unwrap_or_else(|_| "did:web:mlschat.catbird.blue".to_string());
-        let pds_endpoint =
-            std::env::var("CATMOS_PDS_URL").unwrap_or_else(|_| "https://swan.place".to_string());
+            .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
+        let pds_endpoint = std::env::var("CATMOS_PDS_URL").unwrap_or_else(|_| crate::nest_url());
+
+        self.transport
+            .configure_endpoints(&pds_endpoint, &home_ds_endpoint, &home_ds_did);
 
         let cfg = CatbirdMlsClientConfig {
             storage_root: self.data_dir.to_string_lossy().to_string(),
@@ -714,6 +828,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let mgr = TauriMlsManager::new_for_testing(tmp.path().to_path_buf(), true);
         let did = "did:plc:catmostauriuser000001";
+        let did_hash = account_did_hash_hex(did).expect("did hash");
+
+        // Seed a legacy non-UUIDv4 `.device` file and verify migration to canonical lowercase UUIDv4.
+        let opt_dir = tmp.path().join("mls-opt-in");
+        std::fs::create_dir_all(&opt_dir).expect("mkdir mls-opt-in");
+        std::fs::write(
+            opt_dir.join(format!("{did_hash}.device")),
+            b"catmos-desktop-legacy",
+        )
+        .expect("seed legacy device file");
 
         let status = mgr
             .enable_and_enroll(did, Some(true), None)
@@ -721,8 +845,15 @@ mod tests {
         assert!(mgr.is_opted_in(did));
         assert!(status.backup_enabled);
         assert_eq!(status.epoch_seq, 1);
+        assert_eq!(status.active_device_ids.len(), 1);
+        let parsed_uuid = uuid::Uuid::parse_str(&status.active_device_ids[0])
+            .expect("enrolled device_id must be valid UUID");
+        assert_eq!(parsed_uuid.get_version_num(), 4);
+        assert_eq!(
+            status.active_device_ids[0],
+            parsed_uuid.hyphenated().to_string()
+        );
 
-        let did_hash = account_did_hash_hex(did).expect("did hash");
         assert!(
             tmp.path()
                 .join("catbird-mls")

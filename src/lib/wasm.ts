@@ -593,6 +593,57 @@ const NEST_URL = (() => {
 	return 'https://api.catbird.blue';
 })();
 
+const HOME_DS_DID = 'did:web:chat.catbird.blue';
+const HOME_DS_URL = 'https://chat.catbird.blue';
+const UUID_V4_LOWER_RE =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export function getOrCreateBrowserDeviceId(didHash: string): string {
+	const storageKey = `catmos_mls_device_id_${didHash}`;
+	try {
+		if (typeof localStorage !== 'undefined') {
+			const existing = localStorage.getItem(storageKey)?.trim().toLowerCase();
+			if (existing && UUID_V4_LOWER_RE.test(existing)) {
+				return existing;
+			}
+		}
+	} catch {
+		// Ignore storage access errors (private browsing / Node test harness)
+	}
+	const generated = crypto.randomUUID().toLowerCase();
+	try {
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem(storageKey, generated);
+		}
+	} catch {
+		// Ignore storage write errors
+	}
+	return generated;
+}
+
+async function mintChatServiceAuthToken(sessionId: string, lxm: string): Promise<string> {
+	const params = new URLSearchParams({
+		aud: HOME_DS_DID,
+		lxm
+	});
+	const resp = await fetch(`${NEST_URL}/xrpc/com.atproto.server.getServiceAuth?${params.toString()}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			Authorization: `Bearer ${sessionId}`
+		}
+	});
+	if (!resp.ok) {
+		const text = await resp.text();
+		throw new Error(`getServiceAuth failed (${resp.status}): ${text}`);
+	}
+	const data = (await resp.json()) as { token?: string };
+	if (!data.token) {
+		throw new Error('getServiceAuth response missing token');
+	}
+	return data.token;
+}
+
 export async function bffFetch(
 	path: string,
 	init: RequestInit = {},
@@ -978,10 +1029,18 @@ export async function submitPreparedRequest(
 		throw new Error('Session changed: prepared request actor DID does not match current session');
 	}
 
-	const url = `${NEST_URL}${prepared.path}`;
+	const pathWithoutQuery = prepared.path.split('?')[0] ?? '';
+	const nsid = pathWithoutQuery.startsWith('/xrpc/')
+		? pathWithoutQuery.slice('/xrpc/'.length)
+		: '';
+	const isDirectChatDs = nsid.startsWith('blue.catbird.chat.');
+
+	const url = isDirectChatDs ? `${HOME_DS_URL}${prepared.path}` : `${NEST_URL}${prepared.path}`;
+	const authToken = isDirectChatDs
+		? await mintChatServiceAuthToken(saved.sessionId, nsid)
+		: saved.sessionId;
 	const headers: Record<string, string> = {
-		Authorization: `Bearer ${saved.sessionId}`,
-		'atproto-proxy': 'did:web:chat.catbird.blue#atproto_mls'
+		Authorization: `Bearer ${authToken}`
 	};
 	if (prepared.body) {
 		headers['Content-Type'] = 'application/json';
@@ -1603,12 +1662,15 @@ export async function reportSpam(
 	if (!saved) throw new Error('Not authenticated');
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
 	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.chat.reportSpam`, {
+	const serviceJwt = await mintChatServiceAuthToken(
+		saved.sessionId,
+		'blue.catbird.chat.reportSpam'
+	);
+	const resp = await fetch(`${HOME_DS_URL}/xrpc/blue.catbird.chat.reportSpam`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
-			Authorization: `Bearer ${saved.sessionId}`,
-			'atproto-proxy': 'did:web:chat.catbird.blue#atproto_mls'
+			Authorization: `Bearer ${serviceJwt}`
 		},
 		body: JSON.stringify(body)
 	});
@@ -1842,10 +1904,10 @@ async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<Worke
 	const w = getWorker();
 	await w.openUnifiedClient({
 		accountDid: did,
-		deviceId: `web-${didHash.slice(0, 12)}`,
-		homeDsDid: 'did:web:mlschat.catbird.blue',
-		homeDsEndpoint: 'https://mlschat.catbird.blue',
-		pdsEndpoint: 'https://bsky.social',
+		deviceId: getOrCreateBrowserDeviceId(didHash),
+		homeDsDid: HOME_DS_DID,
+		homeDsEndpoint: HOME_DS_URL,
+		pdsEndpoint: NEST_URL,
 		dbKeyHex
 	});
 	return w;
