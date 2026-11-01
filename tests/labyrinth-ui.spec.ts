@@ -1,0 +1,102 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import {
+	detectPasskeyPrfCapability,
+	evaluateSpacesGateForUi,
+	isMlsOptedInForDid,
+	mapWebAuthnErrorToMessage,
+	setMlsOptedInForDid
+} from '../src/lib/labyrinth-ui.ts';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const CATMOS_ROOT = path.resolve(__dirname, '..');
+
+describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, and WebAuthn capabilities', () => {
+	it('keeps MLS and Spaces off by default on fresh sign-in (ctl #2)', () => {
+		const mem = new Map<string, string>();
+		const store = {
+			getItem: (k: string) => mem.get(k) ?? null,
+			setItem: (k: string, v: string) => {
+				mem.set(k, v);
+			},
+			removeItem: (k: string) => {
+				mem.delete(k);
+			}
+		};
+		assert.equal(isMlsOptedInForDid('did:plc:alice123', store), false);
+		setMlsOptedInForDid('did:plc:alice123', true, store);
+		assert.equal(isMlsOptedInForDid('did:plc:alice123', store), true);
+		setMlsOptedInForDid('did:plc:alice123', false, store);
+		assert.equal(isMlsOptedInForDid('did:plc:alice123', store), false);
+	});
+
+	it('enforces I15 Spaces-required gate and required OAuth scopes', () => {
+		const blockedPds = evaluateSpacesGateForUi(false, [
+			'atproto',
+			'space:blob',
+			'repo:blue.catbird.mlsChat.device'
+		]);
+		assert.equal(blockedPds.eligible, false);
+		assert.match(blockedPds.message, /Spaces/i);
+
+		const blockedScopes = evaluateSpacesGateForUi(true, ['atproto']);
+		assert.equal(blockedScopes.eligible, false);
+		assert.ok(blockedScopes.missingScopes.includes('space:blob'));
+
+		const eligible = evaluateSpacesGateForUi(true, [
+			'atproto',
+			'space:blob',
+			'repo:blue.catbird.mlsChat.device'
+		]);
+		assert.equal(eligible.eligible, true);
+		assert.equal(eligible.missingScopes.length, 0);
+	});
+
+	it('gates Passkey PRF registration on PublicKeyCredential.getClientCapabilities()', async () => {
+		const unsupported = await detectPasskeyPrfCapability({
+			getClientCapabilities: async () => ({
+				passkeyPlatformAuthenticator: false,
+				conditionalGet: true
+			})
+		});
+		assert.equal(unsupported.canRegisterPasskeyPrf, false);
+
+		const supported = await detectPasskeyPrfCapability({
+			getClientCapabilities: async () => ({
+				passkeyPlatformAuthenticator: true,
+				conditionalGet: true
+			})
+		});
+		assert.equal(supported.canRegisterPasskeyPrf, true);
+
+		assert.match(
+			mapWebAuthnErrorToMessage({ name: 'InvalidStateError' }),
+			/already registered/i
+		);
+		assert.match(mapWebAuthnErrorToMessage({ name: 'NotAllowedError' }), /cancelled|denied/i);
+		assert.match(mapWebAuthnErrorToMessage({ name: 'SecurityError' }), /origin|RP ID/i);
+	});
+
+	it('uses semantic HTML (<figure><pre tabindex="0"><code> and native <dialog method="dialog">) in /settings/labyrinth/+page.svelte', () => {
+		const sveltePath = path.join(
+			CATMOS_ROOT,
+			'src/routes/settings/labyrinth/+page.svelte'
+		);
+		const markup = fs.readFileSync(sveltePath, 'utf8');
+		const h1Matches = markup.match(/<h1\b/g) ?? [];
+		assert.equal(h1Matches.length, 1, 'must have exactly one <h1> page heading');
+		assert.ok(markup.includes('<figure'), 'must wrap recovery code in <figure>');
+		assert.ok(markup.includes('<figcaption'), 'must include <figcaption> for recovery code');
+		assert.ok(
+			markup.includes('<pre tabindex="0"><code>'),
+			'must present 40-char recovery code inside <pre tabindex="0"><code>'
+		);
+		assert.ok(markup.includes('<dialog'), 'must use native <dialog> for device revocation');
+		assert.ok(markup.includes('method="dialog"'), 'must use <form method="dialog"> inside <dialog>');
+		assert.ok(markup.includes('.showModal()'), 'must open confirmation modal via .showModal()');
+	});
+});

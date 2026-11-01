@@ -54,6 +54,16 @@ import type {
 
 import { wrap, proxy, type Remote } from 'comlink';
 import type { WorkerApi } from './mls-worker';
+import {
+	accountDidHashHex,
+	loadOrCreateDbKeyHex,
+	loadOrCreateWrappedSecretBytes
+} from './webcrypto-keystore';
+import {
+	isMlsOptedInForDid,
+	REQUIRED_LABYRINTH_OAUTH_SCOPES,
+	setMlsOptedInForDid
+} from './labyrinth-ui';
 
 // ---------------------------------------------------------------------------
 // Environment detection
@@ -471,6 +481,10 @@ export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
 
 	const keyId = mlsKeyIdForDid(resolvedDid);
 	const legacySessionKey = didKey(resolvedDid, 'mls_db_key');
+	if (typeof sessionStorage !== 'undefined') {
+		sessionStorage.removeItem(keyId);
+		sessionStorage.removeItem(legacySessionKey);
+	}
 
 	return withKeyringLock(async () => {
 		const db = await openKeyringDb();
@@ -479,9 +493,6 @@ export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
 			let wrappedRaw = await idbGet<unknown>(db, keyId);
 
 			if (wrappedRaw === undefined) {
-				// Key is genuinely absent on a healthy transaction: generate a fresh
-				// 32-byte key, wrap under the committed master KEK, and atomically
-				// insert-if-absent + read back.
 				const rawBytes = new Uint8Array(32);
 				crypto.getRandomValues(rawBytes);
 
@@ -528,16 +539,9 @@ export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
 				);
 			}
 
-			const keyHex = Array.from(rawBytes)
+			return Array.from(rawBytes)
 				.map((b) => b.toString(16).padStart(2, '0'))
 				.join('');
-
-			if (typeof sessionStorage !== 'undefined') {
-				sessionStorage.setItem(keyId, keyHex);
-				sessionStorage.setItem(legacySessionKey, keyHex);
-			}
-
-			return keyHex;
 		} finally {
 			try {
 				db.close();
@@ -549,62 +553,15 @@ export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// MLS field-level encryption: per-DID content root key (localStorage)
+// MLS field-level encryption: per-DID content root key (WebCrypto IndexedDB)
 //
-// The 32-byte content root key feeds catbird-mls's field_encryption layer:
-//   - per-conversation AES-GCM content keys (envelope around `text`)
-//   - per-conversation HMAC chain keys (tamper-evident transcript)
-//
-// Persisted in localStorage so cold-starts on the same browser profile
-// can decrypt the existing transcript. Namespaced by sha256(did) so that
-// (a) DID strings don't end up readable in DevTools and (b) multi-account
-// scenarios stay isolated. Browser localStorage is per-origin so the key
-// never leaks across catmos / Bluesky / unrelated sites.
-//
-// This is intentionally separate from the SQLCipher DB key (sessionStorage)
-// so that compromise of the DB-at-rest key alone (where sealed rows live)
-// doesn't directly expose decrypted message bodies.
+// Wrapped under the non-extractable AES-GCM CryptoKey in `webcrypto-keystore.ts`
+// (`Gate 9` — zero keys in `localStorage` or `sessionStorage`).
 // ---------------------------------------------------------------------------
 
-const CONTENT_ROOT_PREFIX = 'mls.content.root.';
-
-async function sha256Hex(input: string): Promise<string> {
-	const bytes = new TextEncoder().encode(input);
-	const digest = await crypto.subtle.digest('SHA-256', bytes);
-	return Array.from(new Uint8Array(digest))
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
-}
-
-async function contentRootStorageKey(userDid: string): Promise<string> {
-	return CONTENT_ROOT_PREFIX + (await sha256Hex(userDid));
-}
-
-/**
- * Load the per-DID content root key from localStorage, creating a fresh
- * random 32-byte key on first use. Returns the raw bytes so they can be
- * pushed into the Worker via comlink (Uint8Array is structured-cloneable).
- */
 async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> {
-	const storageKey = await contentRootStorageKey(userDid);
-	const existing = localStorage.getItem(storageKey);
-	if (existing) {
-		try {
-			const bytes = Uint8Array.from(atob(existing), (c) => c.charCodeAt(0));
-			if (bytes.length === 32) return bytes;
-			console.warn(
-				'[catmos] content root key has wrong length, regenerating:',
-				bytes.length
-			);
-		} catch (e) {
-			console.warn('[catmos] content root key base64 decode failed, regenerating:', e);
-		}
-	}
-	const fresh = new Uint8Array(32);
-	crypto.getRandomValues(fresh);
-	const b64 = btoa(String.fromCharCode(...fresh));
-	localStorage.setItem(storageKey, b64);
-	return fresh;
+	const didHash = await accountDidHashHex(userDid);
+	return loadOrCreateWrappedSecretBytes(didHash, 'content');
 }
 
 /**
@@ -849,25 +806,23 @@ export async function completeLogin(sessionId: string): Promise<AuthState> {
 	try {
 		// 1. Persist browser auth first so active DID is established
 		persistBrowserAuth(did, sessionId);
+		// ctl #2: Chat/Spaces off by default — zero MLS DB opens, PDS/DS calls, or KeyPackage uploads on fresh sign-in
+		if (!isMlsOptedInForDid(did)) {
+			return { did, handle };
+		}
 		// 2. Initialize WASM Worker for `did` (terminating any Worker bound to a different DID)
 		await initWasm(did);
 		// 3. Push credentials and complete MLS setup on the DID-scoped Worker
 		const w = getWorker();
 		await w.setAuth(did, sessionId);
-		// Install the per-DID content root key BEFORE setup() so the field-
-		// level encryption layer is ready for the very first message that
-		// setup() may decrypt during initial sync.
 		await installContentRootKey(did);
 		await w.setup();
 
-		// Ensure key packages are available for other clients to send us Welcomes
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
 
 		return { did, handle };
 	} catch (error) {
-		// On activation failure clear partial worker auth/key/setup state
-		// using existing reset/log-out seam and do not persist new bearer
 		if (_replenishInterval) {
 			clearInterval(_replenishInterval);
 			_replenishInterval = null;
@@ -1100,18 +1055,17 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		}
 
 		persistBrowserAuth(restoredDid, sessionId);
+		if (!isMlsOptedInForDid(restoredDid)) {
+			return { did: restoredDid, handle: info.handle ?? restoredDid };
+		}
 		await initWasm(restoredDid);
 
 		// Push restored credentials to Worker
 		const w = getWorker();
 		await w.setAuth(restoredDid, sessionId);
-		// Restore the per-DID content root key from localStorage (or
-		// generate one if first restore on this profile) so the field-
-		// level encryption layer can read pre-existing sealed rows.
 		await installContentRootKey(restoredDid);
 		await w.setup();
 
-		// Replenish key packages (setup skips upload on returning sessions)
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
 
@@ -1855,4 +1809,135 @@ export async function confirmManualReset(conversationId: string): Promise<void> 
 		return tauriInvoke('confirm_manual_reset', { conversationId });
 	}
 	throw new Error('confirmManualReset is not yet implemented in browser builds');
+}
+
+// ---------------------------------------------------------------------------
+// Unified Clean-Slate Labyrinth 1.1 & Spaces Eligibility (`Spec §6.3`, `D4`, `I15`, `I16`)
+// ---------------------------------------------------------------------------
+
+export interface LabyrinthBackupStatusView {
+	backup_enabled: boolean;
+	mailbox_space_uri: string;
+	has_recovery_code: boolean;
+	has_passkey_prf: boolean;
+	epoch_seq: number;
+	active_device_ids: string[];
+}
+
+export interface OtcPairingOfferView {
+	six_digit_code: string;
+	formatted_code: string;
+}
+
+export interface OtcPairingCompletionView {
+	session_id: number[];
+	initiator_mlkem768_ek_len: number;
+	responder_mlkem768_ct_len: number;
+	new_epoch_seq: number;
+}
+
+async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<WorkerApi>> {
+	const didHash = await accountDidHashHex(did);
+	const dbKeyHex = await loadOrCreateDbKeyHex(didHash);
+	const w = getWorker();
+	await w.openUnifiedClient({
+		accountDid: did,
+		deviceId: `web-${didHash.slice(0, 12)}`,
+		homeDsDid: 'did:web:mlschat.catbird.blue',
+		homeDsEndpoint: 'https://mlschat.catbird.blue',
+		pdsEndpoint: 'https://bsky.social',
+		dbKeyHex
+	});
+	return w;
+}
+
+export async function enableMlsAndEnroll(
+	did: string,
+	pdsSupportsSpaces = true,
+	grantedScopes: string[] = [...REQUIRED_LABYRINTH_OAUTH_SCOPES]
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_enable_and_enroll', {
+			did,
+			grantedScopes
+		});
+	}
+	setMlsOptedInForDid(did, true);
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.enrollUnifiedDevice(pdsSupportsSpaces, grantedScopes);
+	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+}
+
+export async function getLabyrinthStatus(did: string): Promise<LabyrinthBackupStatusView | null> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_status', { did });
+	}
+	if (!isMlsOptedInForDid(did)) return null;
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+}
+
+export async function setupLabyrinthRecoveryCode(did: string): Promise<string> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_setup_recovery_code', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.setupRecoveryCode();
+}
+
+export async function restoreWithLabyrinthRecoveryCode(
+	did: string,
+	recoveryCodeInput: string
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_recovery_code', { did, recoveryCodeInput });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.restoreWithRecoveryCode(recoveryCodeInput)) as LabyrinthBackupStatusView;
+}
+
+export async function registerLabyrinthPasskeyPrf(
+	did: string,
+	credentialId: Uint8Array,
+	prfOutput32: Uint8Array
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_register_passkey_prf', {
+			did,
+			credentialId: Array.from(credentialId),
+			prfOutput32: Array.from(prfOutput32)
+		});
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.registerPasskeyPrf(credentialId, prfOutput32)) as LabyrinthBackupStatusView;
+}
+
+export async function initiateLabyrinthOtcPairing(did: string): Promise<OtcPairingOfferView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_initiate_otc', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.initiateOtcPairing()) as OtcPairingOfferView;
+}
+
+export async function completeLabyrinthOtcPairing(
+	did: string,
+	sixDigitCode: string
+): Promise<OtcPairingCompletionView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_complete_otc', { did, sixDigitCode });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.completeOtcPairing(sixDigitCode)) as OtcPairingCompletionView;
+}
+
+export async function revokeLabyrinthDevice(
+	did: string,
+	targetDeviceId: string
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_revoke_device', { did, targetDeviceId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.revokeLabyrinthDevice(targetDeviceId)) as LabyrinthBackupStatusView;
 }

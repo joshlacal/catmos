@@ -79,8 +79,7 @@ impl SqliteStorage {
         ))?;
         #[cfg(target_os = "android")]
         {
-            let version: String =
-                conn.query_row("PRAGMA cipher_version", [], |row| row.get(0))?;
+            let version: String = conn.query_row("PRAGMA cipher_version", [], |row| row.get(0))?;
             if version.is_empty() {
                 tracing::error!("Android SQLCipher probe returned empty cipher_version");
                 return Err(rusqlite::Error::InvalidQuery);
@@ -2332,13 +2331,9 @@ mod field_encryption_tests {
         // The encrypted column and HMAC tag must be persisted; the legacy
         // text column should hold an empty string (NOT NULL constraint).
         {
+            type RawMessageRow = (Option<Vec<u8>>, Option<Vec<u8>>, String, Option<i64>);
             let conn = storage.conn.lock().unwrap();
-            let (payload_encrypted, entry_hmac, text, payload_key_version): (
-                Option<Vec<u8>>,
-                Option<Vec<u8>>,
-                String,
-                Option<i64>,
-            ) = conn
+            let (payload_encrypted, entry_hmac, text, payload_key_version): RawMessageRow = conn
                 .query_row(
                     "SELECT payload_encrypted, entry_hmac, text, payload_key_version FROM messages WHERE id = 'msg-rt'",
                     [],

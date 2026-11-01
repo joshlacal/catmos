@@ -1,11 +1,12 @@
-mod native_keyring;
 mod api_client;
+mod native_keyring;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
 mod commands;
 mod credentials;
 mod keychain;
 mod keys;
+pub mod mls;
 mod mls_proxy;
 mod quarantine_observer;
 mod recovery;
@@ -32,8 +33,8 @@ use tokio::sync::Mutex;
 /// `label` distinguishes between multiple databases (e.g. "conversation-db", "mls-db").
 fn get_or_create_db_key(label: &str) -> String {
     let service = "blue.catbird.catmos";
-    let entry =
-        crate::native_keyring::entry(service, label).expect("Failed to create keyring entry for DB key");
+    let entry = crate::native_keyring::entry(service, label)
+        .expect("Failed to create keyring entry for DB key");
 
     // Try to load an existing key
     match entry.get_password() {
@@ -90,6 +91,7 @@ impl WsHandle {
 
 pub struct AppState {
     pub orchestrator: Arc<CatmosOrchestrator>,
+    pub mls_manager: Arc<mls::TauriMlsManager>,
     pub api_client: Arc<ReqwestApiClient>,
     /// Runtime-owned clean-chat auth capabilities. The provider contains
     /// opaque session/device/JKT state; commands never persist or log secrets.
@@ -143,8 +145,6 @@ pub fn run() {
     )
     .expect("Failed to initialize MLS context");
 
-    // Clear leftover WAL from previous session — ensures all committed data is
-    // checkpointed into the main database file before we start reading.
     if let Err(e) = mls_context.launch_checkpoint() {
         eprintln!(
             "[catmos] Warning: launch checkpoint failed (non-fatal): {:?}",
@@ -152,16 +152,9 @@ pub fn run() {
         );
     }
 
-    // Share the MLS context with the API client so it can derive confirmation tags.
     api_client.set_mls_context(mls_context.clone());
-
-    // Share the MLS context with storage so the field-level (envelope)
-    // encryption layer can encrypt on write / decrypt on read. The content
-    // root key is installed later in the auth flow once `user_did` is known
-    // (see `commands::complete_login` / `commands::try_restore_session`).
     storage.set_mls_context(mls_context.clone());
 
-    // Create orchestrator (MLSContext::new already returns Arc<MLSContext>)
     let orchestrator = Arc::new(MLSOrchestrator::new(
         mls_context,
         storage,
@@ -169,9 +162,11 @@ pub fn run() {
         cred_store,
         catbird_mls::orchestrator::OrchestratorConfig::default(),
     ));
+    let mls_manager = Arc::new(mls::TauriMlsManager::new(data_dir.clone()));
     let chat_auth = api_client.chat_auth_provider();
     let app_state = AppState {
         orchestrator,
+        mls_manager,
         chat_auth,
         api_client,
         ws_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -221,17 +216,19 @@ pub fn run() {
             commands::list_own_blocks,
             commands::get_quarantine_state,
             commands::confirm_manual_reset,
+            commands::labyrinth_enable_and_enroll,
+            commands::labyrinth_status,
+            commands::labyrinth_setup_recovery_code,
+            commands::labyrinth_restore_recovery_code,
+            commands::labyrinth_register_passkey_prf,
+            commands::labyrinth_initiate_otc,
+            commands::labyrinth_complete_otc,
+            commands::labyrinth_revoke_device,
         ])
         .setup(|app| {
-            // Layer 3 MLS quarantine: install the orchestrator event observer
-            // so quarantine entry/exit events become Tauri events
-            // (`mls://quarantined` / `mls://quarantine-cleared`) the
-            // SvelteKit frontend can listen for. Done inside `setup` because
-            // an `AppHandle` is required to emit, and one isn't available at
-            // `run()` time. The orchestrator's setter is async, so we
-            // block_on it from the Tauri runtime.
             let app_handle = app.handle().clone();
             let state = app.state::<AppState>();
+            state.mls_manager.attach_app_handle(app_handle.clone());
             let orchestrator = state.orchestrator.clone();
             let observer: Arc<
                 dyn catbird_mls::orchestrator::event_observer::OrchestratorEventObserver,

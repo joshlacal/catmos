@@ -23,7 +23,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 futures-util = "0.3.34"
 chrono = { version = "0.4.45", features = ["serde"] }
 uuid = { version = "1.29.0", features = ["v4"] }
-rusqlite = { version = "0.41.0", default-features = false }
+rusqlite = { version = "=0.37.0", default-features = false }
 base64 = "0.23.1"
 async-trait = "0.1.92"
 tracing = "0.1.44"
@@ -32,7 +32,7 @@ bytes = "1.12.1"
 dirs = "7.0.0"
 ciborium = "0.2.2"
 catbird_mls = { path = "../../catbird-mls" }
-catbird-atproto = { git = "https://github.com/joshlacal/catbird-atproto", rev = "d3da6f7f4fce482e3255c74128a05a40001af671" }
+catbird-atproto = { path = "../../catbird-atproto" }
 
 urlencoding = "2.1.3"
 httparse = "1.10.1"
@@ -44,10 +44,10 @@ sha2 = "0.11.1"
 tempfile = "3.27.0"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-rusqlite = { version = "0.41.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }

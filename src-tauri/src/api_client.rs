@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use async_trait::async_trait;
 use catbird_atproto::blue_catbird;
 use catbird_atproto::jacquard_common::IntoStatic;
@@ -14,7 +16,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 
 fn parse_did(s: &str) -> Did {
-    Did::new_owned(s.to_string()).unwrap_or_else(|_| panic!("invalid DID: {}", s))
+    Did::new_owned(s).unwrap_or_else(|_| panic!("invalid DID: {}", s))
 }
 
 fn parse_lexicon_json<'de, T>(body: &'de [u8]) -> Result<T::Output>
@@ -55,7 +57,7 @@ fn canonical_conversation_view(
 
 fn decode_hex_bytes(input: &str) -> std::result::Result<Vec<u8>, String> {
     let trimmed = input.trim_start_matches("0x").trim_start_matches("0X");
-    if trimmed.len() % 2 != 0 {
+    if !trimmed.len().is_multiple_of(2) {
         return Err("hex string length must be even".to_string());
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
@@ -304,6 +306,7 @@ impl std::fmt::Debug for CompletedDeviceBinding {
     }
 }
 
+#[derive(Default)]
 struct ChatAuthSnapshot {
     actor_did: Option<String>,
     session_token: Option<String>,
@@ -311,19 +314,6 @@ struct ChatAuthSnapshot {
     local_device_uuid: Option<String>,
     server_device_id: Option<String>,
     binding: Option<CompletedDeviceBinding>,
-}
-
-impl Default for ChatAuthSnapshot {
-    fn default() -> Self {
-        Self {
-            actor_did: None,
-            session_token: None,
-            session_revision: 0,
-            local_device_uuid: None,
-            server_device_id: None,
-            binding: None,
-        }
-    }
 }
 
 /// Immutable actor/token/revision captured for one asynchronous operation.
@@ -1090,41 +1080,15 @@ impl ReqwestApiClient {
         )))
     }
 
-    /// Fetch a clean-chat opaque blob by blob ID using the admitted canonical
-    /// device identity. Blob bytes remain opaque and are never JSON-decoded.
+    /// Clean-slate (`Spec §4.1` / `1A` / `1B`): `mls-ds` `BlobStore` (`blue.catbird.chat.getBlob`)
+    /// is retired; encrypted attachments and avatars live in ATProto Spaces (`com.atproto.space.getBlob`).
     pub async fn get_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
-        let auth = self
-            .chat_auth
-            .canonical_read_context()
-            .map_err(|error| OrchestratorError::Api(error.to_string()))?;
-        let route = catbird_mls::orchestrator::canonical_route(
-            catbird_mls::orchestrator::CanonicalOperation::GetBlob,
-        );
-        let path = format!(
-            "{}?actorDeviceId={}&blobId={}",
-            route.path,
-            urlencoding::encode(&auth.device_id),
-            urlencoding::encode(blob_id)
-        );
-        let resp = self
-            .client
-            .get(self.canonical_url(&path))
-            .header(reqwest::header::AUTHORIZATION, &auth.authorization)
-            .header("x-catbird-chat-device-id", &auth.device_id)
-            .send()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(self.handle_error_for_session(resp, &auth.session).await);
-        }
-
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| OrchestratorError::Api(e.to_string()))?;
-        self.ensure_session_current(&auth.session)?;
-        Ok(body.to_vec())
+        let _ = blob_id;
+        self.require_canonical_admission()
+            .map_err(|error| OrchestratorError::Api(crate::recovery::actionable_error(error)))?;
+        Err(OrchestratorError::Api(crate::recovery::actionable_error(
+            "mls-ds BlobStore is retired in clean-slate; fetch blobs from ATProto Spaces via CatbirdMlsClient",
+        )))
     }
 
     fn xrpc_url(&self, nsid: &str) -> String {
@@ -1552,8 +1516,6 @@ impl MLSAPIClient for ReqwestApiClient {
         }
         let expected_method = match request.operation {
             CanonicalOperation::GetConversations
-            | CanonicalOperation::GetBlob
-            | CanonicalOperation::GetBlobUsage
             | CanonicalOperation::GetConversationState
             | CanonicalOperation::GetDeviceKey
             | CanonicalOperation::GetDevices
@@ -1562,9 +1524,9 @@ impl MLSAPIClient for ReqwestApiClient {
             | CanonicalOperation::GetLeafRecoveryInbox
             | CanonicalOperation::GetOwnDevices
             | CanonicalOperation::GetPendingWelcomes => "GET",
-            CanonicalOperation::UploadBlob | CanonicalOperation::SubscribeEvents => {
+            CanonicalOperation::SubscribeEvents => {
                 return Err(OrchestratorError::Api(
-                    "blob upload and event subscription require their dedicated binary/WebSocket transports".into(),
+                    "event subscription requires its dedicated WebSocket transport".into(),
                 ));
             }
             _ => "POST",
@@ -2458,7 +2420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_blob_uses_canonical_route_and_admitted_server_device() {
+    async fn retired_ds_get_blob_fails_closed_before_http_in_clean_slate() {
         let (base_url, rx) = spawn_capture_server();
         let client = ReqwestApiClient::new(base_url);
         client.set_auth("did:plc:catmos-test".to_string(), "test-token".to_string());
@@ -2468,25 +2430,16 @@ mod tests {
         client.chat_auth.set_device_for_tests(TEST_AUTH_DEVICE_A);
         client.chat_auth.admit_for_tests(1);
 
-        let body = client
+        let err = client
             .get_blob("blob-1")
             .await
-            .expect("admitted canonical blob read should accept opaque bytes");
-        assert_eq!(body, b"{}".to_vec());
-
-        let captured = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server received canonical blob request");
-        assert_eq!(
-            captured.path,
-            "/xrpc/blue.catbird.chat.getBlob?actorDeviceId=00000000-0000-4000-8000-000000000001&blobId=blob-1"
+            .expect_err("retired DS BlobStore get_blob must fail closed in clean-slate");
+        assert!(err.to_string().contains("BlobStore is retired"));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "retired DS BlobStore gate must reject before sending HTTP traffic"
         );
-        let device_header = captured
-            .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("x-catbird-chat-device-id"))
-            .expect("canonical blob request must carry the server device ID");
-        assert_eq!(device_header.1, TEST_AUTH_DEVICE_A);
     }
 
     #[tokio::test]

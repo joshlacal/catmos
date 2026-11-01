@@ -6,13 +6,14 @@
 	import { auth } from '#lib/stores/auth.ts';
 	import { selectedConversation } from '#lib/stores/conversations.ts';
 	import { isTauri, initWasm, readBrowserAuth } from '#lib/wasm.ts';
+	import { isMlsOptedInForDid } from '#lib/labyrinth-ui.ts';
 	import { acquireTabLock, type TabLockStatus } from '#lib/stores/tab-lock.ts';
 
 	let { children } = $props();
 	let sidebarCollapsed = $state(false);
 	let theme = $state<'light' | 'dark'>('dark');
 	let tabLockStatus = $state<TabLockStatus>('acquiring');
-	let stealLock: (() => void) | undefined = $state(undefined);
+	let releaseTabLock: (() => void) | undefined = $state(undefined);
 	let requestNewConversation = $state(false);
 
 	function toggleTheme() {
@@ -34,8 +35,6 @@
 
 		// Escape — close any open panel/dialog
 		if (e.key === 'Escape') {
-			// Dialogs handle their own Escape via overlay click;
-			// this closes the member list panel if open by deselecting conversation focus
 			return;
 		}
 
@@ -46,7 +45,6 @@
 				// Cmd/Ctrl+N — new conversation
 				e.preventDefault();
 				requestNewConversation = true;
-				// Ensure sidebar is visible so the dialog is accessible
 				if (sidebarCollapsed) sidebarCollapsed = false;
 				break;
 			case ',':
@@ -65,7 +63,8 @@
 
 		if (!isTauri) {
 			const savedAuth = readBrowserAuth();
-			if (savedAuth?.did) {
+			// ctl #2: never open OPFS SQLite or trigger MLS/Spaces calls unless explicitly opted in
+			if (savedAuth?.did && isMlsOptedInForDid(savedAuth.did)) {
 				await initWasm(savedAuth.did);
 			}
 		}
@@ -74,38 +73,31 @@
 	}
 
 	onMount(async () => {
-		// Restore theme preference
 		const saved = localStorage.getItem('catmos-theme') as 'light' | 'dark' | null;
 		if (saved) {
 			theme = saved;
 			document.documentElement.setAttribute('data-theme', saved);
 		} else {
-			// Match system preference
 			const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
 			theme = prefersDark ? 'dark' : 'light';
 			document.documentElement.setAttribute('data-theme', theme);
 		}
 
-		// Register global keyboard shortcuts
 		window.addEventListener('keydown', handleGlobalKeydown);
 		cleanupKeydown = () => window.removeEventListener('keydown', handleGlobalKeydown);
 
-		// Single-tab enforcement (web only — Tauri handles this natively).
-		// Acquire the tab lock BEFORE any WASM initialization. If tabConflict is
-		// true (another tab owns the lock) or no authenticated DID is saved yet,
-		// do NOT call initWasm().
+		// Gate 9: await exclusive navigator.locks mutex without lock stealing.
 		if (!isTauri) {
-			const { steal, ready } = acquireTabLock((status) => {
+			const { release, ready } = acquireTabLock((status) => {
 				tabLockStatus = status;
 				if (status === 'granted') {
 					void bootstrapTabSession();
 				}
 			});
-			stealLock = steal;
+			releaseTabLock = release;
 
 			const initialStatus = await ready;
-			const tabConflict = initialStatus === 'blocked';
-			if (!tabConflict && initialStatus === 'granted') {
+			if (initialStatus === 'granted') {
 				await bootstrapTabSession();
 			}
 		} else {
@@ -116,11 +108,12 @@
 
 	onDestroy(() => {
 		cleanupKeydown?.();
+		releaseTabLock?.();
 	});
 </script>
 
-{#if tabLockStatus === 'blocked' && stealLock}
-	<TabBlockedMessage onSteal={stealLock} />
+{#if tabLockStatus === 'blocked'}
+	<TabBlockedMessage />
 {:else}
 <div
 	class="app-shell"

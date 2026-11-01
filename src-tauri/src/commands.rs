@@ -437,7 +437,7 @@ pub struct Conversation {
     pub is_group: bool,
     /// Decrypted avatar rendered as a `data:` URL. Populated from the
     /// `avatar_bytes` column when the encrypted-metadata bootstrap fetched
-    /// + decrypted an avatar blob; `None` otherwise. Frontend renders this
+    /// and decrypted an avatar blob; `None` otherwise. Frontend renders this
     /// directly into an `<img src>` slot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub avatar_data_url: Option<String>,
@@ -613,6 +613,7 @@ async fn refresh_message_delivery_statuses(
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReactionEvent {
@@ -623,6 +624,7 @@ pub struct ReactionEvent {
     pub action: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TypingEvent {
@@ -772,71 +774,64 @@ pub async fn complete_login(
         .await
         .map_err(actionable_error)?;
 
-    // Initialize orchestrator for this user
-    state
-        .orchestrator
-        .initialize(&session.did)
-        .await
-        .map_err(|e| actionable_error(format!("{e:?}")))?;
-
-    // Install the per-DID content-root key so the field-level (envelope)
-    // encryption layer can encrypt subsequent message inserts. Best-effort:
-    // a failure here downgrades to legacy plaintext writes with a warning
-    // rather than blocking login.
-    install_content_root_key(&state, &session.did);
-
-    // Set auth on API client (before device registration and opt-in, which need auth)
     state
         .api_client
         .set_auth(session.did.clone(), session_id.clone());
+    state
+        .mls_manager
+        .set_session_token(Some(session_id.clone()));
 
-    // Reconcile a durable identity before any registration attempt. Only a
-    // first-login device without a local UUID may create a new registration.
-    if reconcile_device_before_registration(&state, &session.did)
-        .await
-        .map_err(actionable_error)?
-    {
-        let authority_session = state
-            .api_client
-            .current_session()
-            .map_err(actionable_error)?;
-        if authority_session.actor_did != session.did || authority_session.token != session_id {
-            return Err(actionable_error(
-                "chat session changed before signer restoration",
-            ));
-        }
-        state
-            .api_client
-            .ensure_session_current(&authority_session)
-            .map_err(actionable_error)?;
-        restore_registered_signer(
-            state.orchestrator.mls_context().as_ref(),
-            state.orchestrator.credentials().as_ref(),
-            &session.did,
-        )
-        .await
-        .map_err(actionable_error)?;
-        state
-            .api_client
-            .ensure_session_current(&authority_session)
-            .map_err(actionable_error)?;
-    } else {
+    // ctl #2: Chat/Spaces is strictly OFF by default on fresh sign-ins.
+    // Do NOT open MLS databases, upload KeyPackages, or make DS/Spaces calls
+    // unless the user has explicitly opted in for this DID.
+    if state.mls_manager.is_opted_in(&session.did) {
         state
             .orchestrator
-            .ensure_device_registered()
+            .initialize(&session.did)
             .await
             .map_err(|e| actionable_error(format!("{e:?}")))?;
+        install_content_root_key(&state, &session.did);
+
+        if reconcile_device_before_registration(&state, &session.did)
+            .await
+            .map_err(actionable_error)?
+        {
+            let authority_session = state
+                .api_client
+                .current_session()
+                .map_err(actionable_error)?;
+            if authority_session.actor_did != session.did || authority_session.token != session_id {
+                return Err(actionable_error(
+                    "chat session changed before signer restoration",
+                ));
+            }
+            state
+                .api_client
+                .ensure_session_current(&authority_session)
+                .map_err(actionable_error)?;
+            restore_registered_signer(
+                state.orchestrator.mls_context().as_ref(),
+                state.orchestrator.credentials().as_ref(),
+                &session.did,
+            )
+            .await
+            .map_err(actionable_error)?;
+            state
+                .api_client
+                .ensure_session_current(&authority_session)
+                .map_err(actionable_error)?;
+        } else {
+            state
+                .orchestrator
+                .ensure_device_registered()
+                .await
+                .map_err(|e| actionable_error(format!("{e:?}")))?;
+        }
+        configure_chat_auth(&state, &session.did, &session_id).await;
+        ensure_opted_in(&state).await;
+        start_kp_monitor(&state).await;
+        start_sync_loop(&state).await;
     }
-    configure_chat_auth(&state, &session.did, &session_id).await;
-
-    // Auto opt-in to MLS (non-blocking — failures are logged only)
-    ensure_opted_in(&state).await;
-
-    // Start background key package replenishment
-    start_kp_monitor(&state).await;
-
-    // Start periodic sync loop (spec §6.1)
-    start_sync_loop(&state).await;
 
     // Persist session to keyring
     if let Ok(entry) = crate::native_keyring::entry("catmos", "session_id") {
@@ -874,6 +869,7 @@ pub async fn try_restore_session(
                         log_catmos!("Stored session was rejected; clearing saved login: {}", e);
                         clear_saved_session_credentials();
                         state.api_client.clear_auth();
+                        state.mls_manager.set_session_token(None);
                         return Ok(None);
                     }
                     log_catmos!(
@@ -894,64 +890,59 @@ pub async fn try_restore_session(
                 }
             }
             log_catmos!("Restoring session for DID: {}", session.did);
-            state
-                .orchestrator
-                .initialize(&session.did)
-                .await
-                .map_err(|e| actionable_error(format!("{e:?}")))?;
-            // Install the per-DID content-root key for the field-level
-            // encryption layer; see `complete_login` for rationale.
-            install_content_root_key(&state, &session.did);
             state.api_client.set_auth(session.did.clone(), sid.clone());
+            state.mls_manager.set_session_token(Some(sid.clone()));
 
-            // Reconcile before any registration. An existing UUID with a
-            // missing/ambiguous server row fails closed instead of creating
-            // another server device after a restart or transient 401/403.
-            if reconcile_device_before_registration(&state, &session.did)
-                .await
-                .map_err(actionable_error)?
-            {
-                let authority_session = state
-                    .api_client
-                    .current_session()
-                    .map_err(actionable_error)?;
-                if authority_session.actor_did != session.did || authority_session.token != sid {
-                    return Err(actionable_error(
-                        "chat session changed before signer restoration",
-                    ));
-                }
-                state
-                    .api_client
-                    .ensure_session_current(&authority_session)
-                    .map_err(actionable_error)?;
-                restore_registered_signer(
-                    state.orchestrator.mls_context().as_ref(),
-                    state.orchestrator.credentials().as_ref(),
-                    &session.did,
-                )
-                .await
-                .map_err(actionable_error)?;
-                state
-                    .api_client
-                    .ensure_session_current(&authority_session)
-                    .map_err(actionable_error)?;
-            } else {
+            // ctl #2: Only initialize MLS runtime + background sync if explicitly opted in.
+            if state.mls_manager.is_opted_in(&session.did) {
                 state
                     .orchestrator
-                    .ensure_device_registered()
+                    .initialize(&session.did)
                     .await
                     .map_err(|e| actionable_error(format!("{e:?}")))?;
+                install_content_root_key(&state, &session.did);
+
+                if reconcile_device_before_registration(&state, &session.did)
+                    .await
+                    .map_err(actionable_error)?
+                {
+                    let authority_session = state
+                        .api_client
+                        .current_session()
+                        .map_err(actionable_error)?;
+                    if authority_session.actor_did != session.did || authority_session.token != sid
+                    {
+                        return Err(actionable_error(
+                            "chat session changed before signer restoration",
+                        ));
+                    }
+                    state
+                        .api_client
+                        .ensure_session_current(&authority_session)
+                        .map_err(actionable_error)?;
+                    restore_registered_signer(
+                        state.orchestrator.mls_context().as_ref(),
+                        state.orchestrator.credentials().as_ref(),
+                        &session.did,
+                    )
+                    .await
+                    .map_err(actionable_error)?;
+                    state
+                        .api_client
+                        .ensure_session_current(&authority_session)
+                        .map_err(actionable_error)?;
+                } else {
+                    state
+                        .orchestrator
+                        .ensure_device_registered()
+                        .await
+                        .map_err(|e| actionable_error(format!("{e:?}")))?;
+                }
+                configure_chat_auth(&state, &session.did, &sid).await;
+                ensure_opted_in(&state).await;
+                start_kp_monitor(&state).await;
+                start_sync_loop(&state).await;
             }
-            configure_chat_auth(&state, &session.did, &sid).await;
-
-            // Auto opt-in to MLS (non-blocking — failures are logged only)
-            ensure_opted_in(&state).await;
-
-            // Start background key package replenishment
-            start_kp_monitor(&state).await;
-
-            // Start periodic sync loop (spec §6.1)
-            start_sync_loop(&state).await;
 
             if let Ok(entry) = crate::native_keyring::entry("catmos", "user_did") {
                 let _ = entry.set_password(&session.did);
@@ -971,23 +962,21 @@ pub async fn try_restore_session(
 
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
-    // Stop key package monitor
     if let Some(handle) = state.kp_monitor.lock().await.take() {
         handle.abort();
     }
-    // Stop sync loop
     if let Some(handle) = state.sync_loop.lock().await.take() {
         handle.abort();
     }
-    // Drop the in-memory content-root key. The file on disk is preserved so
-    // re-login on the same machine resumes the same chain seed; an explicit
-    // wipe path (account removal) would also call `keys::delete_content_root_key`.
+    if let Ok(did) =
+        crate::native_keyring::entry("catmos", "user_did").and_then(|e| e.get_password())
+    {
+        let _ = state.mls_manager.sign_out_and_wipe(&did);
+    }
+    state.mls_manager.set_session_token(None);
     state.orchestrator.mls_context().clear_content_root_key();
     state.orchestrator.shutdown().await;
     state.api_client.clear_auth();
-    // Logout revokes only runtime authority and saved session credentials.
-    // The local UUID and server device ID remain durable so the next login
-    // can reconcile listDevices before considering registration.
     clear_saved_session_credentials();
     Ok(())
 }
@@ -1252,7 +1241,7 @@ async fn resolve_current_group_id<S: MLSStorageBackend + ?Sized>(
 fn validate_current_group_id(conversation_id: &str, group_id: &str) -> Result<String, String> {
     let normalized = group_id.trim();
     if normalized.is_empty()
-        || normalized.len() % 2 != 0
+        || !normalized.len().is_multiple_of(2)
         || hex::decode(normalized)
             .map(|bytes| bytes.is_empty())
             .unwrap_or(true)
@@ -1300,6 +1289,7 @@ pub async fn send_message(
     Ok(ui)
 }
 
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_image(
     state: State<'_, AppState>,
@@ -1762,7 +1752,7 @@ pub async fn update_cursor(
 }
 
 fn parse_did(s: &str) -> Did {
-    Did::new_owned(s.to_string()).unwrap_or_else(|_| panic!("invalid DID: {}", s))
+    Did::new_owned(s).unwrap_or_else(|_| panic!("invalid DID: {}", s))
 }
 
 fn parse_lexicon_json<'de, T>(body: &'de [u8]) -> std::result::Result<T::Output, String>
@@ -2074,6 +2064,7 @@ pub(crate) async fn bootstrap_group_metadata_for_ws(
                         description: payload.description.clone(),
                         avatar_blob_locator: avatar_locator.clone(),
                         avatar_content_type: avatar_content_type.clone(),
+                        space_avatar: None,
                     };
 
                     match catbird_mls::metadata::encrypt_metadata_blob(
@@ -2314,6 +2305,7 @@ pub(crate) async fn bootstrap_group_metadata_for_ws(
 /// External Commit. We do a best-effort attempt; failure is logged but
 /// non-fatal so a metadata-republish hiccup never blocks the user from
 /// sending messages on the freshly-reset group.
+#[allow(clippy::too_many_arguments)]
 async fn republish_group_metadata_after_reset(
     state: &AppState,
     convo_id: &str,
@@ -2362,6 +2354,7 @@ async fn republish_group_metadata_after_reset(
         description: description.unwrap_or_default(),
         avatar_blob_locator: avatar_locator.clone(),
         avatar_content_type: avatar_content_type.clone(),
+        space_avatar: None,
     };
 
     let metadata_ct = catbird_mls::metadata::encrypt_metadata_blob(
@@ -2949,6 +2942,103 @@ pub async fn confirm_manual_reset(
         .user_confirmed_manual_reset(&conversation_id)
         .await
         .map_err(|e| format!("{:?}", e))
+}
+
+#[tauri::command]
+pub async fn labyrinth_enable_and_enroll(
+    state: State<'_, AppState>,
+    did: String,
+    pds_supports_spaces: Option<bool>,
+    granted_scopes: Option<Vec<String>>,
+) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        mgr.enable_and_enroll(&did, pds_supports_spaces, granted_scopes)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_status(
+    state: State<'_, AppState>,
+    did: String,
+) -> Result<Option<catbird_mls::client::LabyrinthBackupStatus>, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.status(&did))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_setup_recovery_code(
+    state: State<'_, AppState>,
+    did: String,
+) -> Result<String, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.setup_recovery_code(&did))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_restore_recovery_code(
+    state: State<'_, AppState>,
+    did: String,
+    recovery_code_input: String,
+) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.restore_recovery_code(&did, &recovery_code_input))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_register_passkey_prf(
+    state: State<'_, AppState>,
+    did: String,
+    credential_id: Vec<u8>,
+    prf_output32: Vec<u8>,
+) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.register_passkey_prf(&did, credential_id, prf_output32))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_initiate_otc(
+    state: State<'_, AppState>,
+    did: String,
+) -> Result<catbird_mls::client::OtcPairingOffer, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.initiate_otc(&did))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_complete_otc(
+    state: State<'_, AppState>,
+    did: String,
+    six_digit_code: String,
+) -> Result<catbird_mls::client::OtcPairingCompletion, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.complete_otc(&did, &six_digit_code))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_revoke_device(
+    state: State<'_, AppState>,
+    did: String,
+    target_device_id: String,
+) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.revoke_device(&did, &target_device_id))
+        .await
+        .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[cfg(test)]

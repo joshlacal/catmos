@@ -1,95 +1,63 @@
 /**
- * Single-tab enforcement for Catmos Web.
+ * Single-tab enforcement store adapter for Catmos Web (`Gate 9`).
  *
- * Uses the Web Locks API to acquire an exclusive lock named "catmos-mls-session".
- * If another tab already holds the lock, the caller is notified so it can show
- * a blocked UI instead of the app (preventing MLS epoch conflicts).
- *
- * Falls back gracefully when the Web Locks API is unavailable (older browsers,
- * Tauri desktop) — the lock is simply granted immediately.
+ * Delegates to `#lib/tab-lock.ts` (`navigator.locks.request(..., { mode: "exclusive" })`)
+ * and NEVER steals an active lock. When another tab holds the lock, this tab
+ * surfaces `'blocked'` (`"Chat active in another tab"`) and automatically transitions
+ * to `'granted'` once the active tab closes and releases its OPFS `SyncAccessHandle`.
  */
+
+import { acquireTabLock as acquireExclusiveTabLock, type TabLockHandle } from '#lib/tab-lock.ts';
 
 export type TabLockStatus = 'acquiring' | 'granted' | 'blocked';
 
 type TabLockCallback = (status: TabLockStatus) => void;
 
-/**
- * Attempt to acquire the exclusive tab lock.
- *
- * `onStatusChange` fires with:
- * - `'acquiring'` — initial state while requesting the lock
- * - `'granted'`   — this tab owns the lock (app may proceed)
- * - `'blocked'`   — another tab holds the lock
- *
- * Returns a function that, when called, will steal the lock for this tab
- * (used by the "Use this tab instead" button).
- */
-export function acquireTabLock(onStatusChange: TabLockCallback): {
-  steal: () => void;
-  ready: Promise<TabLockStatus>;
+export function acquireTabLock(
+	onStatusChange: TabLockCallback,
+	didHash = 'session'
+): {
+	release: () => void;
+	ready: Promise<TabLockStatus>;
 } {
-  let stealResolver: (() => void) | null = null;
-  let resolveReady: ((status: TabLockStatus) => void) | null = null;
-  const ready = new Promise<TabLockStatus>((resolve) => {
-    resolveReady = resolve;
-  });
-  const notifyStatus = (status: TabLockStatus) => {
-    onStatusChange(status);
-    if (status !== 'acquiring' && resolveReady) {
-      const r = resolveReady;
-      resolveReady = null;
-      r(status);
-    }
-  };
+	let activeHandle: TabLockHandle | null = null;
+	let initialSettled = false;
+	let resolveReady: ((status: TabLockStatus) => void) | null = null;
 
-  // No Web Locks API — grant immediately (Tauri, old browser).
-  if (typeof navigator === 'undefined' || !navigator.locks) {
-    notifyStatus('granted');
-    return { steal: () => {}, ready };
-  }
+	const ready = new Promise<TabLockStatus>((resolve) => {
+		resolveReady = resolve;
+	});
 
-  onStatusChange('acquiring');
+	const emit = (status: TabLockStatus) => {
+		onStatusChange(status);
+		if (status !== 'acquiring' && !initialSettled && resolveReady) {
+			initialSettled = true;
+			const r = resolveReady;
+			resolveReady = null;
+			r(status);
+		}
+	};
 
-  // Try to grab the lock without waiting. If unavailable, we know another
-  // tab has it and can show the blocked UI right away.
-  navigator.locks
-    .request(
-      'catmos-mls-session',
-      { ifAvailable: true },
-      async (lock) => {
-        if (lock) {
-          // Got the lock — hold it for the lifetime of the tab by returning a
-          // promise that never resolves (until the page unloads).
-          notifyStatus('granted');
-          return new Promise<void>(() => {
-            // Hold forever; released automatically on tab close.
-          });
-        }
+	emit('acquiring');
 
-        // Lock is held by another tab.
-        notifyStatus('blocked');
-        return undefined;
-      },
-    )
-    .catch(() => {
-      notifyStatus('blocked');
-    });
+	acquireExclusiveTabLock(didHash, {
+		onWaiting: () => {
+			emit('blocked');
+		}
+	})
+		.then((handle) => {
+			activeHandle = handle;
+			emit('granted');
+		})
+		.catch(() => {
+			emit('blocked');
+		});
 
-  const steal = () => {
-    // If there is already a pending steal, bail.
-    if (stealResolver) return;
-
-    // Request the lock *with* waiting. When the other tab releases (or the
-    // user closes it), this will fire.
-    navigator.locks.request('catmos-mls-session', { steal: true }, async () => {
-      notifyStatus('granted');
-      stealResolver = null;
-      return new Promise<void>((resolve) => {
-        stealResolver = resolve;
-        // Hold the lock forever (same pattern as above).
-      });
-    });
-  };
-
-  return { steal, ready };
+	return {
+		release: () => {
+			activeHandle?.release();
+			activeHandle = null;
+		},
+		ready
+	};
 }

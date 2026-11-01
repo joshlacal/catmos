@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -330,6 +332,7 @@ pub async fn subscribe_all(
 /// Single WebSocket connection session. Returns the last cursor on clean disconnect.
 /// `convo_id` = Some(id) subscribes to a single conversation; `None` subscribes
 /// globally to every event the server fans out to the authenticated user.
+#[allow(clippy::too_many_arguments)]
 async fn do_subscribe(
     app: &AppHandle,
     orchestrator: &Arc<CatmosOrchestrator>,

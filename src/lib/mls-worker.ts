@@ -152,9 +152,17 @@ const api = {
 		keyB64: string,
 		ivB64: string,
 		sha256: string,
-		contentType: string
+		contentType: string,
+		convoId = ''
 	) =>
-		wasm.catbird_mls_get_image_attachment(blobId, keyB64, ivB64, sha256, contentType),
+		wasm.catbird_mls_get_image_attachment(
+			convoId,
+			blobId,
+			keyB64,
+			ivB64,
+			sha256,
+			contentType
+		),
 	fetchNewMessages: async (convoId: string) =>
 		plain(await wasm.catbird_mls_fetch_new_messages(convoId)),
 	sendReaction: async (convoId: string, msgId: string, emoji: string, action: string) => {
@@ -288,8 +296,95 @@ const api = {
 		key: Uint8Array,
 		iv: Uint8Array,
 		sha256: string
-	) => await (wasm as any).catbird_mls_fetch_and_decrypt_blob(blobId, key, iv, sha256)
+	) => await (wasm as any).catbird_mls_fetch_and_decrypt_blob(blobId, key, iv, sha256),
+
+	// -----------------------------------------------------------------------
+	// Unified Clean-Slate WasmMlsClient (`catbird-mls/<did_hash>.db`, `G2`, `D4`, `I15`, `I16`)
+	// -----------------------------------------------------------------------
+	openUnifiedClient: async (params: {
+		accountDid: string;
+		deviceId: string;
+		homeDsDid: string;
+		homeDsEndpoint: string;
+		pdsEndpoint: string;
+		dbKeyHex: string;
+	}) => {
+		await wasmReady;
+		if (unifiedClient) {
+			try {
+				unifiedClient.close();
+			} catch {
+				// Ignore prior handle close
+			}
+		}
+		unifiedClient = new wasm.WasmMlsClient(
+			params.accountDid,
+			params.deviceId,
+			params.homeDsDid,
+			params.homeDsEndpoint,
+			params.pdsEndpoint,
+			params.dbKeyHex
+		);
+		return {
+			accountDid: unifiedClient.accountDid(),
+			accountDidHash: unifiedClient.accountDidHash()
+		};
+	},
+	evaluateSpacesEligibility: async (pdsSupportsSpaces: boolean, grantedScopes: string[]) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.evaluateSpacesEligibility(pdsSupportsSpaces, grantedScopes));
+	},
+	enrollUnifiedDevice: async (pdsSupportsSpaces: boolean, grantedScopes: string[]) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.enrollDevice(pdsSupportsSpaces, grantedScopes));
+	},
+	labyrinthStatus: async () => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.labyrinthStatus());
+	},
+	setupRecoveryCode: async () => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return unifiedClient.setupRecoveryCode();
+	},
+	restoreWithRecoveryCode: async (recoveryCodeInput: string) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.restoreWithRecoveryCode(recoveryCodeInput));
+	},
+	registerPasskeyPrf: async (credentialId: Uint8Array, prfOutput32: Uint8Array) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.registerPasskeyPrf(credentialId, prfOutput32));
+	},
+	initiateOtcPairing: async () => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.initiateOtcPairing());
+	},
+	completeOtcPairing: async (sixDigitCode: string) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.completeOtcPairing(sixDigitCode));
+	},
+	revokeLabyrinthDevice: async (targetDeviceId: string) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		return plain(unifiedClient.revokeLabyrinthDevice(targetDeviceId));
+	},
+	closeUnifiedClient: async () => {
+		await wasmReady;
+		if (unifiedClient) {
+			unifiedClient.close();
+			unifiedClient = null;
+		}
+	}
 };
+
+let unifiedClient: wasm.WasmMlsClient | null = null;
 
 export type WorkerApi = typeof api;
 expose(api);
