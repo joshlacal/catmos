@@ -1360,6 +1360,100 @@ pub async fn get_group_members(
         .collect())
 }
 
+async fn run_unified_sync_subscription(
+    app: tauri::AppHandle,
+    mgr: std::sync::Arc<crate::mls::TauriMlsManager>,
+    did: String,
+    target_convo: Option<String>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    use tauri::Emitter as _;
+
+    let mut seen_ids = std::collections::HashSet::<(String, String)>::new();
+    {
+        let mgr_seed = mgr.clone();
+        let did_seed = did.clone();
+        let target_seed = target_convo.clone();
+        if let Ok(Ok(seeded)) =
+            tokio::task::spawn_blocking(move || -> Result<Vec<(String, String)>, String> {
+                let mut pairs = Vec::new();
+                let convos: Vec<String> = match target_seed {
+                    Some(cid) => vec![cid],
+                    None => mgr_seed
+                        .list_conversations_detailed(&did_seed, 100)?
+                        .into_iter()
+                        .map(|(row, _, _, _)| row.conversation_id)
+                        .collect(),
+                };
+                for cid in convos {
+                    if let Ok(msgs) = mgr_seed.list_messages(&did_seed, &cid, None, 50) {
+                        for m in msgs {
+                            pairs.push((cid.clone(), m.message_id));
+                        }
+                    }
+                }
+                Ok(pairs)
+            })
+            .await
+        {
+            seen_ids.extend(seeded);
+        }
+    }
+
+    loop {
+        if *shutdown.borrow() {
+            break;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {},
+            _ = shutdown.changed() => {
+                break;
+            }
+        }
+        if *shutdown.borrow() {
+            break;
+        }
+
+        let mgr_tick = mgr.clone();
+        let did_tick = did.clone();
+        let target_tick = target_convo.clone();
+        let sync_res = tokio::task::spawn_blocking(
+            move || -> Result<Vec<catbird_mls::storage::MessageRow>, String> {
+                let _ = mgr_tick.sync(&did_tick)?;
+                let convos: Vec<String> = match target_tick {
+                    Some(cid) => vec![cid],
+                    None => mgr_tick
+                        .list_conversations_detailed(&did_tick, 100)?
+                        .into_iter()
+                        .map(|(row, _, _, _)| row.conversation_id)
+                        .collect(),
+                };
+                let mut rows = Vec::new();
+                for cid in convos {
+                    if let Ok(mut msgs) = mgr_tick.list_messages(&did_tick, &cid, None, 20) {
+                        msgs.sort_by_key(|m| m.seq);
+                        rows.extend(msgs);
+                    }
+                }
+                Ok(rows)
+            },
+        )
+        .await;
+
+        if let Ok(Ok(rows)) = sync_res {
+            for row in rows {
+                let key = (row.conversation_id.clone(), row.message_id.clone());
+                if seen_ids.insert(key) {
+                    let cid = row.conversation_id.clone();
+                    let ui_msg = ui_message_from_row(row);
+                    let _ = app.emit("mls-incoming-message", &ui_msg);
+                    let _ = app.emit("mls-refresh-group", &cid);
+                }
+            }
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn subscribe_conversation(
     app: tauri::AppHandle,
@@ -1370,6 +1464,33 @@ pub async fn subscribe_conversation(
     {
         let handles = state.ws_handles.lock().await;
         if handles.contains_key(&conversation_id) {
+            return Ok(());
+        }
+    }
+
+    if let Ok(did) = require_authenticated_did(&state).await {
+        if state.mls_manager.is_opted_in(&did) {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let owner = shutdown_tx.clone();
+            state.ws_handles.lock().await.insert(
+                conversation_id.clone(),
+                WsHandle {
+                    shutdown: shutdown_tx,
+                },
+            );
+            let mgr = state.mls_manager.clone();
+            let ws_handles = state.ws_handles.clone();
+            let convo_id = conversation_id.clone();
+            let task_convo_id = convo_id.clone();
+            tokio::spawn(async move {
+                run_unified_sync_subscription(app, mgr, did, Some(task_convo_id), shutdown_rx)
+                    .await;
+                cleanup_ws_handle(&ws_handles, &convo_id, &owner).await;
+            });
+            log_catmos!(
+                " subscribe_conversation (unified): convo={}",
+                conversation_id
+            );
             return Ok(());
         }
     }
@@ -1449,6 +1570,27 @@ pub async fn subscribe_all_events(
     {
         let handles = state.ws_handles.lock().await;
         if handles.contains_key(GLOBAL_KEY) {
+            return Ok(());
+        }
+    }
+
+    if let Ok(did) = require_authenticated_did(&state).await {
+        if state.mls_manager.is_opted_in(&did) {
+            let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+            let owner = shutdown_tx.clone();
+            state.ws_handles.lock().await.insert(
+                GLOBAL_KEY.to_string(),
+                WsHandle {
+                    shutdown: shutdown_tx,
+                },
+            );
+            let mgr = state.mls_manager.clone();
+            let ws_handles = state.ws_handles.clone();
+            tokio::spawn(async move {
+                run_unified_sync_subscription(app, mgr, did, None, shutdown_rx).await;
+                cleanup_ws_handle(&ws_handles, GLOBAL_KEY, &owner).await;
+            });
+            log_catmos!(" subscribe_all_events (unified): global sync loop opened");
             return Ok(());
         }
     }
@@ -1591,6 +1733,34 @@ pub async fn send_reaction(
     emoji: String,
     action: String,
 ) -> Result<(), String> {
+    if let Ok(did) = require_authenticated_did(&state).await {
+        if state.mls_manager.is_opted_in(&did) {
+            log_catmos!(
+                " send_reaction (unified): convo={}, msg={}, emoji={}, action={}",
+                conversation_id,
+                message_id,
+                emoji,
+                action
+            );
+            let normalized_action = if action == "remove" { "remove" } else { "add" };
+            let payload = serde_json::json!({
+                "messageType": "reaction",
+                "reaction": {
+                    "messageId": message_id,
+                    "emoji": emoji,
+                    "action": normalized_action,
+                }
+            })
+            .to_string();
+            let mgr = state.mls_manager.clone();
+            tokio::task::spawn_blocking(move || mgr.send_message(&did, &conversation_id, &payload))
+                .await
+                .map_err(|e| format!("task join error: {e}"))?
+                .map_err(actionable_error)?;
+            return Ok(());
+        }
+    }
+
     state
         .api_client
         .require_canonical_admission()

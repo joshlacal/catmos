@@ -383,10 +383,26 @@ impl TauriTransport {
                     body,
                 })
             }
-            _ => Ok(PlatformHttpResponse {
+            "com.atproto.repo.putRecord" => Ok(PlatformHttpResponse {
                 status: 200,
                 headers: Vec::new(),
-                body: b"{}".to_vec(),
+                body: b"{\"uri\":\"at://did:plc:mock/blue.catbird.chat.device/self\",\"cid\":\"bafyreimock\"}".to_vec(),
+            }),
+            "blue.catbird.chat.enrollDevice" => Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"authGeneration\":1,\"device\":{\"authGeneration\":1}}".to_vec(),
+            }),
+            "blue.catbird.chat.publishDirectRequestKeys"
+            | "blue.catbird.chat.replenishKeyPackages" => Ok(PlatformHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"accepted\":true}".to_vec(),
+            }),
+            _ => Ok(PlatformHttpResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: b"{\"error\":\"NotFound\"}".to_vec(),
             }),
         }
     }

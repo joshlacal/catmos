@@ -249,7 +249,11 @@ const api = {
 		return rows.map((row) => {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const convoId = String((row as any).conversation_id ?? '');
-			const members = (plain(unifiedClient!.listMembers(convoId)) as string[]) ?? [];
+			const rawMembers = (plain(unifiedClient!.listMembers(convoId)) as unknown[]) ?? [];
+			const members = rawMembers
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				.map((m: any) => (typeof m === 'string' ? m : String(m?.did ?? '')))
+				.filter((d) => d.length > 0);
 			const meta = unifiedClient!.getGroupMetadata(convoId);
 			const msgs = (plain(unifiedClient!.listMessages(convoId, null, 1)) as unknown[]) ?? [];
 			const lastMsg = msgs.length > 0 ? msgs[0] : null;
@@ -269,7 +273,11 @@ const api = {
 			titleOpt,
 			descOpt
 		);
-		const members = (plain(client.listMembers(convoId)) as string[]) ?? [];
+		const rawMembers = (plain(client.listMembers(convoId)) as unknown[]) ?? [];
+		const members = rawMembers
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			.map((m: any) => (typeof m === 'string' ? m : String(m?.did ?? '')))
+			.filter((d) => d.length > 0);
 		const meta = client.getGroupMetadata(convoId);
 		return mapConversationRowToUi(row, members, meta, null);
 	},
@@ -281,7 +289,11 @@ const api = {
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const found = rows.find((r: any) => r.conversation_id === convoId);
 		if (!found) throw new Error(`Conversation ${convoId} not found after sync`);
-		const members = (plain(client.listMembers(convoId)) as string[]) ?? [];
+		const rawMembers = (plain(client.listMembers(convoId)) as unknown[]) ?? [];
+		const members = rawMembers
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			.map((m: any) => (typeof m === 'string' ? m : String(m?.did ?? '')))
+			.filter((d) => d.length > 0);
 		const meta = client.getGroupMetadata(convoId);
 		return mapConversationRowToUi(found, members, meta, null);
 	},
@@ -354,19 +366,108 @@ const api = {
 		return mapped;
 	},
 	sendReaction: async (convoId: string, msgId: string, emoji: string, action: string) => {
-		await wasm.catbird_mls_send_reaction(convoId, msgId, emoji, action);
+		await wasmReady;
+		const client = requireUnified();
+		const reactionMsgId = crypto.randomUUID().toLowerCase();
+		const payload = JSON.stringify({
+			messageType: 'reaction',
+			reaction: {
+				messageId: msgId,
+				emoji,
+				action: action === 'remove' ? 'remove' : 'add'
+			}
+		});
+		await client.sendMessage(convoId, reactionMsgId, payload);
+		client.flushLabyrinthQueue().catch(() => {});
 	},
-	updateCursor: async (_convoId: string, _cursor: string) => {},
+	updateCursor: async (convoId: string, cursor: string) => {
+		await wasmReady;
+		if (!unifiedClient) return;
+		const trimmed = cursor.trim();
+		if (/^\d+$/.test(trimmed)) {
+			const seq = BigInt(trimmed);
+			if (seq >= 1n) {
+				await unifiedClient.acknowledgeEntriesUpTo(convoId, seq);
+			}
+		}
+	},
 
 	subscribe: async (
 		convoId: string,
 		onMessage: (data: unknown) => void,
-		onEvent: (data: unknown) => void,
+		_onEvent: (data: unknown) => void,
 		onStatus: (status: unknown) => void,
 		_cursor?: string
 	) => {
-		const sub = await wasm.catbird_mls_subscribe(convoId, onMessage, onEvent, onStatus);
-		if (sub) subscriptions.set(convoId, sub);
+		await wasmReady;
+		subscriptions.get(convoId)?.close();
+		subscriptions.delete(convoId);
+		if (!unifiedClient) return;
+
+		const seenIds = new Set<string>();
+		const seedConvo = (cid: string) => {
+			try {
+				const initial = (plain(unifiedClient!.listMessages(cid, null, 50)) as unknown[]) ?? [];
+				for (const row of initial) {
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					const id = String((row as any)?.message_id ?? '');
+					if (id) seenIds.add(`${cid}:${id}`);
+				}
+			} catch {
+				// Ignore seeding errors on empty/unjoined conversations
+			}
+		};
+
+		if (convoId === '*') {
+			const convos = (plain(unifiedClient.listConversations(null, 100)) as unknown[]) ?? [];
+			for (const c of convos) {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const cid = String((c as any)?.conversation_id ?? '');
+				if (cid) seedConvo(cid);
+			}
+		} else {
+			seedConvo(convoId);
+		}
+
+		onStatus('connected');
+		let closed = false;
+		let running = false;
+		const timer = setInterval(async () => {
+			if (closed || running || !unifiedClient) return;
+			running = true;
+			try {
+				await unifiedClient.sync();
+				const targetIds: string[] =
+					convoId === '*'
+						? ((plain(unifiedClient.listConversations(null, 100)) as unknown[]) ?? [])
+								// eslint-disable-next-line @typescript-eslint/no-explicit-any
+								.map((c: any) => String(c?.conversation_id ?? ''))
+								.filter((id) => id.length > 0)
+						: [convoId];
+				for (const cid of targetIds) {
+					const rows = (plain(unifiedClient.listMessages(cid, null, 20)) as unknown[]) ?? [];
+					const ordered = rows.map(mapMessageRowToUi).sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+					for (const msg of ordered) {
+						const key = `${cid}:${msg.id}`;
+						if (msg.id && !seenIds.has(key)) {
+							seenIds.add(key);
+							onMessage(msg);
+						}
+					}
+				}
+			} catch (err) {
+				console.warn('[catmos] unified subscription sync warning:', err);
+			} finally {
+				running = false;
+			}
+		}, 3000);
+
+		subscriptions.set(convoId, {
+			close() {
+				closed = true;
+				clearInterval(timer);
+			}
+		});
 	},
 	unsubscribe: (convoId: string) => {
 		subscriptions.get(convoId)?.close();
@@ -377,13 +478,24 @@ const api = {
 	getMembers: async (convoId: string) => {
 		await wasmReady;
 		if (!unifiedClient) return [];
-		const dids = (plain(unifiedClient.listMembers(convoId)) as string[]) ?? [];
-		return dids.map((did) => ({
-			did,
-			handle: '',
-			displayName: undefined,
-			role: 'Member'
-		}));
+		const rawMembers = (plain(unifiedClient.listMembers(convoId)) as unknown[]) ?? [];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		return rawMembers.map((m: any) =>
+			typeof m === 'string'
+				? {
+						did: m,
+						handle: '',
+						displayName: undefined,
+						role: 'Member'
+					}
+				: {
+						did: String(m?.did ?? ''),
+						handle: typeof m?.handle === 'string' ? m.handle : '',
+						displayName:
+							typeof m?.displayName === 'string' && m.displayName ? m.displayName : undefined,
+						role: typeof m?.role === 'string' && m.role ? m.role : 'Member'
+					}
+		);
 	},
 	addParticipants: async (convoId: string, did: string) => {
 		await wasmReady;
@@ -395,14 +507,14 @@ const api = {
 		const client = requireUnified();
 		await client.addGroupMembers(convoId, memberDids);
 	},
-	demoteMember: async (convoId: string, did: string) => {
-		await wasm.catbird_mls_demote_member(convoId, did);
+	demoteMember: async (_convoId: string, _did: string) => {
+		throw new Error('Member role demotion is not supported in Clean-Slate v1');
 	},
-	sendTyping: async (convoId: string, isTyping: boolean) => {
-		await wasm.catbird_mls_send_typing(convoId, isTyping);
+	sendTyping: async (_convoId: string, _isTyping: boolean) => {
+		// Signed ephemeral typing transport is not yet wired in Clean-Slate v1.
 	},
-	promoteMember: async (convoId: string, did: string) => {
-		await wasm.catbird_mls_promote_member(convoId, did);
+	promoteMember: async (_convoId: string, _did: string) => {
+		throw new Error('Member role promotion is not supported in Clean-Slate v1');
 	},
 	removeParticipants: async (convoId: string, did: string) => {
 		await wasmReady;
@@ -412,7 +524,24 @@ const api = {
 	leaveConversation: async (convoId: string) => {
 		await wasmReady;
 		const client = requireUnified();
-		await client.declineDirectRequest(convoId);
+		const requests = (plain(client.listRequests(null)) as unknown[]) ?? [];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const pending = requests.find((r: any) => {
+			const matchesId = r?.conversation_id === convoId || r?.request_id === convoId;
+			const consent = String(r?.consent ?? '');
+			const isPending =
+				consent === 'incomingPending' ||
+				consent === 'outgoingPending' ||
+				consent === 'incoming_pending' ||
+				consent === 'outgoing_pending';
+			return matchesId && isPending;
+		});
+		if (pending) {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			await client.declineDirectRequest(String((pending as any).request_id));
+		} else {
+			await client.removeGroupMember(true, convoId, client.accountDid());
+		}
 	},
 
 	// Profiles & search
