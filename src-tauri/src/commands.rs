@@ -45,6 +45,7 @@ async fn cleanup_ws_handle(
 /// layer keeps writing legacy plaintext columns until the next attempt.
 /// Idempotent — re-running with the same DID is a no-op once the in-memory
 /// key matches the file on disk.
+#[allow(dead_code)]
 fn install_content_root_key(state: &AppState, user_did: &str) {
     match crate::keys::load_or_create_content_root_key(&state.data_dir, user_did) {
         Ok(root_key) => {
@@ -109,6 +110,7 @@ macro_rules! log_catmos {
     };
 }
 
+#[allow(dead_code)]
 pub fn spawn_key_package_monitor(
     orchestrator: Arc<CatmosOrchestrator>,
 ) -> tokio::task::JoinHandle<()> {
@@ -127,6 +129,7 @@ pub fn spawn_key_package_monitor(
 
 /// Ensure the user is opted into MLS. Checks status first, then opts in if needed.
 /// Failures are logged but never propagated — opt-in should not block login.
+#[allow(dead_code)]
 async fn ensure_opted_in(state: &AppState) {
     let did = match state.orchestrator.api_client().current_did().await {
         Some(d) => d,
@@ -167,33 +170,167 @@ async fn ensure_opted_in(state: &AppState) {
     }
 }
 
-async fn start_kp_monitor(state: &AppState) {
-    let mut guard = state.kp_monitor.lock().await;
-    if let Some(handle) = guard.take() {
-        handle.abort();
-    }
-    *guard = Some(spawn_key_package_monitor(state.orchestrator.clone()));
-}
-
-/// Periodic sync loop — calls sync_with_server every SYNC_INTERVAL_SECS (spec §6.1).
-fn spawn_sync_loop(orchestrator: Arc<CatmosOrchestrator>) -> tokio::task::JoinHandle<()> {
-    use catbird_mls::orchestrator::constants::SYNC_INTERVAL_SECS;
+fn spawn_unified_kp_monitor(
+    mgr: Arc<crate::mls::TauriMlsManager>,
+    did: String,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(SYNC_INTERVAL_SECS)).await;
-            if let Err(e) = orchestrator.sync_with_server(false).await {
-                tracing::debug!("Sync cycle error: {:?}", e);
-            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let mgr_tick = mgr.clone();
+            let did_tick = did.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = mgr_tick.replenish_key_packages(&did_tick, 10) {
+                    log_catmos!("Unified key package replenishment warning: {}", e);
+                }
+                let _ = mgr_tick.flush_labyrinth_queue(&did_tick);
+            })
+            .await;
         }
     })
 }
 
-async fn start_sync_loop(state: &AppState) {
+async fn start_kp_monitor(state: &AppState, did: String) {
+    let mut guard = state.kp_monitor.lock().await;
+    if let Some(handle) = guard.take() {
+        handle.abort();
+    }
+    *guard = Some(spawn_unified_kp_monitor(state.mls_manager.clone(), did));
+}
+
+fn spawn_unified_sync_loop(
+    mgr: Arc<crate::mls::TauriMlsManager>,
+    did: String,
+) -> tokio::task::JoinHandle<()> {
+    use catbird_mls::orchestrator::constants::SYNC_INTERVAL_SECS;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(SYNC_INTERVAL_SECS)).await;
+            let mgr_tick = mgr.clone();
+            let did_tick = did.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Err(e) = mgr_tick.sync(&did_tick) {
+                    tracing::debug!("Unified sync cycle warning: {}", e);
+                }
+            })
+            .await;
+        }
+    })
+}
+
+async fn start_sync_loop(state: &AppState, did: String) {
     let mut guard = state.sync_loop.lock().await;
     if let Some(handle) = guard.take() {
         handle.abort();
     }
-    *guard = Some(spawn_sync_loop(state.orchestrator.clone()));
+    *guard = Some(spawn_unified_sync_loop(state.mls_manager.clone(), did));
+}
+
+async fn require_authenticated_did(state: &AppState) -> Result<String, String> {
+    if let Some(did) = state.api_client.current_did().await {
+        if !did.trim().is_empty() {
+            return Ok(did);
+        }
+    }
+    crate::native_keyring::entry("catmos", "user_did")
+        .and_then(|e| e.get_password())
+        .map_err(|_| "Not authenticated".to_string())
+        .and_then(|d| {
+            if d.trim().is_empty() {
+                Err("Not authenticated".to_string())
+            } else {
+                Ok(d)
+            }
+        })
+}
+
+fn extract_message_text_and_type(plaintext_json: &str) -> (String, String) {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(plaintext_json) {
+        let msg_type = val
+            .get("messageType")
+            .or_else(|| val.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("text")
+            .to_string();
+        let text = val
+            .get("text")
+            .or_else(|| val.get("content"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| plaintext_json.to_string());
+        return (msg_type, text);
+    }
+    ("text".to_string(), plaintext_json.to_string())
+}
+
+fn rfc3339_from_ms(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339()
+}
+
+fn ui_message_from_row(row: catbird_mls::storage::MessageRow) -> Message {
+    let (message_type, content) = extract_message_text_and_type(&row.plaintext_json);
+    Message {
+        id: row.message_id,
+        conversation_id: row.conversation_id,
+        sender_did: row.sender_did,
+        sender_handle: String::new(),
+        content,
+        timestamp: rfc3339_from_ms(row.created_at_ms),
+        sequence_number: row.seq.max(0) as u64,
+        status: if row.is_own {
+            "sent".to_string()
+        } else {
+            "delivered".to_string()
+        },
+        message_type,
+        image: None,
+    }
+}
+
+fn ui_conversation_from_row(
+    row: catbird_mls::storage::ConversationRow,
+    members: Vec<String>,
+    meta: Option<catbird_mls::storage::GroupMetadataRow>,
+    last_msg: Option<catbird_mls::storage::MessageRow>,
+) -> Conversation {
+    let meta_title = meta
+        .as_ref()
+        .and_then(|m| m.title.clone())
+        .filter(|s| !s.trim().is_empty());
+    let row_title = row.title.filter(|s| !s.trim().is_empty());
+    let display_name = meta_title.or(row_title).unwrap_or_else(|| {
+        if members.is_empty() {
+            row.conversation_id.clone()
+        } else {
+            members.join(", ")
+        }
+    });
+    let description = meta
+        .as_ref()
+        .and_then(|m| m.description.clone())
+        .filter(|s| !s.trim().is_empty());
+    let (last_message, last_message_at) = match last_msg {
+        Some(m) => {
+            let (_mt, txt) = extract_message_text_and_type(&m.plaintext_json);
+            (Some(txt), Some(rfc3339_from_ms(m.created_at_ms)))
+        }
+        None => (None, None),
+    };
+    let is_group = members.len() > 2 || meta.is_some();
+    Conversation {
+        id: row.conversation_id,
+        group_id: hex::encode(&row.group_id),
+        display_name,
+        description,
+        members,
+        last_message,
+        last_message_at,
+        unread_count: row.unread_count.max(0) as u32,
+        is_group,
+        avatar_data_url: None,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,6 +359,7 @@ fn clear_saved_session_credentials() {
 /// Install only opaque runtime capabilities after login/device enrollment.
 /// Persisted session/device identifiers never enter command logs; DPoP
 /// binding evidence is admitted only through the runtime authority provider.
+#[allow(dead_code)]
 async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
     state
         .api_client
@@ -309,6 +447,7 @@ async fn configure_chat_auth(state: &AppState, did: &str, session_id: &str) {
 /// storage restart.  Import the keychain-held keypair before allowing the
 /// session to continue; if the key is unavailable or cannot be imported, fail
 /// closed rather than registering a second device with a new signer.
+#[allow(dead_code)]
 async fn restore_registered_signer<M, C>(
     mls_context: &M,
     credentials: &C,
@@ -349,6 +488,7 @@ where
 /// listDevices row. Zero/duplicate/error results stop login and prevent
 /// accidental device churn. A missing local UUID is the only case that may
 /// proceed to first registration.
+#[allow(dead_code)]
 async fn reconcile_device_before_registration(state: &AppState, did: &str) -> Result<bool, String> {
     let session = state
         .api_client
@@ -556,6 +696,7 @@ pub(crate) fn ui_status_for_delivery(
     }
 }
 
+#[allow(dead_code)]
 async fn refresh_message_delivery_statuses(
     state: &AppState,
     conversation_id: &str,
@@ -785,52 +926,16 @@ pub async fn complete_login(
     // Do NOT open MLS databases, upload KeyPackages, or make DS/Spaces calls
     // unless the user has explicitly opted in for this DID.
     if state.mls_manager.is_opted_in(&session.did) {
-        state
-            .orchestrator
-            .initialize(&session.did)
-            .await
-            .map_err(|e| actionable_error(format!("{e:?}")))?;
-        install_content_root_key(&state, &session.did);
-
-        if reconcile_device_before_registration(&state, &session.did)
-            .await
-            .map_err(actionable_error)?
-        {
-            let authority_session = state
-                .api_client
-                .current_session()
-                .map_err(actionable_error)?;
-            if authority_session.actor_did != session.did || authority_session.token != session_id {
-                return Err(actionable_error(
-                    "chat session changed before signer restoration",
-                ));
+        let mgr = state.mls_manager.clone();
+        let did_for_sync = session.did.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = mgr.sync(&did_for_sync) {
+                log_catmos!("Initial unified MLS sync warning: {}", e);
             }
-            state
-                .api_client
-                .ensure_session_current(&authority_session)
-                .map_err(actionable_error)?;
-            restore_registered_signer(
-                state.orchestrator.mls_context().as_ref(),
-                state.orchestrator.credentials().as_ref(),
-                &session.did,
-            )
-            .await
-            .map_err(actionable_error)?;
-            state
-                .api_client
-                .ensure_session_current(&authority_session)
-                .map_err(actionable_error)?;
-        } else {
-            state
-                .orchestrator
-                .ensure_device_registered()
-                .await
-                .map_err(|e| actionable_error(format!("{e:?}")))?;
-        }
-        configure_chat_auth(&state, &session.did, &session_id).await;
-        ensure_opted_in(&state).await;
-        start_kp_monitor(&state).await;
-        start_sync_loop(&state).await;
+        })
+        .await;
+        start_kp_monitor(&state, session.did.clone()).await;
+        start_sync_loop(&state, session.did.clone()).await;
     }
 
     // Persist session to keyring
@@ -895,53 +1000,16 @@ pub async fn try_restore_session(
 
             // ctl #2: Only initialize MLS runtime + background sync if explicitly opted in.
             if state.mls_manager.is_opted_in(&session.did) {
-                state
-                    .orchestrator
-                    .initialize(&session.did)
-                    .await
-                    .map_err(|e| actionable_error(format!("{e:?}")))?;
-                install_content_root_key(&state, &session.did);
-
-                if reconcile_device_before_registration(&state, &session.did)
-                    .await
-                    .map_err(actionable_error)?
-                {
-                    let authority_session = state
-                        .api_client
-                        .current_session()
-                        .map_err(actionable_error)?;
-                    if authority_session.actor_did != session.did || authority_session.token != sid
-                    {
-                        return Err(actionable_error(
-                            "chat session changed before signer restoration",
-                        ));
+                let mgr = state.mls_manager.clone();
+                let did_for_sync = session.did.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(e) = mgr.sync(&did_for_sync) {
+                        log_catmos!("Restored unified MLS sync warning: {}", e);
                     }
-                    state
-                        .api_client
-                        .ensure_session_current(&authority_session)
-                        .map_err(actionable_error)?;
-                    restore_registered_signer(
-                        state.orchestrator.mls_context().as_ref(),
-                        state.orchestrator.credentials().as_ref(),
-                        &session.did,
-                    )
-                    .await
-                    .map_err(actionable_error)?;
-                    state
-                        .api_client
-                        .ensure_session_current(&authority_session)
-                        .map_err(actionable_error)?;
-                } else {
-                    state
-                        .orchestrator
-                        .ensure_device_registered()
-                        .await
-                        .map_err(|e| actionable_error(format!("{e:?}")))?;
-                }
-                configure_chat_auth(&state, &session.did, &sid).await;
-                ensure_opted_in(&state).await;
-                start_kp_monitor(&state).await;
-                start_sync_loop(&state).await;
+                })
+                .await;
+                start_kp_monitor(&state, session.did.clone()).await;
+                start_sync_loop(&state, session.did.clone()).await;
             }
 
             if let Ok(entry) = crate::native_keyring::entry("catmos", "user_did") {
@@ -983,94 +1051,27 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_conversations(state: State<'_, AppState>) -> Result<Vec<Conversation>, String> {
-    // Sync with server first — joins any groups we were added to
-    if let Err(e) = state.orchestrator.sync_with_server(false).await {
-        log_catmos!(" sync_with_server warning: {}", e);
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(vec![]);
     }
 
-    let page = state
-        .orchestrator
-        .api_client()
-        .get_conversations(50, None)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // Encrypted-metadata cutover: titles/descriptions/avatars come from the
-    // local SQLite cache populated by `bootstrap_group_metadata` after every
-    // Welcome / commit-merge that touches metadata. The server no longer
-    // exposes plaintext title (post-Phase-E), and the plaintext 0xff00
-    // extension is gone (Wave 1). For any row where the bootstrap has not
-    // yet run (first observation post-restart or a freshly-joined group
-    // whose Welcome arrived during this same tick), opportunistically
-    // bootstrap inline so the very next render has a real title.
-    let mut convos: Vec<Conversation> = Vec::with_capacity(page.conversations.len());
-    for c in page.conversations.into_iter() {
-        let member_dids: Vec<String> = c.members.iter().map(|m| m.did.clone()).collect();
-
-        // Lazy bootstrap on miss. Best-effort; failure leaves the snapshot
-        // empty and we fall back to a member-DID join below.
-        let mut snapshot = state
-            .orchestrator
-            .storage()
-            .get_metadata_snapshot(&c.conversation_id);
-        let needs_bootstrap = snapshot
-            .as_ref()
-            .map(|s| s.metadata_json.is_none())
-            .unwrap_or(true);
-        if needs_bootstrap {
-            if let Err(e) = bootstrap_group_metadata(&state, &c.group_id, &c.conversation_id).await
-            {
-                log_catmos!(
-                    "get_conversations: lazy bootstrap failed for {}: {}",
-                    c.conversation_id,
-                    e
-                );
-            }
-            snapshot = state
-                .orchestrator
-                .storage()
-                .get_metadata_snapshot(&c.conversation_id);
+    let mgr = state.mls_manager.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        if let Err(e) = mgr.sync(&did) {
+            log_catmos!(" unified sync warning in get_conversations: {}", e);
         }
+        mgr.list_conversations_detailed(&did, 100)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
 
-        let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
-            .as_ref()
-            .and_then(|s| s.metadata_json.as_deref())
-            .and_then(|j| serde_json::from_str(j).ok());
-
-        let display_name = payload
-            .as_ref()
-            .map(|p| p.title.clone())
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| member_dids.join(", "));
-        let description = payload
-            .as_ref()
-            .map(|p| p.description.clone())
-            .filter(|d| !d.is_empty());
-
-        let avatar_data_url = state
-            .orchestrator
-            .storage()
-            .get_avatar(&c.conversation_id)
-            .map(|(bytes, ct)| {
-                let mime = ct.unwrap_or_else(|| "image/jpeg".to_string());
-                format!("data:{};base64,{}", mime, B64.encode(&bytes))
-            });
-
-        convos.push(Conversation {
-            id: c.conversation_id.clone(),
-            group_id: c.group_id,
-            display_name,
-            description,
-            members: member_dids.clone(),
-            last_message: None,
-            last_message_at: None,
-            unread_count: 0,
-            is_group: member_dids.len() > 2,
-            avatar_data_url,
-        });
-    }
-
-    Ok(convos)
+    Ok(rows
+        .into_iter()
+        .map(|(row, members, meta, last_msg)| {
+            ui_conversation_from_row(row, members, meta, last_msg)
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1080,6 +1081,7 @@ pub async fn create_group(
     member_dids: Vec<String>,
     description: Option<String>,
 ) -> Result<Conversation, String> {
+    let did = require_authenticated_did(&state).await?;
     log_catmos!(
         " create_group called: name={}, members={:?}, description={:?}",
         name,
@@ -1087,90 +1089,23 @@ pub async fn create_group(
         description
     );
 
-    let members = if member_dids.is_empty() {
-        None
-    } else {
-        Some(member_dids.as_slice())
-    };
-
-    let convo = state
-        .orchestrator
-        .create_group(&name, members, description.as_deref())
-        .await
-        .map_err(|e| {
-            log_catmos!(" create_group error: {:?}", e);
-            format!("{:?}", e)
-        })?;
-
-    log_catmos!(" create_group success: group_id={}", convo.group_id);
-
-    let member_list: Vec<String> = convo.members.iter().map(|m| m.did.clone()).collect();
-
-    // Encrypted-metadata cutover: server-plaintext `convo.metadata` is gone
-    // post-cutover. The orchestrator's create flow has already produced an
-    // epoch-0 group with a `MetadataReference` in AppDataDictionary 0x8001
-    // (when name/description were supplied). Run the bootstrap to fetch +
-    // decrypt the freshly-uploaded blob so the local SQLite cache has the
-    // title/description before the Tauri command returns to the UI.
-    if let Err(e) = bootstrap_group_metadata(&state, &convo.group_id, &convo.conversation_id).await
-    {
-        log_catmos!(
-            " create_group: bootstrap_group_metadata failed for {}: {}",
-            convo.conversation_id,
-            e
-        );
-    }
-
-    let snapshot = state
-        .orchestrator
-        .storage()
-        .get_metadata_snapshot(&convo.conversation_id);
-    let payload: Option<catbird_mls::metadata::GroupMetadataV1> = snapshot
-        .as_ref()
-        .and_then(|s| s.metadata_json.as_deref())
-        .and_then(|j| serde_json::from_str(j).ok());
-
-    let display_name = payload
-        .as_ref()
-        .map(|p| p.title.clone())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| {
-            // Fall back to the requested name (the bootstrap may not have
-            // run yet if the orchestrator hasn't uploaded the blob in this
-            // build) — never expose the server's plaintext field.
-            if !name.is_empty() {
-                name.clone()
-            } else {
-                member_list.join(", ")
-            }
-        });
-    let desc = payload
-        .as_ref()
-        .map(|p| p.description.clone())
-        .filter(|d| !d.is_empty())
-        .or_else(|| description.clone());
-
-    let avatar_data_url = state
-        .orchestrator
-        .storage()
-        .get_avatar(&convo.conversation_id)
-        .map(|(bytes, ct)| {
-            let mime = ct.unwrap_or_else(|| "image/jpeg".to_string());
-            format!("data:{};base64,{}", mime, B64.encode(&bytes))
-        });
-
-    Ok(Conversation {
-        id: convo.conversation_id.clone(),
-        group_id: convo.group_id,
-        display_name,
-        description: desc,
-        members: member_list.clone(),
-        last_message: None,
-        last_message_at: None,
-        unread_count: 0,
-        is_group: member_list.len() > 2,
-        avatar_data_url,
+    let mgr = state.mls_manager.clone();
+    let (row, members, meta) = tokio::task::spawn_blocking(move || {
+        mgr.create_group_detailed(&did, name, member_dids, description)
     })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(|e| {
+        log_catmos!(" create_group error: {}", e);
+        actionable_error(e)
+    })?;
+
+    log_catmos!(
+        " create_group success: convo_id={} group_id={}",
+        row.conversation_id,
+        hex::encode(&row.group_id)
+    );
+    Ok(ui_conversation_from_row(row, members, meta, None))
 }
 
 /// Resolve the hex MLS group id for a canonical conversation id (UUID).
@@ -1259,34 +1194,20 @@ pub async fn send_message(
     conversation_id: String,
     content: String,
 ) -> Result<Message, String> {
-    state
-        .api_client
-        .require_canonical_admission()
-        .map_err(|error| {
-            actionable_error(format!("Signed clean-chat send unavailable: {error}"))
-        })?;
+    let did = require_authenticated_did(&state).await?;
     log_catmos!(" send_message: convo={}", conversation_id);
 
-    // The canonical projection exposes the UUID conversationId and the hex
-    // groupId as separate fields; the Rust orchestrator hex-decodes the id it
-    // is handed. Translate at the send boundary so the orchestrator encrypts
-    // under the MLS group, not the UUID.
-    let group_id = resolve_group_id(&state, &conversation_id).await?;
-
-    let msg = state
-        .orchestrator
-        .send_message(&group_id, &content)
+    let mgr = state.mls_manager.clone();
+    let convo_id = conversation_id.clone();
+    let row = tokio::task::spawn_blocking(move || mgr.send_message(&did, &convo_id, &content))
         .await
+        .map_err(|e| format!("task join error: {e}"))?
         .map_err(|e| {
-            log_catmos!(" send_message error: {:?}", e);
-            actionable_error(format!("{e:?}"))
+            log_catmos!(" send_message error: {}", e);
+            actionable_error(e)
         })?;
 
-    // The orchestrator stamps the hex group id on the message; the UI keys
-    // conversations by the canonical UUID, so restore it at the boundary.
-    let mut ui = ui_message_from_orchestrator(msg);
-    ui.conversation_id = conversation_id;
-    Ok(ui)
+    Ok(ui_message_from_row(row))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1397,23 +1318,20 @@ pub async fn get_messages(
     conversation_id: String,
     before: Option<String>,
 ) -> Result<Vec<Message>, String> {
-    // Try local storage first
-    let before_seq = before.and_then(|b| b.parse::<u64>().ok());
-    let mut stored = state
-        .orchestrator
-        .storage()
-        .get_messages(&conversation_id, 50, before_seq)
-        .await
-        .map_err(|e| format!("{:?}", e))?;
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(vec![]);
+    }
+    let before_seq = before.and_then(|b| b.parse::<i64>().ok());
+    let mgr = state.mls_manager.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        mgr.list_messages(&did, &conversation_id, before_seq, 50)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
 
-    refresh_message_delivery_statuses(&state, &conversation_id, &mut stored).await;
-
-    let messages = stored
-        .into_iter()
-        .filter(|m| m.has_displayable_body())
-        .map(ui_message_from_orchestrator)
-        .collect();
-
+    let mut messages: Vec<Message> = rows.into_iter().map(ui_message_from_row).collect();
+    messages.sort_by_key(|m| m.sequence_number);
     Ok(messages)
 }
 
@@ -1422,33 +1340,24 @@ pub async fn get_group_members(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<GroupMember>, String> {
-    let user_did = state
-        .orchestrator
-        .api_client()
-        .current_did()
-        .await
-        .unwrap_or_default();
-
-    let convo = state
-        .orchestrator
-        .storage()
-        .get_conversation(&user_did, &conversation_id)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    match convo {
-        Some(c) => Ok(c
-            .members
-            .into_iter()
-            .map(|m| GroupMember {
-                did: m.did.clone(),
-                handle: String::new(),
-                display_name: None,
-                role: format!("{:?}", m.role),
-            })
-            .collect()),
-        None => Ok(vec![]),
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(vec![]);
     }
+    let mgr = state.mls_manager.clone();
+    let members = tokio::task::spawn_blocking(move || mgr.list_members(&did, &conversation_id))
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
+
+    Ok(members
+        .into_iter()
+        .map(|member_did| GroupMember {
+            did: member_did,
+            handle: String::new(),
+            display_name: None,
+            role: "Member".to_string(),
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1602,13 +1511,23 @@ pub async fn fetch_new_messages(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Vec<Message>, String> {
-    let (msgs, _cursor) = state
-        .orchestrator
-        .fetch_messages(&conversation_id, None, 50, Some("app"), None, None)
-        .await
-        .map_err(|e| format!("{:?}", e))?;
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(vec![]);
+    }
+    let mgr = state.mls_manager.clone();
+    let rows = tokio::task::spawn_blocking(move || {
+        if let Err(e) = mgr.sync(&did) {
+            log_catmos!(" unified sync warning in fetch_new_messages: {}", e);
+        }
+        mgr.list_messages(&did, &conversation_id, None, 50)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
 
-    Ok(msgs.into_iter().map(ui_message_from_orchestrator).collect())
+    let mut messages: Vec<Message> = rows.into_iter().map(ui_message_from_row).collect();
+    messages.sort_by_key(|m| m.sequence_number);
+    Ok(messages)
 }
 
 #[tauri::command]
@@ -1738,17 +1657,26 @@ pub async fn update_cursor(
     conversation_id: String,
     cursor: String,
 ) -> Result<(), String> {
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(());
+    }
     log_catmos!(
         " update_cursor: convo={}, cursor={}",
         conversation_id,
         cursor
     );
 
-    state
-        .api_client
-        .update_cursor(&conversation_id, &cursor)
+    if let Ok(seq) = cursor.parse::<i64>() {
+        let mgr = state.mls_manager.clone();
+        tokio::task::spawn_blocking(move || {
+            mgr.acknowledge_entries_up_to(&did, &conversation_id, seq)
+        })
         .await
-        .map_err(|e| actionable_error(format!("Update cursor failed: {e:?}")))
+        .map_err(|e| format!("task join error: {e}"))?
+        .map_err(actionable_error)?;
+    }
+    Ok(())
 }
 
 fn parse_did(s: &str) -> Did {
@@ -1843,10 +1771,38 @@ pub async fn check_opt_in_status(
         .get_auth_token()
         .ok_or("Not authenticated")?;
 
+    let client = reqwest::Client::new();
+    let home_ds_did = crate::mls::TauriMlsManager::home_ds_did();
+    let home_ds_url = crate::mls::TauriMlsManager::home_ds_endpoint();
+    let sa_resp = client
+        .get(format!(
+            "{}/xrpc/com.atproto.server.getServiceAuth",
+            crate::nest_url().trim_end_matches('/')
+        ))
+        .query(&[
+            ("aud", home_ds_did.as_str()),
+            ("lxm", "blue.catbird.chat.getDevices"),
+        ])
+        .bearer_auth(&token)
+        .send()
+        .await
+        .map_err(|e| format!("getServiceAuth for getDevices failed: {e}"))?;
+
+    if !sa_resp.status().is_success() {
+        return Err(format!(
+            "getServiceAuth for getDevices failed: {}",
+            sa_resp.status()
+        ));
+    }
+    let sa_json: serde_json::Value = sa_resp.json().await.map_err(|e| e.to_string())?;
+    let service_jwt = sa_json
+        .get("token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "getServiceAuth missing token".to_string())?;
+
     let url = format!(
-        "{}/xrpc/{}",
-        crate::nest_url(),
-        "blue.catbird.chat.getDevices",
+        "{}/xrpc/blue.catbird.chat.getDevices",
+        home_ds_url.trim_end_matches('/')
     );
     let parsed_dids: Vec<Did> = dids.iter().map(|did| parse_did(did)).collect();
     let query_params: Vec<(&str, &str)> = parsed_dids
@@ -1854,9 +1810,10 @@ pub async fn check_opt_in_status(
         .map(|d| ("userDids", d.as_str()))
         .collect();
 
-    let client = reqwest::Client::new();
-    let resp = crate::mls_proxy::with_mls_proxy_header(client.get(&url).query(&query_params))
-        .bearer_auth(&token)
+    let resp = client
+        .get(&url)
+        .query(&query_params)
+        .bearer_auth(service_jwt)
         .send()
         .await
         .map_err(|e| format!("Opt-in check failed: {}", e))?;
@@ -1870,8 +1827,44 @@ pub async fn check_opt_in_status(
         catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>,
     >(body.as_ref())?;
 
-    let active_dids: std::collections::HashSet<&str> =
-        output.devices.iter().map(|d| d.user_did.as_str()).collect();
+    let mut active_dids: std::collections::HashSet<String> = output
+        .devices
+        .iter()
+        .map(|d| d.user_did.as_str().to_string())
+        .collect();
+
+    // Federated peers not hosted on our home DS still publish blue.catbird.chat.device on their PDS (ADR-009).
+    for did in &dids {
+        if active_dids.contains(did.as_str()) {
+            continue;
+        }
+        if let Ok(pds_resp) = client
+            .get(format!(
+                "{}/xrpc/com.atproto.repo.listRecords",
+                crate::nest_url().trim_end_matches('/')
+            ))
+            .query(&[
+                ("repo", did.as_str()),
+                ("collection", "blue.catbird.chat.device"),
+                ("limit", "1"),
+            ])
+            .bearer_auth(&token)
+            .send()
+            .await
+        {
+            if pds_resp.status().is_success() {
+                if let Ok(json) = pds_resp.json::<serde_json::Value>().await {
+                    if json
+                        .get("records")
+                        .and_then(|r| r.as_array())
+                        .is_some_and(|arr| !arr.is_empty())
+                    {
+                        active_dids.insert(did.clone());
+                    }
+                }
+            }
+        }
+    }
 
     Ok(dids
         .into_iter()
@@ -1916,19 +1909,20 @@ pub async fn remove_group_member(
     conversation_id: String,
     target_did: String,
 ) -> Result<(), String> {
+    let did = require_authenticated_did(&state).await?;
     log_catmos!(
         "remove_group_member: convo={}, target={}",
         conversation_id,
         target_did
     );
 
-    state
-        .orchestrator
-        .remove_members(&conversation_id, &[target_did])
-        .await
-        .map_err(|e| format!("{:?}", e))?;
-
-    Ok(())
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        mgr.remove_group_member(&did, &conversation_id, &target_did)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(actionable_error)
 }
 
 #[tauri::command]
@@ -1936,32 +1930,28 @@ pub async fn get_group_metadata(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<Option<serde_json::Value>, String> {
-    // Post-cutover, group titles / descriptions live in the encrypted blob
-    // path persisted by `bootstrap_group_metadata`. The plaintext 0xff00
-    // extension is gone; serve everything from local SQLite.
-    let snapshot = state
-        .orchestrator
-        .storage()
-        .get_metadata_snapshot(&conversation_id);
-    Ok(snapshot
-        .and_then(|s| s.metadata_json)
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok()))
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(None);
+    }
+    let mgr = state.mls_manager.clone();
+    let row = tokio::task::spawn_blocking(move || mgr.get_group_metadata(&did, &conversation_id))
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
+
+    Ok(row.map(|m| {
+        serde_json::json!({
+            "conversationId": m.conversation_id,
+            "title": m.title,
+            "description": m.description,
+            "avatarBlobCid": m.avatar_blob_cid,
+            "epoch": m.epoch,
+            "updatedAtMs": m.updated_at_ms,
+        })
+    }))
 }
 
-/// Fetch + decrypt the encrypted group metadata blob for a group at its
-/// current epoch and persist title/description/avatar into local SQLite.
-///
-/// Mirrors iOS `MLSConversationManager+Metadata.swift::bootstrapMetadataAfterJoin`.
-/// Call after:
-///   - `create_group` succeeds (we authored the first commit at epoch 0)
-///   - a Welcome lands and the orchestrator joins a new group
-///   - any commit merges that may have updated metadata
-///
-/// Reuses `catbird_mls::metadata::decrypt_metadata_blob` /
-/// `decrypt_avatar_blob` for crypto. AAD = group_id || epoch ||
-/// metadata_version, so the call is idempotent: re-running at the same
-/// (epoch, version) produces the same plaintext and silently overwrites
-/// the SQLite row.
+#[allow(dead_code)]
 async fn bootstrap_group_metadata(
     state: &AppState,
     group_id_hex: &str,
@@ -2459,27 +2449,30 @@ pub async fn update_group_metadata(
     avatar_blob_locator: Option<String>,
     avatar_content_type: Option<String>,
 ) -> Result<(), String> {
+    let did = require_authenticated_did(&state).await?;
+    let _ = (&avatar_blob_locator, &avatar_content_type);
     log_catmos!(
-        "update_group_metadata (encrypted Phase A.2): convo={}, name={:?}, description={:?}",
+        "update_group_metadata: convo={}, name={:?}, description={:?}",
         conversation_id,
         name,
         description
     );
 
-    state
-        .orchestrator
-        .update_group_metadata_encrypted(
-            &conversation_id,
-            name.as_deref(),
-            description.as_deref(),
-            avatar_blob_locator.as_deref(),
-            avatar_content_type.as_deref(),
-            None,
-        )
-        .await
-        .map_err(|e| format!("{:?}", e))?;
-
-    Ok(())
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        let existing = mgr.get_group_metadata(&did, &conversation_id)?;
+        let next_title = name
+            .or_else(|| existing.as_ref().and_then(|e| e.title.clone()))
+            .unwrap_or_default();
+        let next_desc = description
+            .or_else(|| existing.as_ref().and_then(|e| e.description.clone()))
+            .unwrap_or_default();
+        mgr.update_group_metadata(&did, &conversation_id, next_title, next_desc)
+            .map(|_| ())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(actionable_error)
 }
 
 #[tauri::command]
@@ -2488,19 +2481,21 @@ pub async fn add_group_members(
     conversation_id: String,
     member_dids: Vec<String>,
 ) -> Result<(), String> {
+    let did = require_authenticated_did(&state).await?;
     log_catmos!(
         "add_group_members: convo={}, members={:?}",
         conversation_id,
         member_dids
     );
 
-    state
-        .orchestrator
-        .add_members(&conversation_id, &member_dids)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        mgr.add_group_members(&did, &conversation_id, member_dids)
+            .map(|_| ())
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(actionable_error)
 }
 
 #[tauri::command]
@@ -2508,15 +2503,14 @@ pub async fn leave_conversation(
     state: State<'_, AppState>,
     conversation_id: String,
 ) -> Result<(), String> {
+    let did = require_authenticated_did(&state).await?;
     log_catmos!("leave_conversation: convo={}", conversation_id);
 
-    state
-        .orchestrator
-        .leave_group(&conversation_id)
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || mgr.decline_direct_request(&did, &conversation_id))
         .await
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
+        .map_err(|e| format!("task join error: {e}"))?
+        .map_err(actionable_error)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2541,81 +2535,51 @@ pub async fn search_messages(
         return Ok(vec![]);
     }
 
-    let user_did = state
-        .orchestrator
-        .api_client()
-        .current_did()
-        .await
-        .unwrap_or_default();
+    let did = require_authenticated_did(&state).await?;
+    if !state.mls_manager.is_opted_in(&did) {
+        return Ok(vec![]);
+    }
 
-    // Get all conversations for name lookup
-    let conversations = state
-        .orchestrator
-        .storage()
-        .list_conversations(&user_did)
-        .await
-        .map_err(|e| format!("{:?}", e))?;
-
-    // Encrypted-metadata cutover: titles come from the local SQLite cache
-    // populated by `bootstrap_group_metadata`. Plaintext server metadata
-    // (`c.metadata`) and the 0xff00 extension are both gone. Fall back to
-    // the conversation_id when bootstrap hasn't run yet.
-    let convo_names: std::collections::HashMap<String, String> = conversations
-        .iter()
-        .map(|c| {
-            let title = state
-                .orchestrator
-                .storage()
-                .get_metadata_snapshot(&c.conversation_id)
-                .and_then(|s| s.metadata_json)
-                .and_then(|j| {
-                    serde_json::from_str::<catbird_mls::metadata::GroupMetadataV1>(&j).ok()
-                })
-                .map(|p| p.title)
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| c.conversation_id.clone());
-            (c.conversation_id.clone(), title)
-        })
-        .collect();
-
-    // Search messages across all conversations
-    let mut hits = Vec::new();
+    let mgr = state.mls_manager.clone();
     let lower_query = query.to_lowercase();
-
-    for convo in &conversations {
-        // Use stable conversation_id for message lookups
-        let convo_id = &convo.conversation_id;
-        if let Ok(all_msgs) = state
-            .orchestrator
-            .storage()
-            .get_messages(convo_id, 500, None)
-            .await
-        {
-            let convo_name = convo_names
-                .get(convo_id)
-                .cloned()
-                .unwrap_or_else(|| convo_id.clone());
-
-            for msg in all_msgs {
-                if msg.text.to_lowercase().contains(&lower_query) {
-                    hits.push(SearchHit {
-                        message_id: msg.id.clone(),
-                        conversation_id: msg.conversation_id.clone(),
-                        conversation_name: convo_name.clone(),
-                        sender_did: msg.sender_did.clone(),
-                        content: msg.text.clone(),
-                        timestamp: msg.timestamp.to_rfc3339(),
-                    });
+    tokio::task::spawn_blocking(move || {
+        let convos = mgr.list_conversations_detailed(&did, 200)?;
+        let mut hits = Vec::new();
+        for (row, members, meta, _) in convos {
+            let convo_name = meta
+                .as_ref()
+                .and_then(|m| m.title.clone())
+                .filter(|t| !t.trim().is_empty())
+                .or_else(|| row.title.clone().filter(|t| !t.trim().is_empty()))
+                .unwrap_or_else(|| {
+                    if members.is_empty() {
+                        row.conversation_id.clone()
+                    } else {
+                        members.join(", ")
+                    }
+                });
+            if let Ok(msgs) = mgr.list_messages(&did, &row.conversation_id, None, 500) {
+                for msg in msgs {
+                    let (_mt, content) = extract_message_text_and_type(&msg.plaintext_json);
+                    if content.to_lowercase().contains(&lower_query) {
+                        hits.push(SearchHit {
+                            message_id: msg.message_id,
+                            conversation_id: msg.conversation_id,
+                            conversation_name: convo_name.clone(),
+                            sender_did: msg.sender_did,
+                            content,
+                            timestamp: rfc3339_from_ms(msg.created_at_ms),
+                        });
+                    }
                 }
             }
         }
-    }
-
-    // Sort by timestamp descending (newest first)
-    hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-    hits.truncate(100);
-
-    Ok(hits)
+        hits.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        hits.truncate(100);
+        Ok(hits)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -2952,11 +2916,16 @@ pub async fn labyrinth_enable_and_enroll(
     granted_scopes: Option<Vec<String>>,
 ) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
     let mgr = state.mls_manager.clone();
-    tokio::task::spawn_blocking(move || {
-        mgr.enable_and_enroll(&did, pds_supports_spaces, granted_scopes)
+    let did_for_enroll = did.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        mgr.enable_and_enroll(&did_for_enroll, pds_supports_spaces, granted_scopes)
     })
     .await
-    .map_err(|e| format!("task join error: {e}"))?
+    .map_err(|e| format!("task join error: {e}"))??;
+
+    start_kp_monitor(&state, did.clone()).await;
+    start_sync_loop(&state, did).await;
+    Ok(status)
 }
 
 #[tauri::command]

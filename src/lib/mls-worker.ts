@@ -12,40 +12,160 @@ const wasmReady = init().then(() => undefined);
 // WsSubscription structs can't cross the Worker boundary, so we track them here.
 const subscriptions = new Map<string, { close(): void }>();
 
-// WASM return values may contain non-cloneable JsValue handles.
+let unifiedClient: wasm.WasmMlsClient | null = null;
+let latestAuthToken: string | null = null;
+let backgroundSyncTimer: ReturnType<typeof setInterval> | null = null;
+
+// WASM return values may contain non-cloneable JsValue handles or BigInt (from Rust i64).
 // Strip them to plain JSON-safe objects for structured clone across Worker boundary.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const plain = (v: any) => (v === undefined || v === null ? v : JSON.parse(JSON.stringify(v)));
+const plain = (v: any) =>
+	v === undefined || v === null
+		? v
+		: JSON.parse(
+				JSON.stringify(v, (_k, val) => {
+					if (typeof val === 'bigint') return Number(val);
+					if (val instanceof Uint8Array) return Array.from(val);
+					return val;
+				})
+			);
+
+function bytesToHex(bytes: number[] | Uint8Array | undefined | null): string {
+	if (!bytes) return '';
+	const arr = bytes instanceof Uint8Array ? Array.from(bytes) : bytes;
+	return arr.map((b) => Number(b & 0xff).toString(16).padStart(2, '0')).join('');
+}
+
+function extractMessageTextAndType(plaintextJson: string): { messageType: string; content: string } {
+	try {
+		const parsed = JSON.parse(plaintextJson) as Record<string, unknown>;
+		const messageType =
+			typeof parsed.messageType === 'string'
+				? parsed.messageType
+				: typeof parsed.type === 'string'
+					? parsed.type
+					: 'text';
+		const content =
+			typeof parsed.text === 'string'
+				? parsed.text
+				: typeof parsed.content === 'string'
+					? parsed.content
+					: plaintextJson;
+		return { messageType, content };
+	} catch {
+		return { messageType: 'text', content: plaintextJson };
+	}
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapMessageRowToUi(rawRow: any) {
+	const row = plain(rawRow);
+	const { messageType, content } = extractMessageTextAndType(String(row.plaintext_json ?? ''));
+	const createdMs = Number(row.created_at_ms ?? Date.now());
+	return {
+		id: String(row.message_id ?? ''),
+		conversationId: String(row.conversation_id ?? ''),
+		senderDid: String(row.sender_did ?? ''),
+		senderHandle: '',
+		content,
+		timestamp: new Date(createdMs).toISOString(),
+		sequenceNumber: Math.max(0, Number(row.seq ?? 0)),
+		status: row.is_own ? 'sent' : 'delivered',
+		messageType
+	};
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function mapConversationRowToUi(rawRow: any, members: string[], rawMeta: any, rawLastMsg: any) {
+	const row = plain(rawRow);
+	const meta = rawMeta ? plain(rawMeta) : null;
+	const lastMsg = rawLastMsg ? plain(rawLastMsg) : null;
+	const metaTitle = typeof meta?.title === 'string' && meta.title.trim() ? meta.title : null;
+	const rowTitle = typeof row?.title === 'string' && row.title.trim() ? row.title : null;
+	const displayName =
+		metaTitle ??
+		rowTitle ??
+		(members.length > 0 ? members.join(', ') : String(row.conversation_id ?? ''));
+	const description =
+		typeof meta?.description === 'string' && meta.description.trim()
+			? meta.description
+			: undefined;
+	let lastMessage: string | undefined;
+	let lastMessageAt: string | undefined;
+	if (lastMsg) {
+		lastMessage = extractMessageTextAndType(String(lastMsg.plaintext_json ?? '')).content;
+		lastMessageAt = new Date(Number(lastMsg.created_at_ms ?? Date.now())).toISOString();
+	}
+	return {
+		id: String(row.conversation_id ?? ''),
+		groupId: bytesToHex(row.group_id),
+		displayName,
+		description,
+		members,
+		lastMessage,
+		lastMessageAt,
+		unreadCount: Math.max(0, Number(row.unread_count ?? 0)),
+		isGroup: members.length > 2 || meta !== null
+	};
+}
+
+function requireUnified(): wasm.WasmMlsClient {
+	if (!unifiedClient) {
+		throw new Error('WasmMlsClient is not open');
+	}
+	return unifiedClient;
+}
 
 const api = {
 	// Keep background orchestration in the worker that owns the WASM instance.
 	runDeferredRecovery: async () => {
 		await wasmReady;
-		return plain(await wasm.catbird_mls_run_deferred_recovery());
+		if (unifiedClient) {
+			return unifiedClient.sync();
+		}
+		return 0;
 	},
 	startBackgroundTasks: async (intervalMs: number) => {
 		await wasmReady;
-		wasm.catbird_mls_start_background_tasks(intervalMs);
+		if (backgroundSyncTimer) {
+			clearInterval(backgroundSyncTimer);
+		}
+		backgroundSyncTimer = setInterval(() => {
+			if (unifiedClient) {
+				unifiedClient.sync().catch((e) => console.warn('[catmos] background sync warning:', e));
+				unifiedClient
+					.flushLabyrinthQueue()
+					.catch((e) => console.warn('[catmos] background labyrinth flush warning:', e));
+			}
+		}, Math.max(5_000, intervalMs));
 	},
 	stopBackgroundTasks: async () => {
 		await wasmReady;
-		wasm.catbird_mls_stop_background_tasks();
+		if (backgroundSyncTimer) {
+			clearInterval(backgroundSyncTimer);
+			backgroundSyncTimer = null;
+		}
 	},
 	// Init & auth — void returns, discard WASM internals
-	init: async (config: object) => {
+	init: async (_config: object) => {
 		await wasmReady;
-		await wasm.catbird_mls_init(config);
 	},
-	setAuth: (did: string, token: string) => {
-		wasm.catbird_mls_set_auth(did, token);
+	setAuth: (_did: string, token: string) => {
+		latestAuthToken = token;
+		if (unifiedClient) {
+			unifiedClient.setAuthToken(token);
+		}
 	},
 	clearAuth: () => {
-		wasm.catbird_mls_clear_auth();
-		(wasm as unknown as { catbird_mls_clear_signer_bridge: () => void }).catbird_mls_clear_signer_bridge();
+		latestAuthToken = null;
+		if (backgroundSyncTimer) {
+			clearInterval(backgroundSyncTimer);
+			backgroundSyncTimer = null;
+		}
+		if (unifiedClient) {
+			unifiedClient.setAuthToken(null);
+		}
 	},
-	// Browser signer bridge. The CryptoKey remains owned by the worker's
-	// WebCrypto implementation; only its public key and a callback cross into
-	// WASM. No private key bytes, access token, DPoP proof, or JKT is exported.
 	setSignerBridge: async (
 		actorDid: string,
 		deviceId: string,
@@ -96,35 +216,85 @@ const api = {
 				) => Promise<unknown>;
 			}).catbird_mls_prepare_signed_request(operation, requestJson)
 		),
-	// Field-level encryption (Stage 6 / Task 22): install the 32-byte
-	// per-DID content root key. Pushed by the main thread after pulling
-	// the bytes from localStorage. wasm-bindgen exports the function as
-	// `setContentRootKey`/`clearContentRootKey` (see catbird-mls-web/src/lib.rs).
-	setContentRootKey: (key: Uint8Array) => {
-		(wasm as unknown as { setContentRootKey: (k: Uint8Array) => void }).setContentRootKey(
-			key
-		);
-	},
-	clearContentRootKey: () => {
-		(wasm as unknown as { clearContentRootKey: () => void }).clearContentRootKey();
-	},
+	setContentRootKey: (_key: Uint8Array) => {},
+	clearContentRootKey: () => {},
 	setup: async () => {
-		await wasm.catbird_mls_setup();
+		await wasmReady;
+		if (unifiedClient) {
+			try {
+				await unifiedClient.sync();
+			} catch (e) {
+				console.warn('[catmos] initial unified sync warning:', e);
+			}
+		}
 	},
 	replenishKeyPackages: async () => {
-		await wasm.catbird_mls_replenish_key_packages();
+		await wasmReady;
+		if (unifiedClient) {
+			await unifiedClient.replenishKeyPackages(10);
+		}
 	},
 	ping: () => wasm.catbird_mls_ping(),
 
-	// Conversations — return plain-serializable data
-	listConversations: async () => plain(await wasm.catbird_mls_list_conversations()),
-	createConversation: async (name: string, memberDids: string[]) =>
-		plain(await wasm.catbird_mls_create_conversation(name, memberDids)),
-	joinGroup: async (convoId: string) => plain(await wasm.catbird_mls_join_group(convoId)),
+	// Conversations — unified WasmMlsClient (`Spec §4` single DB)
+	listConversations: async () => {
+		await wasmReady;
+		if (!unifiedClient) return [];
+		try {
+			await unifiedClient.sync();
+		} catch (e) {
+			console.warn('[catmos] listConversations sync warning:', e);
+		}
+		const rows = plain(unifiedClient.listConversations(null, 100)) as unknown[];
+		return rows.map((row) => {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const convoId = String((row as any).conversation_id ?? '');
+			const members = (plain(unifiedClient!.listMembers(convoId)) as string[]) ?? [];
+			const meta = unifiedClient!.getGroupMetadata(convoId);
+			const msgs = (plain(unifiedClient!.listMessages(convoId, null, 1)) as unknown[]) ?? [];
+			const lastMsg = msgs.length > 0 ? msgs[0] : null;
+			return mapConversationRowToUi(row, members, meta, lastMsg);
+		});
+	},
+	createConversation: async (name: string, memberDids: string[], description?: string) => {
+		await wasmReady;
+		const client = requireUnified();
+		const convoId = crypto.randomUUID().toLowerCase();
+		const titleOpt = name.trim() ? name : null;
+		const descOpt = description && description.trim() ? description : null;
+		const row = await client.createGroup(
+			convoId,
+			client.homeDsDid(),
+			memberDids,
+			titleOpt,
+			descOpt
+		);
+		const members = (plain(client.listMembers(convoId)) as string[]) ?? [];
+		const meta = client.getGroupMetadata(convoId);
+		return mapConversationRowToUi(row, members, meta, null);
+	},
+	joinGroup: async (convoId: string) => {
+		await wasmReady;
+		const client = requireUnified();
+		await client.sync();
+		const rows = (plain(client.listConversations(null, 100)) as unknown[]) ?? [];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const found = rows.find((r: any) => r.conversation_id === convoId);
+		if (!found) throw new Error(`Conversation ${convoId} not found after sync`);
+		const members = (plain(client.listMembers(convoId)) as string[]) ?? [];
+		const meta = client.getGroupMetadata(convoId);
+		return mapConversationRowToUi(found, members, meta, null);
+	},
 
 	// Messages
-	sendMessage: async (convoId: string, content: string) =>
-		plain(await wasm.catbird_mls_send_message(convoId, content)),
+	sendMessage: async (convoId: string, content: string) => {
+		await wasmReady;
+		const client = requireUnified();
+		const msgId = crypto.randomUUID().toLowerCase();
+		const row = await client.sendMessage(convoId, msgId, content);
+		client.flushLabyrinthQueue().catch(() => {});
+		return mapMessageRowToUi(row);
+	},
 	sendImage: async (
 		convoId: string,
 		content: string,
@@ -145,8 +315,15 @@ const api = {
 				altText
 			)
 		),
-	getMessages: async (convoId: string, before?: string) =>
-		plain(await wasm.catbird_mls_messages(convoId, before)),
+	getMessages: async (convoId: string, before?: string) => {
+		await wasmReady;
+		if (!unifiedClient) return [];
+		const beforeSeq = before && /^\d+$/.test(before) ? BigInt(before) : null;
+		const rows = (plain(unifiedClient.listMessages(convoId, beforeSeq, 50)) as unknown[]) ?? [];
+		const mapped = rows.map(mapMessageRowToUi);
+		mapped.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+		return mapped;
+	},
 	getImageAttachment: async (
 		blobId: string,
 		keyB64: string,
@@ -163,20 +340,24 @@ const api = {
 			sha256,
 			contentType
 		),
-	fetchNewMessages: async (convoId: string) =>
-		plain(await wasm.catbird_mls_fetch_new_messages(convoId)),
+	fetchNewMessages: async (convoId: string) => {
+		await wasmReady;
+		if (!unifiedClient) return [];
+		try {
+			await unifiedClient.sync();
+		} catch (e) {
+			console.warn('[catmos] fetchNewMessages sync warning:', e);
+		}
+		const rows = (plain(unifiedClient.listMessages(convoId, null, 50)) as unknown[]) ?? [];
+		const mapped = rows.map(mapMessageRowToUi);
+		mapped.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+		return mapped;
+	},
 	sendReaction: async (convoId: string, msgId: string, emoji: string, action: string) => {
 		await wasm.catbird_mls_send_reaction(convoId, msgId, emoji, action);
 	},
-	updateCursor: async (convoId: string, cursor: string) => {
-		await wasm.catbird_mls_update_cursor(convoId, cursor);
-	},
+	updateCursor: async (_convoId: string, _cursor: string) => {},
 
-	// Subscribe — callbacks proxied via Comlink.proxy() from main thread.
-	// Accepts an optional `cursor` to match the Tauri IPC contract, but the
-	// current catbird-mls-web WASM binding does not plumb it through:
-	// subscription state is persisted on the Rust side, so the cursor hint
-	// is dropped here and the worker relies on that persisted state instead.
 	subscribe: async (
 		convoId: string,
 		onMessage: (data: unknown) => void,
@@ -193,14 +374,26 @@ const api = {
 	},
 
 	// Members
-	getMembers: async (convoId: string) =>
-		plain(await wasm.catbird_mls_get_members(convoId)),
+	getMembers: async (convoId: string) => {
+		await wasmReady;
+		if (!unifiedClient) return [];
+		const dids = (plain(unifiedClient.listMembers(convoId)) as string[]) ?? [];
+		return dids.map((did) => ({
+			did,
+			handle: '',
+			displayName: undefined,
+			role: 'Member'
+		}));
+	},
 	addParticipants: async (convoId: string, did: string) => {
-		await wasm.catbird_mls_add_participants(convoId, did);
+		await wasmReady;
+		const client = requireUnified();
+		await client.addGroupMembers(convoId, [did]);
 	},
 	addGroupMembers: async (convoId: string, memberDids: string[]) => {
-		// Batch add — single MLS commit for all members (one epoch advance).
-		await wasm.catbird_mls_add_group_members(convoId, memberDids);
+		await wasmReady;
+		const client = requireUnified();
+		await client.addGroupMembers(convoId, memberDids);
 	},
 	demoteMember: async (convoId: string, did: string) => {
 		await wasm.catbird_mls_demote_member(convoId, did);
@@ -212,10 +405,14 @@ const api = {
 		await wasm.catbird_mls_promote_member(convoId, did);
 	},
 	removeParticipants: async (convoId: string, did: string) => {
-		await wasm.catbird_mls_remove_participants(convoId, did);
+		await wasmReady;
+		const client = requireUnified();
+		await client.removeGroupMember(true, convoId, did);
 	},
 	leaveConversation: async (convoId: string) => {
-		await wasm.catbird_mls_leave_conversation(convoId);
+		await wasmReady;
+		const client = requireUnified();
+		await client.declineDirectRequest(convoId);
 	},
 
 	// Profiles & search
@@ -226,34 +423,28 @@ const api = {
 	checkOptInStatus: async (dids: string[]) =>
 		plain(await wasm.catbird_mls_check_opt_in_status(dids)),
 
-	// Group metadata (encrypted-only; MLS metadata cutover)
-	//
-	// Cutover note: post-Wave-1 the WASM `update_group_metadata` returns a
-	// rich result object (commit bytes, ciphertext, MetadataReference, version),
-	// uploads the encrypted blob internally, and persists the decrypted state
-	// to local OPFS-SQLite. `get_group_metadata` reads from that local cache.
-	// Hosts MUST call `bootstrapGroupMetadata` after every Welcome / commit
-	// merge so titles/descriptions/avatars decode and persist locally.
+	// Group metadata
 	getGroupMetadata: async (convoId: string) => {
-		const result = wasm.catbird_mls_get_group_metadata(convoId);
+		await wasmReady;
+		if (!unifiedClient) return null;
+		const result = unifiedClient.getGroupMetadata(convoId);
 		return result ? plain(result) : null;
 	},
 	updateGroupMetadata: async (
 		convoId: string,
 		title: string | null,
 		description: string | null,
-		avatarBlobLocator: string | null,
-		avatarContentType: string | null,
-		avatarBytes: Uint8Array | null
+		_avatarBlobLocator: string | null,
+		_avatarContentType: string | null,
+		_avatarBytes: Uint8Array | null
 	) => {
-		const result = await wasm.catbird_mls_update_group_metadata(
-			convoId,
-			title ?? undefined,
-			description ?? undefined,
-			avatarBlobLocator ?? undefined,
-			avatarContentType ?? undefined,
-			avatarBytes ?? undefined
-		);
+		await wasmReady;
+		const client = requireUnified();
+		const existing = client.getGroupMetadata(convoId);
+		const existingPlain = existing ? plain(existing) : null;
+		const nextTitle = title ?? existingPlain?.title ?? '';
+		const nextDesc = description ?? existingPlain?.description ?? '';
+		const result = await client.updateGroupMetadata(convoId, nextTitle, nextDesc);
 		return result ? plain(result) : null;
 	},
 	bootstrapGroupMetadata: async (groupIdHex: string) => {
@@ -268,7 +459,7 @@ const api = {
 		return result ? plain(result) : null;
 	},
 
-	// Voice messages (WASM bindings pending Rust implementation)
+	// Voice messages
 	prepareVoice: async (pcmPath: string, sampleRate: number) =>
 		plain(await (wasm as any).catbird_mls_prepare_voice(pcmPath, sampleRate)),
 	decodeOpus: async (opusData: Uint8Array) =>
@@ -308,10 +499,17 @@ const api = {
 		homeDsEndpoint: string;
 		pdsEndpoint: string;
 		dbKeyHex: string;
+		authToken?: string | null;
 	}) => {
 		await wasmReady;
+		if (params.authToken !== undefined) {
+			latestAuthToken = params.authToken;
+		}
 		const normalizedTarget = params.accountDid.trim().toLowerCase();
 		if (unifiedClient && unifiedClient.accountDid() === normalizedTarget) {
+			if (latestAuthToken !== null) {
+				unifiedClient.setAuthToken(latestAuthToken);
+			}
 			return {
 				accountDid: unifiedClient.accountDid(),
 				accountDidHash: unifiedClient.accountDidHash()
@@ -333,10 +531,18 @@ const api = {
 			params.pdsEndpoint,
 			params.dbKeyHex
 		);
+		if (latestAuthToken !== null) {
+			unifiedClient.setAuthToken(latestAuthToken);
+		}
 		return {
 			accountDid: unifiedClient.accountDid(),
 			accountDidHash: unifiedClient.accountDidHash()
 		};
+	},
+	syncUnified: async () => {
+		await wasmReady;
+		if (!unifiedClient) return 0;
+		return unifiedClient.sync();
 	},
 	evaluateSpacesEligibility: async (pdsSupportsSpaces: boolean, grantedScopes: string[]) => {
 		await wasmReady;
@@ -346,7 +552,7 @@ const api = {
 	enrollUnifiedDevice: async (pdsSupportsSpaces: boolean, grantedScopes: string[]) => {
 		await wasmReady;
 		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return plain(unifiedClient.enrollDevice(pdsSupportsSpaces, grantedScopes));
+		return plain(await unifiedClient.enrollDevice(pdsSupportsSpaces, grantedScopes));
 	},
 	labyrinthStatus: async () => {
 		await wasmReady;
@@ -383,6 +589,21 @@ const api = {
 		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
 		return plain(unifiedClient.revokeLabyrinthDevice(targetDeviceId));
 	},
+	listDirectRequests: async (consentFilter?: string | null) => {
+		await wasmReady;
+		if (!unifiedClient) return [];
+		return plain(unifiedClient.listRequests(consentFilter ?? null));
+	},
+	acceptDirectRequest: async (requestId: string) => {
+		await wasmReady;
+		const client = requireUnified();
+		await client.acceptDirectRequest(requestId);
+	},
+	declineDirectRequest: async (requestId: string) => {
+		await wasmReady;
+		const client = requireUnified();
+		await client.declineDirectRequest(requestId);
+	},
 	closeUnifiedClient: async () => {
 		await wasmReady;
 		if (unifiedClient) {
@@ -391,8 +612,6 @@ const api = {
 		}
 	}
 };
-
-let unifiedClient: wasm.WasmMlsClient | null = null;
 
 export type WorkerApi = typeof api;
 expose(api);

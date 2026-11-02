@@ -4,7 +4,7 @@
  * Enforces:
  * - `ctl #2`: Chat/Spaces off by default on fresh sign-in (zero DB opens, zero PDS/DS calls,
  *   and zero KeyPackage uploads until explicit user opt-in).
- * - `I15`: Spaces-required gate (`pdsSupportsSpaces` + `space:blob` + `repo:blue.catbird.mlsChat.device`).
+ * - `I15`: Spaces-required gate (`pdsSupportsSpaces` + `space:blob` + `repo:blue.catbird.chat.device`).
  * - WebAuthn capability probing via `PublicKeyCredential.getClientCapabilities()`.
  */
 
@@ -12,7 +12,7 @@ export const REQUIRED_LABYRINTH_OAUTH_SCOPES = [
 	'atproto',
 	'blob:*/*',
 	'repo:blue.catbird.labyrinth.mailboxKeys',
-	'repo:blue.catbird.mlsChat.device',
+	'repo:blue.catbird.chat.device',
 	'space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete',
 	'space:blue.catbird.labyrinth.conversation?authority=*'
 ] as const;

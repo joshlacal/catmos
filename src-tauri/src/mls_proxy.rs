@@ -8,6 +8,7 @@ pub fn atproto_proxy_header_value() -> String {
         .unwrap_or_else(|_| DEFAULT_ATPROTO_PROXY_DID.to_string())
 }
 
+#[allow(dead_code)]
 pub fn with_mls_proxy_header(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     request.header("atproto-proxy", atproto_proxy_header_value())
 }

@@ -695,10 +695,7 @@ export async function initWasm(did?: string): Promise<void> {
 
 	const runInit = (async () => {
 		try {
-			const mlsDbKey = await getOrCreateMlsDbKey(resolvedDid);
-			const dbPrefix = mlsDbPrefixForDid(resolvedDid);
-			const w = getWorker();
-			await w.init({ baseUrl: NEST_URL, mlsDbKey, dbPrefix });
+			await ensureUnifiedBrowserClientOpen(resolvedDid);
 			_workerDid = resolvedDid;
 		} catch (err) {
 			terminateWorkerInstance();
@@ -1230,7 +1227,7 @@ export async function createGroup(
 	// Ensure fresh key packages before group creation
 	await replenishKeyPackages();
 	const w = getWorker();
-	return w.createConversation(name, memberDids) as Promise<Conversation>;
+	return w.createConversation(name, memberDids, description) as Promise<Conversation>;
 }
 
 export async function subscribeConversation(
@@ -1901,6 +1898,8 @@ export interface OtcPairingCompletionView {
 async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<WorkerApi>> {
 	const didHash = await accountDidHashHex(did);
 	const dbKeyHex = await loadOrCreateDbKeyHex(didHash);
+	const savedAuth = readBrowserAuth();
+	const authToken = savedAuth && savedAuth.did === did ? savedAuth.sessionId : null;
 	const w = getWorker();
 	await w.openUnifiedClient({
 		accountDid: did,
@@ -1908,7 +1907,8 @@ async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<Worke
 		homeDsDid: HOME_DS_DID,
 		homeDsEndpoint: HOME_DS_URL,
 		pdsEndpoint: NEST_URL,
-		dbKeyHex
+		dbKeyHex,
+		authToken
 	});
 	return w;
 }
@@ -1928,6 +1928,8 @@ export async function enableMlsAndEnroll(
 	setMlsOptedInForDid(did, true);
 	const w = await ensureUnifiedBrowserClientOpen(did);
 	await w.enrollUnifiedDevice(Boolean(pdsSupportsSpaces), plainScopes);
+	startKeyPackageReplenishment();
+	await w.startBackgroundTasks(30_000);
 	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
 }
 

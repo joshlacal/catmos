@@ -800,6 +800,234 @@ impl TauriMlsManager {
         Ok(())
     }
 
+    pub fn home_ds_did() -> String {
+        std::env::var("CATMOS_MLS_DS_DID")
+            .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string())
+    }
+
+    pub fn home_ds_endpoint() -> String {
+        std::env::var("CATMOS_MLS_DS_URL")
+            .unwrap_or_else(|_| "https://chat.catbird.blue".to_string())
+    }
+
+    pub fn sync(&self, did: &str) -> Result<u32, String> {
+        let client = self.open_or_get_client(did)?;
+        client.sync().map_err(|e| e.to_string())
+    }
+
+    pub fn replenish_key_packages(&self, did: &str, count: u32) -> Result<u32, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .replenish_key_packages(count)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn flush_labyrinth_queue(&self, did: &str) -> Result<u32, String> {
+        let client = self.open_or_get_client(did)?;
+        client.flush_labyrinth_queue().map_err(|e| e.to_string())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn list_conversations_detailed(
+        &self,
+        did: &str,
+        limit: u32,
+    ) -> Result<
+        Vec<(
+            catbird_mls::storage::ConversationRow,
+            Vec<String>,
+            Option<catbird_mls::storage::GroupMetadataRow>,
+            Option<catbird_mls::storage::MessageRow>,
+        )>,
+        String,
+    > {
+        let client = self.open_or_get_client(did)?;
+        let rows = client
+            .list_conversations(None, limit)
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let members = client
+                .list_members(&row.conversation_id)
+                .unwrap_or_default();
+            let meta = client
+                .get_group_metadata(&row.conversation_id)
+                .ok()
+                .flatten();
+            let last_msg = client
+                .list_messages(&row.conversation_id, None, 1)
+                .ok()
+                .and_then(|mut v| v.pop());
+            out.push((row, members, meta, last_msg));
+        }
+        Ok(out)
+    }
+
+    pub fn create_group_detailed(
+        &self,
+        did: &str,
+        name: String,
+        member_dids: Vec<String>,
+        description: Option<String>,
+    ) -> Result<
+        (
+            catbird_mls::storage::ConversationRow,
+            Vec<String>,
+            Option<catbird_mls::storage::GroupMetadataRow>,
+        ),
+        String,
+    > {
+        let client = self.open_or_get_client(did)?;
+        let conversation_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let sequencer_did = Self::home_ds_did();
+        let title_opt = if name.trim().is_empty() {
+            None
+        } else {
+            Some(name)
+        };
+        let row = client
+            .create_group(
+                &conversation_id,
+                &sequencer_did,
+                member_dids,
+                title_opt,
+                description,
+            )
+            .map_err(|e| e.to_string())?;
+        let members = client
+            .list_members(&row.conversation_id)
+            .unwrap_or_default();
+        let meta = client
+            .get_group_metadata(&row.conversation_id)
+            .ok()
+            .flatten();
+        Ok((row, members, meta))
+    }
+
+    pub fn send_message(
+        &self,
+        did: &str,
+        conversation_id: &str,
+        content: &str,
+    ) -> Result<catbird_mls::storage::MessageRow, String> {
+        let client = self.open_or_get_client(did)?;
+        let message_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let row = client
+            .send_message(conversation_id, &message_id, content)
+            .map_err(|e| e.to_string())?;
+        let _ = client.flush_labyrinth_queue();
+        Ok(row)
+    }
+
+    pub fn list_messages(
+        &self,
+        did: &str,
+        conversation_id: &str,
+        before_seq: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<catbird_mls::storage::MessageRow>, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .list_messages(conversation_id, before_seq, limit)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_members(&self, did: &str, conversation_id: &str) -> Result<Vec<String>, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .list_members(conversation_id)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn add_group_members(
+        &self,
+        did: &str,
+        conversation_id: &str,
+        member_dids: Vec<String>,
+    ) -> Result<catbird_mls::storage::ConversationRow, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .add_group_members(conversation_id, member_dids)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn remove_group_member(
+        &self,
+        did: &str,
+        conversation_id: &str,
+        target_did: &str,
+    ) -> Result<(), String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .remove_group_member(
+                catbird_mls::groups::lifecycle::MemberRole::Admin,
+                conversation_id,
+                target_did,
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn get_group_metadata(
+        &self,
+        did: &str,
+        conversation_id: &str,
+    ) -> Result<Option<catbird_mls::storage::GroupMetadataRow>, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .get_group_metadata(conversation_id)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn update_group_metadata(
+        &self,
+        did: &str,
+        conversation_id: &str,
+        title: String,
+        description: String,
+    ) -> Result<catbird_mls::storage::GroupMetadataRow, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .update_group_metadata(conversation_id, title, description, None)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn list_requests(
+        &self,
+        did: &str,
+        consent_filter: Option<&str>,
+    ) -> Result<Vec<catbird_mls::storage::RequestRow>, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .list_requests(consent_filter)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn accept_direct_request(&self, did: &str, request_id: &str) -> Result<(), String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .accept_direct_request(request_id)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn decline_direct_request(&self, did: &str, request_id: &str) -> Result<(), String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .decline_direct_request(request_id)
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn acknowledge_entries_up_to(
+        &self,
+        did: &str,
+        conversation_id: &str,
+        up_to_seq: i64,
+    ) -> Result<(), String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .acknowledge_entries_up_to(conversation_id, up_to_seq)
+            .map_err(|e| e.to_string())
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
