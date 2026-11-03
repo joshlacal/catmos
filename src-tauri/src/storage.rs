@@ -835,6 +835,13 @@ impl MLSStorageBackend for SqliteStorage {
         for row in rows {
             result.push(row.map_err(|e| OrchestratorError::Storage(e.to_string()))?);
         }
+        // Stable replay order, as catbird-mls: `updated_at DESC, conversation_id ASC`
+        // (sorted parsed, so text format can't skew chronology).
+        result.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.conversation_id.cmp(&b.conversation_id))
+        });
         Ok(result)
     }
 
@@ -1691,6 +1698,50 @@ mod field_encryption_tests {
         let storage =
             SqliteStorage::new(db_path.to_str().unwrap(), TEST_DB_KEY).expect("open SqliteStorage");
         (tmp, storage)
+    }
+
+    #[tokio::test]
+    async fn list_conversations_orders_by_updated_at_then_conversation_id() {
+        let user = "did:plc:alice";
+        let (old, new) = ("2026-09-05T00:00:00Z", "2026-09-06T00:00:00Z");
+        let rows = [
+            ("c3", old),
+            ("c0", old),
+            ("c4", new),
+            ("c2", old),
+            ("c1", new),
+        ];
+        for order in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [2, 0, 4, 1, 3]] {
+            let (_tmp, storage) = new_temp_storage();
+            for i in order {
+                let (cid, at) = rows[i];
+                storage
+                    .ensure_conversation_exists(user, cid, &format!("{i}{i}").repeat(32))
+                    .await
+                    .unwrap();
+                storage
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "UPDATE conversations SET updated_at = ?1 WHERE conversation_id = ?2",
+                        rusqlite::params![at, cid],
+                    )
+                    .unwrap();
+            }
+            let ids: Vec<String> = storage
+                .list_conversations(user)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|c| c.conversation_id)
+                .collect();
+            assert_eq!(
+                ids,
+                ["c1", "c4", "c0", "c2", "c3"],
+                "insertion order {order:?}"
+            );
+        }
     }
 
     #[tokio::test]

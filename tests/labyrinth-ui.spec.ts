@@ -45,9 +45,17 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.ok(blockedScopes.missingScopes.includes('blob:*/*'));
 		assert.ok(
 			blockedScopes.missingScopes.includes(
-				'space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete'
+				'space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete'
 			)
 		);
+
+		const oldScopeSession = evaluateSpacesGateForUi(true, [
+			...REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(0, 4),
+			'space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete',
+			'space:blue.catbird.labyrinth.conversation?authority=*'
+		]);
+		assert.equal(oldScopeSession.eligible, false);
+		assert.deepEqual(oldScopeSession.missingScopes, REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(4));
 
 		const eligible = evaluateSpacesGateForUi(true, [...REQUIRED_LABYRINTH_OAUTH_SCOPES]);
 		assert.equal(eligible.eligible, true);

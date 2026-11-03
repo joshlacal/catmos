@@ -43,6 +43,10 @@ rand = "0.10.3"
 sha2 = "0.11.1"
 tempfile = "3.27.0"
 
+[dev-dependencies]
+# Unit tests open catbird-mls's explicit offline archive harness (`open_offline_archive_for_test`).
+catbird_mls = { path = "../../catbird-mls", features = ["test-utils"] }
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
 

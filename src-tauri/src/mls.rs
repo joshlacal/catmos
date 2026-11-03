@@ -698,7 +698,13 @@ impl TauriMlsManager {
         };
         let observer: Arc<dyn PlatformChangeObserver> =
             Arc::clone(&self.observer) as Arc<dyn PlatformChangeObserver>;
-        let client = CatbirdMlsClient::open(
+        // Unit tests drive Space-only flows over the offline test transport, so they open
+        // catbird-mls's explicit offline archive harness; every other build opens the live client.
+        #[cfg(test)]
+        let open = CatbirdMlsClient::open_offline_archive_for_test;
+        #[cfg(not(test))]
+        let open = CatbirdMlsClient::open;
+        let client = open(
             cfg,
             Arc::clone(&self.keystore) as Arc<dyn PlatformKeyStore>,
             Arc::clone(&self.transport) as Arc<dyn PlatformTransport>,
