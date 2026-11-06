@@ -54,7 +54,7 @@ cd catmos && npm run dev
 cd catmos && npm test
 ```
 
-Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through the `resolve.alias` in `vite.config.ts` (bundling) and the `paths` entry in `tsconfig.json` (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract. The current unsealed Task 4 R2 candidate consumes `pkg/` rebuilt from exact `catbird-mls` revision `b3c40d05baf512c5093db8615abe66bbb90941ee` with `catbird-atproto` `a6986331eee54f3f0ce16e7ea07dda63ab581dd7` and `labyrinth` `c8a6f6c76fd3ffe84137b5508a20a8258496f2ba`; rebuild `pkg/` and rerun `npm run check` after any source change. This is not a published or release-qualified artifact.
+Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through the `resolve.alias` in `vite.config.ts` (bundling) and the `paths` entry in `tsconfig.json` (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract. The current unsealed Task 4 R2 candidate consumes `pkg/` rebuilt from exact `catbird-mls` revision `e9f56c44878c0797b37724e425a02301649f8312` with `catbird-atproto` `a6986331eee54f3f0ce16e7ea07dda63ab581dd7` and `labyrinth` `c8a6f6c76fd3ffe84137b5508a20a8258496f2ba`; rebuild `pkg/` and rerun `npm run check` after any source change. This is not a published or release-qualified artifact.
 
 The SvelteKit frontend auto-detects Tauri vs browser at runtime via `$lib/wasm.ts`.
 
