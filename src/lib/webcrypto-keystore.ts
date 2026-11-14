@@ -6,12 +6,19 @@
  * - Wraps the 32-byte `sqlite3mc` DB key (and 32-byte content-root key) with a
  *   fresh 12-byte random IV (`crypto.getRandomValues(new Uint8Array(12))`) and
  *   domain-separated `additionalData` (`"catbird-mls-db-key:" + didHash`).
+ * - Coordinates per-account reads/writes through exclusive Web Locks without lock
+ *   stealing, normalizes cross-realm `Uint8Array` views, and zeroizes plaintext
+ *   key buffers after wrapping.
  * - Proactively purges any legacy `mls_db_key` / `content_root_key` / `mls.content.root.`
  *   entries from `sessionStorage` and `localStorage` so zero raw keys reside in DOM storage.
  */
 
+import { normalizeAccountDid } from './did.ts';
+
 export const WEBCRYPTO_DB_NAME = 'catbird_mls_webcrypto_v2';
 export const WEBCRYPTO_STORE_NAME = 'keystore';
+const LEGACY_KEYRING_DB_NAME = 'catbird_mls_keyring';
+const LEGACY_KEYRING_STORE_NAME = 'keys';
 
 export interface WrappedSecretEnvelope {
 	iv: Uint8Array;
@@ -27,6 +34,34 @@ const memoryKeyStoreFallback = new Map<string, unknown>();
 
 export function resetKeyStoreMemoryFallbackForTests(): void {
 	memoryKeyStoreFallback.clear();
+}
+
+function toUint8Array(input: unknown): Uint8Array | null {
+	if (input instanceof Uint8Array) {
+		return input;
+	}
+	if (input instanceof ArrayBuffer) {
+		return new Uint8Array(input);
+	}
+	if (ArrayBuffer.isView(input)) {
+		return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+	}
+	return null;
+}
+
+async function withAccountKeyStoreLock<T>(didHash: string, fn: () => Promise<T>): Promise<T> {
+	if (
+		typeof navigator !== 'undefined' &&
+		navigator.locks &&
+		typeof navigator.locks.request === 'function'
+	) {
+		return navigator.locks.request(
+			`catbird-mls-keystore:${didHash}`,
+			{ mode: 'exclusive' },
+			async () => fn()
+		);
+	}
+	return fn();
 }
 
 function purgeLegacyWebStorageKeys(): void {
@@ -125,31 +160,71 @@ async function storePutIfAbsent<T>(key: string, candidate: T): Promise<T> {
 	}
 }
 
-export async function deleteAccountKeyStoreEntries(didHash: string): Promise<void> {
+async function purgeLegacyKeyringEntry(legacySanitizedDid?: string): Promise<void> {
+	if (!legacySanitizedDid || typeof indexedDB === 'undefined') return;
+	try {
+		const db = await new Promise<IDBDatabase | null>((resolve) => {
+			const req = indexedDB.open(LEGACY_KEYRING_DB_NAME, 1);
+			req.onupgradeneeded = () => {
+				const candidate = req.result;
+				if (!candidate.objectStoreNames.contains(LEGACY_KEYRING_STORE_NAME)) {
+					candidate.createObjectStore(LEGACY_KEYRING_STORE_NAME);
+				}
+			};
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => resolve(null);
+			req.onblocked = () => resolve(null);
+		});
+		if (!db) return;
+		try {
+			if (!db.objectStoreNames.contains(LEGACY_KEYRING_STORE_NAME)) return;
+			await new Promise<void>((resolve) => {
+				const tx = db.transaction(LEGACY_KEYRING_STORE_NAME, 'readwrite');
+				tx.objectStore(LEGACY_KEYRING_STORE_NAME).delete(`mls_db_key_${legacySanitizedDid}`);
+				tx.oncomplete = () => resolve();
+				tx.onabort = () => resolve();
+				tx.onerror = () => resolve();
+			});
+		} finally {
+			db.close();
+		}
+	} catch {
+		// Best-effort cleanup of retired keyring store
+	}
+}
+
+export async function deleteAccountKeyStoreEntries(
+	didHash: string,
+	legacySanitizedDid?: string
+): Promise<void> {
 	purgeLegacyWebStorageKeys();
 	const normalized = didHash.trim();
 	if (!normalized) return;
-	const keys = [
-		`kek:${normalized}`,
-		`wrapped:db:${normalized}`,
-		`wrapped:content:${normalized}`
-	];
-	const db = await openKeyStoreDb();
-	if (!db) {
-		for (const k of keys) memoryKeyStoreFallback.delete(k);
-		return;
-	}
-	try {
-		await new Promise<void>((resolve, reject) => {
-			const tx = db.transaction(WEBCRYPTO_STORE_NAME, 'readwrite');
-			const store = tx.objectStore(WEBCRYPTO_STORE_NAME);
-			for (const k of keys) store.delete(k);
-			tx.onabort = () => reject(tx.error ?? new Error('IndexedDB delete aborted'));
-			tx.oncomplete = () => resolve();
-		});
-	} finally {
-		db.close();
-	}
+
+	await withAccountKeyStoreLock(normalized, async () => {
+		const keys = [
+			`kek:${normalized}`,
+			`wrapped:db:${normalized}`,
+			`wrapped:content:${normalized}`
+		];
+		const db = await openKeyStoreDb();
+		if (!db) {
+			for (const k of keys) memoryKeyStoreFallback.delete(k);
+		} else {
+			try {
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction(WEBCRYPTO_STORE_NAME, 'readwrite');
+					const store = tx.objectStore(WEBCRYPTO_STORE_NAME);
+					for (const k of keys) store.delete(k);
+					tx.onabort = () => reject(tx.error ?? new Error('IndexedDB delete aborted'));
+					tx.oncomplete = () => resolve();
+				});
+			} finally {
+				db.close();
+			}
+		}
+		await purgeLegacyKeyringEntry(legacySanitizedDid);
+	});
 }
 
 function isNonExtractableAesGcmKey(val: unknown): val is CryptoKey {
@@ -199,50 +274,63 @@ export async function loadOrCreateWrappedSecretBytes(
 		throw new Error('didHash must not be empty');
 	}
 
-	const kek = await getOrCreateAccountWrappingKey(normalized);
-	const recordId = `wrapped:${purpose}:${normalized}`;
-	const aad = new TextEncoder().encode(`catbird-mls-${purpose}-key:${normalized}`);
+	return withAccountKeyStoreLock(normalized, async () => {
+		const kek = await getOrCreateAccountWrappingKey(normalized);
+		const recordId = `wrapped:${purpose}:${normalized}`;
+		const aad = new TextEncoder().encode(`catbird-mls-${purpose}-key:${normalized}`);
 
-	let wrapped = await storeGet<WrappedSecretEnvelope>(recordId);
-	if (!wrapped) {
-		const rawSecret = crypto.getRandomValues(new Uint8Array(32));
-		const iv = crypto.getRandomValues(new Uint8Array(12));
-		const ctBuf = await crypto.subtle.encrypt(
+		let wrappedRaw = await storeGet<unknown>(recordId);
+		if (!wrappedRaw) {
+			const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+			try {
+				const iv = crypto.getRandomValues(new Uint8Array(12));
+				const ctBuf = await crypto.subtle.encrypt(
+					{
+						name: 'AES-GCM',
+						iv: iv as BufferSource,
+						additionalData: aad as BufferSource
+					},
+					kek,
+					rawSecret as BufferSource
+				);
+				wrappedRaw = await storePutIfAbsent<WrappedSecretEnvelope>(recordId, {
+					iv,
+					ciphertext: new Uint8Array(ctBuf)
+				});
+			} finally {
+				rawSecret.fill(0);
+			}
+		}
+
+		if (typeof wrappedRaw !== 'object' || wrappedRaw === null) {
+			throw new Error(`Corrupt wrapped key envelope for ${recordId}`);
+		}
+		const candidate = wrappedRaw as Record<string, unknown>;
+		const ivBytes = toUint8Array(candidate.iv);
+		const ctBytes = toUint8Array(candidate.ciphertext);
+		if (!ivBytes || ivBytes.byteLength !== 12) {
+			throw new Error(`Invalid 12-byte AES-GCM IV for ${recordId}`);
+		}
+		if (!ctBytes || ctBytes.byteLength !== 48) {
+			throw new Error(`Invalid AES-GCM ciphertext length for ${recordId}`);
+		}
+
+		const ptBuf = await crypto.subtle.decrypt(
 			{
 				name: 'AES-GCM',
-				iv: iv as BufferSource,
+				iv: new Uint8Array(ivBytes) as BufferSource,
 				additionalData: aad as BufferSource
 			},
 			kek,
-			rawSecret as BufferSource
+			new Uint8Array(ctBytes) as BufferSource
 		);
-		wrapped = await storePutIfAbsent<WrappedSecretEnvelope>(recordId, {
-			iv,
-			ciphertext: new Uint8Array(ctBuf)
-		});
-	}
-
-	if (!(wrapped.iv instanceof Uint8Array) || wrapped.iv.byteLength !== 12) {
-		throw new Error(`Invalid 12-byte AES-GCM IV for ${recordId}`);
-	}
-	if (!(wrapped.ciphertext instanceof Uint8Array) || wrapped.ciphertext.byteLength !== 48) {
-		throw new Error(`Invalid AES-GCM ciphertext length for ${recordId}`);
-	}
-
-	const ptBuf = await crypto.subtle.decrypt(
-		{
-			name: 'AES-GCM',
-			iv: wrapped.iv as BufferSource,
-			additionalData: aad as BufferSource
-		},
-		kek,
-		wrapped.ciphertext as BufferSource
-	);
-	const bytes = new Uint8Array(ptBuf);
-	if (bytes.byteLength !== 32) {
-		throw new Error(`Unwrapped key length mismatch for ${recordId}: ${bytes.byteLength}`);
-	}
-	return bytes;
+		const bytes = new Uint8Array(ptBuf);
+		if (bytes.byteLength !== 32) {
+			bytes.fill(0);
+			throw new Error(`Unwrapped key length mismatch for ${recordId}: ${bytes.byteLength}`);
+		}
+		return bytes;
+	});
 }
 
 /**
@@ -251,25 +339,18 @@ export async function loadOrCreateWrappedSecretBytes(
  */
 export async function loadOrCreateDbKeyHex(didHash: string): Promise<string> {
 	const bytes = await loadOrCreateWrappedSecretBytes(didHash, 'db');
-	return Array.from(bytes)
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
+	try {
+		return Array.from(bytes)
+			.map((b) => b.toString(16).padStart(2, '0'))
+			.join('');
+	} finally {
+		bytes.fill(0);
+	}
 }
 
 /** Compute canonical 64-char lowercase hex SHA-256 of normalized DID (`I8`). */
 export async function accountDidHashHex(did: string): Promise<string> {
-	const trimmed = did.trim().split('#')[0]?.trim() ?? '';
-	if (!trimmed.startsWith('did:')) {
-		throw new Error(`Invalid ATProto DID: ${did}`);
-	}
-	const parts = trimmed.split(':');
-	if (parts.length < 3) {
-		throw new Error(`Invalid ATProto DID: ${did}`);
-	}
-	const scheme = parts[0].toLowerCase();
-	const method = parts[1].toLowerCase();
-	const rest = parts.slice(2).join(':');
-	const normalized = `${scheme}:${method}:${method === 'web' ? rest.toLowerCase() : rest}`;
+	const normalized = normalizeAccountDid(did);
 	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalized));
 	return Array.from(new Uint8Array(digest))
 		.map((b) => b.toString(16).padStart(2, '0'))

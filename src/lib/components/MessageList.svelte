@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Message } from '#lib/tauri.ts';
+	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import MessageBubble, { type ReplyInfo } from './MessageBubble.svelte';
 
@@ -26,14 +27,15 @@
 		if (index === 0) return true;
 		const msg = messages[index];
 		const prev = messages[index - 1];
-		if (msg.senderDid !== prev.senderDid) return true;
+		if (!isSameAccountDid(msg.senderDid, prev.senderDid)) return true;
 		if (msg.messageType === 'system' || prev.messageType === 'system') return true;
 		const gap = new Date(msg.timestamp).getTime() - new Date(prev.timestamp).getTime();
 		return gap > 5 * 60 * 1000;
 	}
 
 	function shortDid(did: string): string {
-		return did.split(':').pop() ?? did;
+		const bare = stripDidFragment(did);
+		return bare.split(':').pop() ?? bare;
 	}
 
 	let typingLabel = $derived.by(() => {

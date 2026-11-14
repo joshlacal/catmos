@@ -1,5 +1,6 @@
 <script lang="ts">
 	import type { Message } from '#lib/tauri.ts';
+	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 	import { profiles } from '#lib/stores/profiles.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import Reactions from './Reactions.svelte';
@@ -23,20 +24,28 @@
 		onReply?: (info: ReplyInfo) => void;
 	} = $props();
 
+	let senderAccountDid = $derived(stripDidFragment(message.senderDid));
+
 	$effect(() => {
-		if (message.messageType !== 'system' && message.senderDid) {
-			profiles.resolveProfiles([message.senderDid]);
+		if (message.messageType !== 'system' && senderAccountDid) {
+			profiles.resolveProfiles([senderAccountDid]);
 		}
 	});
 
-	let profile = $derived(message.senderDid ? $profiles.cache.get(message.senderDid) : undefined);
+	let profile = $derived(senderAccountDid ? $profiles.cache.get(senderAccountDid) : undefined);
 	let displayName = $derived(
-		profile?.displayName || profile?.handle || message.senderHandle || message.senderDid || 'Unknown'
+		profile?.displayName ||
+			profile?.handle ||
+			stripDidFragment(message.senderHandle) ||
+			senderAccountDid ||
+			'Unknown'
 	);
 	let avatarUrl = $derived(profile?.avatar);
 	let initial = $derived(displayName.charAt(0).toUpperCase());
 	let isSystem = $derived(message.messageType === 'system');
-	let isOwn = $derived(message.senderDid === $auth.user?.did);
+	let isOwn = $derived(
+		Boolean(message.isOwn) || isSameAccountDid(message.senderDid, $auth.user?.did)
+	);
 
 	// Parse structured content (may contain reply reference)
 	let parsed = $derived.by(() => {
@@ -57,18 +66,19 @@
 
 	// Reply reference from parsed content
 	let replyRef = $derived(parsed?.reply ?? null);
+	let replyAccountDid = $derived(replyRef ? stripDidFragment(replyRef.senderDid) : '');
 
 	// Resolve reply sender profile
 	$effect(() => {
-		if (replyRef?.senderDid) {
-			profiles.resolveProfiles([replyRef.senderDid]);
+		if (replyAccountDid) {
+			profiles.resolveProfiles([replyAccountDid]);
 		}
 	});
 
 	let replySenderName = $derived.by(() => {
 		if (!replyRef) return '';
-		const p = $profiles.cache.get(replyRef.senderDid);
-		return p?.displayName || p?.handle || replyRef.senderDid;
+		const p = replyAccountDid ? $profiles.cache.get(replyAccountDid) : undefined;
+		return p?.displayName || p?.handle || replyAccountDid || replyRef.senderDid;
 	});
 
 	// Detect Bluesky post URLs in message content
@@ -99,7 +109,7 @@
 	function handleReply() {
 		onReply?.({
 			messageId: message.id,
-			senderDid: message.senderDid,
+			senderDid: senderAccountDid || message.senderDid,
 			senderName: displayName,
 			preview: (rawContent ?? '').slice(0, 100)
 		});

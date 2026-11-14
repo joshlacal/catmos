@@ -12,7 +12,8 @@
     "moduleResolution": "bundler",
     "paths": {
       "catbird-mls-web": [
-        "../catbird-mls-web/pkg/catbird_mls_web.d.ts"
+        "../catbird-mls-web/pkg/catbird_mls_web.d.ts",
+        "./src/lib/wasm-pkg/catbird_mls_web.d.ts"
       ]
     }
   },
@@ -23,6 +24,7 @@
     "*.js"
   ],
   "exclude": [
-    "src/service-worker/**"
+    "src/service-worker/**",
+    "src/lib/wasm-pkg/**"
   ]
 }

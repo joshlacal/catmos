@@ -29,6 +29,7 @@ export interface Message {
 	content: string;
 	timestamp: string;
 	status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+	isOwn?: boolean;
 	messageType?: 'text' | 'image' | 'voice' | 'system' | 'event';
 	image?: ImageAttachment;
 	audioAttachment?: AudioAttachment;
@@ -97,6 +98,7 @@ export interface AuthState {
 	handle: string;
 	displayName?: string;
 	avatar?: string;
+	grantedScopes?: string[];
 }
 
 export interface GroupMember {
@@ -127,6 +129,14 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 
 export async function logout(): Promise<void> {
 	return invoke('logout');
+}
+
+export async function retireCurrentDevice(): Promise<void> {
+	return invoke('retire_current_device');
+}
+
+export async function deleteAccountData(): Promise<void> {
+	return invoke('delete_account_data');
 }
 
 export async function getConversations(): Promise<Conversation[]> {

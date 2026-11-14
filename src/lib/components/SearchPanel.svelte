@@ -3,6 +3,7 @@
   import { conversations } from '#lib/stores/conversations.ts';
   import { messages } from '#lib/stores/messages.ts';
   import * as api from '#lib/wasm.ts';
+  import { stripDidFragment } from '#lib/did.ts';
   import type { SearchHit } from '#lib/wasm.ts';
 
   let {
@@ -183,7 +184,7 @@
                 <span class="result-convo">{hit.conversationName}</span>
                 <span class="result-time">{formatTimestamp(hit.timestamp)}</span>
               </div>
-              <div class="result-sender">{hit.senderDid}</div>
+              <div class="result-sender">{stripDidFragment(hit.senderDid)}</div>
               <div class="result-content">
                 {#each highlightSegments(hit.content, query) as segment}
                   {#if segment.match}

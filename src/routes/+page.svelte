@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import {
 		conversations,
@@ -227,7 +228,9 @@
 	/** Resolve display name for 1:1 conversations using profile data. */
 	function resolvedDisplayName(convo: Conversation): string {
 		if (convo.isGroup) return convo.displayName;
-		const otherDid = convo.members.find((did) => did !== $auth.user?.did) ?? convo.members[0];
+		const otherRaw =
+			convo.members.find((did) => !isSameAccountDid(did, $auth.user?.did)) ?? convo.members[0];
+		const otherDid = stripDidFragment(otherRaw);
 		if (otherDid) {
 			const profile = $profiles.cache.get(otherDid);
 			if (profile) return profile.displayName ?? profile.handle;
@@ -291,7 +294,7 @@
 	let currentTypingUsers = $derived(
 		currentConversation
 			? ($messages.typingByConversation.get(currentConversation.id) ?? []).filter(
-					(did) => did !== $auth.user?.did
+					(did) => !isSameAccountDid(did, $auth.user?.did)
 				)
 			: []
 	);

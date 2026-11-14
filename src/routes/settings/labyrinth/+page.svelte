@@ -1,36 +1,53 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { auth } from '#lib/stores/auth.ts';
+	import { normalizeAccountDid, tryNormalizeAccountDid } from '#lib/did.ts';
 	import {
+		approveLabyrinthSiblingDevice,
 		completeLabyrinthOtcPairing,
 		enableMlsAndEnroll,
+		getCurrentLabyrinthDeviceId,
 		getLabyrinthStatus,
 		initiateLabyrinthOtcPairing,
+		probePdsSpacesSupport,
 		registerLabyrinthPasskeyPrf,
+		restoreWithLabyrinthPasskeyPrf,
 		restoreWithLabyrinthRecoveryCode,
 		revokeLabyrinthDevice,
 		setupLabyrinthRecoveryCode,
+		syncLabyrinthBackfill,
 		type LabyrinthBackupStatusView,
 		type OtcPairingOfferView
 	} from '#lib/wasm.ts';
 	import {
+		assertCanRevokeLabyrinthDevice,
+		deriveLabyrinthPasskeyUserId,
+		deriveLabyrinthPrfSalt,
+		deriveSiblingBackfillSummary,
 		detectPasskeyPrfCapability,
 		evaluateSpacesGateForUi,
 		isMlsOptedInForDid,
 		mapWebAuthnErrorToMessage,
+		normalizeLabyrinthDeviceList,
+		performPasskeyPrfAssertion,
 		REQUIRED_LABYRINTH_OAUTH_SCOPES,
+		resolveLabyrinthPasskeyRpId,
 		setMlsOptedInForDid
 	} from '#lib/labyrinth-ui.ts';
 
-	const FALLBACK_DEMO_DID = 'did:plc:catmosdemoaccount0001';
-	const activeDid = $derived($auth.user?.did ?? FALLBACK_DEMO_DID);
+	const activeDid = $derived($auth.user?.did ? tryNormalizeAccountDid($auth.user.did) : null);
 
-	let pdsSupportsSpaces = $state(true);
-	let grantedScopes = $state<string[]>([...REQUIRED_LABYRINTH_OAUTH_SCOPES]);
-	const spacesGate = $derived(evaluateSpacesGateForUi(pdsSupportsSpaces, grantedScopes));
+	let pdsSupportsSpaces = $state(false);
+	let probingPds = $state(false);
+	const grantedScopes = $derived($auth.user?.grantedScopes ?? []);
+	const spacesGate = $derived(
+		evaluateSpacesGateForUi(pdsSupportsSpaces, grantedScopes, activeDid ?? '')
+	);
 
 	let optedIn = $state(false);
 	let status = $state<LabyrinthBackupStatusView | null>(null);
+	let currentDeviceId = $state<string | null>(null);
 	let generatedRecoveryCode = $state('');
 	let restoreCodeInput = $state('');
 	let otcOffer = $state<OtcPairingOfferView | null>(null);
@@ -40,24 +57,99 @@
 	let statusBanner = $state<string | null>(null);
 	let errorBanner = $state<string | null>(null);
 	let busy = $state(false);
+	let initializedForDid = $state<string | null>(null);
 
 	let pendingRevokeDeviceId = $state<string | null>(null);
 	let revokeDialogEl: HTMLDialogElement | undefined = $state(undefined);
+	let deleteAccountDialogEl: HTMLDialogElement | undefined = $state(undefined);
+
+	const effectiveCurrentDeviceId = $derived(status?.current_device_id ?? currentDeviceId);
+	const devices = $derived(normalizeLabyrinthDeviceList(status, effectiveCurrentDeviceId));
+	const currentDeviceEntry = $derived(devices.find((d) => d.isCurrent) ?? null);
+	const backfillSummary = $derived(deriveSiblingBackfillSummary(status));
+
+	function requireAuthenticatedDid(): string {
+		if (!activeDid) {
+			throw new Error('Sign in with your AT Protocol account to manage Labyrinth Backup.');
+		}
+		return normalizeAccountDid(activeDid);
+	}
+
+	async function refreshDeviceIdentityAndStatus(did: string) {
+		currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+		status = await getLabyrinthStatus(did);
+	}
+
+	async function loadAccountLabyrinthState(did: string) {
+		probingPds = true;
+		try {
+			pdsSupportsSpaces = await probePdsSpacesSupport();
+		} finally {
+			probingPds = false;
+		}
+		optedIn = isMlsOptedInForDid(did);
+		if (optedIn) {
+			try {
+				await refreshDeviceIdentityAndStatus(did);
+			} catch (err) {
+				errorBanner = err instanceof Error ? err.message : String(err);
+			}
+		} else {
+			status = null;
+			currentDeviceId = null;
+		}
+	}
 
 	onMount(async () => {
-		optedIn = isMlsOptedInForDid(activeDid);
 		const prfCap = await detectPasskeyPrfCapability();
 		canRegisterPasskeyPrf = prfCap.canRegisterPasskeyPrf;
 		passkeyReason = prfCap.reason;
 
-		if (optedIn) {
-			try {
-				status = await getLabyrinthStatus(activeDid);
-			} catch (err) {
-				errorBanner = err instanceof Error ? err.message : String(err);
-			}
+		if (!activeDid && !$auth.loading) {
+			await auth.tryRestore();
 		}
 	});
+
+	$effect(() => {
+		const did = activeDid;
+		if (!did) {
+			initializedForDid = null;
+			pdsSupportsSpaces = false;
+			optedIn = false;
+			status = null;
+			currentDeviceId = null;
+			return;
+		}
+		if (initializedForDid !== did) {
+			initializedForDid = did;
+			void loadAccountLabyrinthState(did);
+		}
+	});
+
+	function formatDeviceTimestamp(iso: string | null): string {
+		if (!iso) return '—';
+		const parsed = new Date(iso);
+		if (Number.isNaN(parsed.getTime())) return iso;
+		return parsed.toLocaleString();
+	}
+
+	async function handleUpgradeScopes() {
+		busy = true;
+		errorBanner = null;
+		statusBanner = null;
+		try {
+			requireAuthenticatedDid();
+			const targetScopes =
+				spacesGate.missingScopes.length > 0
+					? spacesGate.missingScopes
+					: REQUIRED_LABYRINTH_OAUTH_SCOPES;
+			await auth.upgradeScopes(targetScopes, '/settings/labyrinth');
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
 
 	async function handleOptInAndEnroll() {
 		if (!spacesGate.eligible) {
@@ -67,13 +159,33 @@
 		busy = true;
 		errorBanner = null;
 		statusBanner = null;
+		let did = '';
 		try {
-			status = await enableMlsAndEnroll(activeDid, pdsSupportsSpaces, grantedScopes);
+			did = requireAuthenticatedDid();
+			status = await enableMlsAndEnroll(did, pdsSupportsSpaces, grantedScopes);
+			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
 			optedIn = true;
 			statusBanner = 'Encrypted Chat and Labyrinth 1.1 Spaces history enabled on this device.';
 		} catch (err) {
-			setMlsOptedInForDid(activeDid, false);
+			if (did) {
+				setMlsOptedInForDid(did, false);
+			}
 			optedIn = false;
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function handleSyncBackfillNow() {
+		busy = true;
+		errorBanner = null;
+		try {
+			const did = requireAuthenticatedDid();
+			status = await syncLabyrinthBackfill(did);
+			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+			statusBanner = 'Synchronized sibling Space history batches.';
+		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
@@ -84,8 +196,9 @@
 		busy = true;
 		errorBanner = null;
 		try {
-			generatedRecoveryCode = await setupLabyrinthRecoveryCode(activeDid);
-			status = await getLabyrinthStatus(activeDid);
+			const did = requireAuthenticatedDid();
+			generatedRecoveryCode = await setupLabyrinthRecoveryCode(did);
+			await refreshDeviceIdentityAndStatus(did);
 			statusBanner = '40-character GF(32) recovery code bound to your Labyrinth virtual device.';
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
@@ -100,7 +213,9 @@
 		busy = true;
 		errorBanner = null;
 		try {
-			status = await restoreWithLabyrinthRecoveryCode(activeDid, restoreCodeInput.trim());
+			const did = requireAuthenticatedDid();
+			status = await restoreWithLabyrinthRecoveryCode(did, restoreCodeInput.trim());
+			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
 			restoreCodeInput = '';
 			statusBanner = `Restored Labyrinth mailbox and rotated to epoch ${status.epoch_seq}.`;
 		} catch (err) {
@@ -114,19 +229,22 @@
 		busy = true;
 		errorBanner = null;
 		try {
+			const canonicalDid = requireAuthenticatedDid();
 			const challenge = crypto.getRandomValues(new Uint8Array(32));
-			const prfSalt = new TextEncoder().encode(`catbird-labyrinth-prf:${activeDid}`);
-			const userId = new TextEncoder().encode(activeDid).slice(0, 64);
-			const rpId = typeof window !== 'undefined' ? window.location.hostname : 'catbird.blue';
+			const prfSalt = await deriveLabyrinthPrfSalt(canonicalDid);
+			const userId = await deriveLabyrinthPasskeyUserId(canonicalDid);
+			const rpId = resolveLabyrinthPasskeyRpId(
+				typeof window !== 'undefined' ? window.location.hostname : undefined
+			);
 
 			const cred = (await navigator.credentials.create({
 				publicKey: {
-					challenge,
-					rp: { name: 'Catbird Encrypted Chat', id: rpId },
+					challenge: challenge as BufferSource,
+					rp: { name: 'Catbird', id: rpId },
 					user: {
-						id: userId,
-						name: $auth.user?.handle ?? activeDid,
-						displayName: $auth.user?.displayName ?? $auth.user?.handle ?? activeDid
+						id: userId as BufferSource,
+						name: canonicalDid,
+						displayName: $auth.user?.displayName ?? $auth.user?.handle ?? canonicalDid
 					},
 					pubKeyCredParams: [
 						{ alg: -7, type: 'public-key' },
@@ -141,7 +259,7 @@
 					extensions: {
 						prf: {
 							eval: {
-								first: prfSalt
+								first: prfSalt as BufferSource
 							}
 						}
 					} as AuthenticationExtensionsClientInputs
@@ -165,11 +283,30 @@
 			}
 
 			status = await registerLabyrinthPasskeyPrf(
-				activeDid,
+				canonicalDid,
 				new Uint8Array(cred.rawId),
 				prfBytes
 			);
+			currentDeviceId = await getCurrentLabyrinthDeviceId(canonicalDid);
 			statusBanner = 'Passkey PRF bound to your Labyrinth recovery keyring.';
+		} catch (err) {
+			errorBanner = mapWebAuthnErrorToMessage(err);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function handleRestorePasskeyPrf() {
+		busy = true;
+		errorBanner = null;
+		try {
+			const canonicalDid = requireAuthenticatedDid();
+			const { credentialId, prfOutput32 } = await performPasskeyPrfAssertion({
+				did: canonicalDid
+			});
+			status = await restoreWithLabyrinthPasskeyPrf(canonicalDid, credentialId, prfOutput32);
+			currentDeviceId = await getCurrentLabyrinthDeviceId(canonicalDid);
+			statusBanner = `Restored Labyrinth mailbox via Passkey PRF (epoch ${status.epoch_seq}).`;
 		} catch (err) {
 			errorBanner = mapWebAuthnErrorToMessage(err);
 		} finally {
@@ -181,7 +318,8 @@
 		busy = true;
 		errorBanner = null;
 		try {
-			otcOffer = await initiateLabyrinthOtcPairing(activeDid);
+			const did = requireAuthenticatedDid();
+			otcOffer = await initiateLabyrinthOtcPairing(did);
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
@@ -195,8 +333,9 @@
 		busy = true;
 		errorBanner = null;
 		try {
-			const res = await completeLabyrinthOtcPairing(activeDid, otcInput.trim());
-			status = await getLabyrinthStatus(activeDid);
+			const did = requireAuthenticatedDid();
+			const res = await completeLabyrinthOtcPairing(did, otcInput.trim());
+			await refreshDeviceIdentityAndStatus(did);
 			otcInput = '';
 			statusBanner = `Completed hybrid PQ CPace + ML-KEM-768 pairing (epoch ${res.new_epoch_seq}).`;
 		} catch (err) {
@@ -206,7 +345,28 @@
 		}
 	}
 
+	async function handleApproveSiblingDevice(deviceId: string) {
+		busy = true;
+		errorBanner = null;
+		try {
+			const did = requireAuthenticatedDid();
+			status = await approveLabyrinthSiblingDevice(did, deviceId);
+			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+			statusBanner = `Approved device ${deviceId} and shared mailbox epoch ${status.epoch_seq}.`;
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
+
 	function promptRevokeDevice(deviceId: string) {
+		try {
+			assertCanRevokeLabyrinthDevice(deviceId, effectiveCurrentDeviceId);
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+			return;
+		}
 		pendingRevokeDeviceId = deviceId;
 		revokeDialogEl?.showModal();
 	}
@@ -221,8 +381,34 @@
 		busy = true;
 		errorBanner = null;
 		try {
-			status = await revokeLabyrinthDevice(activeDid, target);
+			const did = requireAuthenticatedDid();
+			assertCanRevokeLabyrinthDevice(target, effectiveCurrentDeviceId);
+			status = await revokeLabyrinthDevice(did, target);
+			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
 			statusBanner = `Revoked device ${target} and rotated mailbox to epoch ${status.epoch_seq}.`;
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
+
+	function promptDeleteAccountData() {
+		deleteAccountDialogEl?.showModal();
+	}
+
+	async function handleDeleteAccountDialogClose() {
+		if (deleteAccountDialogEl?.returnValue !== 'confirm') {
+			return;
+		}
+		busy = true;
+		errorBanner = null;
+		try {
+			const did = requireAuthenticatedDid();
+			await auth.deleteAccountData(did);
+			optedIn = false;
+			status = null;
+			goto('/');
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
@@ -237,57 +423,117 @@
 			<h1 id="labyrinth-page-title">Encrypted Chat &amp; Labyrinth Backup</h1>
 			<a class="back-link" href="/">Back to Chat</a>
 		</div>
-		<p class="subtitle">
-			End-to-end encrypted conversations (`MLS_256_XWING`) and Spaces-backed Labyrinth 1.1 history
-			for <code>{activeDid}</code>.
-		</p>
+		{#if activeDid}
+			<p class="subtitle">
+				End-to-end encrypted conversations (`MLS_256_XWING`) and Spaces-backed Labyrinth 1.1 history
+				for <code>{activeDid}</code>.
+			</p>
+		{:else}
+			<p class="subtitle">
+				End-to-end encrypted conversations (`MLS_256_XWING`) and Spaces-backed Labyrinth 1.1 history.
+			</p>
+		{/if}
 	</header>
 
-	{#if statusBanner}
-		<p class="banner ok" role="status">{statusBanner}</p>
-	{/if}
-	{#if errorBanner}
-		<p class="banner err" role="alert">{errorBanner}</p>
-	{/if}
-
-	<section class="card" aria-labelledby="spaces-gate-heading">
-		<h2 id="spaces-gate-heading">ATProto Spaces &amp; Opt-In Status</h2>
-		<p class="gate-copy">{spacesGate.message}</p>
-
-		{#if !optedIn}
-			<p class="hint">
-				Encrypted Chat is off by default on fresh sign-in — no MLS databases, KeyPackages, or Spaces
-				calls run until you opt in.
+	{#if !activeDid}
+		<section class="card" aria-labelledby="auth-required-heading">
+			<h2 id="auth-required-heading">Sign In Required</h2>
+			<p class="gate-copy">
+				Sign in with your AT Protocol account before enabling Encrypted Chat, granting ATProto
+				Spaces backup permissions, or managing authorized devices.
 			</p>
-			<button
-				type="button"
-				class="btn-primary"
-				disabled={!spacesGate.eligible || busy}
-				onclick={handleOptInAndEnroll}
-			>
-				Enable Encrypted Chat &amp; Labyrinth Backup
-			</button>
-		{:else if status}
-			<dl class="status-grid">
-				<div>
-					<dt>Mailbox Space</dt>
-					<dd><code>{status.mailbox_space_uri}</code></dd>
-				</div>
-				<div>
-					<dt>Mailbox Epoch</dt>
-					<dd>{status.epoch_seq}</dd>
-				</div>
-				<div>
-					<dt>40-Char Recovery Code</dt>
-					<dd>{status.has_recovery_code ? 'Configured' : 'Not set'}</dd>
-				</div>
-				<div>
-					<dt>Passkey PRF</dt>
-					<dd>{status.has_passkey_prf ? 'Registered' : 'Not set'}</dd>
-				</div>
-			</dl>
+			<div class="button-row">
+				<a class="back-link" href="/">Return to Sign In</a>
+			</div>
+		</section>
+	{:else}
+		{#if currentDeviceEntry?.status === 'pending_approval'}
+			<p class="banner warn" role="status">
+				This device is <strong>pending approval</strong> from an already-enrolled device. Approve it
+				from another active device, enter a 6-digit pairing code, or restore via Passkey PRF /
+				40-character recovery code to unlock prior history.
+			</p>
 		{/if}
-	</section>
+		{#if statusBanner}
+			<p class="banner ok" role="status">{statusBanner}</p>
+		{/if}
+		{#if errorBanner}
+			<p class="banner err" role="alert">{errorBanner}</p>
+		{/if}
+
+		<section class="card" aria-labelledby="spaces-gate-heading">
+			<h2 id="spaces-gate-heading">ATProto Spaces &amp; Opt-In Status</h2>
+			{#if probingPds}
+				<p class="gate-copy">Checking Personal Data Server for ATProto Spaces support…</p>
+			{:else}
+				<p class="gate-copy">{spacesGate.message}</p>
+			{/if}
+
+			{#if spacesGate.missingScopes.length > 0}
+				<div class="button-row">
+					<button
+						type="button"
+						class="btn-primary"
+						disabled={busy}
+						onclick={handleUpgradeScopes}
+					>
+						Grant Spaces Permissions
+					</button>
+				</div>
+			{/if}
+
+			{#if !optedIn}
+				<p class="hint">
+					Encrypted Chat is off by default on fresh sign-in — no MLS databases, KeyPackages, or Spaces
+					calls run until you opt in.
+				</p>
+				<button
+					type="button"
+					class="btn-primary"
+					disabled={!spacesGate.eligible || probingPds || busy}
+					onclick={handleOptInAndEnroll}
+				>
+					Enable Encrypted Chat &amp; Labyrinth Backup
+				</button>
+			{:else if status}
+				<dl class="status-grid">
+					<div>
+						<dt>Mailbox Space</dt>
+						<dd><code>{status.mailbox_space_uri}</code></dd>
+					</div>
+					<div>
+						<dt>Mailbox Epoch</dt>
+						<dd>{status.epoch_seq}</dd>
+					</div>
+					<div>
+						<dt>40-Char Recovery Code</dt>
+						<dd>{status.has_recovery_code ? 'Configured' : 'Not set'}</dd>
+					</div>
+					<div>
+						<dt>Passkey PRF</dt>
+						<dd>{status.has_passkey_prf ? 'Registered' : 'Not set'}</dd>
+					</div>
+					<div>
+						<dt>Sibling Space Backfill</dt>
+						<dd>{backfillSummary.label}</dd>
+					</div>
+					<div>
+						<dt>Last History Sync</dt>
+						<dd>{formatDeviceTimestamp(backfillSummary.lastSyncedAt)}</dd>
+					</div>
+				</dl>
+				<div class="button-row">
+					<button
+						type="button"
+						class="btn-secondary"
+						disabled={busy}
+						onclick={handleSyncBackfillNow}
+					>
+						Sync History Now
+					</button>
+				</div>
+			{/if}
+		</section>
 
 	<section class="card" aria-labelledby="recovery-heading">
 		<h2 id="recovery-heading">40-Character Recovery Code &amp; Passkey PRF</h2>
@@ -313,6 +559,15 @@
 				onclick={handleRegisterPasskeyPrf}
 			>
 				Register Passkey PRF
+			</button>
+
+			<button
+				type="button"
+				class="btn-secondary"
+				disabled={!optedIn || !canRegisterPasskeyPrf || busy}
+				onclick={handleRestorePasskeyPrf}
+			>
+				Restore with Passkey PRF
 			</button>
 		</div>
 
@@ -387,25 +642,79 @@
 
 	<section class="card" aria-labelledby="devices-heading">
 		<h2 id="devices-heading">Authorized Labyrinth Devices</h2>
-		{#if status && status.active_device_ids.length > 0}
+		{#if devices.length > 0}
 			<ul class="device-list">
-				{#each status.active_device_ids as deviceId (deviceId)}
+				{#each devices as device (device.deviceId)}
 					<li class="device-row">
-						<code>{deviceId}</code>
-						<button
-							type="button"
-							class="btn-danger"
-							disabled={busy}
-							onclick={() => promptRevokeDevice(deviceId)}
-						>
-							Revoke Device
-						</button>
+						<div class="device-details">
+							<div class="device-title-row">
+								<span class="device-name">{device.deviceName}</span>
+								{#if device.isCurrent}
+									<span class="device-pill current">This Device</span>
+								{/if}
+								{#if device.status === 'pending_approval'}
+									<span class="device-pill pending">Pending Approval</span>
+								{:else if device.status === 'dormant'}
+									<span class="device-pill dormant">Dormant</span>
+								{:else}
+									<span class="device-pill active">Active</span>
+								{/if}
+							</div>
+							<code class="device-id-code">{device.deviceId}</code>
+							<div class="device-meta-row">
+								<span>Last active: {formatDeviceTimestamp(device.lastActiveAt)}</span>
+								{#if device.dormantAt}
+									<span>Dormant since: {formatDeviceTimestamp(device.dormantAt)}</span>
+								{/if}
+							</div>
+						</div>
+						<div class="device-actions">
+							{#if !device.isCurrent && device.status === 'pending_approval'}
+								<button
+									type="button"
+									class="btn-primary"
+									disabled={busy}
+									onclick={() => handleApproveSiblingDevice(device.deviceId)}
+								>
+									Approve Device
+								</button>
+							{/if}
+							<button
+								type="button"
+								class="btn-danger"
+								disabled={busy || device.isCurrent}
+								title={device.isCurrent
+									? 'Sign out to retire this device; self-revocation is disabled'
+									: 'Revoke device and rotate mailbox epoch'}
+								onclick={() => promptRevokeDevice(device.deviceId)}
+							>
+								{device.isCurrent ? 'Current Device' : 'Revoke Device'}
+							</button>
+						</div>
 					</li>
 				{/each}
 			</ul>
 		{:else}
 			<p class="hint">No enrolled Labyrinth devices on this account yet.</p>
 		{/if}
+	</section>
+
+	<section class="card danger-card" aria-labelledby="delete-account-heading">
+		<h2 id="delete-account-heading">Delete Encrypted Account Data</h2>
+		<p class="hint">
+			Permanently purge local encrypted chat databases, WebCrypto wrapping keys, device identity,
+			and request remote encrypted chat state deletion for <code>{activeDid}</code>.
+		</p>
+		<div class="button-row">
+			<button
+				type="button"
+				class="btn-danger"
+				disabled={busy}
+				onclick={promptDeleteAccountData}
+			>
+				Delete Encrypted Account Data
+			</button>
+		</div>
 	</section>
 
 	<dialog
@@ -425,6 +734,25 @@
 			</div>
 		</form>
 	</dialog>
+
+	<dialog
+		bind:this={deleteAccountDialogEl}
+		aria-labelledby="delete-account-dialog-title"
+		onclose={handleDeleteAccountDialogClose}
+	>
+		<form method="dialog" class="revoke-dialog-form">
+			<h3 id="delete-account-dialog-title">Delete Encrypted Account Data?</h3>
+			<p>
+				This permanently erases local encrypted messages, WebCrypto keys, and OPFS storage on this
+				device and requests encrypted chat account deletion for <code>{activeDid}</code>.
+			</p>
+			<div class="dialog-actions">
+				<button type="submit" value="cancel" class="btn-secondary">Cancel</button>
+				<button type="submit" value="confirm" class="btn-danger">Delete Account Data</button>
+			</div>
+		</form>
+	</dialog>
+	{/if}
 </section>
 
 <style>
@@ -491,6 +819,10 @@
 		gap: 12px;
 	}
 
+	.danger-card {
+		border-color: rgba(220, 38, 38, 0.4);
+	}
+
 	.banner {
 		padding: 12px 16px;
 		border-radius: var(--radius-sm);
@@ -501,6 +833,12 @@
 	.banner.ok {
 		background: color-mix(in srgb, var(--accent) 14%, transparent);
 		border: 1px solid var(--accent);
+		color: var(--text-primary);
+	}
+
+	.banner.warn {
+		background: rgba(217, 119, 6, 0.14);
+		border: 1px solid rgba(217, 119, 6, 0.5);
 		color: var(--text-primary);
 	}
 
@@ -531,7 +869,8 @@
 
 	.button-row,
 	.input-row,
-	.dialog-actions {
+	.dialog-actions,
+	.device-actions {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
@@ -601,16 +940,80 @@
 		margin: 0;
 		display: flex;
 		flex-direction: column;
-		gap: 8px;
+		gap: 10px;
 	}
 
 	.device-row {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		padding: 10px 12px;
+		gap: 12px;
+		padding: 12px 14px;
 		border-radius: var(--radius-sm);
 		background: var(--bg-elevated);
+		border: 1px solid var(--border);
+	}
+
+	.device-details {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		min-width: 0;
+	}
+
+	.device-title-row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.device-name {
+		font-size: 14px;
+		font-weight: 600;
+		color: var(--text-primary);
+	}
+
+	.device-id-code {
+		font-size: 12px;
+		color: var(--text-secondary);
+		word-break: break-all;
+	}
+
+	.device-meta-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 12px;
+		font-size: 12px;
+		color: var(--text-tertiary, var(--text-secondary));
+	}
+
+	.device-pill {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 2px 8px;
+		border-radius: 999px;
+	}
+
+	.device-pill.current {
+		background: color-mix(in srgb, var(--accent) 18%, transparent);
+		color: var(--accent);
+		border: 1px solid var(--accent);
+	}
+
+	.device-pill.active {
+		background: rgba(52, 199, 89, 0.15);
+		color: #4ade80;
+	}
+
+	.device-pill.pending {
+		background: rgba(217, 119, 6, 0.18);
+		color: #fbbf24;
+	}
+
+	.device-pill.dormant {
+		background: rgba(148, 163, 184, 0.16);
+		color: var(--text-secondary);
 	}
 
 	.btn-primary,

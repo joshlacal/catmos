@@ -13,6 +13,7 @@ const wasmReady = init().then(() => undefined);
 const subscriptions = new Map<string, { close(): void }>();
 
 let unifiedClient: wasm.WasmMlsClient | null = null;
+let unifiedDeviceId: string | null = null;
 let latestAuthToken: string | null = null;
 let backgroundSyncTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -62,6 +63,7 @@ function mapMessageRowToUi(rawRow: any) {
 	const row = plain(rawRow);
 	const { messageType, content } = extractMessageTextAndType(String(row.plaintext_json ?? ''));
 	const createdMs = Number(row.created_at_ms ?? Date.now());
+	const isOwn = Boolean(row.is_own);
 	return {
 		id: String(row.message_id ?? ''),
 		conversationId: String(row.conversation_id ?? ''),
@@ -70,7 +72,8 @@ function mapMessageRowToUi(rawRow: any) {
 		content,
 		timestamp: new Date(createdMs).toISOString(),
 		sequenceNumber: Math.max(0, Number(row.seq ?? 0)),
-		status: row.is_own ? 'sent' : 'delivered',
+		status: isOwn ? 'sent' : 'delivered',
+		isOwn,
 		messageType
 	};
 }
@@ -216,8 +219,16 @@ const api = {
 				) => Promise<unknown>;
 			}).catbird_mls_prepare_signed_request(operation, requestJson)
 		),
-	setContentRootKey: (_key: Uint8Array) => {},
-	clearContentRootKey: () => {},
+	setContentRootKey: async (key: Uint8Array) => {
+		await wasmReady;
+		const mod = wasm as unknown as { setContentRootKey?: (k: Uint8Array) => void };
+		mod.setContentRootKey?.(key);
+	},
+	clearContentRootKey: async () => {
+		await wasmReady;
+		const mod = wasm as unknown as { clearContentRootKey?: () => void };
+		mod.clearContentRootKey?.();
+	},
 	setup: async () => {
 		await wasmReady;
 		if (unifiedClient) {
@@ -636,6 +647,7 @@ const api = {
 		}
 		const normalizedTarget = params.accountDid.trim().toLowerCase();
 		if (unifiedClient && unifiedClient.accountDid() === normalizedTarget) {
+			unifiedDeviceId = params.deviceId;
 			if (latestAuthToken !== null) {
 				unifiedClient.setAuthToken(latestAuthToken);
 			}
@@ -651,6 +663,7 @@ const api = {
 				// Ignore prior handle close
 			}
 			unifiedClient = null;
+			unifiedDeviceId = null;
 		}
 		unifiedClient = await wasm.WasmMlsClient.openAsync(
 			params.accountDid,
@@ -660,6 +673,7 @@ const api = {
 			params.pdsEndpoint,
 			params.dbKeyHex
 		);
+		unifiedDeviceId = params.deviceId;
 		if (latestAuthToken !== null) {
 			unifiedClient.setAuthToken(latestAuthToken);
 		}
@@ -667,6 +681,16 @@ const api = {
 			accountDid: unifiedClient.accountDid(),
 			accountDidHash: unifiedClient.accountDidHash()
 		};
+	},
+	currentDeviceId: async () => {
+		await wasmReady;
+		if (unifiedClient) {
+			const dynamicClient = unifiedClient as unknown as { deviceId?: () => string };
+			if (typeof dynamicClient.deviceId === 'function') {
+				return dynamicClient.deviceId();
+			}
+		}
+		return unifiedDeviceId;
 	},
 	syncUnified: async () => {
 		await wasmReady;
@@ -702,6 +726,78 @@ const api = {
 		await wasmReady;
 		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
 		return plain(unifiedClient.registerPasskeyPrf(credentialId, prfOutput32));
+	},
+	restoreWithPasskeyPrf: async (credentialId: Uint8Array, prfOutput32: Uint8Array) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		const dynamicClient = unifiedClient as unknown as {
+			restoreWithPasskeyPrf?: (
+				credentialId: Uint8Array,
+				prfOutput32: Uint8Array
+			) => Promise<unknown> | unknown;
+		};
+		if (typeof dynamicClient.restoreWithPasskeyPrf !== 'function') {
+			throw new Error('Passkey PRF restore requires updated WASM runtime');
+		}
+		return plain(await dynamicClient.restoreWithPasskeyPrf(credentialId, prfOutput32));
+	},
+	approveSiblingDevice: async (targetDeviceId: string) => {
+		await wasmReady;
+		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
+		const dynamicClient = unifiedClient as unknown as {
+			approveDevice?: (targetDeviceId: string) => Promise<unknown> | unknown;
+			approveLabyrinthDevice?: (targetDeviceId: string) => Promise<unknown> | unknown;
+		};
+		if (typeof dynamicClient.approveLabyrinthDevice === 'function') {
+			return plain(await dynamicClient.approveLabyrinthDevice(targetDeviceId));
+		}
+		if (typeof dynamicClient.approveDevice === 'function') {
+			return plain(await dynamicClient.approveDevice(targetDeviceId));
+		}
+		throw new Error('Sibling device approval requires updated WASM runtime');
+	},
+	retireCurrentDevice: async () => {
+		await wasmReady;
+		if (!unifiedClient) return false;
+		const dynamicClient = unifiedClient as unknown as {
+			retireCurrentDevice?: () => Promise<unknown> | unknown;
+		};
+		if (typeof dynamicClient.retireCurrentDevice === 'function') {
+			await dynamicClient.retireCurrentDevice();
+			return true;
+		}
+		return false;
+	},
+	deleteAccountData: async () => {
+		await wasmReady;
+		if (backgroundSyncTimer) {
+			clearInterval(backgroundSyncTimer);
+			backgroundSyncTimer = null;
+		}
+		for (const sub of subscriptions.values()) {
+			sub.close();
+		}
+		subscriptions.clear();
+		if (!unifiedClient) return false;
+		try {
+			const dynamicClient = unifiedClient as unknown as {
+				deleteAccountData?: () => Promise<unknown> | unknown;
+			};
+			if (typeof dynamicClient.deleteAccountData === 'function') {
+				await dynamicClient.deleteAccountData();
+				return true;
+			}
+			return false;
+		} finally {
+			try {
+				unifiedClient.close();
+			} catch {
+				// Ignore handle close failure after wipe
+			}
+			unifiedClient = null;
+			unifiedDeviceId = null;
+			latestAuthToken = null;
+		}
 	},
 	initiateOtcPairing: async () => {
 		await wasmReady;
@@ -739,6 +835,7 @@ const api = {
 			unifiedClient.close();
 			unifiedClient = null;
 		}
+		unifiedDeviceId = null;
 	}
 };
 

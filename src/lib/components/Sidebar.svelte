@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { conversations } from '#lib/stores/conversations.ts';
+	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import { drafts } from '#lib/stores/drafts.ts';
 	import { profiles } from '#lib/stores/profiles.ts';
@@ -49,8 +50,10 @@
 	/** For 1:1 conversations, resolve the other participant's display name from profiles. */
 	function convoDisplayName(convo: Conversation): string {
 		if (convo.isGroup) return convo.displayName;
-		// For 1:1: find the other member's profile
-		const otherDid = convo.members.find((did) => did !== $auth.user?.did) ?? convo.members[0];
+		// For 1:1: find the other member's profile (ignoring #<deviceId> suffixes)
+		const otherRaw =
+			convo.members.find((did) => !isSameAccountDid(did, $auth.user?.did)) ?? convo.members[0];
+		const otherDid = stripDidFragment(otherRaw);
 		if (otherDid) {
 			const profile = $profiles.cache.get(otherDid);
 			if (profile) {

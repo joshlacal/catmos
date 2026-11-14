@@ -1,5 +1,10 @@
 <script lang="ts">
 	import * as api from '#lib/wasm.ts';
+	import {
+		foldReactionsByAccount,
+		hasAccountReacted,
+		stripDidFragment
+	} from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import { messages } from '#lib/stores/messages.ts';
 
@@ -14,17 +19,16 @@
 	} = $props();
 
 	let showPicker = $state(false);
+	let foldedReactions = $derived(foldReactionsByAccount(reactions));
 
 	const quickEmojis = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
 
 	function hasReacted(emoji: string): boolean {
-		const userDid = $auth.user?.did;
-		if (!userDid) return false;
-		return reactions[emoji]?.includes(userDid) ?? false;
+		return hasAccountReacted(foldedReactions, emoji, $auth.user?.did);
 	}
 
 	async function toggleReaction(emoji: string) {
-		const userDid = $auth.user?.did;
+		const userDid = stripDidFragment($auth.user?.did);
 		if (!userDid) return;
 		const action = hasReacted(emoji) ? 'remove' : 'add';
 
@@ -56,8 +60,8 @@
 	}
 </script>
 
-<div class="reactions-container" class:has-reactions={Object.keys(reactions).length > 0}>
-	{#each Object.entries(reactions) as [emoji, users]}
+<div class="reactions-container" class:has-reactions={Object.keys(foldedReactions).length > 0}>
+	{#each Object.entries(foldedReactions) as [emoji, users]}
 		<button
 			class="reaction-pill"
 			class:reacted={hasReacted(emoji)}

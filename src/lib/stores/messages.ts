@@ -6,6 +6,7 @@ import type {
 	ReactionEvent,
 	TypingEvent
 } from '#lib/tauri.ts';
+import { applyReactionToMap, foldReactionsByAccount, stripDidFragment } from '#lib/did.ts';
 import * as api from '#lib/wasm.ts';
 
 interface MessagesStore {
@@ -33,11 +34,15 @@ function createMessagesStore() {
 				const msgs = await api.getMessages(conversationId);
 				// Deduplicate by ID to prevent Svelte {#each} key collisions
 				const seen = new Set<string>();
-				const deduped = msgs.filter((m) => {
-					if (seen.has(m.id)) return false;
-					seen.add(m.id);
-					return true;
-				});
+				const deduped = msgs
+					.filter((m) => {
+						if (seen.has(m.id)) return false;
+						seen.add(m.id);
+						return true;
+					})
+					.map((m) =>
+						m.reactions ? { ...m, reactions: foldReactionsByAccount(m.reactions) } : m
+					);
 				update((s) => {
 					const byConversation = new Map(s.byConversation);
 					byConversation.set(conversationId, sortByTimestamp(deduped));
@@ -55,11 +60,15 @@ function createMessagesStore() {
 					const existing = byConversation.get(conversationId) ?? [];
 					// Merge: add any messages not already present (dedup both sides)
 					const existingIds = new Set(existing.map((m) => m.id));
-					const newMsgs = msgs.filter((m) => {
-						if (existingIds.has(m.id)) return false;
-						existingIds.add(m.id); // prevent dupes within the batch too
-						return true;
-					});
+					const newMsgs = msgs
+						.filter((m) => {
+							if (existingIds.has(m.id)) return false;
+							existingIds.add(m.id); // prevent dupes within the batch too
+							return true;
+						})
+						.map((m) =>
+							m.reactions ? { ...m, reactions: foldReactionsByAccount(m.reactions) } : m
+						);
 					if (newMsgs.length > 0) {
 						byConversation.set(conversationId, sortByTimestamp([...existing, ...newMsgs]));
 					}
@@ -235,11 +244,17 @@ function createMessagesStore() {
 			}
 		},
 		addIncoming(message: Message) {
+			const normalized = message.reactions
+				? { ...message, reactions: foldReactionsByAccount(message.reactions) }
+				: message;
 			update((s) => {
 				const byConversation = new Map(s.byConversation);
-				const existing = byConversation.get(message.conversationId) ?? [];
-				if (!existing.find((m) => m.id === message.id)) {
-					byConversation.set(message.conversationId, sortByTimestamp([...existing, message]));
+				const existing = byConversation.get(normalized.conversationId) ?? [];
+				if (!existing.find((m) => m.id === normalized.id)) {
+					byConversation.set(
+						normalized.conversationId,
+						sortByTimestamp([...existing, normalized])
+					);
 				}
 				return { ...s, byConversation };
 			});
@@ -254,24 +269,12 @@ function createMessagesStore() {
 					event.conversationId,
 					existing.map((m) => {
 						if (m.id !== event.messageId) return m;
-						const reactions = { ...(m.reactions ?? {}) };
-						const users = reactions[event.emoji] ? [...reactions[event.emoji]] : [];
-
-						if (event.action === 'add') {
-							if (!users.includes(event.senderDid)) {
-								users.push(event.senderDid);
-							}
-						} else {
-							const idx = users.indexOf(event.senderDid);
-							if (idx >= 0) users.splice(idx, 1);
-						}
-
-						if (users.length > 0) {
-							reactions[event.emoji] = users;
-						} else {
-							delete reactions[event.emoji];
-						}
-
+						const reactions = applyReactionToMap(
+							m.reactions,
+							event.senderDid,
+							event.emoji,
+							event.action
+						);
 						return { ...m, reactions };
 					})
 				);
@@ -279,18 +282,21 @@ function createMessagesStore() {
 			});
 		},
 		applyTyping(event: TypingEvent) {
+			const accountDid = stripDidFragment(event.senderDid);
+			if (!accountDid) return;
 			update((s) => {
 				const typingByConversation = new Map(s.typingByConversation);
 				const existing = typingByConversation.get(event.conversationId) ?? [];
-				const next = [...existing];
+				const next = existing.map((did) => stripDidFragment(did)).filter(Boolean);
 
 				if (event.isTyping) {
-					if (!next.includes(event.senderDid)) {
-						next.push(event.senderDid);
+					if (!next.includes(accountDid)) {
+						next.push(accountDid);
 					}
 				} else {
-					const idx = next.indexOf(event.senderDid);
-					if (idx >= 0) next.splice(idx, 1);
+					for (let i = next.length - 1; i >= 0; i -= 1) {
+						if (next[i] === accountDid) next.splice(i, 1);
+					}
 				}
 
 				if (next.length > 0) {

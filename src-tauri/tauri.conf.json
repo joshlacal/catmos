@@ -23,7 +23,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https://api.catbird.blue wss://api.catbird.blue"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; media-src 'self' blob: data:; font-src 'self'; manifest-src 'self'; worker-src 'self'; connect-src 'self' ipc: http://ipc.localhost https://api.catbird.blue wss://api.catbird.blue https://chat.catbird.blue wss://chat.catbird.blue https://public.api.bsky.app; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
     }
   },
   "bundle": {

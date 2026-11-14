@@ -11,6 +11,11 @@
 		type QuarantineState
 	} from '#lib/wasm.ts';
 	import { auth } from '#lib/stores/auth.ts';
+	import {
+		foldGroupMembersByAccount,
+		isSameAccountDid,
+		stripDidFragment
+	} from '#lib/did.ts';
 	import { profiles } from '#lib/stores/profiles.ts';
 	import {
 		conversations,
@@ -49,7 +54,8 @@
 
 	async function loadMembers() {
 		try {
-			members = await getGroupMembers(conversationId);
+			const rawMembers = await getGroupMembers(conversationId);
+			members = foldGroupMembersByAccount(rawMembers);
 			const dids = members.map((m) => m.did);
 			profiles.resolveProfiles(dids);
 		} catch {
@@ -60,23 +66,31 @@
 	function currentUserDid(): string {
 		let authState: { user?: { did?: string } | null } | undefined;
 		auth.subscribe((s) => (authState = s))();
-		return authState?.user?.did ?? '';
+		return stripDidFragment(authState?.user?.did);
 	}
 
 	function isCurrentUserAdmin(): boolean {
 		const myDid = currentUserDid();
-		return members.some((m) => m.did === myDid && m.role.toLowerCase().includes('admin'));
+		return members.some(
+			(m) => isSameAccountDid(m.did, myDid) && m.role.toLowerCase().includes('admin')
+		);
 	}
 
 	function memberDisplayName(member: GroupMember): string {
+		const accountDid = stripDidFragment(member.did);
 		let profile: { displayName?: string; handle?: string } | undefined;
-		profiles.subscribe((s) => (profile = s.cache.get(member.did)))();
-		return profile?.displayName ?? profile?.handle ?? (member.handle || member.did.slice(0, 20));
+		profiles.subscribe((s) => (profile = s.cache.get(accountDid)))();
+		return (
+			profile?.displayName ??
+			profile?.handle ??
+			(stripDidFragment(member.handle) || accountDid.slice(0, 20))
+		);
 	}
 
 	function memberAvatar(member: GroupMember): string | undefined {
+		const accountDid = stripDidFragment(member.did);
 		let profile: { avatar?: string } | undefined;
-		profiles.subscribe((s) => (profile = s.cache.get(member.did)))();
+		profiles.subscribe((s) => (profile = s.cache.get(accountDid)))();
 		return profile?.avatar;
 	}
 
@@ -223,7 +237,7 @@
 			{@const name = memberDisplayName(member)}
 			{@const avatar = memberAvatar(member)}
 			{@const admin = isAdmin(member.role)}
-			{@const isSelf = member.did === currentUserDid()}
+			{@const isSelf = isSameAccountDid(member.did, currentUserDid())}
 			<div class="member-item">
 				<div class="member-avatar" class:admin>
 					{#if avatar}

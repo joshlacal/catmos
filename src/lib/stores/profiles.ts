@@ -1,5 +1,6 @@
 import { writable, get } from 'svelte/store';
 import type { ProfileView } from '#lib/tauri.ts';
+import { dedupeAccountDids, stripDidFragment } from '#lib/did.ts';
 import * as api from '#lib/wasm.ts';
 
 interface ProfilesStore {
@@ -28,8 +29,11 @@ function createProfilesStore() {
 				const cache = new Map(s.cache);
 				const pending = new Set(s.pending);
 				for (const p of profiles) {
-					cache.set(p.did, p);
-					pending.delete(p.did);
+					const accountDid = stripDidFragment(p.did);
+					if (!accountDid) continue;
+					const normalizedProfile = { ...p, did: accountDid };
+					cache.set(accountDid, normalizedProfile);
+					pending.delete(accountDid);
 				}
 				// Mark any DIDs that weren't returned as resolved (no profile found)
 				for (const did of dids) {
@@ -56,7 +60,8 @@ function createProfilesStore() {
 		subscribe,
 		resolveProfiles(dids: string[]) {
 			const store = get({ subscribe });
-			const needed = dids.filter((d) => d && !store.cache.has(d) && !store.pending.has(d));
+			const accountDids = dedupeAccountDids(dids);
+			const needed = accountDids.filter((d) => !store.cache.has(d) && !store.pending.has(d));
 			if (needed.length === 0) return;
 
 			update((s) => {
@@ -73,14 +78,18 @@ function createProfilesStore() {
 			batchTimeout = setTimeout(flushBatch, 50);
 		},
 		getProfile(did: string): ProfileView | undefined {
+			const accountDid = stripDidFragment(did);
+			if (!accountDid) return undefined;
 			const store = get({ subscribe });
-			return store.cache.get(did);
+			return store.cache.get(accountDid);
 		},
 		/** Manually set a profile (e.g., for the current user after login) */
 		setProfile(profile: ProfileView) {
+			const accountDid = stripDidFragment(profile.did);
+			if (!accountDid) return;
 			update((s) => {
 				const cache = new Map(s.cache);
-				cache.set(profile.did, profile);
+				cache.set(accountDid, { ...profile, did: accountDid });
 				return { ...s, cache };
 			});
 		}

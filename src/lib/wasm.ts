@@ -35,7 +35,7 @@ export type {
 	QuarantineEnteredEvent,
 	QuarantineClearedEvent,
 	QuarantineState
-} from './tauri';
+} from './tauri.ts';
 
 import type {
 	Conversation,
@@ -50,20 +50,26 @@ import type {
 	SearchHit,
 	OptInStatus,
 	GroupMetadataView
-} from './tauri';
+} from './tauri.ts';
 
 import { wrap, proxy, type Remote } from 'comlink';
-import type { WorkerApi } from './mls-worker';
+import type { WorkerApi } from './mls-worker.ts';
+import { normalizeAccountDid, stripDidFragment } from './did.ts';
+import { normalizeSessionId } from './oauth-callback.ts';
 import {
 	accountDidHashHex,
+	deleteAccountKeyStoreEntries,
 	loadOrCreateDbKeyHex,
 	loadOrCreateWrappedSecretBytes
-} from './webcrypto-keystore';
+} from './webcrypto-keystore.ts';
 import {
+	assertCanRevokeLabyrinthDevice,
+	buildUpgradeAdditionalScopes,
+	evaluateSpacesGateForUi,
 	isMlsOptedInForDid,
 	REQUIRED_LABYRINTH_OAUTH_SCOPES,
 	setMlsOptedInForDid
-} from './labyrinth-ui';
+} from './labyrinth-ui.ts';
 
 // ---------------------------------------------------------------------------
 // Environment detection
@@ -152,37 +158,16 @@ function getWorker(): Remote<WorkerApi> {
 }
 
 // ---------------------------------------------------------------------------
-// MLS DB key management: Durable WebCrypto key wrapping with IndexedDB
+// MLS DB key management: Non-extractable WebCrypto IndexedDB key custody
 //
-// The 32-byte (256-bit) MLS DB encryption key encrypts SQLite state in OPFS.
-// To ensure encrypted OPFS databases persist across tab and session restarts
-// without stranding ciphertext:
-//   - A non-extractable AES-GCM (256-bit) master Key Encryption Key (KEK) is
-//     persisted in IndexedDB ('catbird_mls_keyring', store 'keys').
-//   - Each per-DID MLS DB key is wrapped (encrypted with the KEK + 96-bit IV)
-//     and durably stored in IndexedDB under `mls_db_key_<sanitized_did>`.
-//   - Keyring writes resolve ONLY on `tx.oncomplete` and use atomic
-//     insert-if-absent (`idbPutIfAbsent`) + readback inside an exclusive Web
-//     Lock (`catmos_mls_keyring_lock`) so concurrent tabs can never clobber
-//     either the master KEK or a per-DID wrapped key.
-//   - Key restoration failures (IDB open/read/write error, transaction abort,
-//     corrupt record shape, or AES-GCM authentication failure) fail closed and
-//     NEVER generate an unretained session-only key.
+// All 32-byte (256-bit) `sqlite3mc` DB keys and content-root keys are wrapped
+// under per-account `extractable: false` AES-GCM-256 `CryptoKey` handles in
+// `webcrypto-keystore.ts` (`catbird_mls_webcrypto_v2`) with domain-separated AAD.
 // ---------------------------------------------------------------------------
 
-export const KEYRING_DB_NAME = 'catbird_mls_keyring';
-export const KEYRING_STORE_NAME = 'keys';
-export const MASTER_KEK_ID = '__mls_master_kek__';
-export const KEYRING_LOCK_NAME = 'catmos_mls_keyring_lock';
-
-export interface WrappedKeyRecord {
-	iv: Uint8Array;
-	ciphertext: Uint8Array;
-}
-
-/** Sanitize a DID for deterministic storage keys and database filenames. */
+/** Sanitize a DID for deterministic legacy storage filenames when cleaning up. */
 export function sanitizeDid(did: string): string {
-	const trimmed = (did ?? '').trim();
+	const trimmed = stripDidFragment(did);
 	if (!trimmed) {
 		throw new Error('Cannot derive MLS storage identity from an empty DID');
 	}
@@ -204,277 +189,16 @@ export function mlsKeyIdForDid(did: string): string {
 	return `mls_db_key_${sanitizeDid(did)}`;
 }
 
-async function withKeyringLock<T>(fn: () => Promise<T>): Promise<T> {
-	if (
-		typeof navigator !== 'undefined' &&
-		navigator.locks &&
-		typeof navigator.locks.request === 'function'
-	) {
-		return navigator.locks.request(KEYRING_LOCK_NAME, { mode: 'exclusive' }, async () => fn());
-	}
-	return fn();
-}
-
-export function openKeyringDb(): Promise<IDBDatabase> {
-	return new Promise((resolve, reject) => {
-		if (typeof indexedDB === 'undefined') {
-			return reject(new Error('IndexedDB unavailable'));
-		}
-		const req = indexedDB.open(KEYRING_DB_NAME, 1);
-		req.onupgradeneeded = () => {
-			const db = req.result;
-			if (!db.objectStoreNames.contains(KEYRING_STORE_NAME)) {
-				db.createObjectStore(KEYRING_STORE_NAME);
-			}
-		};
-		req.onsuccess = () => resolve(req.result);
-		req.onerror = () => reject(req.error || new Error('Failed to open IndexedDB keyring'));
-		req.onblocked = () => reject(new Error('IndexedDB keyring open blocked'));
-	});
-}
-
-export function idbGet<T>(db: IDBDatabase, key: string): Promise<T | undefined> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let result: T | undefined = undefined;
-		let hasResult = false;
-		const fail = (err: unknown) => {
-			if (settled) return;
-			settled = true;
-			reject(err instanceof Error ? err : new Error(String(err || `Failed to get key: ${key}`)));
-		};
-
-		let tx: IDBTransaction;
-		try {
-			tx = db.transaction(KEYRING_STORE_NAME, 'readonly');
-		} catch (err) {
-			fail(err);
-			return;
-		}
-
-		const store = tx.objectStore(KEYRING_STORE_NAME);
-		const req = store.get(key);
-		req.onsuccess = () => {
-			result = req.result as T | undefined;
-			hasResult = true;
-		};
-		req.onerror = () => fail(req.error || new Error(`Failed to get key: ${key}`));
-		tx.onabort = () =>
-			fail(tx.error || req.error || new Error(`IndexedDB read transaction aborted for key: ${key}`));
-		tx.onerror = () =>
-			fail(tx.error || req.error || new Error(`IndexedDB read transaction error for key: ${key}`));
-		tx.oncomplete = () => {
-			if (settled) return;
-			if (!hasResult) {
-				fail(new Error(`IndexedDB read transaction completed without result for key: ${key}`));
-				return;
-			}
-			settled = true;
-			resolve(result);
-		};
-	});
-}
-
-export function idbPut(db: IDBDatabase, key: string, value: unknown): Promise<void> {
-	return new Promise((resolve, reject) => {
-		let settled = false;
-		let requestSucceeded = false;
-		const fail = (err: unknown) => {
-			if (settled) return;
-			settled = true;
-			reject(err instanceof Error ? err : new Error(String(err || `Failed to put key: ${key}`)));
-		};
-
-		let tx: IDBTransaction;
-		try {
-			tx = db.transaction(KEYRING_STORE_NAME, 'readwrite');
-		} catch (err) {
-			fail(err);
-			return;
-		}
-
-		const store = tx.objectStore(KEYRING_STORE_NAME);
-		const req = store.put(value, key);
-		req.onsuccess = () => {
-			requestSucceeded = true;
-		};
-		req.onerror = () => fail(req.error || new Error(`Failed to put key: ${key}`));
-		tx.onabort = () =>
-			fail(tx.error || req.error || new Error(`IndexedDB write transaction aborted for key: ${key}`));
-		tx.onerror = () =>
-			fail(tx.error || req.error || new Error(`IndexedDB write transaction error for key: ${key}`));
-		tx.oncomplete = () => {
-			if (settled) return;
-			if (!requestSucceeded) {
-				fail(new Error(`IndexedDB write transaction completed before request succeeded for key: ${key}`));
-				return;
-			}
-			settled = true;
-			resolve();
-		};
-	});
-}
-
 /**
- * Atomically insert `value` under `key` only if `key` is currently absent in a
- * single `readwrite` transaction, waiting for `tx.oncomplete`, and then reading
- * back the committed record. Never overwrites an existing key.
- */
-export async function idbPutIfAbsent<T>(
-	db: IDBDatabase,
-	key: string,
-	value: T
-): Promise<{ value: T; inserted: boolean }> {
-	const inserted = await new Promise<boolean>((resolve, reject) => {
-		let settled = false;
-		let didInsert = false;
-		let opDone = false;
-		const fail = (err: unknown) => {
-			if (settled) return;
-			settled = true;
-			reject(
-				err instanceof Error
-					? err
-					: new Error(String(err || `Failed atomic insert-if-absent for key: ${key}`))
-			);
-		};
-
-		let tx: IDBTransaction;
-		try {
-			tx = db.transaction(KEYRING_STORE_NAME, 'readwrite');
-		} catch (err) {
-			fail(err);
-			return;
-		}
-
-		const store = tx.objectStore(KEYRING_STORE_NAME);
-		const getReq = store.get(key);
-		getReq.onerror = () => fail(getReq.error || new Error(`Failed to inspect key: ${key}`));
-		getReq.onsuccess = () => {
-			if (getReq.result !== undefined) {
-				didInsert = false;
-				opDone = true;
-				return;
-			}
-			const addReq = store.add(value, key);
-			addReq.onsuccess = () => {
-				didInsert = true;
-				opDone = true;
-			};
-			addReq.onerror = () => fail(addReq.error || new Error(`Failed to add key: ${key}`));
-		};
-
-		tx.onabort = () =>
-			fail(
-				tx.error ||
-					getReq.error ||
-					new Error(`IndexedDB atomic transaction aborted for key: ${key}`)
-			);
-		tx.onerror = () =>
-			fail(
-				tx.error ||
-					getReq.error ||
-					new Error(`IndexedDB atomic transaction error for key: ${key}`)
-			);
-		tx.oncomplete = () => {
-			if (settled) return;
-			if (!opDone) {
-				fail(new Error(`IndexedDB atomic transaction completed before operation finished for key: ${key}`));
-				return;
-			}
-			settled = true;
-			resolve(didInsert);
-		};
-	});
-
-	const committed = await idbGet<T>(db, key);
-	if (committed === undefined) {
-		throw new Error(`IndexedDB readback after commit returned undefined for key: ${key}`);
-	}
-	return { value: committed, inserted };
-}
-
-function isValidCryptoKey(value: unknown): value is CryptoKey {
-	return (
-		typeof value === 'object' &&
-		value !== null &&
-		'type' in value &&
-		'extractable' in value &&
-		'algorithm' in value &&
-		'usages' in value
-	);
-}
-
-function toUint8Array(input: unknown): Uint8Array | null {
-	if (input instanceof Uint8Array) {
-		return input;
-	}
-	if (input instanceof ArrayBuffer) {
-		return new Uint8Array(input);
-	}
-	if (ArrayBuffer.isView(input)) {
-		return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
-	}
-	return null;
-}
-
-function parseValidatedWrappedRecord(record: unknown, keyId: string): WrappedKeyRecord {
-	if (typeof record !== 'object' || record === null) {
-		throw new Error(`Corrupt wrapped key record for ${keyId}: expected object`);
-	}
-	const candidate = record as Record<string, unknown>;
-	const iv = toUint8Array(candidate.iv);
-	const ciphertext = toUint8Array(candidate.ciphertext);
-	if (!iv || iv.byteLength !== 12) {
-		throw new Error(`Corrupt wrapped key record for ${keyId}: invalid 12-byte AES-GCM IV`);
-	}
-	if (!ciphertext || ciphertext.byteLength !== 48) {
-		throw new Error(
-			`Corrupt wrapped key record for ${keyId}: invalid AES-GCM ciphertext length (${ciphertext?.byteLength ?? 0})`
-		);
-	}
-	return {
-		iv: new Uint8Array(iv),
-		ciphertext: new Uint8Array(ciphertext)
-	};
-}
-
-async function getOrCreateMasterKek(db: IDBDatabase): Promise<CryptoKey> {
-	const existing = await idbGet<unknown>(db, MASTER_KEK_ID);
-	if (existing !== undefined) {
-		if (!isValidCryptoKey(existing)) {
-			throw new Error('Corrupt master KEK record in IndexedDB keyring');
-		}
-		return existing;
-	}
-
-	const candidateKek = await crypto.subtle.generateKey(
-		{ name: 'AES-GCM', length: 256 },
-		false, // non-extractable master key encryption key
-		['encrypt', 'decrypt']
-	);
-	const { value: committedKek } = await idbPutIfAbsent<CryptoKey>(db, MASTER_KEK_ID, candidateKek);
-	if (!isValidCryptoKey(committedKek)) {
-		throw new Error('Corrupt committed master KEK record in IndexedDB keyring');
-	}
-	return committedKek;
-}
-
-/**
- * Get or create the per-DID MLS DB encryption key with durable IndexedDB/WebCrypto
- * key wrapping.
- *
- * Distinguishes key absence (`wrapped === undefined` on a healthy transaction)
- * from key restoration or persistence failures (IndexedDB open/read/write error,
- * transaction abort, corrupt record shape, or AES-GCM authentication error).
- * Any failure throws and NEVER falls back to an unpersisted session key.
+ * Get or create the per-DID 64-character hex MLS DB encryption key backed by
+ * non-extractable WebCrypto AES-GCM wrapping in IndexedDB (`webcrypto-keystore.ts`).
  */
 export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
-	const resolvedDid = (
+	const resolvedDid = stripDidFragment(
 		targetDid ??
-		(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null) ??
-		''
-	).trim();
+			(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null) ??
+			''
+	);
 	if (!resolvedDid) {
 		throw new Error('getOrCreateMlsDbKey requires a valid authenticated DID');
 	}
@@ -486,70 +210,8 @@ export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
 		sessionStorage.removeItem(legacySessionKey);
 	}
 
-	return withKeyringLock(async () => {
-		const db = await openKeyringDb();
-		try {
-			const kek = await getOrCreateMasterKek(db);
-			let wrappedRaw = await idbGet<unknown>(db, keyId);
-
-			if (wrappedRaw === undefined) {
-				const rawBytes = new Uint8Array(32);
-				crypto.getRandomValues(rawBytes);
-
-				const iv = new Uint8Array(12);
-				crypto.getRandomValues(iv);
-				const ciphertextBuffer = await crypto.subtle.encrypt(
-					{ name: 'AES-GCM', iv: iv as BufferSource },
-					kek,
-					rawBytes as BufferSource
-				);
-				const candidateWrapped: WrappedKeyRecord = {
-					iv,
-					ciphertext: new Uint8Array(ciphertextBuffer)
-				};
-
-				const { value: committedWrapped } = await idbPutIfAbsent<WrappedKeyRecord>(
-					db,
-					keyId,
-					candidateWrapped
-				);
-				wrappedRaw = committedWrapped;
-			}
-
-			const wrapped = parseValidatedWrappedRecord(wrappedRaw, keyId);
-			let decrypted: ArrayBuffer;
-			try {
-				decrypted = await crypto.subtle.decrypt(
-					{ name: 'AES-GCM', iv: wrapped.iv as BufferSource },
-					kek,
-					wrapped.ciphertext as BufferSource
-				);
-			} catch (err) {
-				throw new Error(
-					`Failed to unwrap durable MLS DB key for ${keyId} (AES-GCM authentication failed): ${
-						err instanceof Error ? err.message : String(err)
-					}`
-				);
-			}
-
-			const rawBytes = new Uint8Array(decrypted);
-			if (rawBytes.byteLength !== 32) {
-				throw new Error(
-					`Unwrapped MLS DB key for ${keyId} has invalid length: ${rawBytes.byteLength}`
-				);
-			}
-
-			return Array.from(rawBytes)
-				.map((b) => b.toString(16).padStart(2, '0'))
-				.join('');
-		} finally {
-			try {
-				db.close();
-			} catch {
-				// Ignore close errors
-			}
-		}
-	});
+	const didHash = await accountDidHashHex(resolvedDid);
+	return loadOrCreateDbKeyHex(didHash);
 }
 
 // ---------------------------------------------------------------------------
@@ -598,19 +260,53 @@ const HOME_DS_URL = 'https://chat.catbird.blue';
 const UUID_V4_LOWER_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export function getOrCreateBrowserDeviceId(didHash: string): string {
-	const storageKey = `catmos_mls_device_id_${didHash}`;
+export const BROWSER_DEVICE_ID_PREFIX = 'catmos.mls.deviceId.';
+const LEGACY_BROWSER_DEVICE_ID_PREFIX = 'catmos_mls_device_id_';
+
+export function readBrowserDeviceId(didHash: string): string | null {
+	const normalizedHash = didHash.trim();
+	if (!normalizedHash) return null;
+	const canonicalKey = `${BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`;
+	const legacyKey = `${LEGACY_BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`;
 	try {
 		if (typeof localStorage !== 'undefined') {
-			const existing = localStorage.getItem(storageKey)?.trim().toLowerCase();
+			const existing = localStorage.getItem(canonicalKey)?.trim().toLowerCase();
 			if (existing && UUID_V4_LOWER_RE.test(existing)) {
 				return existing;
+			}
+			const legacy = localStorage.getItem(legacyKey)?.trim().toLowerCase();
+			if (legacy && UUID_V4_LOWER_RE.test(legacy)) {
+				localStorage.setItem(canonicalKey, legacy);
+				localStorage.removeItem(legacyKey);
+				return legacy;
 			}
 		}
 	} catch {
 		// Ignore storage access errors (private browsing / Node test harness)
 	}
+	return null;
+}
+
+export function wipeBrowserDeviceId(didHash: string): void {
+	const normalizedHash = didHash.trim();
+	if (!normalizedHash) return;
+	try {
+		if (typeof localStorage !== 'undefined') {
+			localStorage.removeItem(`${BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`);
+			localStorage.removeItem(`${LEGACY_BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`);
+		}
+	} catch {
+		// Ignore storage removal errors
+	}
+}
+
+export function getOrCreateBrowserDeviceId(didHash: string): string {
+	const existing = readBrowserDeviceId(didHash);
+	if (existing) {
+		return existing;
+	}
 	const generated = crypto.randomUUID().toLowerCase();
+	const storageKey = `${BROWSER_DEVICE_ID_PREFIX}${didHash.trim()}`;
 	try {
 		if (typeof localStorage !== 'undefined') {
 			localStorage.setItem(storageKey, generated);
@@ -619,6 +315,167 @@ export function getOrCreateBrowserDeviceId(didHash: string): string {
 		// Ignore storage write errors
 	}
 	return generated;
+}
+
+interface OpfsFileHandleLike {
+	kind?: string;
+	name?: string;
+	getFile?: () => Promise<{ slice: (start?: number, end?: number) => { arrayBuffer: () => Promise<ArrayBuffer> } }>;
+}
+
+interface OpfsDirectoryHandleLike {
+	kind?: string;
+	name?: string;
+	getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<OpfsDirectoryHandleLike>;
+	removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
+	entries?: () => AsyncIterable<[string, OpfsFileHandleLike | OpfsDirectoryHandleLike]>;
+	values?: () => AsyncIterable<OpfsFileHandleLike | OpfsDirectoryHandleLike>;
+}
+
+function sahPoolHeaderMatchesAccount(
+	headerPath: string,
+	didHash: string,
+	legacyDbBaseName: string | null
+): boolean {
+	const clean = headerPath.replace(/^\/+/, '').trim();
+	if (!clean) return false;
+	const targetPrefix = `catbird-mls/${didHash}.db`;
+	const barePrefix = `${didHash}.db`;
+	if (
+		clean === targetPrefix ||
+		clean.startsWith(`${targetPrefix}-`) ||
+		clean === barePrefix ||
+		clean.startsWith(`${barePrefix}-`)
+	) {
+		return true;
+	}
+	if (
+		legacyDbBaseName &&
+		(clean === legacyDbBaseName ||
+			clean.startsWith(`${legacyDbBaseName}-`) ||
+			clean.endsWith(`/${legacyDbBaseName}`) ||
+			clean.includes(`/${legacyDbBaseName}-`))
+	) {
+		return true;
+	}
+	return false;
+}
+
+async function listDirectoryEntries(
+	dir: OpfsDirectoryHandleLike
+): Promise<Array<[string, OpfsFileHandleLike | OpfsDirectoryHandleLike]>> {
+	const out: Array<[string, OpfsFileHandleLike | OpfsDirectoryHandleLike]> = [];
+	if (typeof dir.entries === 'function') {
+		for await (const pair of dir.entries()) {
+			out.push(pair);
+		}
+		return out;
+	}
+	if (typeof dir.values === 'function') {
+		for await (const entry of dir.values()) {
+			if (entry && typeof entry.name === 'string') {
+				out.push([entry.name, entry]);
+			}
+		}
+	}
+	return out;
+}
+
+/**
+ * Purge an account's SQLite database files from OPFS (both direct files and
+ * `sqlite-wasm-vfs` `.opfs-sahpool/.opaque` pool slots matching `<didHash>.db`),
+ * leaving any other account's OPFS files untouched.
+ *
+ * Must be called AFTER `terminateWorkerInstance()` so all `SyncAccessHandle`
+ * file locks held by the dedicated Worker have been released.
+ */
+export async function purgeAccountOpfsDatabase(
+	didHash: string,
+	did?: string,
+	opfsRootProvider?: () => Promise<OpfsDirectoryHandleLike | null>
+): Promise<number> {
+	const normalizedHash = didHash.trim();
+	if (!normalizedHash) return 0;
+
+	let root: OpfsDirectoryHandleLike | null = null;
+	try {
+		if (opfsRootProvider) {
+			root = await opfsRootProvider();
+		} else if (
+			typeof navigator !== 'undefined' &&
+			navigator.storage &&
+			typeof navigator.storage.getDirectory === 'function'
+		) {
+			root = (await navigator.storage.getDirectory()) as unknown as OpfsDirectoryHandleLike;
+		}
+	} catch {
+		return 0;
+	}
+	if (!root) return 0;
+
+	const legacyBase = did && stripDidFragment(did) ? mlsDbFileNameForDid(did) : null;
+	const suffixes = ['', '-journal', '-wal', '-shm'];
+	let removedCount = 0;
+
+	const tryRemoveDirect = async (dir: OpfsDirectoryHandleLike, baseName: string) => {
+		for (const suffix of suffixes) {
+			try {
+				await dir.removeEntry(`${baseName}${suffix}`);
+				removedCount += 1;
+			} catch {
+				// Entry not present
+			}
+		}
+	};
+
+	await tryRemoveDirect(root, `${normalizedHash}.db`);
+	if (legacyBase) {
+		await tryRemoveDirect(root, legacyBase);
+	}
+
+	try {
+		const subDir = await root.getDirectoryHandle('catbird-mls', { create: false });
+		await tryRemoveDirect(subDir, `${normalizedHash}.db`);
+		if (legacyBase) {
+			await tryRemoveDirect(subDir, legacyBase);
+		}
+	} catch {
+		// No direct `catbird-mls/` directory in OPFS root
+	}
+
+	// Inspect `sqlite-wasm-vfs` OpfsSAHPool `.opfs-sahpool/.opaque` slot headers (first 512 bytes)
+	for (const poolDirName of ['.opfs-sahpool', 'opfs-sahpool']) {
+		try {
+			const poolDir = await root.getDirectoryHandle(poolDirName, { create: false });
+			const opaqueDir = await poolDir.getDirectoryHandle('.opaque', { create: false });
+			const entries = await listDirectoryEntries(opaqueDir);
+			const decoder = new TextDecoder();
+			for (const [slotName, handle] of entries) {
+				if (!handle || handle.kind === 'directory') continue;
+				const fileHandle = handle as OpfsFileHandleLike;
+				if (typeof fileHandle.getFile !== 'function') continue;
+				try {
+					const file = await fileHandle.getFile();
+					const headerBuf = await file.slice(0, 516).arrayBuffer();
+					if (headerBuf.byteLength === 0) continue;
+					const headerBytes = new Uint8Array(headerBuf, 0, Math.min(512, headerBuf.byteLength));
+					const nulIdx = headerBytes.indexOf(0);
+					const pathSlice = nulIdx >= 0 ? headerBytes.subarray(0, nulIdx) : headerBytes;
+					const associatedPath = decoder.decode(pathSlice);
+					if (sahPoolHeaderMatchesAccount(associatedPath, normalizedHash, legacyBase)) {
+						await opaqueDir.removeEntry(slotName);
+						removedCount += 1;
+					}
+				} catch {
+					// Slot busy or concurrently removed
+				}
+			}
+		} catch {
+			// Pool directory not initialized yet
+		}
+	}
+
+	return removedCount;
 }
 
 async function mintChatServiceAuthToken(sessionId: string, lxm: string): Promise<string> {
@@ -733,6 +590,26 @@ export async function listenForEvent<T>(
 /** Base keys -- the DID key is unnamespaced (bootstrap). */
 const SS_ACTIVE_DID = 'catbird_mls_active_did';
 const SS_PENDING_BROWSER_NONCE = 'catbird_mls_pending_browser_nonce';
+const SS_PENDING_UPGRADE_NONCE = 'catbird_mls_pending_upgrade_nonce';
+const SS_PENDING_UPGRADE_DID = 'catbird_mls_pending_upgrade_did';
+const SS_PENDING_UPGRADE_RETURN_TO = 'catbird_mls_pending_upgrade_return_to';
+const OAUTH_CODE_FORMAT_RE = /^[A-Za-z0-9._~+/-]{8,512}={0,2}$/;
+
+function parseGrantedScopes(raw: unknown): string[] {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.filter((entry): entry is string => typeof entry === 'string')
+		.map((s) => s.trim())
+		.filter(Boolean);
+}
+
+function sanitizeReturnPath(rawPath: string | null | undefined): string {
+	const trimmed = typeof rawPath === 'string' ? rawPath.trim() : '';
+	if (!trimmed || !trimmed.startsWith('/') || trimmed.startsWith('//') || /[\u0000-\u001f\u007f\\]/.test(trimmed)) {
+		return '/settings/labyrinth';
+	}
+	return trimmed;
+}
 
 /** Generate a cryptographically secure 32-byte unpadded base64url challenge nonce (43 chars). */
 export function generateBrowserNonce(): string {
@@ -750,7 +627,27 @@ export function generateBrowserNonce(): string {
 
 /** Clear any pending browser OAuth nonce from sessionStorage. */
 export function clearPendingOAuthLogin(): void {
+	if (typeof sessionStorage === 'undefined') return;
 	sessionStorage.removeItem(SS_PENDING_BROWSER_NONCE);
+}
+
+export function hasPendingOAuthUpgrade(): boolean {
+	if (typeof sessionStorage === 'undefined') return false;
+	return Boolean(sessionStorage.getItem(SS_PENDING_UPGRADE_NONCE));
+}
+
+export function clearPendingOAuthUpgrade(): void {
+	if (typeof sessionStorage === 'undefined') return;
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_NONCE);
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_DID);
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_RETURN_TO);
+}
+
+export function consumePendingUpgradeReturnPath(): string {
+	if (typeof sessionStorage === 'undefined') return '/settings/labyrinth';
+	const raw = sessionStorage.getItem(SS_PENDING_UPGRADE_RETURN_TO);
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_RETURN_TO);
+	return sanitizeReturnPath(raw);
 }
 
 /** Return a per-DID namespaced key for browser sessionStorage. */
@@ -760,8 +657,9 @@ function didKey(did: string, suffix: string): string {
 
 /** Persist auth credentials in sessionStorage, namespaced by DID. */
 export function persistBrowserAuth(did: string, sessionId: string): void {
-	sessionStorage.setItem(SS_ACTIVE_DID, did);
-	sessionStorage.setItem(didKey(did, 'session_id'), sessionId);
+	const canonicalDid = normalizeAccountDid(did);
+	sessionStorage.setItem(SS_ACTIVE_DID, canonicalDid);
+	sessionStorage.setItem(didKey(canonicalDid, 'session_id'), sessionId);
 }
 
 /** Read stored session for the active DID. Returns null if nothing saved. */
@@ -782,6 +680,7 @@ export function clearBrowserAuth(): void {
 		sessionStorage.removeItem(didKey(did, 'session_id'));
 	}
 	sessionStorage.removeItem(SS_ACTIVE_DID);
+	clearPendingOAuthUpgrade();
 }
 
 export async function startLogin(identifier: string): Promise<void> {
@@ -806,6 +705,10 @@ export async function startLogin(identifier: string): Promise<void> {
  * Consumes and clears the pending nonce immediately upon attempt.
  */
 export async function exchangeOAuthCode(code: string): Promise<string> {
+	if (!code || typeof code !== 'string' || !OAUTH_CODE_FORMAT_RE.test(code)) {
+		clearPendingOAuthLogin();
+		throw new Error('Invalid OAuth authorization code.');
+	}
 	const browserNonce = sessionStorage.getItem(SS_PENDING_BROWSER_NONCE);
 	// Single-use: clear pending nonce immediately
 	clearPendingOAuthLogin();
@@ -835,41 +738,344 @@ export async function exchangeOAuthCode(code: string): Promise<string> {
 		throw new Error('Invalid exchange response from auth gateway: missing session_id');
 	}
 
-	return data.session_id;
+	return normalizeSessionId(data.session_id);
+}
+
+/**
+ * Probe whether the authenticated account's PDS implements `com.atproto.space.*` (`I15`),
+ * matching `catbird-mls/src/client/spaces_gate.rs:272-290` (`getSpace` probe).
+ * Fails closed (`false`) when unauthenticated or on network / 5xx errors.
+ */
+export async function probePdsSpacesSupport(
+	fetchImpl: typeof fetch = fetch
+): Promise<boolean> {
+	if (isTauri) {
+		try {
+			return await tauriInvoke<boolean>('labyrinth_probe_pds_spaces');
+		} catch {
+			// Tauri desktop evaluates `probe_and_check_spaces_eligibility` directly in Rust during enrollment;
+			// fall back to authenticated BFF probe when no dedicated IPC probe command is registered.
+		}
+	}
+	const saved = readBrowserAuth();
+	if (!saved) return false;
+	try {
+		const resp = await fetchImpl(`${NEST_URL}/xrpc/com.atproto.space.getSpace`, {
+			method: 'GET',
+			headers: {
+				Authorization: `Bearer ${saved.sessionId}`
+			}
+		});
+		let errCode = '';
+		try {
+			const parsed = (await resp.json()) as { error?: unknown };
+			if (typeof parsed?.error === 'string') {
+				errCode = parsed.error;
+			}
+		} catch {
+			// Non-JSON body is acceptable when status indicates support
+		}
+		const notImplemented =
+			resp.status === 404 ||
+			resp.status === 501 ||
+			errCode === 'XRPCNotSupported' ||
+			errCode === 'MethodNotImplemented';
+		return !notImplemented && resp.status < 500;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Initiate progressive OAuth scope upgrade (`POST /auth/upgrade`) on `nest`
+ * for `REQUIRED_LABYRINTH_OAUTH_SCOPES` (excluding `'atproto'`, which is carried
+ * forward from the active session).
+ */
+export async function startOAuthScopeUpgrade(
+	requestedScopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES,
+	options: {
+		returnTo?: string;
+		fetchImpl?: typeof fetch;
+		navigate?: (authorizationUrl: string) => void;
+	} = {}
+): Promise<string> {
+	const saved = readBrowserAuth();
+	if (!saved) {
+		throw new Error('Cannot upgrade OAuth permissions without an active authenticated session.');
+	}
+	const additionalScopes = buildUpgradeAdditionalScopes(requestedScopes);
+	if (additionalScopes.length === 0) {
+		throw new Error(
+			'Active session is missing base atproto scope; please sign out and sign in again.'
+		);
+	}
+
+	const browserNonce = generateBrowserNonce();
+	sessionStorage.setItem(SS_PENDING_UPGRADE_NONCE, browserNonce);
+	sessionStorage.setItem(SS_PENDING_UPGRADE_DID, saved.did);
+	sessionStorage.setItem(
+		SS_PENDING_UPGRADE_RETURN_TO,
+		sanitizeReturnPath(options.returnTo ?? '/settings/labyrinth')
+	);
+
+	const doFetch = options.fetchImpl ?? fetch;
+	let resp: Response;
+	try {
+		resp = await doFetch(`${NEST_URL}/auth/upgrade`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${saved.sessionId}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				additional_scopes: additionalScopes,
+				browser_nonce: browserNonce
+			})
+		});
+	} catch (err) {
+		clearPendingOAuthUpgrade();
+		throw err;
+	}
+
+	if (!resp.ok) {
+		clearPendingOAuthUpgrade();
+		const errText = await resp.text().catch(() => '');
+		throw new Error(
+			`Permission upgrade initiation failed (${resp.status}): ${errText || resp.statusText}`
+		);
+	}
+
+	const data = (await resp.json()) as { authorization_url?: unknown };
+	const rawAuthUrl = typeof data?.authorization_url === 'string' ? data.authorization_url.trim() : '';
+	if (!rawAuthUrl || /[\u0000-\u001f\u007f]/.test(rawAuthUrl)) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Invalid authorization_url returned from /auth/upgrade');
+	}
+
+	let parsedAuthUrl: URL;
+	try {
+		parsedAuthUrl = new URL(rawAuthUrl);
+	} catch {
+		clearPendingOAuthUpgrade();
+		throw new Error('Malformed authorization_url returned from /auth/upgrade');
+	}
+	if (parsedAuthUrl.protocol !== 'https:' || parsedAuthUrl.username || parsedAuthUrl.password) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Insecure authorization_url returned from /auth/upgrade');
+	}
+
+	const authHref = parsedAuthUrl.toString();
+	if (options.navigate) {
+		options.navigate(authHref);
+	} else if (typeof window !== 'undefined' && window.location) {
+		window.location.href = authHref;
+	}
+	return authHref;
+}
+
+/**
+ * Complete progressive OAuth scope upgrade (`POST /auth/upgrade/exchange` ->
+ * `POST /auth/upgrade/commit` -> session promotion), fenced to the active DID.
+ */
+export async function completeOAuthScopeUpgrade(
+	code: string,
+	options: {
+		fetchImpl?: typeof fetch;
+	} = {}
+): Promise<AuthState> {
+	if (!code || typeof code !== 'string' || !OAUTH_CODE_FORMAT_RE.test(code)) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Invalid OAuth upgrade authorization code.');
+	}
+
+	const browserNonce =
+		typeof sessionStorage !== 'undefined'
+			? sessionStorage.getItem(SS_PENDING_UPGRADE_NONCE)
+			: null;
+	const expectedDidRaw =
+		typeof sessionStorage !== 'undefined'
+			? sessionStorage.getItem(SS_PENDING_UPGRADE_DID)
+			: null;
+	// Single-use: clear nonce and expected DID immediately (preserve returnTo for caller navigation)
+	if (typeof sessionStorage !== 'undefined') {
+		sessionStorage.removeItem(SS_PENDING_UPGRADE_NONCE);
+		sessionStorage.removeItem(SS_PENDING_UPGRADE_DID);
+	}
+
+	if (!browserNonce || !expectedDidRaw) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Missing or expired OAuth permission upgrade nonce.');
+	}
+
+	const saved = readBrowserAuth();
+	if (!saved) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Session expired or signed out during OAuth permission upgrade.');
+	}
+
+	const canonicalDid = normalizeAccountDid(saved.did);
+	if (canonicalDid !== normalizeAccountDid(expectedDidRaw)) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Active account changed during OAuth permission upgrade.');
+	}
+
+	const doFetch = options.fetchImpl ?? fetch;
+	const exResp = await doFetch(`${NEST_URL}/auth/upgrade/exchange`, {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${saved.sessionId}`,
+			'Content-Type': 'application/json'
+		},
+		body: JSON.stringify({
+			code,
+			browser_nonce: browserNonce
+		})
+	});
+	if (!exResp.ok) {
+		const errText = await exResp.text().catch(() => '');
+		throw new Error(
+			`Permission upgrade exchange failed (${exResp.status}): ${errText || exResp.statusText}`
+		);
+	}
+
+	const exData = (await exResp.json()) as {
+		candidate_session_id?: unknown;
+		did?: unknown;
+		granted_scopes?: unknown;
+	};
+	const candidateSessionId = normalizeSessionId(exData?.candidate_session_id);
+	const exDid = typeof exData?.did === 'string' ? normalizeAccountDid(exData.did) : '';
+	if (exDid !== canonicalDid) {
+		throw new Error('Permission upgrade exchange DID mismatch.');
+	}
+
+	let commitResp = await doFetch(`${NEST_URL}/auth/upgrade/commit`, {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${candidateSessionId}`
+		}
+	});
+	if (commitResp.status >= 500) {
+		// Retryable side-effect failure (e.g. push registry CAS) per nest `upgrade_commit` contract
+		commitResp = await doFetch(`${NEST_URL}/auth/upgrade/commit`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${candidateSessionId}`
+			}
+		});
+	}
+	if (!commitResp.ok) {
+		const errText = await commitResp.text().catch(() => '');
+		throw new Error(
+			`Permission upgrade commit failed (${commitResp.status}): ${errText || commitResp.statusText}`
+		);
+	}
+
+	const commitData = (await commitResp.json()) as {
+		status?: unknown;
+		session_id?: unknown;
+		did?: unknown;
+		granted_scopes?: unknown;
+	};
+	if (commitData?.status !== 'committed') {
+		throw new Error('Permission upgrade commit returned unexpected status.');
+	}
+	const committedSessionId = normalizeSessionId(commitData.session_id);
+	if (committedSessionId !== candidateSessionId) {
+		throw new Error('Committed session_id did not match candidate session_id.');
+	}
+	const commitDid = typeof commitData.did === 'string' ? normalizeAccountDid(commitData.did) : '';
+	if (commitDid !== canonicalDid) {
+		throw new Error('Committed session DID mismatch.');
+	}
+
+	// Re-verify session was not logged out or switched while commit was in flight
+	const stillActive = readBrowserAuth();
+	if (!stillActive || stillActive.sessionId !== saved.sessionId || normalizeAccountDid(stillActive.did) !== canonicalDid) {
+		throw new Error('Active session changed while committing permission upgrade.');
+	}
+
+	const committedScopes = parseGrantedScopes(commitData.granted_scopes);
+	const sessionResp = await doFetch(`${NEST_URL}/auth/session`, {
+		method: 'GET',
+		headers: {
+			Authorization: `Bearer ${committedSessionId}`
+		}
+	});
+	if (!sessionResp.ok) {
+		throw new Error(`Failed to verify upgraded session: ${sessionResp.status}`);
+	}
+	const sessionInfo = (await sessionResp.json()) as {
+		did?: unknown;
+		handle?: unknown;
+		granted_scopes?: unknown;
+	};
+	const verifiedDid =
+		typeof sessionInfo?.did === 'string' ? normalizeAccountDid(sessionInfo.did) : '';
+	if (verifiedDid !== canonicalDid) {
+		throw new Error('Upgraded session verification DID mismatch.');
+	}
+	const grantedScopes =
+		Array.isArray(sessionInfo?.granted_scopes)
+			? parseGrantedScopes(sessionInfo.granted_scopes)
+			: committedScopes;
+	const handle = typeof sessionInfo?.handle === 'string' && sessionInfo.handle ? sessionInfo.handle : canonicalDid;
+
+	persistBrowserAuth(canonicalDid, committedSessionId);
+	if (isMlsOptedInForDid(canonicalDid) && _worker && _workerDid === canonicalDid) {
+		await _worker.setAuth(canonicalDid, committedSessionId);
+	}
+
+	return {
+		did: canonicalDid,
+		handle,
+		grantedScopes
+	};
 }
 
 export async function completeLogin(sessionId: string): Promise<AuthState> {
+	const validatedSessionId = normalizeSessionId(sessionId);
 	if (isTauri) {
-		return tauriInvoke('complete_login', { sessionId });
+		const raw = await tauriInvoke<AuthState & { granted_scopes?: unknown }>('complete_login', {
+			sessionId: validatedSessionId
+		});
+		const grantedScopes = raw.grantedScopes ?? parseGrantedScopes(raw.granted_scopes);
+		return {
+			...raw,
+			did: normalizeAccountDid(raw.did),
+			grantedScopes
+		};
 	}
-	const resp = await bffFetch('/auth/session', { method: 'GET' }, sessionId);
+	const resp = await bffFetch('/auth/session', { method: 'GET' }, validatedSessionId);
 	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
 	const info = await resp.json();
-	const did: string = typeof info?.did === 'string' ? info.did.trim() : '';
-	if (!did) {
+	const rawDid = typeof info?.did === 'string' ? info.did : '';
+	if (!stripDidFragment(rawDid)) {
 		throw new Error('Invalid session response from auth gateway: missing did');
 	}
+	const did = normalizeAccountDid(rawDid);
 	const handle: string = info.handle ?? did;
+	const grantedScopes = parseGrantedScopes(info?.granted_scopes);
 
 	try {
 		// 1. Persist browser auth first so active DID is established
-		persistBrowserAuth(did, sessionId);
+		persistBrowserAuth(did, validatedSessionId);
 		// ctl #2: Chat/Spaces off by default — zero MLS DB opens, PDS/DS calls, or KeyPackage uploads on fresh sign-in
 		if (!isMlsOptedInForDid(did)) {
-			return { did, handle };
+			return { did, handle, grantedScopes };
 		}
 		// 2. Initialize WASM Worker for `did` (terminating any Worker bound to a different DID)
 		await initWasm(did);
 		// 3. Push credentials and complete MLS setup on the DID-scoped Worker
 		const w = getWorker();
-		await w.setAuth(did, sessionId);
+		await w.setAuth(did, validatedSessionId);
 		await installContentRootKey(did);
 		await w.setup();
 
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
 
-		return { did, handle };
+		return { did, handle, grantedScopes };
 	} catch (error) {
 		if (_replenishInterval) {
 			clearInterval(_replenishInterval);
@@ -1088,7 +1294,16 @@ export async function clearAuth(): Promise<void> {
 
 export async function tryRestoreSession(): Promise<AuthState | null> {
 	if (isTauri) {
-		return tauriInvoke('try_restore_session');
+		const raw = await tauriInvoke<(AuthState & { granted_scopes?: unknown }) | null>(
+			'try_restore_session'
+		);
+		if (!raw) return null;
+		const grantedScopes = raw.grantedScopes ?? parseGrantedScopes(raw.granted_scopes);
+		return {
+			...raw,
+			did: normalizeAccountDid(raw.did),
+			grantedScopes
+		};
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return null;
@@ -1105,14 +1320,16 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 			throw new Error(`Failed to restore session: ${resp.status}`);
 		}
 		const info = await resp.json();
-		const restoredDid: string = typeof info?.did === 'string' ? info.did.trim() : '';
-		if (!restoredDid) {
+		const rawDid = typeof info?.did === 'string' ? info.did.trim() : '';
+		if (!stripDidFragment(rawDid)) {
 			throw new Error('Invalid restored session response: missing did');
 		}
+		const restoredDid = normalizeAccountDid(rawDid);
+		const grantedScopes = parseGrantedScopes(info?.granted_scopes);
 
 		persistBrowserAuth(restoredDid, sessionId);
 		if (!isMlsOptedInForDid(restoredDid)) {
-			return { did: restoredDid, handle: info.handle ?? restoredDid };
+			return { did: restoredDid, handle: info.handle ?? restoredDid, grantedScopes };
 		}
 		await initWasm(restoredDid);
 
@@ -1125,7 +1342,7 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
 
-		return { did: restoredDid, handle: info.handle ?? restoredDid };
+		return { did: restoredDid, handle: info.handle ?? restoredDid, grantedScopes };
 	} catch (error) {
 		if (_replenishInterval) {
 			clearInterval(_replenishInterval);
@@ -1150,32 +1367,165 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 	}
 }
 
-export async function logout(): Promise<void> {
+async function withBoundedTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), timeoutMs);
+			})
+		]);
+	} finally {
+		if (timer !== null) {
+			clearTimeout(timer);
+		}
+	}
+}
+
+export interface AccountCleanupOptions {
+	opfsRootProvider?: () => Promise<OpfsDirectoryHandleLike | null>;
+	retireTimeoutMs?: number;
+}
+
+export async function logout(options?: AccountCleanupOptions): Promise<void> {
+	const retireTimeoutMs = options?.retireTimeoutMs ?? 3_000;
 	if (isTauri) {
+		await withBoundedTimeout(
+			tauriInvoke('retire_current_device').catch(() => undefined),
+			retireTimeoutMs
+		);
 		return tauriInvoke('logout');
 	}
-	clearBrowserAuth();
 
-	// Clear key package replenishment interval
+	const activeDid = stripDidFragment(readBrowserAuth()?.did ?? _workerDid ?? '');
+
+	// Clear key package replenishment interval before tearing down Worker
 	if (_replenishInterval) {
 		clearInterval(_replenishInterval);
 		_replenishInterval = null;
 	}
 
-	// Clear auth in worker, then terminate it and reset wasmReady/worker state
+	// Best-effort bounded (~3s) device retirement BEFORE wiping local device keys & OPFS DB
 	try {
 		if (_worker) {
-			try {
-				await (
-					_worker as unknown as { clearContentRootKey: () => Promise<void> }
-				).clearContentRootKey();
-			} catch (e) {
-				console.warn('[catmos] clearContentRootKey failed during logout:', e);
-			}
-			await _worker.clearAuth();
+			const w = _worker;
+			await withBoundedTimeout(
+				(async () => {
+					try {
+						await w.stopBackgroundTasks();
+					} catch {
+						// Ignore timer stop warning
+					}
+					try {
+						await w.retireCurrentDevice();
+					} catch (e) {
+						console.warn('[catmos] retireCurrentDevice skipped or failed during logout:', e);
+					}
+					try {
+						await w.clearContentRootKey();
+					} catch {
+						// Ignore root key clear warning
+					}
+					try {
+						await w.clearAuth();
+					} catch {
+						// Ignore auth clear warning
+					}
+					try {
+						await w.closeUnifiedClient();
+					} catch {
+						// Ignore close warning
+					}
+				})(),
+				retireTimeoutMs
+			);
 		}
 	} finally {
 		terminateWorkerInstance();
+	}
+
+	clearBrowserAuth();
+	if (typeof sessionStorage !== 'undefined') {
+		clearPendingOAuthLogin();
+	}
+
+	if (activeDid) {
+		const didHash = await accountDidHashHex(activeDid);
+		wipeBrowserDeviceId(didHash);
+		await deleteAccountKeyStoreEntries(didHash, sanitizeDid(activeDid));
+		await purgeAccountOpfsDatabase(didHash, activeDid, options?.opfsRootProvider);
+	}
+}
+
+export async function deleteAccountData(
+	did?: string,
+	options?: AccountCleanupOptions
+): Promise<void> {
+	const targetDid = stripDidFragment(did ?? readBrowserAuth()?.did ?? _workerDid ?? '');
+	const timeoutMs = options?.retireTimeoutMs ?? 5_000;
+
+	if (isTauri) {
+		if (targetDid) {
+			setMlsOptedInForDid(targetDid, false);
+		}
+		await tauriInvoke('delete_account_data', targetDid ? { did: targetDid } : undefined);
+		return;
+	}
+
+	if (_replenishInterval) {
+		clearInterval(_replenishInterval);
+		_replenishInterval = null;
+	}
+
+	try {
+		if (!_worker && targetDid && isMlsOptedInForDid(targetDid)) {
+			try {
+				await withBoundedTimeout(ensureUnifiedBrowserClientOpen(targetDid), timeoutMs);
+			} catch {
+				// Proceed to local wipe even if offline or client open fails
+			}
+		}
+		if (_worker) {
+			const w = _worker;
+			await withBoundedTimeout(
+				(async () => {
+					try {
+						await w.deleteAccountData();
+					} catch (e) {
+						console.warn('[catmos] worker deleteAccountData warning:', e);
+					}
+					try {
+						await w.clearContentRootKey();
+					} catch {
+						// Ignore
+					}
+					try {
+						await w.clearAuth();
+					} catch {
+						// Ignore
+					}
+				})(),
+				timeoutMs
+			);
+		}
+	} finally {
+		terminateWorkerInstance();
+	}
+
+	if (targetDid) {
+		setMlsOptedInForDid(targetDid, false);
+	}
+	clearBrowserAuth();
+	if (typeof sessionStorage !== 'undefined') {
+		clearPendingOAuthLogin();
+	}
+
+	if (targetDid) {
+		const didHash = await accountDidHashHex(targetDid);
+		wipeBrowserDeviceId(didHash);
+		await deleteAccountKeyStoreEntries(didHash, sanitizeDid(targetDid));
+		await purgeAccountOpfsDatabase(didHash, targetDid, options?.opfsRootProvider);
 	}
 }
 
@@ -1874,6 +2224,16 @@ export async function confirmManualReset(conversationId: string): Promise<void> 
 // Unified Clean-Slate Labyrinth 1.1 & Spaces Eligibility (`Spec §6.3`, `D4`, `I15`, `I16`)
 // ---------------------------------------------------------------------------
 
+export interface LabyrinthDeviceMetadataView {
+	device_id: string;
+	device_name?: string;
+	status?: 'active' | 'pending_approval' | 'dormant';
+	pending_approval?: boolean;
+	is_current?: boolean;
+	last_active_at?: string | null;
+	dormant_at?: string | null;
+}
+
 export interface LabyrinthBackupStatusView {
 	backup_enabled: boolean;
 	mailbox_space_uri: string;
@@ -1881,6 +2241,15 @@ export interface LabyrinthBackupStatusView {
 	has_passkey_prf: boolean;
 	epoch_seq: number;
 	active_device_ids: string[];
+	pending_device_ids?: string[];
+	current_device_id?: string;
+	devices?: LabyrinthDeviceMetadataView[];
+	backfill?: {
+		state?: string;
+		synced_batches?: number;
+		total_batches?: number | null;
+		last_synced_at?: string | null;
+	};
 }
 
 export interface OtcPairingOfferView {
@@ -1896,13 +2265,14 @@ export interface OtcPairingCompletionView {
 }
 
 async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<WorkerApi>> {
-	const didHash = await accountDidHashHex(did);
+	const accountDid = normalizeAccountDid(did);
+	const didHash = await accountDidHashHex(accountDid);
 	const dbKeyHex = await loadOrCreateDbKeyHex(didHash);
 	const savedAuth = readBrowserAuth();
-	const authToken = savedAuth && savedAuth.did === did ? savedAuth.sessionId : null;
+	const authToken = savedAuth && savedAuth.did === accountDid ? savedAuth.sessionId : null;
 	const w = getWorker();
 	await w.openUnifiedClient({
-		accountDid: did,
+		accountDid,
 		deviceId: getOrCreateBrowserDeviceId(didHash),
 		homeDsDid: HOME_DS_DID,
 		homeDsEndpoint: HOME_DS_URL,
@@ -1915,22 +2285,32 @@ async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<Worke
 
 export async function enableMlsAndEnroll(
 	did: string,
-	pdsSupportsSpaces = true,
-	grantedScopes: string[] = [...REQUIRED_LABYRINTH_OAUTH_SCOPES]
+	pdsSupportsSpaces = false,
+	grantedScopes: readonly string[] = []
 ): Promise<LabyrinthBackupStatusView> {
-	const plainScopes = Array.from(grantedScopes, (s) => String(s));
+	const accountDid = normalizeAccountDid(did);
+	const plainScopes = Array.from(grantedScopes, (s) => String(s).trim()).filter(Boolean);
 	if (isTauri) {
 		return tauriInvoke('labyrinth_enable_and_enroll', {
-			did,
+			did: accountDid,
 			grantedScopes: plainScopes
 		});
 	}
-	setMlsOptedInForDid(did, true);
-	const w = await ensureUnifiedBrowserClientOpen(did);
-	await w.enrollUnifiedDevice(Boolean(pdsSupportsSpaces), plainScopes);
-	startKeyPackageReplenishment();
-	await w.startBackgroundTasks(30_000);
-	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+	const gate = evaluateSpacesGateForUi(Boolean(pdsSupportsSpaces), plainScopes, accountDid);
+	if (!gate.eligible) {
+		throw new Error(gate.message);
+	}
+	setMlsOptedInForDid(accountDid, true);
+	try {
+		const w = await ensureUnifiedBrowserClientOpen(accountDid);
+		await w.enrollUnifiedDevice(Boolean(pdsSupportsSpaces), plainScopes);
+		startKeyPackageReplenishment();
+		await w.startBackgroundTasks(30_000);
+		return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+	} catch (err) {
+		setMlsOptedInForDid(accountDid, false);
+		throw err;
+	}
 }
 
 export async function getLabyrinthStatus(did: string): Promise<LabyrinthBackupStatusView | null> {
@@ -1961,6 +2341,32 @@ export async function restoreWithLabyrinthRecoveryCode(
 	return (await w.restoreWithRecoveryCode(recoveryCodeInput)) as LabyrinthBackupStatusView;
 }
 
+export async function getCurrentLabyrinthDeviceId(did: string): Promise<string | null> {
+	const accountDid = stripDidFragment(did);
+	if (!accountDid) return null;
+	if (isTauri) {
+		try {
+			const id = await tauriInvoke<string | null>('labyrinth_current_device_id', {
+				did: accountDid
+			});
+			return id ? id.trim() : null;
+		} catch {
+			return null;
+		}
+	}
+	const didHash = await accountDidHashHex(accountDid);
+	const stored = readBrowserDeviceId(didHash);
+	if (stored) return stored;
+	if (_worker) {
+		try {
+			return await _worker.currentDeviceId();
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+
 export async function registerLabyrinthPasskeyPrf(
 	did: string,
 	credentialId: Uint8Array,
@@ -1975,6 +2381,46 @@ export async function registerLabyrinthPasskeyPrf(
 	}
 	const w = await ensureUnifiedBrowserClientOpen(did);
 	return (await w.registerPasskeyPrf(credentialId, prfOutput32)) as LabyrinthBackupStatusView;
+}
+
+export async function restoreWithLabyrinthPasskeyPrf(
+	did: string,
+	credentialId: Uint8Array,
+	prfOutput32: Uint8Array
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_passkey_prf', {
+			did,
+			credentialId: Array.from(credentialId),
+			prfOutput32: Array.from(prfOutput32)
+		});
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.restoreWithPasskeyPrf(credentialId, prfOutput32)) as LabyrinthBackupStatusView;
+}
+
+export async function approveLabyrinthSiblingDevice(
+	did: string,
+	targetDeviceId: string
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_approve_device', { did, targetDeviceId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.approveSiblingDevice(targetDeviceId)) as LabyrinthBackupStatusView;
+}
+
+export async function syncLabyrinthBackfill(did: string): Promise<LabyrinthBackupStatusView | null> {
+	if (isTauri) {
+		try {
+			return await tauriInvoke<LabyrinthBackupStatusView>('labyrinth_sync_backfill', { did });
+		} catch {
+			return tauriInvoke<LabyrinthBackupStatusView>('labyrinth_status', { did });
+		}
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.syncUnified();
+	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
 }
 
 export async function initiateLabyrinthOtcPairing(did: string): Promise<OtcPairingOfferView> {
@@ -2000,6 +2446,8 @@ export async function revokeLabyrinthDevice(
 	did: string,
 	targetDeviceId: string
 ): Promise<LabyrinthBackupStatusView> {
+	const currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+	assertCanRevokeLabyrinthDevice(targetDeviceId, currentDeviceId);
 	if (isTauri) {
 		return tauriInvoke('labyrinth_revoke_device', { did, targetDeviceId });
 	}

@@ -1,5 +1,6 @@
 import { writable, derived, get } from 'svelte/store';
 import type { Conversation } from '#lib/tauri.ts';
+import { dedupeAccountDids, isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 import * as api from '#lib/wasm.ts';
 import { createBlock, listOwnBlocks } from '#lib/wasm.ts';
 
@@ -22,9 +23,13 @@ function createConversationsStore() {
 	return {
 		subscribe,
 		findDirectConversation(targetDid: string): string | null {
-			const match = currentState.items.find(
-				(c) => !c.isGroup && c.members.length === 2 && c.members.includes(targetDid)
-			);
+			const targetAccount = stripDidFragment(targetDid);
+			if (!targetAccount) return null;
+			const match = currentState.items.find((c) => {
+				if (c.isGroup) return false;
+				const accountMembers = dedupeAccountDids(c.members);
+				return accountMembers.length === 2 && accountMembers.includes(targetAccount);
+			});
 			return match?.id ?? null;
 		},
 		async load() {
@@ -98,7 +103,7 @@ export const selectedConversation = derived(conversations, ($c) =>
  */
 export function affectedConversationsFor(did: string): Conversation[] {
 	const state = get(conversations);
-	return state.items.filter((c) => c.members.includes(did));
+	return state.items.filter((c) => c.members.some((memberDid) => isSameAccountDid(memberDid, did)));
 }
 
 /**
@@ -151,7 +156,7 @@ export async function reconcileBlockedConversations(): Promise<number> {
 
 	const state = get(conversations);
 	const toLeave = state.items.filter((c) =>
-		c.members.some((did) => blocked.has(did))
+		c.members.some((did) => blocked.has(stripDidFragment(did)))
 	);
 
 	let leftCount = 0;
