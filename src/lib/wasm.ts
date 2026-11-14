@@ -1466,52 +1466,43 @@ export async function deleteAccountData(
 	const timeoutMs = options?.retireTimeoutMs ?? 5_000;
 
 	if (isTauri) {
+		await tauriInvoke('delete_account_data', targetDid ? { did: targetDid } : undefined);
 		if (targetDid) {
 			setMlsOptedInForDid(targetDid, false);
 		}
-		await tauriInvoke('delete_account_data', targetDid ? { did: targetDid } : undefined);
 		return;
+	}
+
+	// Fail-closed (`D-3`): remote OwnerMailbox, PDS mailboxKeys, mls-ds, and owned Space
+	// deletes MUST succeed before we tear down the worker, opt-in flag, session, or local DB.
+	if (!_worker && targetDid && isMlsOptedInForDid(targetDid)) {
+		await withBoundedTimeout(ensureUnifiedBrowserClientOpen(targetDid), timeoutMs);
+	}
+	if (_worker) {
+		const w = _worker;
+		await withBoundedTimeout(w.deleteAccountData(), timeoutMs);
+		try {
+			await w.clearContentRootKey?.();
+		} catch {
+			// Ignore post-delete cleanup warnings
+		}
+		try {
+			await w.clearAuth?.();
+		} catch {
+			// Ignore post-delete cleanup warnings
+		}
+		try {
+			await w.closeUnifiedClient?.();
+		} catch {
+			// Ignore post-delete cleanup warnings
+		}
 	}
 
 	if (_replenishInterval) {
 		clearInterval(_replenishInterval);
 		_replenishInterval = null;
 	}
-
-	try {
-		if (!_worker && targetDid && isMlsOptedInForDid(targetDid)) {
-			try {
-				await withBoundedTimeout(ensureUnifiedBrowserClientOpen(targetDid), timeoutMs);
-			} catch {
-				// Proceed to local wipe even if offline or client open fails
-			}
-		}
-		if (_worker) {
-			const w = _worker;
-			await withBoundedTimeout(
-				(async () => {
-					try {
-						await w.deleteAccountData();
-					} catch (e) {
-						console.warn('[catmos] worker deleteAccountData warning:', e);
-					}
-					try {
-						await w.clearContentRootKey();
-					} catch {
-						// Ignore
-					}
-					try {
-						await w.clearAuth();
-					} catch {
-						// Ignore
-					}
-				})(),
-				timeoutMs
-			);
-		}
-	} finally {
-		terminateWorkerInstance();
-	}
+	terminateWorkerInstance();
 
 	if (targetDid) {
 		setMlsOptedInForDid(targetDid, false);
@@ -2167,20 +2158,28 @@ export async function sendVoice(
 
 export async function fetchAndDecryptBlob(
 	blobId: string,
-	key: Uint8Array,
-	iv: Uint8Array,
+	key: Uint8Array | number[],
+	iv: Uint8Array | number[],
 	sha256: string
 ): Promise<Uint8Array> {
+	const keyArr = key instanceof Uint8Array ? Array.from(key) : key;
+	const ivArr = iv instanceof Uint8Array ? Array.from(iv) : iv;
 	if (isTauri) {
-		return tauriInvoke('fetch_and_decrypt_blob', {
+		const bytes = await tauriInvoke<number[]>('fetch_and_decrypt_blob', {
 			blobId,
-			key: Array.from(key),
-			iv: Array.from(iv),
+			key: keyArr,
+			iv: ivArr,
 			sha256
 		});
+		return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 	}
 	const w = getWorker();
-	return w.fetchAndDecryptBlob(blobId, key, iv, sha256) as Promise<Uint8Array>;
+	return w.fetchAndDecryptBlob(
+		blobId,
+		key instanceof Uint8Array ? key : new Uint8Array(key),
+		iv instanceof Uint8Array ? iv : new Uint8Array(iv),
+		sha256
+	) as Promise<Uint8Array>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2453,4 +2452,195 @@ export async function revokeLabyrinthDevice(
 	}
 	const w = await ensureUnifiedBrowserClientOpen(did);
 	return (await w.revokeLabyrinthDevice(targetDeviceId)) as LabyrinthBackupStatusView;
+}
+
+export interface LiveOtcInitiationView {
+	session_id_hex: string;
+	formatted_code: string;
+	six_digit_code: string;
+}
+
+export interface ReadStateView {
+	conversation_id: string;
+	last_read_seq: number;
+	updated_at?: string;
+}
+
+export interface CircleOwnerStateView {
+	circle_id: string;
+	name: string;
+	description?: string | null;
+	member_dids: string[];
+	acl_tombstone_dids?: string[];
+	updated_at: string;
+	record_cid?: string | null;
+}
+
+export interface CircleOwnerStateMergeUpdate {
+	circle_id: string;
+	name?: string | null;
+	description?: string | null;
+	add_member_dids?: string[];
+	remove_member_dids?: string[];
+	updated_at?: string | null;
+}
+
+export async function isLabyrinthDevicePendingApproval(did: string): Promise<boolean> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_is_device_pending_approval', { did });
+	}
+	if (!isMlsOptedInForDid(did)) return false;
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.isDevicePendingApproval();
+}
+
+export async function listRegisteredLabyrinthDevices(
+	did: string
+): Promise<LabyrinthDeviceMetadataView[]> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_list_devices', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.listRegisteredDevices()) as LabyrinthDeviceMetadataView[];
+}
+
+export async function revokeRegisteredLabyrinthDeviceLive(
+	did: string,
+	targetDeviceId: string
+): Promise<LabyrinthBackupStatusView> {
+	const currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+	assertCanRevokeLabyrinthDevice(targetDeviceId, currentDeviceId);
+	if (isTauri) {
+		return tauriInvoke('labyrinth_revoke_device_live', { did, targetDeviceId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.revokeRegisteredDevice(targetDeviceId)) as LabyrinthBackupStatusView;
+}
+
+export async function startLiveLabyrinthOtcPairing(
+	did: string,
+	sixDigitCode: string
+): Promise<LiveOtcInitiationView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_start_otc', { did, sixDigitCode });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.startLiveOtcPairing(sixDigitCode)) as LiveOtcInitiationView;
+}
+
+export async function respondLiveLabyrinthOtcPairing(
+	did: string,
+	sessionIdHex: string,
+	sixDigitCode?: string
+): Promise<void> {
+	if (isTauri) {
+		await tauriInvoke('labyrinth_respond_otc', {
+			did,
+			sessionIdHex,
+			sixDigitCode: sixDigitCode ?? null
+		});
+		return;
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.respondLiveOtcPairing(sessionIdHex, sixDigitCode ?? null);
+}
+
+export async function verifyAndReindexLabyrinthHistory(
+	did: string,
+	conversationId: string
+): Promise<number> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_verify_and_reindex_history', { did, conversationId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.verifyAndReindexHistory(conversationId);
+}
+
+export async function getReadState(
+	did: string,
+	conversationId: string
+): Promise<ReadStateView | null> {
+	if (isTauri) {
+		return tauriInvoke('get_read_state', { did, conversationId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.getReadState(conversationId)) as ReadStateView | null;
+}
+
+export async function advanceReadState(
+	did: string,
+	conversationId: string,
+	candidateSeq: number
+): Promise<ReadStateView> {
+	if (isTauri) {
+		return tauriInvoke('advance_read_state', { did, conversationId, candidateSeq });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.advanceReadState(conversationId, candidateSeq)) as ReadStateView;
+}
+
+export async function listReadStates(did: string): Promise<ReadStateView[]> {
+	if (isTauri) {
+		return tauriInvoke('list_read_states', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.listReadStates()) as ReadStateView[];
+}
+
+export async function getCircleOwnerState(
+	did: string,
+	circleId: string
+): Promise<CircleOwnerStateView | null> {
+	if (isTauri) {
+		return tauriInvoke('get_circle_owner_state', { did, circleId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.getCircleOwnerState(circleId)) as CircleOwnerStateView | null;
+}
+
+export async function putCircleOwnerState(
+	did: string,
+	state: CircleOwnerStateView,
+	swapRecordCid?: string | null
+): Promise<string> {
+	if (isTauri) {
+		return tauriInvoke('put_circle_owner_state', {
+			did,
+			state,
+			swapRecordCid: swapRecordCid ?? null
+		});
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.putCircleOwnerState(state, swapRecordCid ?? null);
+}
+
+export async function mergeCircleOwnerState(
+	did: string,
+	update: CircleOwnerStateMergeUpdate
+): Promise<CircleOwnerStateView> {
+	if (isTauri) {
+		return tauriInvoke('merge_circle_owner_state', { did, update });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.mergeCircleOwnerState(update)) as CircleOwnerStateView;
+}
+
+export async function clearCircleAclTombstone(
+	did: string,
+	circleId: string,
+	memberDid: string
+): Promise<CircleOwnerStateView> {
+	if (isTauri) {
+		return tauriInvoke('clear_circle_acl_tombstone', { did, circleId, memberDid });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.clearCircleAclTombstone(circleId, memberDid)) as CircleOwnerStateView;
+}
+
+export async function listCircleOwnerStates(did: string): Promise<CircleOwnerStateView[]> {
+	if (isTauri) {
+		return tauriInvoke('list_circle_owner_states', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.listCircleOwnerStates()) as CircleOwnerStateView[];
 }

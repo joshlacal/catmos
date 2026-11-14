@@ -1,64 +1,24 @@
-mod api_client;
-mod native_keyring;
 pub use catbird_atproto::catbird;
 pub use catbird_atproto::types;
 mod commands;
-mod credentials;
-mod keychain;
-mod keys;
 pub mod mls;
-mod mls_proxy;
-mod quarantine_observer;
+#[cfg(test)]
+#[rustfmt::skip]
+#[path = "../../../catbird-mls/tests/support/native_archive_auth.rs"]
+pub(crate) mod native_archive_auth;
+mod native_keyring;
 mod recovery;
 mod session_restore;
-mod storage;
-mod websocket;
 
 use std::collections::HashMap;
-pub(crate) fn nest_url() -> String {
-    std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string())
-}
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
-use api_client::ReqwestApiClient;
-use catbird_mls::orchestrator::MLSOrchestrator;
-use credentials::KeyringCredentialStore;
-use keychain::KeyringKeychainAccess;
-use quarantine_observer::QuarantineObserver;
-use storage::SqliteStorage;
 use tauri::Manager;
 use tokio::sync::Mutex;
 
-/// Retrieve or generate a random 32-byte hex key stored in the OS keychain.
-/// `label` distinguishes between multiple databases (e.g. "conversation-db", "mls-db").
-fn get_or_create_db_key(label: &str) -> String {
-    let service = "blue.catbird.catmos";
-    let entry = crate::native_keyring::entry(service, label)
-        .expect("Failed to create keyring entry for DB key");
-
-    // Try to load an existing key
-    match entry.get_password() {
-        Ok(existing) => existing,
-        Err(keyring::Error::NoEntry) => {
-            // Generate a random 32-byte key and hex-encode it
-            let mut key_bytes = [0u8; 32];
-            getrandom::fill(&mut key_bytes).expect("Failed to generate random DB key");
-            let hex_key: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
-            entry
-                .set_password(&hex_key)
-                .expect("Failed to store DB key in keychain");
-            hex_key
-        }
-        Err(e) => panic!("Failed to read DB key from keychain: {e}"),
-    }
+pub(crate) fn nest_url() -> String {
+    std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string())
 }
-
-pub type CatmosOrchestrator = MLSOrchestrator<
-    SqliteStorage,
-    ReqwestApiClient,
-    KeyringCredentialStore,
-    catbird_mls::MLSContext,
->;
 
 fn resolve_data_dir() -> std::path::PathBuf {
     #[cfg(target_os = "android")]
@@ -78,7 +38,7 @@ fn resolve_data_dir() -> std::path::PathBuf {
     std::env::temp_dir().join("catmos")
 }
 
-/// Per-conversation WebSocket subscription handle
+/// Per-conversation or global sync subscription handle.
 pub struct WsHandle {
     pub shutdown: tokio::sync::watch::Sender<bool>,
 }
@@ -90,24 +50,52 @@ impl WsHandle {
 }
 
 pub struct AppState {
-    pub orchestrator: Arc<CatmosOrchestrator>,
     pub mls_manager: Arc<mls::TauriMlsManager>,
-    pub api_client: Arc<ReqwestApiClient>,
-    /// Runtime-owned clean-chat auth capabilities. The provider contains
-    /// opaque session/device/JKT state; commands never persist or log secrets.
-    pub(crate) chat_auth: Arc<api_client::ChatAuthProvider>,
+    pub(crate) session_auth: RwLock<Option<(String, String)>>,
     pub ws_handles: Arc<Mutex<HashMap<String, WsHandle>>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Per-app data directory (`~/Library/Application Support/catmos` on macOS,
-    /// platform-equivalent elsewhere). Used by the auth flow to resolve the
-    /// per-DID content-root key file (`keys::load_or_create_content_root_key`).
     pub data_dir: std::path::PathBuf,
+}
+
+impl AppState {
+    pub(crate) fn set_session_auth(&self, did: String, session_id: String) {
+        if let Ok(mut guard) = self.session_auth.write() {
+            *guard = Some((did, session_id));
+        }
+    }
+
+    pub(crate) fn clear_session_auth(&self) {
+        if let Ok(mut guard) = self.session_auth.write() {
+            *guard = None;
+        }
+    }
+
+    pub(crate) fn current_did(&self) -> Option<String> {
+        self.session_auth
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|(did, _)| did.clone()))
+    }
+
+    pub(crate) fn current_token(&self) -> Option<String> {
+        self.session_auth
+            .read()
+            .ok()
+            .and_then(|g| g.as_ref().map(|(_, tok)| tok.clone()))
+            .or_else(|| {
+                crate::native_keyring::entry("catmos", "session_id")
+                    .and_then(|e| e.get_password())
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            })
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Resolve paths
+    // ctl #2: Create only the empty data directory on startup — never open any SQLite DB
+    // or upload KeyPackages until explicit per-DID opt-in.
     let data_dir = resolve_data_dir();
     std::fs::create_dir_all(&data_dir).unwrap_or_else(|e| {
         panic!(
@@ -117,58 +105,10 @@ pub fn run() {
         )
     });
 
-    let db_path = data_dir.join("catmos.db");
-    let db_path_str = db_path.to_string_lossy().to_string();
-
-    // Route XRPC calls through nest BFF (handles DPoP auth, session management)
-    let mls_ds_url = nest_url();
-    // Create platform implementations
-    let conversation_encryption_key = get_or_create_db_key("conversation-db");
-    let storage = Arc::new(
-        SqliteStorage::new(&db_path_str, &conversation_encryption_key)
-            .expect("Failed to initialize SQLite storage"),
-    );
-    let api_client = Arc::new(ReqwestApiClient::new(mls_ds_url));
-    let cred_store = Arc::new(KeyringCredentialStore::new());
-
-    // Create MLS FFI context — create parent directory first
-    let mls_state_dir = data_dir.join("mls-state");
-    std::fs::create_dir_all(&mls_state_dir).expect("Failed to create mls-state directory");
-
-    let mls_db_path = mls_state_dir.join("mls.db");
-    let encryption_key = get_or_create_db_key("mls-db");
-    let keychain = Box::new(KeyringKeychainAccess::new());
-    let mls_context = catbird_mls::MLSContext::new(
-        mls_db_path.to_string_lossy().to_string(),
-        encryption_key,
-        keychain,
-    )
-    .expect("Failed to initialize MLS context");
-
-    if let Err(e) = mls_context.launch_checkpoint() {
-        eprintln!(
-            "[catmos] Warning: launch checkpoint failed (non-fatal): {:?}",
-            e
-        );
-    }
-
-    api_client.set_mls_context(mls_context.clone());
-    storage.set_mls_context(mls_context.clone());
-
-    let orchestrator = Arc::new(MLSOrchestrator::new(
-        mls_context,
-        storage,
-        api_client.clone(),
-        cred_store,
-        catbird_mls::orchestrator::OrchestratorConfig::default(),
-    ));
     let mls_manager = Arc::new(mls::TauriMlsManager::new(data_dir.clone()));
-    let chat_auth = api_client.chat_auth_provider();
     let app_state = AppState {
-        orchestrator,
         mls_manager,
-        chat_auth,
-        api_client,
+        session_auth: RwLock::new(None),
         ws_handles: Arc::new(Mutex::new(HashMap::new())),
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
@@ -183,12 +123,16 @@ pub fn run() {
             commands::complete_login,
             commands::try_restore_session,
             commands::logout,
+            commands::delete_account_data,
+            commands::retire_current_device,
             commands::get_conversations,
             commands::create_group,
             commands::send_message,
             commands::send_image,
+            commands::send_voice,
             commands::get_messages,
             commands::get_image_attachment,
+            commands::fetch_and_decrypt_blob,
             commands::get_group_members,
             commands::subscribe_conversation,
             commands::unsubscribe_conversation,
@@ -218,24 +162,34 @@ pub fn run() {
             commands::confirm_manual_reset,
             commands::labyrinth_enable_and_enroll,
             commands::labyrinth_status,
+            commands::labyrinth_current_device_id,
             commands::labyrinth_setup_recovery_code,
             commands::labyrinth_restore_recovery_code,
             commands::labyrinth_register_passkey_prf,
-            commands::labyrinth_initiate_otc,
-            commands::labyrinth_complete_otc,
+            commands::labyrinth_restore_passkey_prf,
+            commands::labyrinth_is_device_pending_approval,
+            commands::labyrinth_approve_device,
+            commands::labyrinth_list_devices,
             commands::labyrinth_revoke_device,
+            commands::labyrinth_revoke_device_live,
+            commands::labyrinth_initiate_otc,
+            commands::labyrinth_start_otc,
+            commands::labyrinth_respond_otc,
+            commands::labyrinth_complete_otc,
+            commands::labyrinth_verify_and_reindex_history,
+            commands::labyrinth_get_read_state,
+            commands::labyrinth_advance_read_state,
+            commands::labyrinth_list_read_states,
+            commands::labyrinth_get_circle_owner_state,
+            commands::labyrinth_put_circle_owner_state,
+            commands::labyrinth_merge_circle_owner_state,
+            commands::labyrinth_clear_circle_acl_tombstone,
+            commands::labyrinth_list_circle_owner_states,
         ])
         .setup(|app| {
             let app_handle = app.handle().clone();
             let state = app.state::<AppState>();
-            state.mls_manager.attach_app_handle(app_handle.clone());
-            let orchestrator = state.orchestrator.clone();
-            let observer: Arc<
-                dyn catbird_mls::orchestrator::event_observer::OrchestratorEventObserver,
-            > = Arc::new(QuarantineObserver::new(app_handle));
-            tauri::async_runtime::block_on(async move {
-                orchestrator.set_event_observer(Some(observer)).await;
-            });
+            state.mls_manager.attach_app_handle(app_handle);
             Ok(())
         })
         .run(tauri::generate_context!())

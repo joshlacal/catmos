@@ -45,6 +45,7 @@
 	let reportReason = $state('');
 	let reportSubmitting = $state(false);
 	let reportResult = $state<{ success: boolean; message: string } | null>(null);
+	let actionError = $state<string | null>(null);
 
 	$effect(() => {
 		if (conversationId) {
@@ -135,6 +136,7 @@
 		const { type, did } = confirmAction;
 		processing = did;
 		confirmAction = null;
+		actionError = null;
 		try {
 			if (type === 'promote') {
 				await promoteMember(conversationId, did);
@@ -153,6 +155,7 @@
 			await loadMembers();
 		} catch (err) {
 			console.error(`${type} failed:`, err);
+			actionError = err instanceof Error ? err.message : String(err);
 		} finally {
 			processing = null;
 		}
@@ -316,6 +319,19 @@
 		{/each}
 	</div>
 	<div class="leave-section">
+		{#if actionError}
+			<div class="member-action-error" role="alert">
+				<span>{actionError}</span>
+				<button
+					type="button"
+					class="dismiss-error-btn"
+					aria-label="Dismiss error"
+					onclick={() => {
+						actionError = null;
+					}}
+				>✕</button>
+			</div>
+		{/if}
 		<button
 			class="leave-btn"
 			onclick={() => requestAction('leave', currentUserDid(), 'you')}
@@ -818,5 +834,29 @@
 		background: rgba(0, 0, 0, 0.04);
 		padding: 1px 4px;
 		border-radius: 3px;
+	}
+
+	.member-action-error {
+		display: flex;
+		align-items: flex-start;
+		justify-content: space-between;
+		gap: 8px;
+		margin-bottom: 8px;
+		padding: 8px 10px;
+		border-radius: var(--radius-sm, 6px);
+		background: rgba(255, 59, 48, 0.12);
+		color: var(--danger, #ff3b30);
+		font-size: 12px;
+		line-height: 1.4;
+	}
+
+	.dismiss-error-btn {
+		background: transparent;
+		border: none;
+		color: inherit;
+		cursor: pointer;
+		padding: 0 2px;
+		font-size: 12px;
+		flex-shrink: 0;
 	}
 </style>

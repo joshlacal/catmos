@@ -7,7 +7,7 @@ import {
 	parseTauriOAuthCallbackPayload
 } from '#lib/oauth-callback.ts';
 import type { AuthState } from '#lib/tauri.ts';
-import { profiles } from './profiles';
+import { profiles } from './profiles.ts';
 
 interface AuthStore {
 	user: AuthState | null;
@@ -122,11 +122,8 @@ function createAuthStore() {
 		},
 		async deleteAccountData(did?: string) {
 			cleanupOAuthListeners();
-			try {
-				await api.deleteAccountData(did);
-			} finally {
-				set(initialState);
-			}
+			await api.deleteAccountData(did);
+			set(initialState);
 		},
 		async tryRestore() {
 			update((s) => ({ ...s, loading: true, error: null }));

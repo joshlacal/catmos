@@ -322,6 +322,23 @@
 		}
 	}
 
+	async function handleSendVoice(
+		audioData: Uint8Array,
+		durationMs: number,
+		waveform: number[],
+		contentType: string
+	) {
+		if (currentConversation) {
+			await messages.sendVoice(
+				currentConversation.id,
+				audioData,
+				durationMs,
+				waveform,
+				contentType
+			);
+		}
+	}
+
 	async function handleTypingChanged(isTyping: boolean) {
 		if (!currentConversation) return;
 		try {
@@ -488,6 +505,7 @@
 			conversationId={currentConversation.id}
 			onSend={handleSend}
 			onSendImage={handleSendImage}
+			onSendVoice={handleSendVoice}
 			onTypingChanged={handleTypingChanged}
 			disabled={activeQuarantine !== null}
 			disabledPlaceholder={activeQuarantine ? 'Conversation paused. Reset to continue.' : undefined}

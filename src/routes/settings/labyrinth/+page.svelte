@@ -10,14 +10,20 @@
 		getCurrentLabyrinthDeviceId,
 		getLabyrinthStatus,
 		initiateLabyrinthOtcPairing,
+		isLabyrinthDevicePendingApproval,
+		listRegisteredLabyrinthDevices,
 		probePdsSpacesSupport,
 		registerLabyrinthPasskeyPrf,
+		respondLiveLabyrinthOtcPairing,
 		restoreWithLabyrinthPasskeyPrf,
 		restoreWithLabyrinthRecoveryCode,
 		revokeLabyrinthDevice,
 		setupLabyrinthRecoveryCode,
+		startLiveLabyrinthOtcPairing,
 		syncLabyrinthBackfill,
+		verifyAndReindexLabyrinthHistory,
 		type LabyrinthBackupStatusView,
+		type LiveOtcInitiationView,
 		type OtcPairingOfferView
 	} from '#lib/wasm.ts';
 	import {
@@ -51,7 +57,12 @@
 	let generatedRecoveryCode = $state('');
 	let restoreCodeInput = $state('');
 	let otcOffer = $state<OtcPairingOfferView | null>(null);
+	let liveOtcSession = $state<LiveOtcInitiationView | null>(null);
 	let otcInput = $state('');
+	let otcResponderSessionId = $state('');
+	let otcResponderCode = $state('');
+	let reindexConversationId = $state('');
+	let devicePendingApproval = $state(false);
 	let canRegisterPasskeyPrf = $state(false);
 	let passkeyReason = $state<string | null>(null);
 	let statusBanner = $state<string | null>(null);
@@ -77,7 +88,23 @@
 
 	async function refreshDeviceIdentityAndStatus(did: string) {
 		currentDeviceId = await getCurrentLabyrinthDeviceId(did);
-		status = await getLabyrinthStatus(did);
+		const nextStatus = await getLabyrinthStatus(did);
+		try {
+			devicePendingApproval = await isLabyrinthDevicePendingApproval(did);
+		} catch {
+			devicePendingApproval = false;
+		}
+		if (nextStatus) {
+			try {
+				const liveDevices = await listRegisteredLabyrinthDevices(did);
+				if (Array.isArray(liveDevices) && liveDevices.length > 0) {
+					nextStatus.devices = liveDevices;
+				}
+			} catch {
+				// Keep local status snapshot when offline
+			}
+		}
+		status = nextStatus;
 	}
 
 	async function loadAccountLabyrinthState(did: string) {
@@ -319,7 +346,61 @@
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
-			otcOffer = await initiateLabyrinthOtcPairing(did);
+			const offer = await initiateLabyrinthOtcPairing(did);
+			otcOffer = offer;
+			try {
+				const started = await startLiveLabyrinthOtcPairing(did, offer.six_digit_code);
+				liveOtcSession = started;
+				otcOffer = {
+					six_digit_code: started.six_digit_code,
+					formatted_code: started.formatted_code
+				};
+				otcInput = started.six_digit_code;
+			} catch {
+				liveOtcSession = null;
+			}
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function handleRespondLiveOtc(event: SubmitEvent) {
+		event.preventDefault();
+		if (!otcResponderSessionId.trim() || !otcResponderCode.trim()) return;
+		busy = true;
+		errorBanner = null;
+		try {
+			const did = requireAuthenticatedDid();
+			await respondLiveLabyrinthOtcPairing(
+				did,
+				otcResponderSessionId.trim(),
+				otcResponderCode.trim()
+			);
+			await refreshDeviceIdentityAndStatus(did);
+			otcResponderSessionId = '';
+			otcResponderCode = '';
+			statusBanner = 'Submitted post-quantum OTC pairing response to your OwnerMailbox.';
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function handleVerifyAndReindexHistory(event: SubmitEvent) {
+		event.preventDefault();
+		if (!reindexConversationId.trim()) return;
+		busy = true;
+		errorBanner = null;
+		try {
+			const did = requireAuthenticatedDid();
+			const targetConvo = reindexConversationId.trim();
+			const reindexed = await verifyAndReindexLabyrinthHistory(did, targetConvo);
+			await refreshDeviceIdentityAndStatus(did);
+			reindexConversationId = '';
+			statusBanner = `Verified and re-indexed ${reindexed} message(s) for conversation ${targetConvo}.`;
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
@@ -447,7 +528,7 @@
 			</div>
 		</section>
 	{:else}
-		{#if currentDeviceEntry?.status === 'pending_approval'}
+		{#if devicePendingApproval || currentDeviceEntry?.status === 'pending_approval'}
 			<p class="banner warn" role="status">
 				This device is <strong>pending approval</strong> from an already-enrolled device. Approve it
 				from another active device, enter a 6-digit pairing code, or restore via Passkey PRF /
@@ -620,9 +701,41 @@
 				<span class="otc-badge" aria-live="polite">{otcOffer.formatted_code}</span>
 			{/if}
 		</div>
+		{#if liveOtcSession}
+			<p class="hint">
+				Live OTC Session ID: <code>{liveOtcSession.session_id_hex}</code>
+			</p>
+		{/if}
+
+		<form class="inline-form" onsubmit={handleRespondLiveOtc}>
+			<label for="otc-session-id-input">Respond from already-enrolled device (Session ID + 6-digit code)</label>
+			<div class="input-row">
+				<input
+					id="otc-session-id-input"
+					type="text"
+					autocomplete="off"
+					spellcheck="false"
+					placeholder="OTC Session ID (hex)"
+					bind:value={otcResponderSessionId}
+					disabled={!optedIn || busy}
+				/>
+				<input
+					id="otc-responder-code-input"
+					type="text"
+					inputmode="numeric"
+					maxlength="7"
+					placeholder="123-456"
+					bind:value={otcResponderCode}
+					disabled={!optedIn || busy}
+				/>
+				<button type="submit" class="btn-secondary" disabled={!optedIn || busy}>
+					Respond to Pairing
+				</button>
+			</div>
+		</form>
 
 		<form class="inline-form" onsubmit={handleCompleteOtc}>
-			<label for="otc-code-input">Enter 6-digit code from another enrolled device</label>
+			<label for="otc-code-input">Finalize pairing on new device (6-digit code)</label>
 			<div class="input-row">
 				<input
 					id="otc-code-input"
@@ -635,6 +748,31 @@
 				/>
 				<button type="submit" class="btn-primary" disabled={!optedIn || busy}>
 					Pair Device
+				</button>
+			</div>
+		</form>
+	</section>
+
+	<section class="card" aria-labelledby="reindex-heading">
+		<h2 id="reindex-heading">History Verification &amp; Re-Index</h2>
+		<p>
+			Verify franking tags and rebuild local search/message indexes from encrypted Space history batches
+			for a conversation.
+		</p>
+		<form class="inline-form" onsubmit={handleVerifyAndReindexHistory}>
+			<label for="reindex-convo-input">Conversation ID</label>
+			<div class="input-row">
+				<input
+					id="reindex-convo-input"
+					type="text"
+					autocomplete="off"
+					spellcheck="false"
+					placeholder="00000000-0000-4000-8000-000000000000"
+					bind:value={reindexConversationId}
+					disabled={!optedIn || busy}
+				/>
+				<button type="submit" class="btn-secondary" disabled={!optedIn || busy}>
+					Verify &amp; Re-Index History
 				</button>
 			</div>
 		</form>

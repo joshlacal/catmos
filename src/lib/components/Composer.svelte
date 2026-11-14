@@ -2,11 +2,13 @@
 	import { onDestroy } from 'svelte';
 	import type { PreparedImageUpload } from '#lib/tauri.ts';
 	import { drafts } from '#lib/stores/drafts.ts';
+	import VoiceRecorder, { type RecordedVoicePayload } from './VoiceRecorder.svelte';
 
 	let {
 		conversationId,
 		onSend,
 		onSendImage,
+		onSendVoice,
 		onTypingChanged,
 		disabled = false,
 		disabledPlaceholder
@@ -14,6 +16,12 @@
 		conversationId: string | null;
 		onSend: (content: string) => void;
 		onSendImage?: (content: string, image: PreparedImageUpload) => void | Promise<void>;
+		onSendVoice?: (
+			audioData: Uint8Array,
+			durationMs: number,
+			waveform: number[],
+			contentType: string
+		) => void | Promise<void>;
 		onTypingChanged?: (isTyping: boolean) => void;
 		/** When true, the composer is locked (Layer 3 quarantine, etc.). */
 		disabled?: boolean;
@@ -22,6 +30,7 @@
 	} = $props();
 
 	let text = $state('');
+	let recordingVoice = $state(false);
 	let inputEl: HTMLTextAreaElement | undefined = $state();
 	let fileInputEl: HTMLInputElement | undefined = $state();
 	let isTyping = $state(false);
@@ -259,6 +268,18 @@
 		}
 	}
 
+	async function handleVoiceRecorded(payload: RecordedVoicePayload) {
+		recordingVoice = false;
+		if (!onSendVoice) return;
+		try {
+			uploadError = null;
+			await onSendVoice(payload.data, payload.durationMs, payload.waveform, payload.contentType);
+		} catch (error) {
+			console.error('[catmos] voice send failed:', error);
+			uploadError = error instanceof Error ? error.message : 'Failed to send voice message';
+		}
+	}
+
 	onDestroy(() => {
 		clearIdleTimer();
 		emitTyping(false);
@@ -285,49 +306,77 @@
 		</div>
 	{/if}
 	<div class="composer-inner">
-		{#if onSendImage}
-			<input
-				bind:this={fileInputEl}
-				type="file"
-				accept="image/*"
-				class="hidden-file-input"
-				onchange={handleFileChange}
+		{#if recordingVoice}
+			<VoiceRecorder
+				autoStart={true}
+				onRecorded={handleVoiceRecorded}
+				onCancel={() => {
+					recordingVoice = false;
+				}}
 			/>
-			<button
-				class="composer-btn attach"
-				type="button"
-				onclick={() => fileInputEl?.click()}
-				aria-label="Send image"
+		{:else}
+			{#if onSendImage}
+				<input
+					bind:this={fileInputEl}
+					type="file"
+					accept="image/*"
+					class="hidden-file-input"
+					onchange={handleFileChange}
+				/>
+				<button
+					class="composer-btn attach"
+					type="button"
+					onclick={() => fileInputEl?.click()}
+					aria-label="Send image"
+					disabled={disabled}
+				>
+					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+						<circle cx="8.5" cy="8.5" r="1.5" />
+						<polyline points="21 15 16 10 5 21" />
+					</svg>
+				</button>
+			{/if}
+			<textarea
+				bind:this={inputEl}
+				bind:value={text}
+				oninput={handleInput}
+				onkeydown={handleKeydown}
+				placeholder={disabled ? (disabledPlaceholder ?? 'Sending is disabled.') : 'Message...'}
+				rows="1"
 				disabled={disabled}
+				aria-disabled={disabled}
+			></textarea>
+			{#if onSendVoice && !text.trim()}
+				<button
+					class="composer-btn attach"
+					type="button"
+					onclick={() => {
+						if (!disabled) recordingVoice = true;
+					}}
+					aria-label="Record voice message"
+					disabled={disabled}
+				>
+					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+						<path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+						<line x1="12" y1="19" x2="12" y2="23" />
+						<line x1="8" y1="23" x2="16" y2="23" />
+					</svg>
+				</button>
+			{/if}
+			<button
+				class="composer-btn send"
+				class:active={text.trim().length > 0 && !disabled}
+				onclick={send}
+				disabled={disabled || !text.trim()}
+				aria-label="Send message"
 			>
-				<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-					<circle cx="8.5" cy="8.5" r="1.5" />
-					<polyline points="21 15 16 10 5 21" />
+				<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+					<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
 				</svg>
 			</button>
 		{/if}
-		<textarea
-			bind:this={inputEl}
-			bind:value={text}
-			oninput={handleInput}
-			onkeydown={handleKeydown}
-			placeholder={disabled ? (disabledPlaceholder ?? 'Sending is disabled.') : 'Message...'}
-			rows="1"
-			disabled={disabled}
-			aria-disabled={disabled}
-		></textarea>
-		<button
-			class="composer-btn send"
-			class:active={text.trim().length > 0 && !disabled}
-			onclick={send}
-			disabled={disabled || !text.trim()}
-			aria-label="Send message"
-		>
-			<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
-				<path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
-			</svg>
-		</button>
 	</div>
 	{#if uploadError}
 		<div class="composer-error">{uploadError}</div>

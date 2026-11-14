@@ -5,6 +5,7 @@
 	import { auth } from '#lib/stores/auth.ts';
 	import Reactions from './Reactions.svelte';
 	import MessageImage from './MessageImage.svelte';
+	import VoicePlayer from './VoicePlayer.svelte';
 	import BlueskyEmbed from './BlueskyEmbed.svelte';
 
 	export interface ReplyInfo {
@@ -46,6 +47,7 @@
 	let isOwn = $derived(
 		Boolean(message.isOwn) || isSameAccountDid(message.senderDid, $auth.user?.did)
 	);
+	let voiceAudio = $derived(message.audio ?? message.audioAttachment ?? null);
 
 	// Parse structured content (may contain reply reference)
 	let parsed = $derived.by(() => {
@@ -165,6 +167,9 @@
 				{/if}
 				{#if message.image}
 					<MessageImage image={message.image} fallbackAlt={rawContent || undefined} />
+				{/if}
+				{#if voiceAudio}
+					<VoicePlayer audio={voiceAudio} isOwnMessage={isOwn} />
 				{/if}
 				{#if textContent}
 					<div class="bubble-text">{textContent}</div>

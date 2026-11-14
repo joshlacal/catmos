@@ -37,10 +37,78 @@ function bytesToHex(bytes: number[] | Uint8Array | undefined | null): string {
 	return arr.map((b) => Number(b & 0xff).toString(16).padStart(2, '0')).join('');
 }
 
-function extractMessageTextAndType(plaintextJson: string): { messageType: string; content: string } {
+function decodeBase64Bytes(input: string): Uint8Array {
+	const normalized = input.trim().replace(/-/g, '+').replace(/_/g, '/');
+	if (!normalized) return new Uint8Array();
+	const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+	const bin = atob(padded);
+	const out = new Uint8Array(bin.length);
+	for (let i = 0; i < bin.length; i += 1) {
+		out[i] = bin.charCodeAt(i);
+	}
+	return out;
+}
+
+function encodeBase64Bytes(bytes: Uint8Array | number[]): string {
+	const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+	let bin = '';
+	const chunkSize = 0x8000;
+	for (let i = 0; i < arr.length; i += chunkSize) {
+		bin += String.fromCharCode(...arr.subarray(i, i + chunkSize));
+	}
+	return btoa(bin);
+}
+
+function decodeSha256Bytes(sha256: string): Uint8Array | null {
+	const trimmed = sha256.trim();
+	if (!trimmed) return null;
+	if (/^[0-9a-fA-F]{64}$/.test(trimmed)) {
+		const out = new Uint8Array(32);
+		for (let i = 0; i < 32; i += 1) {
+			out[i] = Number.parseInt(trimmed.slice(i * 2, i * 2 + 2), 16);
+		}
+		return out;
+	}
+	try {
+		const decoded = decodeBase64Bytes(trimmed);
+		return decoded.byteLength === 32 ? decoded : null;
+	} catch {
+		return null;
+	}
+}
+
+function extractMessageDetails(plaintextJson: string): {
+	messageType: string;
+	content: string;
+	image?: {
+		blobId: string;
+		keyB64: string;
+		ivB64: string;
+		sha256: string;
+		contentType: string;
+		size: number;
+		width: number;
+		height: number;
+		altText?: string;
+		blurhash?: string;
+	};
+	audio?: {
+		blobId: string;
+		key: Uint8Array;
+		iv: Uint8Array;
+		keyB64: string;
+		ivB64: string;
+		sha256: string;
+		contentType: string;
+		size: number;
+		durationMs: number;
+		waveform: number[];
+		transcript?: string;
+	};
+} {
 	try {
 		const parsed = JSON.parse(plaintextJson) as Record<string, unknown>;
-		const messageType =
+		let messageType =
 			typeof parsed.messageType === 'string'
 				? parsed.messageType
 				: typeof parsed.type === 'string'
@@ -51,7 +119,58 @@ function extractMessageTextAndType(plaintextJson: string): { messageType: string
 				? parsed.text
 				: typeof parsed.content === 'string'
 					? parsed.content
-					: plaintextJson;
+					: typeof parsed.embed === 'object' && parsed.embed !== null
+						? ''
+						: plaintextJson;
+
+		const embed =
+			typeof parsed.embed === 'object' && parsed.embed !== null
+				? (parsed.embed as Record<string, unknown>)
+				: null;
+		if (embed?.type === 'image') {
+			messageType = 'image';
+			return {
+				messageType,
+				content,
+				image: {
+					blobId: String(embed.blobId ?? ''),
+					keyB64: String(embed.key ?? embed.keyB64 ?? ''),
+					ivB64: String(embed.iv ?? embed.ivB64 ?? ''),
+					sha256: String(embed.sha256 ?? ''),
+					contentType: String(embed.contentType ?? 'image/jpeg'),
+					size: Number(embed.size ?? 0),
+					width: Number(embed.width ?? 0),
+					height: Number(embed.height ?? 0),
+					altText: typeof embed.altText === 'string' ? embed.altText : undefined,
+					blurhash: typeof embed.blurhash === 'string' ? embed.blurhash : undefined
+				}
+			};
+		}
+		if (embed?.type === 'audio') {
+			messageType = 'voice';
+			const keyB64 = String(embed.key ?? embed.keyB64 ?? '');
+			const ivB64 = String(embed.iv ?? embed.ivB64 ?? '');
+			const waveformRaw = Array.isArray(embed.waveform)
+				? embed.waveform.map((n) => Number(n)).filter((n) => Number.isFinite(n))
+				: [];
+			return {
+				messageType,
+				content,
+				audio: {
+					blobId: String(embed.blobId ?? ''),
+					key: decodeBase64Bytes(keyB64),
+					iv: decodeBase64Bytes(ivB64),
+					keyB64,
+					ivB64,
+					sha256: String(embed.sha256 ?? ''),
+					contentType: String(embed.contentType ?? 'audio/webm;codecs=opus'),
+					size: Number(embed.size ?? 0),
+					durationMs: Number(embed.durationMs ?? 0),
+					waveform: waveformRaw,
+					transcript: typeof embed.transcript === 'string' ? embed.transcript : undefined
+				}
+			};
+		}
 		return { messageType, content };
 	} catch {
 		return { messageType: 'text', content: plaintextJson };
@@ -61,7 +180,9 @@ function extractMessageTextAndType(plaintextJson: string): { messageType: string
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mapMessageRowToUi(rawRow: any) {
 	const row = plain(rawRow);
-	const { messageType, content } = extractMessageTextAndType(String(row.plaintext_json ?? ''));
+	const { messageType, content, image, audio } = extractMessageDetails(
+		String(row.plaintext_json ?? '')
+	);
 	const createdMs = Number(row.created_at_ms ?? Date.now());
 	const isOwn = Boolean(row.is_own);
 	return {
@@ -74,8 +195,15 @@ function mapMessageRowToUi(rawRow: any) {
 		sequenceNumber: Math.max(0, Number(row.seq ?? 0)),
 		status: isOwn ? 'sent' : 'delivered',
 		isOwn,
-		messageType
+		messageType,
+		...(image ? { image } : {}),
+		...(audio ? { audio, audioAttachment: audio } : {})
 	};
+}
+
+function bestEffortAdvanceReadState(convoId: string, maxSeq: number) {
+	if (!unifiedClient || !latestAuthToken || maxSeq < 1) return;
+	unifiedClient.advanceReadState(convoId, BigInt(Math.trunc(maxSeq))).catch(() => {});
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -96,7 +224,7 @@ function mapConversationRowToUi(rawRow: any, members: string[], rawMeta: any, ra
 	let lastMessage: string | undefined;
 	let lastMessageAt: string | undefined;
 	if (lastMsg) {
-		lastMessage = extractMessageTextAndType(String(lastMsg.plaintext_json ?? '')).content;
+		lastMessage = extractMessageDetails(String(lastMsg.plaintext_json ?? '')).content;
 		lastMessageAt = new Date(Number(lastMsg.created_at_ms ?? Date.now())).toISOString();
 	}
 	return {
@@ -136,6 +264,9 @@ const api = {
 		backgroundSyncTimer = setInterval(() => {
 			if (unifiedClient) {
 				unifiedClient.sync().catch((e) => console.warn('[catmos] background sync warning:', e));
+				unifiedClient
+					.fulfillPendingGroupLeaves()
+					.catch((e) => console.warn('[catmos] background group leave warning:', e));
 				unifiedClient
 					.flushLabyrinthQueue()
 					.catch((e) => console.warn('[catmos] background labyrinth flush warning:', e));
@@ -326,8 +457,31 @@ const api = {
 		width: number,
 		height: number,
 		altText?: string
-	) =>
-		plain(
+	) => {
+		await wasmReady;
+		if (unifiedClient) {
+			const uploaded = await unifiedClient.uploadConversationAttachment(
+				convoId,
+				data,
+				contentType || 'image/jpeg'
+			);
+			const msgId = crypto.randomUUID().toLowerCase();
+			const row = await unifiedClient.sendMediaAttachmentMessage(
+				convoId,
+				msgId,
+				content,
+				uploaded,
+				width,
+				height,
+				altText ?? null,
+				null,
+				null,
+				null
+			);
+			unifiedClient.flushLabyrinthQueue().catch(() => {});
+			return mapMessageRowToUi(row);
+		}
+		return plain(
 			await wasm.catbird_mls_send_image(
 				convoId,
 				content,
@@ -337,7 +491,8 @@ const api = {
 				height,
 				altText
 			)
-		),
+		);
+	},
 	getMessages: async (convoId: string, before?: string) => {
 		await wasmReady;
 		if (!unifiedClient) return [];
@@ -345,6 +500,8 @@ const api = {
 		const rows = (plain(unifiedClient.listMessages(convoId, beforeSeq, 50)) as unknown[]) ?? [];
 		const mapped = rows.map(mapMessageRowToUi);
 		mapped.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+		const maxSeq = mapped.reduce((acc, m) => Math.max(acc, m.sequenceNumber), 0);
+		bestEffortAdvanceReadState(convoId, maxSeq);
 		return mapped;
 	},
 	getImageAttachment: async (
@@ -354,15 +511,30 @@ const api = {
 		sha256: string,
 		contentType: string,
 		convoId = ''
-	) =>
-		wasm.catbird_mls_get_image_attachment(
+	) => {
+		await wasmReady;
+		if (unifiedClient) {
+			const keyBytes = decodeBase64Bytes(keyB64);
+			const ivBytes = decodeBase64Bytes(ivB64);
+			const shaBytes = decodeSha256Bytes(sha256);
+			const bytes = await unifiedClient.downloadConversationAttachment(
+				blobId,
+				keyBytes,
+				ivBytes,
+				shaBytes
+			);
+			const mime = contentType || 'image/jpeg';
+			return `data:${mime};base64,${encodeBase64Bytes(bytes)}`;
+		}
+		return wasm.catbird_mls_get_image_attachment(
 			convoId,
 			blobId,
 			keyB64,
 			ivB64,
 			sha256,
 			contentType
-		),
+		);
+	},
 	fetchNewMessages: async (convoId: string) => {
 		await wasmReady;
 		if (!unifiedClient) return [];
@@ -374,6 +546,8 @@ const api = {
 		const rows = (plain(unifiedClient.listMessages(convoId, null, 50)) as unknown[]) ?? [];
 		const mapped = rows.map(mapMessageRowToUi);
 		mapped.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+		const maxSeq = mapped.reduce((acc, m) => Math.max(acc, m.sequenceNumber), 0);
+		bestEffortAdvanceReadState(convoId, maxSeq);
 		return mapped;
 	},
 	sendReaction: async (convoId: string, msgId: string, emoji: string, action: string) => {
@@ -399,6 +573,14 @@ const api = {
 			const seq = BigInt(trimmed);
 			if (seq >= 1n) {
 				await unifiedClient.acknowledgeEntriesUpTo(convoId, seq);
+				bestEffortAdvanceReadState(convoId, Number(seq));
+			}
+		} else {
+			const rows = (plain(unifiedClient.listMessages(convoId, null, 1)) as unknown[]) ?? [];
+			if (rows.length > 0) {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const latestSeq = Number((rows[0] as any)?.seq ?? 0);
+				bestEffortAdvanceReadState(convoId, latestSeq);
 			}
 		}
 	},
@@ -448,6 +630,7 @@ const api = {
 			running = true;
 			try {
 				await unifiedClient.sync();
+				unifiedClient.fulfillPendingGroupLeaves().catch(() => {});
 				const targetIds: string[] =
 					convoId === '*'
 						? ((plain(unifiedClient.listConversations(null, 100)) as unknown[]) ?? [])
@@ -551,7 +734,7 @@ const api = {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			await client.declineDirectRequest(String((pending as any).request_id));
 		} else {
-			await client.removeGroupMember(true, convoId, client.accountDid());
+			await client.leaveConversation(convoId);
 		}
 	},
 
@@ -611,8 +794,28 @@ const api = {
 		durationMs: number,
 		waveform: number[],
 		transcript?: string
-	) =>
-		plain(
+	) => {
+		await wasmReady;
+		if (unifiedClient) {
+			const mime = contentType || 'audio/webm;codecs=opus';
+			const uploaded = await unifiedClient.uploadConversationAttachment(convoId, audioData, mime);
+			const msgId = crypto.randomUUID().toLowerCase();
+			const row = await unifiedClient.sendMediaAttachmentMessage(
+				convoId,
+				msgId,
+				'',
+				uploaded,
+				null,
+				null,
+				null,
+				BigInt(Math.max(1, Math.round(durationMs))),
+				waveform,
+				transcript ?? null
+			);
+			unifiedClient.flushLabyrinthQueue().catch(() => {});
+			return mapMessageRowToUi(row);
+		}
+		return plain(
 			await (wasm as any).catbird_mls_send_voice(
 				convoId,
 				audioData,
@@ -621,13 +824,23 @@ const api = {
 				plain(waveform),
 				transcript ?? null
 			)
-		),
+		);
+	},
 	fetchAndDecryptBlob: async (
 		blobId: string,
-		key: Uint8Array,
-		iv: Uint8Array,
+		key: Uint8Array | number[],
+		iv: Uint8Array | number[],
 		sha256: string
-	) => await (wasm as any).catbird_mls_fetch_and_decrypt_blob(blobId, key, iv, sha256),
+	) => {
+		await wasmReady;
+		const keyBytes = key instanceof Uint8Array ? key : new Uint8Array(key);
+		const ivBytes = iv instanceof Uint8Array ? iv : new Uint8Array(iv);
+		if (unifiedClient) {
+			const shaBytes = decodeSha256Bytes(sha256);
+			return unifiedClient.downloadConversationAttachment(blobId, keyBytes, ivBytes, shaBytes);
+		}
+		return await (wasm as any).catbird_mls_fetch_and_decrypt_blob(blobId, keyBytes, ivBytes, sha256);
+	},
 
 	// -----------------------------------------------------------------------
 	// Unified Clean-Slate WasmMlsClient (`catbird-mls/<did_hash>.db`, `G2`, `D4`, `I15`, `I16`)
@@ -712,64 +925,68 @@ const api = {
 		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
 		return plain(unifiedClient.labyrinthStatus());
 	},
+	enableLabyrinthLive: async () => {
+		await wasmReady;
+		const client = requireUnified();
+		return plain(await client.enableLabyrinthLive());
+	},
+	isDevicePendingApproval: async () => {
+		await wasmReady;
+		return requireUnified().isDevicePendingApproval();
+	},
 	setupRecoveryCode: async () => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return unifiedClient.setupRecoveryCode();
+		const client = requireUnified();
+		if (latestAuthToken) {
+			return client.createRecoveryCodeLive();
+		}
+		return client.setupRecoveryCode();
 	},
 	restoreWithRecoveryCode: async (recoveryCodeInput: string) => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return plain(unifiedClient.restoreWithRecoveryCode(recoveryCodeInput));
+		const client = requireUnified();
+		if (latestAuthToken) {
+			return plain(await client.restoreWithRecoveryCodeLive(recoveryCodeInput));
+		}
+		return plain(client.restoreWithRecoveryCode(recoveryCodeInput));
 	},
 	registerPasskeyPrf: async (credentialId: Uint8Array, prfOutput32: Uint8Array) => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return plain(unifiedClient.registerPasskeyPrf(credentialId, prfOutput32));
+		const client = requireUnified();
+		if (latestAuthToken) {
+			return plain(await client.registerPasskeyPrfLive(credentialId, prfOutput32));
+		}
+		return plain(client.registerPasskeyPrf(credentialId, prfOutput32));
 	},
 	restoreWithPasskeyPrf: async (credentialId: Uint8Array, prfOutput32: Uint8Array) => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		const dynamicClient = unifiedClient as unknown as {
-			restoreWithPasskeyPrf?: (
-				credentialId: Uint8Array,
-				prfOutput32: Uint8Array
-			) => Promise<unknown> | unknown;
-		};
-		if (typeof dynamicClient.restoreWithPasskeyPrf !== 'function') {
-			throw new Error('Passkey PRF restore requires updated WASM runtime');
-		}
-		return plain(await dynamicClient.restoreWithPasskeyPrf(credentialId, prfOutput32));
+		const client = requireUnified();
+		return plain(await client.restoreWithPasskeyPrf(credentialId, prfOutput32));
 	},
 	approveSiblingDevice: async (targetDeviceId: string) => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		const dynamicClient = unifiedClient as unknown as {
-			approveDevice?: (targetDeviceId: string) => Promise<unknown> | unknown;
-			approveLabyrinthDevice?: (targetDeviceId: string) => Promise<unknown> | unknown;
-		};
-		if (typeof dynamicClient.approveLabyrinthDevice === 'function') {
-			return plain(await dynamicClient.approveLabyrinthDevice(targetDeviceId));
-		}
-		if (typeof dynamicClient.approveDevice === 'function') {
-			return plain(await dynamicClient.approveDevice(targetDeviceId));
-		}
-		throw new Error('Sibling device approval requires updated WASM runtime');
+		const client = requireUnified();
+		await client.approveDevice(targetDeviceId);
+		return plain(client.labyrinthStatus());
+	},
+	listRegisteredDevices: async () => {
+		await wasmReady;
+		return plain(await requireUnified().listDevices());
+	},
+	revokeRegisteredDevice: async (targetDeviceId: string) => {
+		await wasmReady;
+		return plain(await requireUnified().revokeDevice(targetDeviceId));
 	},
 	retireCurrentDevice: async () => {
 		await wasmReady;
 		if (!unifiedClient) return false;
-		const dynamicClient = unifiedClient as unknown as {
-			retireCurrentDevice?: () => Promise<unknown> | unknown;
-		};
-		if (typeof dynamicClient.retireCurrentDevice === 'function') {
-			await dynamicClient.retireCurrentDevice();
-			return true;
-		}
-		return false;
+		await unifiedClient.retireCurrentDevice();
+		return true;
 	},
 	deleteAccountData: async () => {
 		await wasmReady;
+		const client = requireUnified();
+		await client.deleteAccountData();
 		if (backgroundSyncTimer) {
 			clearInterval(backgroundSyncTimer);
 			backgroundSyncTimer = null;
@@ -778,41 +995,88 @@ const api = {
 			sub.close();
 		}
 		subscriptions.clear();
-		if (!unifiedClient) return false;
 		try {
-			const dynamicClient = unifiedClient as unknown as {
-				deleteAccountData?: () => Promise<unknown> | unknown;
-			};
-			if (typeof dynamicClient.deleteAccountData === 'function') {
-				await dynamicClient.deleteAccountData();
-				return true;
-			}
-			return false;
-		} finally {
-			try {
-				unifiedClient.close();
-			} catch {
-				// Ignore handle close failure after wipe
-			}
-			unifiedClient = null;
-			unifiedDeviceId = null;
-			latestAuthToken = null;
+			client.close();
+		} catch {
+			// Ignore handle close failure after wipe
 		}
+		unifiedClient = null;
+		unifiedDeviceId = null;
+		latestAuthToken = null;
+		return true;
 	},
 	initiateOtcPairing: async () => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return plain(unifiedClient.initiateOtcPairing());
+		return plain(requireUnified().initiateOtcPairing());
+	},
+	startLiveOtcPairing: async (sixDigitCode: string) => {
+		await wasmReady;
+		return plain(await requireUnified().startOtcPairing(sixDigitCode));
+	},
+	respondLiveOtcPairing: async (sessionIdHex: string, sixDigitCode?: string | null) => {
+		await wasmReady;
+		await requireUnified().respondOtcPairing(sessionIdHex, sixDigitCode ?? null);
+	},
+	completeLiveOtcPairing: async (sixDigitCode: string) => {
+		await wasmReady;
+		return plain(await requireUnified().completeLiveOtcPairing(sixDigitCode));
 	},
 	completeOtcPairing: async (sixDigitCode: string) => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return plain(unifiedClient.completeOtcPairing(sixDigitCode));
+		const client = requireUnified();
+		if (latestAuthToken) {
+			return plain(await client.completeLiveOtcPairing(sixDigitCode));
+		}
+		return plain(client.completeOtcPairing(sixDigitCode));
 	},
 	revokeLabyrinthDevice: async (targetDeviceId: string) => {
 		await wasmReady;
-		if (!unifiedClient) throw new Error('WasmMlsClient is not open');
-		return plain(unifiedClient.revokeLabyrinthDevice(targetDeviceId));
+		const client = requireUnified();
+		if (latestAuthToken) {
+			return plain(await client.revokeDevice(targetDeviceId));
+		}
+		return plain(client.revokeLabyrinthDevice(targetDeviceId));
+	},
+	verifyAndReindexHistory: async (conversationId: string) => {
+		await wasmReady;
+		return Number(await requireUnified().verifyAndReindexHistory(conversationId));
+	},
+	getReadState: async (conversationId: string) => {
+		await wasmReady;
+		return plain(await requireUnified().getReadState(conversationId));
+	},
+	advanceReadState: async (conversationId: string, candidateSeq: number) => {
+		await wasmReady;
+		return plain(
+			await requireUnified().advanceReadState(
+				conversationId,
+				BigInt(Math.max(0, Math.trunc(candidateSeq)))
+			)
+		);
+	},
+	listReadStates: async () => {
+		await wasmReady;
+		return plain(await requireUnified().listReadStates());
+	},
+	getCircleOwnerState: async (circleId: string) => {
+		await wasmReady;
+		return plain(await requireUnified().getCircleOwnerState(circleId));
+	},
+	putCircleOwnerState: async (stateDto: unknown, swapRecordCid?: string | null) => {
+		await wasmReady;
+		return requireUnified().putCircleOwnerState(stateDto, swapRecordCid ?? null);
+	},
+	mergeCircleOwnerState: async (update: unknown) => {
+		await wasmReady;
+		return plain(await requireUnified().mergeCircleOwnerState(update));
+	},
+	clearCircleAclTombstone: async (circleId: string, memberDid: string) => {
+		await wasmReady;
+		return plain(await requireUnified().clearCircleAclTombstone(circleId, memberDid));
+	},
+	listCircleOwnerStates: async () => {
+		await wasmReady;
+		return plain(await requireUnified().listCircleOwnerStates());
 	},
 	listDirectRequests: async (consentFilter?: string | null) => {
 		await wasmReady;

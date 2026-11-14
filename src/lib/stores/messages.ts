@@ -184,7 +184,25 @@ function createMessagesStore() {
 				});
 			}
 		},
-		async sendVoice(conversationId: string, audioData: Uint8Array, durationMs: number, waveform: number[]) {
+		async sendVoice(
+			conversationId: string,
+			audioData: Uint8Array,
+			durationMs: number,
+			waveform: number[],
+			contentType = 'audio/webm;codecs=opus',
+			transcript?: string
+		) {
+			const audioPayload: AudioAttachment = {
+				blobId: '',
+				key: new Uint8Array(),
+				iv: new Uint8Array(),
+				sha256: '',
+				contentType,
+				size: audioData.length,
+				durationMs,
+				waveform,
+				transcript
+			};
 			const optimistic: Message = {
 				id: `temp-voice-${Date.now()}`,
 				conversationId,
@@ -194,16 +212,8 @@ function createMessagesStore() {
 				timestamp: new Date().toISOString(),
 				status: 'sending',
 				messageType: 'voice',
-				audioAttachment: {
-					blobId: '',
-					key: new Uint8Array(),
-					iv: new Uint8Array(),
-					sha256: '',
-					contentType: 'audio/webm;codecs=opus',
-					size: audioData.length,
-					durationMs,
-					waveform
-				}
+				audio: audioPayload,
+				audioAttachment: audioPayload
 			};
 			update((s) => {
 				const byConversation = new Map(s.byConversation);
@@ -215,9 +225,10 @@ function createMessagesStore() {
 				const sent = await api.sendVoice(
 					conversationId,
 					audioData,
-					'audio/webm;codecs=opus',
+					contentType,
 					durationMs,
-					waveform
+					waveform,
+					transcript
 				);
 				update((s) => {
 					const byConversation = new Map(s.byConversation);

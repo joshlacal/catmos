@@ -1,14 +1,41 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
 	import type { AudioAttachment } from '#lib/tauri.ts';
 
-	export let audio: AudioAttachment;
-	export let isOwnMessage = false;
+	let {
+		audio,
+		isOwnMessage = false
+	}: {
+		audio: AudioAttachment;
+		isOwnMessage?: boolean;
+	} = $props();
 
-	let isPlaying = false;
-	let isLoading = false;
-	let progress = 0;
+	let isPlaying = $state(false);
+	let isLoading = $state(false);
+	let playbackError = $state<string | null>(null);
+	let progress = $state(0);
+	let showTranscript = $state(false);
+
 	let audioElement: HTMLAudioElement | null = null;
-	let showTranscript = false;
+	let objectUrl: string | null = null;
+
+	function decodeBase64Fallback(b64?: string): Uint8Array {
+		if (!b64) return new Uint8Array();
+		const normalized = b64.trim().replace(/-/g, '+').replace(/_/g, '/');
+		const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
+		const bin = atob(padded);
+		const out = new Uint8Array(bin.length);
+		for (let i = 0; i < bin.length; i += 1) {
+			out[i] = bin.charCodeAt(i);
+		}
+		return out;
+	}
+
+	function resolveBytes(raw: Uint8Array | number[] | undefined, b64?: string): Uint8Array {
+		if (raw instanceof Uint8Array && raw.byteLength > 0) return raw;
+		if (Array.isArray(raw) && raw.length > 0) return new Uint8Array(raw);
+		return decodeBase64Fallback(b64);
+	}
 
 	function formatDuration(ms: number): string {
 		const s = Math.floor(ms / 1000);
@@ -18,6 +45,7 @@
 	}
 
 	async function togglePlayback() {
+		playbackError = null;
 		if (isPlaying && audioElement) {
 			audioElement.pause();
 			isPlaying = false;
@@ -25,26 +53,32 @@
 		}
 
 		if (audioElement) {
-			audioElement.play();
+			await audioElement.play();
 			isPlaying = true;
+			return;
+		}
+
+		if (!audio.blobId) {
 			return;
 		}
 
 		isLoading = true;
 		try {
 			const { fetchAndDecryptBlob } = await import('#lib/wasm.ts');
+			const keyBytes = resolveBytes(audio.key, audio.keyB64);
+			const ivBytes = resolveBytes(audio.iv, audio.ivB64);
 			const decryptedData = await fetchAndDecryptBlob(
 				audio.blobId,
-				audio.key,
-				audio.iv,
+				keyBytes,
+				ivBytes,
 				audio.sha256
 			);
 
-			// Browser/webview can play OGG Opus natively
-			const blob = new Blob([decryptedData as BlobPart], { type: 'audio/ogg; codecs=opus' });
-			const url = URL.createObjectURL(blob);
+			const mimeType = audio.contentType?.trim() || 'audio/webm;codecs=opus';
+			const blob = new Blob([decryptedData as BlobPart], { type: mimeType });
+			objectUrl = URL.createObjectURL(blob);
 
-			audioElement = new Audio(url);
+			audioElement = new Audio(objectUrl);
 			audioElement.ontimeupdate = () => {
 				if (audioElement && audioElement.duration > 0) {
 					progress = audioElement.currentTime / audioElement.duration;
@@ -59,14 +93,36 @@
 			isPlaying = true;
 		} catch (err) {
 			console.error('Voice playback failed:', err);
+			playbackError = err instanceof Error ? err.message : 'Unable to play voice message';
 		} finally {
 			isLoading = false;
 		}
 	}
+
+	onDestroy(() => {
+		if (audioElement) {
+			audioElement.pause();
+			audioElement = null;
+		}
+		if (objectUrl) {
+			URL.revokeObjectURL(objectUrl);
+			objectUrl = null;
+		}
+	});
+
+	let bars = $derived(
+		audio.waveform && audio.waveform.length > 0 ? audio.waveform : [0.2, 0.5, 0.8, 0.4, 0.6, 0.3]
+	);
 </script>
 
 <div class="voice-player" class:own={isOwnMessage}>
-	<button class="play-btn" on:click={togglePlayback} disabled={isLoading}>
+	<button
+		type="button"
+		class="play-btn"
+		aria-label={isPlaying ? 'Pause voice message' : 'Play voice message'}
+		onclick={togglePlayback}
+		disabled={isLoading || !audio.blobId}
+	>
 		{#if isLoading}
 			<span class="spinner"></span>
 		{:else if isPlaying}
@@ -77,12 +133,12 @@
 	</button>
 
 	<div class="waveform">
-		{#each audio.waveform as sample, i}
-			{@const barProgress = i / Math.max(audio.waveform.length - 1, 1)}
+		{#each bars as sample, i}
+			{@const barProgress = i / Math.max(bars.length - 1, 1)}
 			<div
 				class="bar"
 				class:active={barProgress <= progress}
-				style="height: {Math.max(3, sample * 100)}%"
+				style="height: {Math.max(8, sample * 100)}%"
 			></div>
 		{/each}
 	</div>
@@ -90,8 +146,18 @@
 	<span class="duration">{formatDuration(audio.durationMs)}</span>
 </div>
 
+{#if playbackError}
+	<p class="playback-error" role="alert">{playbackError}</p>
+{/if}
+
 {#if audio.transcript}
-	<button class="transcript-toggle" on:click={() => (showTranscript = !showTranscript)}>
+	<button
+		type="button"
+		class="transcript-toggle"
+		onclick={() => {
+			showTranscript = !showTranscript;
+		}}
+	>
 		{#if showTranscript}
 			<span class="transcript-text">{audio.transcript}</span>
 		{:else}
@@ -105,7 +171,7 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		padding: 8px 12px;
+		padding: 6px 4px;
 		min-width: 200px;
 	}
 
@@ -119,9 +185,14 @@
 		align-items: center;
 		justify-content: center;
 		font-size: 1rem;
-		background: var(--accent-color, #007aff);
+		background: var(--accent, #007aff);
 		color: white;
 		flex-shrink: 0;
+	}
+
+	.play-btn:disabled {
+		opacity: 0.5;
+		cursor: default;
 	}
 
 	.own .play-btn {
@@ -145,7 +216,7 @@
 	}
 
 	.bar.active {
-		background: var(--accent-color, #007aff);
+		background: var(--accent, #007aff);
 	}
 
 	.own .bar.active {
@@ -164,7 +235,7 @@
 	}
 
 	.own .duration {
-		color: rgba(255, 255, 255, 0.7);
+		color: rgba(255, 255, 255, 0.75);
 	}
 
 	.spinner {
@@ -182,11 +253,17 @@
 		}
 	}
 
+	.playback-error {
+		margin: 4px 0 0;
+		font-size: 0.75rem;
+		color: var(--danger, #ff3b30);
+	}
+
 	.transcript-toggle {
 		border: none;
 		background: none;
 		cursor: pointer;
-		padding: 4px 12px 0;
+		padding: 4px 4px 0;
 		text-align: left;
 		width: 100%;
 	}
@@ -199,6 +276,6 @@
 	.transcript-hint {
 		font-size: 0.75rem;
 		color: var(--text-secondary, #888);
-		opacity: 0.7;
+		opacity: 0.75;
 	}
 </style>

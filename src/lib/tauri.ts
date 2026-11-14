@@ -32,6 +32,7 @@ export interface Message {
 	isOwn?: boolean;
 	messageType?: 'text' | 'image' | 'voice' | 'system' | 'event';
 	image?: ImageAttachment;
+	audio?: AudioAttachment;
 	audioAttachment?: AudioAttachment;
 	reactions?: Record<string, string[]>;
 }
@@ -52,8 +53,10 @@ export interface ImageAttachment {
 
 export interface AudioAttachment {
 	blobId: string;
-	key: Uint8Array;
-	iv: Uint8Array;
+	key: Uint8Array | number[];
+	iv: Uint8Array | number[];
+	keyB64?: string;
+	ivB64?: string;
 	sha256: string;
 	contentType: string;
 	size: number;
