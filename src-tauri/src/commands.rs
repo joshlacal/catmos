@@ -1,7 +1,7 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_atproto::jacquard_common::IntoStatic;
-use catbird_mls::orchestrator::types::{MLSMessagePayload, MLSMessageType};
+use catbird_mls::payload_types::{MLSMessagePayload, MLSMessageType};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tauri::{Emitter, State};
@@ -97,7 +97,7 @@ fn spawn_unified_sync_loop(
     mgr: Arc<crate::mls::TauriMlsManager>,
     did: String,
 ) -> tokio::task::JoinHandle<()> {
-    use catbird_mls::orchestrator::constants::SYNC_INTERVAL_SECS;
+    use catbird_mls::constants::SYNC_INTERVAL_SECS;
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(SYNC_INTERVAL_SECS)).await;
@@ -1365,9 +1365,9 @@ pub async fn send_reaction(
         action
     );
     let reaction_action = if action == "remove" {
-        catbird_mls::orchestrator::types::ReactionAction::Remove
+        catbird_mls::payload_types::ReactionAction::Remove
     } else {
-        catbird_mls::orchestrator::types::ReactionAction::Add
+        catbird_mls::payload_types::ReactionAction::Add
     };
     let payload = MLSMessagePayload::reaction(&message_id, &emoji, reaction_action);
     let payload_json = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
@@ -2377,7 +2377,7 @@ pub async fn labyrinth_list_circle_owner_states(
 #[cfg(test)]
 mod tests {
     use super::{cleanup_ws_handle, ui_message_from_row};
-    use catbird_mls::orchestrator::types::{
+    use catbird_mls::payload_types::{
         MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload,
     };
     use catbird_mls::storage::MessageRow;

@@ -459,39 +459,27 @@ const api = {
 		altText?: string
 	) => {
 		await wasmReady;
-		if (unifiedClient) {
-			const uploaded = await unifiedClient.uploadConversationAttachment(
-				convoId,
-				data,
-				contentType || 'image/jpeg'
-			);
-			const msgId = crypto.randomUUID().toLowerCase();
-			const row = await unifiedClient.sendMediaAttachmentMessage(
-				convoId,
-				msgId,
-				content,
-				uploaded,
-				width,
-				height,
-				altText ?? null,
-				null,
-				null,
-				null
-			);
-			unifiedClient.flushLabyrinthQueue().catch(() => {});
-			return mapMessageRowToUi(row);
-		}
-		return plain(
-			await wasm.catbird_mls_send_image(
-				convoId,
-				content,
-				data,
-				contentType,
-				width,
-				height,
-				altText
-			)
+		const client = requireUnified();
+		const uploaded = await client.uploadConversationAttachment(
+			convoId,
+			data,
+			contentType || 'image/jpeg'
 		);
+		const msgId = crypto.randomUUID().toLowerCase();
+		const row = await client.sendMediaAttachmentMessage(
+			convoId,
+			msgId,
+			content,
+			uploaded,
+			width,
+			height,
+			altText ?? null,
+			null,
+			null,
+			null
+		);
+		client.flushLabyrinthQueue().catch(() => {});
+		return mapMessageRowToUi(row);
 	},
 	getMessages: async (convoId: string, before?: string) => {
 		await wasmReady;
@@ -510,30 +498,21 @@ const api = {
 		ivB64: string,
 		sha256: string,
 		contentType: string,
-		convoId = ''
+		_convoId = ''
 	) => {
 		await wasmReady;
-		if (unifiedClient) {
-			const keyBytes = decodeBase64Bytes(keyB64);
-			const ivBytes = decodeBase64Bytes(ivB64);
-			const shaBytes = decodeSha256Bytes(sha256);
-			const bytes = await unifiedClient.downloadConversationAttachment(
-				blobId,
-				keyBytes,
-				ivBytes,
-				shaBytes
-			);
-			const mime = contentType || 'image/jpeg';
-			return `data:${mime};base64,${encodeBase64Bytes(bytes)}`;
-		}
-		return wasm.catbird_mls_get_image_attachment(
-			convoId,
+		const client = requireUnified();
+		const keyBytes = decodeBase64Bytes(keyB64);
+		const ivBytes = decodeBase64Bytes(ivB64);
+		const shaBytes = decodeSha256Bytes(sha256);
+		const bytes = await client.downloadConversationAttachment(
 			blobId,
-			keyB64,
-			ivB64,
-			sha256,
-			contentType
+			keyBytes,
+			ivBytes,
+			shaBytes
 		);
+		const mime = contentType || 'image/jpeg';
+		return `data:${mime};base64,${encodeBase64Bytes(bytes)}`;
 	},
 	fetchNewMessages: async (convoId: string) => {
 		await wasmReady;
@@ -796,35 +775,24 @@ const api = {
 		transcript?: string
 	) => {
 		await wasmReady;
-		if (unifiedClient) {
-			const mime = contentType || 'audio/webm;codecs=opus';
-			const uploaded = await unifiedClient.uploadConversationAttachment(convoId, audioData, mime);
-			const msgId = crypto.randomUUID().toLowerCase();
-			const row = await unifiedClient.sendMediaAttachmentMessage(
-				convoId,
-				msgId,
-				'',
-				uploaded,
-				null,
-				null,
-				null,
-				BigInt(Math.max(1, Math.round(durationMs))),
-				waveform,
-				transcript ?? null
-			);
-			unifiedClient.flushLabyrinthQueue().catch(() => {});
-			return mapMessageRowToUi(row);
-		}
-		return plain(
-			await (wasm as any).catbird_mls_send_voice(
-				convoId,
-				audioData,
-				contentType,
-				durationMs,
-				plain(waveform),
-				transcript ?? null
-			)
+		const client = requireUnified();
+		const mime = contentType || 'audio/webm;codecs=opus';
+		const uploaded = await client.uploadConversationAttachment(convoId, audioData, mime);
+		const msgId = crypto.randomUUID().toLowerCase();
+		const row = await client.sendMediaAttachmentMessage(
+			convoId,
+			msgId,
+			'',
+			uploaded,
+			null,
+			null,
+			null,
+			BigInt(Math.max(1, Math.round(durationMs))),
+			waveform,
+			transcript ?? null
 		);
+		client.flushLabyrinthQueue().catch(() => {});
+		return mapMessageRowToUi(row);
 	},
 	fetchAndDecryptBlob: async (
 		blobId: string,
@@ -833,13 +801,11 @@ const api = {
 		sha256: string
 	) => {
 		await wasmReady;
+		const client = requireUnified();
 		const keyBytes = key instanceof Uint8Array ? key : new Uint8Array(key);
 		const ivBytes = iv instanceof Uint8Array ? iv : new Uint8Array(iv);
-		if (unifiedClient) {
-			const shaBytes = decodeSha256Bytes(sha256);
-			return unifiedClient.downloadConversationAttachment(blobId, keyBytes, ivBytes, shaBytes);
-		}
-		return await (wasm as any).catbird_mls_fetch_and_decrypt_blob(blobId, keyBytes, ivBytes, sha256);
+		const shaBytes = decodeSha256Bytes(sha256);
+		return client.downloadConversationAttachment(blobId, keyBytes, ivBytes, shaBytes);
 	},
 
 	// -----------------------------------------------------------------------

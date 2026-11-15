@@ -29,9 +29,7 @@ use catbird_mls::client::{
     PlatformHttpResponse, PlatformKeyStore, PlatformTransport, RegisteredDeviceInfo,
     UploadedConversationAttachment, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
-use catbird_mls::orchestrator::types::{
-    MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload,
-};
+use catbird_mls::payload_types::{MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload};
 use catbird_mls::MLSError;
 use tauri::{AppHandle, Emitter};
 
@@ -561,11 +559,13 @@ impl TauriTransport {
                     body,
                 })
             }
-            "com.atproto.repo.putRecord" => Ok(PlatformHttpResponse {
-                status: 200,
-                headers: Vec::new(),
-                body: b"{\"uri\":\"at://did:plc:mock/blue.catbird.chat.device/self\",\"cid\":\"bafyreimock\"}".to_vec(),
-            }),
+            "com.atproto.repo.createRecord" | "com.atproto.repo.putRecord" => {
+                Ok(PlatformHttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: b"{\"uri\":\"at://did:plc:mock/blue.catbird.chat.device/self\",\"cid\":\"bafyreimock\"}".to_vec(),
+                })
+            }
             "com.atproto.space.deleteSpace"
             | "com.atproto.space.deleteRecord"
             | "blue.catbird.labyrinth.deleteAccountData"
@@ -1903,10 +1903,17 @@ mod tests {
                     .unwrap_or(serde_json::Value::Null);
                 let mut st = self.state.lock().unwrap();
                 match nsid {
-                    "com.atproto.repo.putRecord" => {
+                    "com.atproto.repo.createRecord" | "com.atproto.repo.putRecord" => {
                         let repo = body["repo"].as_str().unwrap_or_default().to_string();
                         let col = body["collection"].as_str().unwrap_or_default().to_string();
                         let rkey = body["rkey"].as_str().unwrap_or_default().to_string();
+                        if nsid == "com.atproto.repo.createRecord"
+                            && st
+                                .repo
+                                .contains_key(&(repo.clone(), col.clone(), rkey.clone()))
+                        {
+                            return Self::err_json(400, "RecordAlreadyExists");
+                        }
                         let uri = format!("at://{repo}/{col}/{rkey}");
                         st.repo.insert((repo, col, rkey), body["record"].clone());
                         Self::ok_json(serde_json::json!({ "uri": uri, "cid": "bafyreilivetest" }))
@@ -1956,8 +1963,7 @@ mod tests {
                         let dev = b["deviceId"].as_str().unwrap_or_default().to_string();
                         let pk_raw =
                             catbird_mls::client::chat_wire::json_bytes(&b["signaturePublicKey"])?;
-                        let key_id =
-                            catbird_mls::orchestrator::canonical_transport::derive_key_id(&pk_raw);
+                        let key_id = catbird_mls::canonical_transport::derive_key_id(&pk_raw);
                         let pk = if b["signaturePublicKey"].is_string() {
                             serde_json::json!({ "$bytes": b["signaturePublicKey"] })
                         } else {

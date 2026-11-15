@@ -169,14 +169,14 @@ Notable crate-level pieces (see catbird-mls-web's own AGENTS.md for detail):
 
 ## Relationship to catbird-mls
 
-- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../catbird-mls`). The orchestrator + MLSContext are linked into the Tauri binary; no UniFFI.
+- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../y9b-catbird-mls`). The unified `CatbirdMlsClient` is linked into the Tauri binary; no UniFFI.
 - **Catmos Web**: does *not* depend on `catbird-mls` directly. The WASM work lives in the sibling `catbird-mls-web` crate, which owns its own `wasm_bindgen` surface and its own adapted storage/network layers. catmos only consumes the generated `pkg/` artifacts.
 - **Catbird iOS**: bridges to `catbird-mls` via UniFFI Swift bindings (outside catmos's scope).
 
 ## Labyrinth and Spaces gate
 
 - MLS chat is default-off per account (`ctl #2`). The frontend records the opt-in with `isMlsOptedInForDid` / `setMlsOptedInForDid` (`src/lib/labyrinth-ui.ts`); the desktop gate is `<data_dir>/mls-opt-in/<sha256(normalized_did)>.enabled` (`src-tauri/src/mls.rs`), and before opt-in a desktop sign-in opens no MLS database, uploads no KeyPackages and probes no PDS/DS endpoint.
-- `REQUIRED_LABYRINTH_OAUTH_SCOPES` in `src/lib/labyrinth-ui.ts` mirrors the allowlisted `nest` + `catbird_mls` Labyrinth/device scopes: `atproto`, `blob:*/*`, `repo:blue.catbird.labyrinth.mailboxKeys`, `repo:blue.catbird.chat.device?action=create`, and the two explicit Labyrinth Space scopes (`space:blue.catbird.labyrinth.mailbox?action=…&manage=delete` including `circleOwnerState` + `readState`, and `space:blue.catbird.labyrinth.conversation?action=…&collection=blue.catbird.labyrinth.mek` including `authorRedaction`; exact strings in the file).
+- `REQUIRED_LABYRINTH_OAUTH_SCOPES` in `src/lib/labyrinth-ui.ts` mirrors the 7 allowlisted `nest` + `catbird_mls` Labyrinth/device scopes: `atproto`, `blob:*/*`, `repo:blue.catbird.labyrinth.mailboxKeys`, `repo:blue.catbird.chat.device?action=create`, `repo:blue.catbird.chat.deviceRevocation?action=create`, and the two explicit Labyrinth Space scopes (`space:blue.catbird.labyrinth.mailbox?action=…&manage=delete` including `circleOwnerState` + `readState`, and `space:blue.catbird.labyrinth.conversation?action=…&collection=blue.catbird.labyrinth.mek` including `authorRedaction`; exact strings in the file).
 - `evaluateSpacesGateForUi(pdsSupportsSpaces, grantedScopes)` returns `missingScopes` and a user message. A session granted only the retired `space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete` and `space:blue.catbird.labyrinth.conversation?authority=*` forms reports both Space scopes missing and must re-authorize; `tests/labyrinth-ui.spec.ts` pins this. Change the strings only together with `catbird-mls`, CatbirdMLSCore, Android and nest.
 
 ## Known Issues

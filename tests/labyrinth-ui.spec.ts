@@ -58,6 +58,11 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 			REQUIRED_LABYRINTH_OAUTH_SCOPES[3],
 			'repo:blue.catbird.chat.device?action=create'
 		);
+		assert.equal(
+			REQUIRED_LABYRINTH_OAUTH_SCOPES[4],
+			'repo:blue.catbird.chat.deviceRevocation?action=create'
+		);
+		assert.equal(REQUIRED_LABYRINTH_OAUTH_SCOPES.length, 7);
 		assert.deepEqual(
 			buildUpgradeAdditionalScopes(REQUIRED_LABYRINTH_OAUTH_SCOPES),
 			UPGRADEABLE_LABYRINTH_OAUTH_SCOPES
@@ -72,6 +77,9 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.equal(blockedScopes.eligible, false);
 		assert.ok(blockedScopes.missingScopes.includes('blob:*/*'));
 		assert.ok(
+			blockedScopes.missingScopes.includes('repo:blue.catbird.chat.deviceRevocation?action=create')
+		);
+		assert.ok(
 			blockedScopes.missingScopes.includes(
 				'space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete'
 			)
@@ -85,14 +93,14 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		const oldScopeSession = evaluateSpacesGateForUi(
 			true,
 			[
-				...REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(0, 4),
+				...REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(0, 5),
 				'space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete',
 				'space:blue.catbird.labyrinth.conversation?authority=*'
 			],
 			did
 		);
 		assert.equal(oldScopeSession.eligible, false);
-		assert.deepEqual(oldScopeSession.missingScopes, REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(4));
+		assert.deepEqual(oldScopeSession.missingScopes, REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(5));
 
 		const eligible = evaluateSpacesGateForUi(true, [...REQUIRED_LABYRINTH_OAUTH_SCOPES], did);
 		assert.equal(eligible.eligible, true);
@@ -130,8 +138,24 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 			),
 			false
 		);
+		assert.equal(
+			scopeGranted(
+				['repo:blue.catbird.chat.deviceRevocation'],
+				'repo:blue.catbird.chat.deviceRevocation?action=create',
+				did
+			),
+			true
+		);
+		assert.equal(
+			scopeGranted(
+				['repo:blue.catbird.chat.deviceRevocation?action=delete'],
+				'repo:blue.catbird.chat.deviceRevocation?action=create',
+				did
+			),
+			false
+		);
 
-		for (const requiredSpace of REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(4)) {
+		for (const requiredSpace of REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(5)) {
 			const [family, query] = requiredSpace.split('?');
 			const reversed = `${family}?${query!.split('&').reverse().join('&')}`;
 			assert.equal(scopeGranted([reversed], requiredSpace, did), true);
@@ -160,13 +184,13 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		}
 
 		// Mailbox space allows explicit self DID or authority=*, rejects foreign DID
-		const mailboxReq = REQUIRED_LABYRINTH_OAUTH_SCOPES[4];
+		const mailboxReq = REQUIRED_LABYRINTH_OAUTH_SCOPES[5];
 		assert.equal(scopeGranted([`${mailboxReq}&authority=${did}`], mailboxReq, did), true);
 		assert.equal(scopeGranted([`${mailboxReq}&authority=*`], mailboxReq, did), true);
 		assert.equal(scopeGranted([`${mailboxReq}&authority=did:plc:foreign`], mailboxReq, did), false);
 
 		// Conversation space requires authority=*
-		const convoReq = REQUIRED_LABYRINTH_OAUTH_SCOPES[5];
+		const convoReq = REQUIRED_LABYRINTH_OAUTH_SCOPES[6];
 		assert.equal(
 			scopeGranted([convoReq.replace('authority=*', 'authority=self')], convoReq, did),
 			false

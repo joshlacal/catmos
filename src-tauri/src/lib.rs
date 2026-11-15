@@ -4,7 +4,7 @@ mod commands;
 pub mod mls;
 #[cfg(test)]
 #[rustfmt::skip]
-#[path = "../../../catbird-mls/tests/support/native_archive_auth.rs"]
+#[path = "../../../y9b-catbird-mls/tests/support/native_archive_auth.rs"]
 pub(crate) mod native_archive_auth;
 mod native_keyring;
 mod recovery;
