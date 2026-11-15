@@ -31,9 +31,9 @@ bytes = "1.12.1"
 
 dirs = "7.0.0"
 ciborium = "0.2.2"
-catbird_mls = { path = "../../y9b-catbird-mls" }
-catbird-atproto = { path = "../../../dec1-w0/wave1-catbird-atproto" }
-atproto-spaces = { path = "../../../dec1-w0/wave1-catbird-atproto/atproto-spaces" }
+catbird_mls = { path = "../../catbird-mls" }
+catbird-atproto = { path = "../../catbird-atproto" }
+atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
 
 urlencoding = "2.1.3"
 httparse = "1.10.1"
@@ -47,8 +47,8 @@ tempfile = "3.27.0"
 [dev-dependencies]
 # Unit tests open catbird-mls's explicit offline archive harness (`open_offline_archive_for_test`)
 # as well as live `CatbirdMlsClient::open` against the Nov-12 Space auth fixture.
-catbird_mls = { path = "../../y9b-catbird-mls", features = ["test-utils"] }
-labyrinth = { path = "../../y9b-labyrinth" }
+catbird_mls = { path = "../../catbird-mls", features = ["test-utils"] }
+labyrinth = { path = "../../labyrinth" }
 multibase = "0.9"
 p256 = { version = "0.13", features = ["ecdsa"] }
 serde_ipld_dagcbor = "0.6"

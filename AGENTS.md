@@ -169,7 +169,7 @@ Notable crate-level pieces (see catbird-mls-web's own AGENTS.md for detail):
 
 ## Relationship to catbird-mls
 
-- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../y9b-catbird-mls`). The unified `CatbirdMlsClient` is linked into the Tauri binary; no UniFFI.
+- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../catbird-mls`). The unified `CatbirdMlsClient` is linked into the Tauri binary; no UniFFI.
 - **Catmos Web**: does *not* depend on `catbird-mls` directly. The WASM work lives in the sibling `catbird-mls-web` crate, which owns its own `wasm_bindgen` surface and its own adapted storage/network layers. catmos only consumes the generated `pkg/` artifacts.
 - **Catbird iOS**: bridges to `catbird-mls` via UniFFI Swift bindings (outside catmos's scope).
 
