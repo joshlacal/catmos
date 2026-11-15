@@ -37,78 +37,135 @@ use tauri::{AppHandle, Emitter};
 
 const KEYRING_SERVICE: &str = "blue.catbird.catmos.clean-slate";
 
+enum KeyStoreBackend {
+    OsKeyring,
+    #[cfg(test)]
+    InMemory(Mutex<HashMap<String, Vec<u8>>>),
+    #[cfg(test)]
+    SimulatedUnavailable(&'static str),
+}
+
 pub struct TauriKeyStore {
-    use_os_keyring: bool,
-    memory_fallback: Mutex<HashMap<String, Vec<u8>>>,
+    backend: KeyStoreBackend,
     dpop_tokens: Mutex<HashMap<String, (String, i64)>>,
 }
 
 impl TauriKeyStore {
     pub fn new_os_keyring() -> Self {
         Self {
-            use_os_keyring: true,
-            memory_fallback: Mutex::new(HashMap::new()),
+            backend: KeyStoreBackend::OsKeyring,
             dpop_tokens: Mutex::new(HashMap::new()),
         }
     }
 
+    #[cfg(test)]
     pub fn new_in_memory() -> Self {
         Self {
-            use_os_keyring: false,
-            memory_fallback: Mutex::new(HashMap::new()),
+            backend: KeyStoreBackend::InMemory(Mutex::new(HashMap::new())),
+            dpop_tokens: Mutex::new(HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn new_simulated_unavailable(reason: &'static str) -> Self {
+        Self {
+            backend: KeyStoreBackend::SimulatedUnavailable(reason),
             dpop_tokens: Mutex::new(HashMap::new()),
         }
     }
 
     fn read_secret(&self, label: &str) -> Result<Option<Vec<u8>>, MLSError> {
-        if self.use_os_keyring {
-            if let Ok(entry) = crate::native_keyring::entry(KEYRING_SERVICE, label) {
+        match &self.backend {
+            KeyStoreBackend::OsKeyring => {
+                let entry = crate::native_keyring::entry(KEYRING_SERVICE, label).map_err(|e| {
+                    MLSError::Internal(format!(
+                        "OS keyring unavailable while opening `{label}`: {e}"
+                    ))
+                })?;
                 match entry.get_password() {
                     Ok(b64) => {
                         let decoded = BASE64_STANDARD.decode(b64.trim()).map_err(|e| {
                             MLSError::Internal(format!("decode keyring secret `{label}`: {e}"))
                         })?;
-                        return Ok(Some(decoded));
+                        Ok(Some(decoded))
                     }
-                    Err(keyring::Error::NoEntry) => return Ok(None),
-                    Err(_) => {
-                        // Fall through to in-memory map if OS keyring is locked/unavailable.
-                    }
+                    Err(keyring::Error::NoEntry) => Ok(None),
+                    Err(e) => Err(MLSError::Internal(format!(
+                        "OS keyring read failed for `{label}` (refusing ephemeral fallback): {e}"
+                    ))),
                 }
             }
+            #[cfg(test)]
+            KeyStoreBackend::InMemory(map) => {
+                let guard = map
+                    .lock()
+                    .map_err(|_| MLSError::Internal("keystore mutex poisoned".to_string()))?;
+                Ok(guard.get(label).cloned())
+            }
+            #[cfg(test)]
+            KeyStoreBackend::SimulatedUnavailable(reason) => Err(MLSError::Internal(format!(
+                "OS keyring read failed for `{label}` (refusing ephemeral fallback): {reason}"
+            ))),
         }
-        let guard = self
-            .memory_fallback
-            .lock()
-            .map_err(|_| MLSError::Internal("keystore mutex poisoned".to_string()))?;
-        Ok(guard.get(label).cloned())
     }
 
     fn write_secret(&self, label: &str, bytes: &[u8]) -> Result<(), MLSError> {
-        if self.use_os_keyring {
-            if let Ok(entry) = crate::native_keyring::entry(KEYRING_SERVICE, label) {
+        match &self.backend {
+            KeyStoreBackend::OsKeyring => {
+                let entry = crate::native_keyring::entry(KEYRING_SERVICE, label).map_err(|e| {
+                    MLSError::Internal(format!(
+                        "OS keyring unavailable while opening `{label}`: {e}"
+                    ))
+                })?;
                 let encoded = BASE64_STANDARD.encode(bytes);
-                if entry.set_password(&encoded).is_ok() {
-                    return Ok(());
-                }
+                entry.set_password(&encoded).map_err(|e| {
+                    MLSError::Internal(format!(
+                        "OS keyring write failed for `{label}` (refusing ephemeral fallback): {e}"
+                    ))
+                })
             }
+            #[cfg(test)]
+            KeyStoreBackend::InMemory(map) => {
+                let mut guard = map
+                    .lock()
+                    .map_err(|_| MLSError::Internal("keystore mutex poisoned".to_string()))?;
+                guard.insert(label.to_string(), bytes.to_vec());
+                Ok(())
+            }
+            #[cfg(test)]
+            KeyStoreBackend::SimulatedUnavailable(reason) => Err(MLSError::Internal(format!(
+                "OS keyring write failed for `{label}` (refusing ephemeral fallback): {reason}"
+            ))),
         }
-        let mut guard = self
-            .memory_fallback
-            .lock()
-            .map_err(|_| MLSError::Internal("keystore mutex poisoned".to_string()))?;
-        guard.insert(label.to_string(), bytes.to_vec());
-        Ok(())
     }
 
-    fn delete_secret(&self, label: &str) {
-        if self.use_os_keyring {
-            if let Ok(entry) = crate::native_keyring::entry(KEYRING_SERVICE, label) {
-                let _ = entry.delete_credential();
+    fn delete_secret(&self, label: &str) -> Result<(), MLSError> {
+        match &self.backend {
+            KeyStoreBackend::OsKeyring => {
+                let entry = crate::native_keyring::entry(KEYRING_SERVICE, label).map_err(|e| {
+                    MLSError::Internal(format!(
+                        "OS keyring unavailable while deleting `{label}`: {e}"
+                    ))
+                })?;
+                match entry.delete_credential() {
+                    Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+                    Err(e) => Err(MLSError::Internal(format!(
+                        "OS keyring delete failed for `{label}`: {e}"
+                    ))),
+                }
             }
-        }
-        if let Ok(mut guard) = self.memory_fallback.lock() {
-            guard.remove(label);
+            #[cfg(test)]
+            KeyStoreBackend::InMemory(map) => {
+                let mut guard = map
+                    .lock()
+                    .map_err(|_| MLSError::Internal("keystore mutex poisoned".to_string()))?;
+                guard.remove(label);
+                Ok(())
+            }
+            #[cfg(test)]
+            KeyStoreBackend::SimulatedUnavailable(reason) => Err(MLSError::Internal(format!(
+                "OS keyring delete failed for `{label}`: {reason}"
+            ))),
         }
     }
 }
@@ -141,8 +198,8 @@ impl PlatformKeyStore for TauriKeyStore {
     }
 
     fn delete_account_keys(&self, account_did_hash: String) -> Result<(), MLSError> {
-        self.delete_secret(&format!("db-key:{account_did_hash}"));
-        self.delete_secret(&format!("sig:mls-signer:{account_did_hash}"));
+        self.delete_secret(&format!("db-key:{account_did_hash}"))?;
+        self.delete_secret(&format!("sig:mls-signer:{account_did_hash}"))?;
         if let Ok(mut dpop) = self.dpop_tokens.lock() {
             dpop.remove(&account_did_hash);
         }
@@ -767,6 +824,7 @@ impl TauriMlsManager {
         }
     }
 
+    #[cfg(test)]
     pub fn new_for_testing(data_dir: PathBuf, pds_supports_spaces: bool) -> Self {
         Self {
             data_dir,
@@ -2239,5 +2297,19 @@ mod tests {
             .expect("list circle owner states");
         assert_eq!(listed_circles.len(), 1);
         assert_eq!(listed_circles[0].circle_id, circle_id);
+    }
+
+    #[test]
+    fn tauri_keystore_fails_closed_when_os_keyring_unavailable() {
+        let store = TauriKeyStore::new_simulated_unavailable("Secret Service locked");
+        let err = store
+            .load_or_create_db_key("a".repeat(64))
+            .expect_err("locked OS keyring must fail closed without RAM fallback");
+        assert!(err.to_string().contains("refusing ephemeral fallback"));
+        assert!(store
+            .store_signature_keypair("key-1".to_string(), vec![1u8; 32])
+            .is_err());
+        assert!(store.load_signature_keypair("key-1".to_string()).is_err());
+        assert!(store.delete_account_keys("a".repeat(64)).is_err());
     }
 }

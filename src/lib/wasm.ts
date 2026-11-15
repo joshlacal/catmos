@@ -1383,6 +1383,28 @@ async function withBoundedTimeout<T>(promise: Promise<T>, timeoutMs: number): Pr
 	}
 }
 
+async function withRequiredTimeout<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+	operationLabel: string
+): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					reject(new Error(`${operationLabel} timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+			})
+		]);
+	} finally {
+		if (timer !== null) {
+			clearTimeout(timer);
+		}
+	}
+}
+
 export interface AccountCleanupOptions {
 	opfsRootProvider?: () => Promise<OpfsDirectoryHandleLike | null>;
 	retireTimeoutMs?: number;
@@ -1475,12 +1497,27 @@ export async function deleteAccountData(
 
 	// Fail-closed (`D-3`): remote OwnerMailbox, PDS mailboxKeys, mls-ds, and owned Space
 	// deletes MUST succeed before we tear down the worker, opt-in flag, session, or local DB.
-	if (!_worker && targetDid && isMlsOptedInForDid(targetDid)) {
-		await withBoundedTimeout(ensureUnifiedBrowserClientOpen(targetDid), timeoutMs);
+	// Any timeout or failure to open the unified worker rejects rather than resolving null.
+	const optedIn = Boolean(targetDid && isMlsOptedInForDid(targetDid));
+	if (!_worker && optedIn) {
+		await withRequiredTimeout(
+			ensureUnifiedBrowserClientOpen(targetDid),
+			timeoutMs,
+			'deleteAccountData(openUnifiedClient)'
+		);
+	}
+	if (optedIn && !_worker) {
+		throw new Error(
+			'deleteAccountData failed: unified MLS worker unavailable; refusing to wipe local state before remote delete succeeds'
+		);
 	}
 	if (_worker) {
 		const w = _worker;
-		await withBoundedTimeout(w.deleteAccountData(), timeoutMs);
+		await withRequiredTimeout(
+			w.deleteAccountData(),
+			timeoutMs,
+			'deleteAccountData(remoteDelete)'
+		);
 		try {
 			await w.clearContentRootKey?.();
 		} catch {

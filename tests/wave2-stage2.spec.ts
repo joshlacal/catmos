@@ -230,6 +230,100 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 		assert.equal(terminateCount, 1);
 	});
 
+	it('deleteAccountData fails closed on remoteDelete timeout and cold-open timeout without wiping local OPFS or keys (B9 / D-3)', async () => {
+		const did = 'did:plc:deltimeout09';
+		const didHash = await accountDidHashHex(did);
+		setMlsOptedInForDid(did, true, fakeLocalStorage);
+		persistBrowserAuth(did, '99999999-9999-4999-8999-999999999999');
+		const deviceId = getOrCreateBrowserDeviceId(didHash);
+		await getOrCreateMlsDbKey(did);
+		auth.setUser({ did, handle: 'timeout.catbird.blue' });
+
+		const opfs = createFakeOpfsPool({
+			slot_main: `/catbird-mls/${didHash}.db`
+		});
+
+		let hangOpen = true;
+		let hangDelete = true;
+		let terminateCount = 0;
+		__setWorkerFactoryForTests(() => ({
+			worker: {
+				openUnifiedClient: async () => {
+					if (hangOpen) {
+						await new Promise(() => {});
+					}
+					return { accountDid: did, accountDidHash: didHash };
+				},
+				deleteAccountData: async () => {
+					if (hangDelete) {
+						await new Promise(() => {});
+					}
+					return true;
+				},
+				clearContentRootKey: async () => {},
+				clearAuth: async () => {},
+				closeUnifiedClient: async () => {}
+			} as unknown as Remote<WorkerApi>,
+			rawWorker: {
+				terminate() {
+					terminateCount += 1;
+				}
+			}
+		}));
+
+		const { deleteAccountData: rawDelete } = await import('../src/lib/wasm.ts');
+
+		// 1. Cold-open timeout (`!_worker && isMlsOptedInForDid`) must reject, never resolve null.
+		await assert.rejects(
+			() =>
+				rawDelete(did, {
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					opfsRootProvider: async () => opfs.rootDir as any,
+					retireTimeoutMs: 30
+				}),
+			/deleteAccountData\(openUnifiedClient\) timed out/
+		);
+		assert.equal(isMlsOptedInForDid(did, fakeLocalStorage), true);
+		assert.equal(readBrowserAuth()?.did, did);
+		assert.equal(readBrowserDeviceId(didHash), deviceId);
+		assert.ok(await inspectWrappingCryptoKey(didHash));
+		assert.equal(opfs.sahPoolSlots.has('slot_main'), true);
+
+		// 2. Active worker `w.deleteAccountData()` timeout must ALSO reject and keep local state intact.
+		hangOpen = false;
+		await initWasm(did);
+		const preTimeoutTerminateCount = terminateCount;
+		await assert.rejects(
+			() =>
+				rawDelete(did, {
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					opfsRootProvider: async () => opfs.rootDir as any,
+					retireTimeoutMs: 30
+				}),
+			/deleteAccountData\(remoteDelete\) timed out/
+		);
+		assert.equal(isMlsOptedInForDid(did, fakeLocalStorage), true);
+		assert.equal(readBrowserAuth()?.did, did);
+		assert.equal(readBrowserDeviceId(didHash), deviceId);
+		assert.ok(await inspectWrappingCryptoKey(didHash));
+		assert.equal(opfs.sahPoolSlots.has('slot_main'), true);
+		assert.equal(terminateCount, preTimeoutTerminateCount);
+
+		// 3. Once remote delete completes within deadline, local cleanup proceeds cleanly.
+		hangDelete = false;
+		await rawDelete(did, {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			opfsRootProvider: async () => opfs.rootDir as any,
+			retireTimeoutMs: 250
+		});
+		assert.equal(isMlsOptedInForDid(did, fakeLocalStorage), false);
+		assert.equal(readBrowserAuth(), null);
+		assert.equal(readBrowserDeviceId(didHash), null);
+		assert.equal(await inspectWrappingCryptoKey(didHash), undefined);
+		assert.equal(opfs.sahPoolSlots.has('slot_main'), false);
+		assert.equal(terminateCount, preTimeoutTerminateCount + 1);
+	});
+
 	it('propagates leaveConversation errors (LastAdminCannotLeave) and preserves conversation state until leave succeeds', async () => {
 		const did = 'did:plc:leaveuser02';
 		const didHash = await accountDidHashHex(did);
