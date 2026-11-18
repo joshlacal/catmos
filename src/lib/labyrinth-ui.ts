@@ -337,12 +337,22 @@ export function resolveLabyrinthPasskeyRpId(hostname?: string | null): string {
 		? host : LABYRINTH_PASSKEY_RP_ID;
 }
 
-export function requireBackupEligiblePasskey(data: ArrayBuffer | undefined): void {
+export async function requireBackupEligiblePasskey(
+	data: ArrayBuffer | undefined,
+	rpId: string,
+	ceremony: 'registration' | 'assertion'
+): Promise<void> {
 	const bytes = data ? new Uint8Array(data) : null;
 	// WebAuthn authenticator data contains a 32-byte RP hash, flags, then a 32-bit counter.
 	// Require user presence (0x01), verification (0x04) and backup eligibility (0x08).
-	if (!bytes || bytes.length < 37 || (bytes[32] & 0x0d) !== 0x0d) {
+	// Registration also carries the attested credential data flag.
+	const requiredFlags = ceremony === 'registration' ? 0x4d : 0x0d;
+	if (!bytes || bytes.length < 37 || (bytes[32] & requiredFlags) !== requiredFlags) {
 		throw new Error('Use a backup-eligible passkey with user verification, or use a recovery code.');
+	}
+	const rpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rpId)));
+	if (!rpHash.every((byte, index) => bytes[index] === byte)) {
+		throw new Error('The passkey belongs to a different recovery domain.');
 	}
 }
 
@@ -420,7 +430,9 @@ export async function performPasskeyPrfAssertion(params: {
 		throw new Error('Passkey verification returned no credential.');
 	}
 
-	requireBackupEligiblePasskey((assertion.response as AuthenticatorAssertionResponse).authenticatorData);
+	await requireBackupEligiblePasskey(
+		(assertion.response as AuthenticatorAssertionResponse).authenticatorData, rpId, 'assertion'
+	);
 	const ext = assertion.getClientExtensionResults() as {
 		prf?: { results?: { first?: BufferSource } };
 	};

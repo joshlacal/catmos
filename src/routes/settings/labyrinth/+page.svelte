@@ -352,7 +352,9 @@
 				throw new Error('Passkey registration returned null credential.');
 			}
 
-			requireBackupEligiblePasskey((cred.response as AuthenticatorAttestationResponse).getAuthenticatorData?.());
+			await requireBackupEligiblePasskey(
+				(cred.response as AuthenticatorAttestationResponse).getAuthenticatorData?.(), rpId, 'registration'
+			);
 			const ext = cred.getClientExtensionResults() as {
 				prf?: { results?: { first?: ArrayBuffer } };
 			};

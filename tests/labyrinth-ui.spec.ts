@@ -223,15 +223,21 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.match(mapWebAuthnErrorToMessage({ name: 'SecurityError' }), /origin|RP ID/i);
 	});
 
-	it('requires verification and backup eligibility for a recovery passkey', () => {
+	it('binds a verified, backup-eligible passkey to the relying party and ceremony', async () => {
+		const rpId = LABYRINTH_PASSKEY_RP_ID;
 		const data = new Uint8Array(37);
+		data.set(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rpId))));
 		for (const flags of [0, 1, 5, 8, 12]) {
 			data[32] = flags;
-			assert.throws(() => requireBackupEligiblePasskey(data.buffer), /backup-eligible/);
+			await assert.rejects(requireBackupEligiblePasskey(data.buffer, rpId, 'assertion'), /backup-eligible/);
 		}
 		data[32] = 0x0d;
-		assert.doesNotThrow(() => requireBackupEligiblePasskey(data.buffer));
-		assert.throws(() => requireBackupEligiblePasskey(data.slice(0, 32).buffer));
+		await requireBackupEligiblePasskey(data.buffer, rpId, 'assertion');
+		await assert.rejects(requireBackupEligiblePasskey(data.buffer, rpId, 'registration'), /backup-eligible/);
+		data[32] = 0x4d;
+		await requireBackupEligiblePasskey(data.buffer, rpId, 'registration');
+		await assert.rejects(requireBackupEligiblePasskey(data.buffer, 'localhost', 'registration'), /domain/);
+		await assert.rejects(requireBackupEligiblePasskey(data.slice(0, 32).buffer, rpId, 'assertion'));
 	});
 
 	it('runs Passkey PRF assertion restore with cross-platform iOS/Android v1 DID salt, random 32-byte user.id, and dedicated rpId', async () => {
@@ -281,11 +287,14 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 					if (prfExt instanceof Uint8Array) {
 						capturedSalt = prfExt;
 					}
+					const authenticatorData = new Uint8Array(37);
+					authenticatorData.set(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(capturedRpId))));
+					authenticatorData[32] = 0x0d;
 					return {
 						id: 'AQIDBAUG',
 						type: 'public-key',
 						rawId: fakeCredId.buffer,
-						response: { authenticatorData: new Uint8Array(37).fill(0x0d, 32, 33).buffer } as AuthenticatorAssertionResponse,
+						response: { authenticatorData: authenticatorData.buffer } as AuthenticatorAssertionResponse,
 						authenticatorAttachment: 'platform',
 						getClientExtensionResults: () => ({
 							prf: {
