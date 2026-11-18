@@ -1691,12 +1691,12 @@ export async function sendImage(
 	return w.sendImage(conversationId, content, data, contentType, width, height, altText) as Promise<Message>;
 }
 
-export async function getMessages(conversationId: string, before?: string): Promise<Message[]> {
+export async function getMessages(conversationId: string, before?: string, markRead = true): Promise<Message[]> {
 	if (isTauri) {
-		return tauriInvoke('get_messages', { conversationId, before });
+		return tauriInvoke('get_messages', { conversationId, before, markRead });
 	}
 	const w = getWorker();
-	return w.getMessages(conversationId, before) as Promise<Message[]>;
+	return w.getMessages(conversationId, before, markRead) as Promise<Message[]>;
 }
 
 export async function getImageAttachment(

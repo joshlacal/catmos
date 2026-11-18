@@ -1,7 +1,7 @@
 {
   "sources": {
-    "catbird-mls": "bc2762a004219fa562d5d9b9077f90a949931af9",
-    "catbird-mls-web": "b08d6dac26769d507f799b783f0a8264cb88599e",
+    "catbird-mls": "53d02fc296f7d5c20930802ed9f2d0363d8c5d8c",
+    "catbird-mls-web": "bace5caba6ad4f9e95217587c8bd701e61247fa4",
     "catbird-atproto": "e3356fd4f3349de1d647e3558964d08449c03b13",
     "labyrinth": "182e76d00d66f7a1b72bbc4248438bd68e25a2fa"
   },
@@ -10,7 +10,7 @@
     "package-lock.json": "2fb26658d64a5cd7343c207579c274c2863d188030cb02aec414c131096b7034",
     "../catbird-mls-web/pkg/catbird_mls_web.js": "c559ce47d9431937ae2f75650c953b7d7fd1466d53a624461c8b4fca91c5bda2",
     "../catbird-mls-web/pkg/catbird_mls_web.d.ts": "5e939296f32e0f148b2d273c1e4c449904d5a9a283f38855f5c8c09d92f34f4f",
-    "../catbird-mls-web/pkg/catbird_mls_web_bg.wasm": "45af9f7800f7039b001500f94caca89aa6fb6ff80751de702aee89791fd70232",
+    "../catbird-mls-web/pkg/catbird_mls_web_bg.wasm": "2b0766bf67725f7ebc68a775c4ecfd3d574863f959bd22f95544a1f070b71833",
     "../catbird-mls-web/pkg/catbird_mls_web_bg.wasm.d.ts": "e798cabf901f4f40fe61c97da8cdda88eae5811c5fa55531f45d9346f6fea4a8"
   }
 }

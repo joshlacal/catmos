@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { onMount, onDestroy } from 'svelte';
-  import { conversations } from '#lib/stores/conversations.ts';
   import { messages } from '#lib/stores/messages.ts';
   import * as api from '#lib/wasm.ts';
   import { stripDidFragment } from '#lib/did.ts';
@@ -20,7 +18,6 @@
   let results = $state<SearchHit[]>([]);
   let loading = $state(false);
   let searched = $state(false);
-  let debounceTimer: ReturnType<typeof setTimeout> | null = null;
   let inputEl: HTMLInputElement | undefined = $state();
 
   type HighlightSegment = {
@@ -35,46 +32,37 @@
   });
 
   $effect(() => {
-    if (!open) {
-      query = '';
-      results = [];
-      searched = false;
-      loading = false;
-    }
-  });
-
-  function handleInput() {
-    if (debounceTimer) clearTimeout(debounceTimer);
-    if (!query.trim()) {
-      results = [];
-      searched = false;
-      loading = false;
-      return;
-    }
-    loading = true;
-    debounceTimer = setTimeout(() => {
-      performSearch();
-    }, 300);
-  }
-
-  async function performSearch() {
+    if (!open) query = '';
     const q = query.trim();
-    if (!q) {
+    if (!open || !q) {
       results = [];
       searched = false;
       loading = false;
       return;
     }
-    try {
-      results = await api.searchMessages(q);
-    } catch (e) {
-      console.error('[catmos] searchMessages failed:', e);
-      results = [];
-    } finally {
-      loading = false;
-      searched = true;
-    }
-  }
+    // An open search must follow committed message removals as well as new queries.
+    void $messages.byConversation;
+    let active = true;
+    loading = true;
+    const timer = setTimeout(async () => {
+      try {
+        const found = await api.searchMessages(q);
+        if (active) results = found;
+      } catch (error) {
+        if (active) results = [];
+        console.error('[catmos] Message search failed', error);
+      } finally {
+        if (active) {
+          searched = true;
+          loading = false;
+        }
+      }
+    }, 300);
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  });
 
   function handleKeydown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
@@ -130,9 +118,6 @@
     return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
   }
 
-  onDestroy(() => {
-    if (debounceTimer) clearTimeout(debounceTimer);
-  });
 </script>
 
 {#if open}
@@ -152,7 +137,6 @@
             type="text"
             placeholder="Search messages..."
             bind:value={query}
-            oninput={handleInput}
             class="search-input"
           />
           <button class="close-btn" onclick={onClose} title="Close search">

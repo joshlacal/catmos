@@ -22,6 +22,7 @@ export interface Conversation {
 }
 
 export interface Message {
+	sequenceNumber?: number;
 	id: string;
 	conversationId: string;
 	senderDid: string;

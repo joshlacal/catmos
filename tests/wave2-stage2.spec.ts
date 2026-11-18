@@ -41,6 +41,7 @@ import {
 	startLiveLabyrinthOtcPairing,
 	verifyAndReindexLabyrinthHistory
 } from '../src/lib/wasm.ts';
+import type { Message } from '../src/lib/tauri.ts';
 import type { WorkerApi } from '../src/lib/mls-worker.ts';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -380,6 +381,7 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 		getOrCreateBrowserDeviceId(didHash);
 		await getOrCreateMlsDbKey(did);
 
+		const persisted: Message[] = [];
 		let capturedMime = '';
 		let capturedWaveform: number[] = [];
 		const sampleAudio = new Uint8Array([0x4f, 0x67, 0x67, 0x53, 0x01, 0x02]);
@@ -389,6 +391,7 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 		__setWorkerFactoryForTests(() => ({
 			worker: {
 				openUnifiedClient: async () => ({ accountDid: did, accountDidHash: didHash }),
+				getMessages: async (cid: string) => persisted.filter((row) => row.conversationId === cid),
 				sendVoice: async (
 					convoId: string,
 					audioData: Uint8Array,
@@ -408,7 +411,7 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 						durationMs,
 						waveform
 					};
-					return {
+					const message: Message = {
 						id: 'msg-voice-1',
 						conversationId: convoId,
 						senderDid: did,
@@ -421,6 +424,8 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 						audio,
 						audioAttachment: audio
 					};
+					persisted.push(message);
+					return message;
 				},
 				fetchAndDecryptBlob: async (
 					blobId: string,

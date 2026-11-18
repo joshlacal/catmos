@@ -481,7 +481,7 @@ const api = {
 		client.flushLabyrinthQueue().catch(() => {});
 		return mapMessageRowToUi(row);
 	},
-	getMessages: async (convoId: string, before?: string) => {
+	getMessages: async (convoId: string, before?: string, markRead = true) => {
 		await wasmReady;
 		if (!unifiedClient) return [];
 		const beforeSeq = before && /^\d+$/.test(before) ? BigInt(before) : null;
@@ -489,7 +489,7 @@ const api = {
 		const mapped = rows.map(mapMessageRowToUi);
 		mapped.sort((a, b) => a.sequenceNumber - b.sequenceNumber);
 		const maxSeq = mapped.reduce((acc, m) => Math.max(acc, m.sequenceNumber), 0);
-		bestEffortAdvanceReadState(convoId, maxSeq);
+		if (markRead && !before) bestEffortAdvanceReadState(convoId, maxSeq);
 		return mapped;
 	},
 	getImageAttachment: async (
@@ -567,7 +567,7 @@ const api = {
 	subscribe: async (
 		convoId: string,
 		onMessage: (data: unknown) => void,
-		_onEvent: (data: unknown) => void,
+		onEvent: (data: unknown) => void,
 		onStatus: (status: unknown) => void,
 		_cursor?: string
 	) => {
@@ -631,6 +631,8 @@ const api = {
 			} catch (err) {
 				console.warn('[catmos] unified subscription sync warning:', err);
 			} finally {
+				// Sync can commit a verified deletion before another conversation fails.
+				if (!closed) onEvent({ type: 'messagesChanged' });
 				running = false;
 			}
 		}, 3000);

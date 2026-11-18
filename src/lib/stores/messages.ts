@@ -1,4 +1,4 @@
-import { writable } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import type {
 	Message,
 	AudioAttachment,
@@ -6,7 +6,8 @@ import type {
 	ReactionEvent,
 	TypingEvent
 } from '#lib/tauri.ts';
-import { applyReactionToMap, foldReactionsByAccount, stripDidFragment } from '#lib/did.ts';
+import { applyReactionToMap, stripDidFragment } from '#lib/did.ts';
+import { readMessageWindow, reconcileMessages } from '../message-window.ts';
 import * as api from '#lib/wasm.ts';
 
 interface MessagesStore {
@@ -15,72 +16,89 @@ interface MessagesStore {
 	loading: boolean;
 }
 
-function sortByTimestamp(msgs: Message[]): Message[] {
-	return msgs.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-}
-
 function createMessagesStore() {
-	const { subscribe, update } = writable<MessagesStore>({
+	const store = writable<MessagesStore>({
 		byConversation: new Map(),
 		typingByConversation: new Map(),
 		loading: false
 	});
 
+	const { subscribe, update } = store;
+	const latest = new Map<string, symbol>();
+	let accountDid: string | undefined;
+	let session = Symbol();
+
+	function updateRoom(cid: string, apply: (rows: Message[]) => Message[], loading?: boolean) {
+		update((s) => {
+			const byConversation = new Map(s.byConversation);
+			byConversation.set(cid, apply(byConversation.get(cid) ?? []));
+			return { ...s, byConversation, loading: loading ?? s.loading };
+		});
+	}
+
+	async function refresh(conversationId: string, source: 'local' | 'open' | 'server') {
+		const owner = session;
+		const request = Symbol();
+		latest.set(conversationId, request);
+		const previous = get(store).byConversation.get(conversationId) ?? [];
+		if (source === 'open') update((s) => ({ ...s, loading: true }));
+		try {
+			const page = source === 'server'
+				? await api.fetchNewMessages(conversationId)
+				: await api.getMessages(conversationId, undefined, source === 'open');
+			const stored = await readMessageWindow(previous, page, (before) => api.getMessages(conversationId, before, false));
+			if (latest.get(conversationId) !== request) {
+				// A parallel local read may have completed before the server sync committed.
+				if (owner === session && source === 'server') await refresh(conversationId, 'local');
+				return;
+			}
+			updateRoom(conversationId, (rows) => reconcileMessages(rows, stored), false);
+		} catch (error) {
+			if (latest.get(conversationId) !== request) return;
+			console.warn('[catmos] Could not refresh room messages', error);
+			// A failed read cannot vouch for previously displayed plaintext.
+			updateRoom(conversationId, (rows) => reconcileMessages(rows, []), false);
+		}
+	}
+
+	async function submit(optimistic: Message, send: () => Promise<Message>) {
+		const owner = session;
+		const cid = optimistic.conversationId;
+		updateRoom(cid, (rows) => [...rows, optimistic]);
+		try {
+			await send();
+		} catch (error) {
+			if (owner !== session) return;
+			console.error('[catmos] Message send failed', error);
+			updateRoom(cid, (rows) => rows.map((row) => row.id === optimistic.id ? { ...row, status: 'failed' } : row));
+			return;
+		}
+		if (owner !== session) return;
+		updateRoom(cid, (rows) => rows.filter((row) => row.id !== optimistic.id));
+		// The send response may precede or follow an erasure. Read the committed rows.
+		await refresh(cid, 'local');
+	}
+
 	return {
 		subscribe,
-		async load(conversationId: string) {
-			update((s) => ({ ...s, loading: true }));
-			try {
-				const msgs = await api.getMessages(conversationId);
-				// Deduplicate by ID to prevent Svelte {#each} key collisions
-				const seen = new Set<string>();
-				const deduped = msgs
-					.filter((m) => {
-						if (seen.has(m.id)) return false;
-						seen.add(m.id);
-						return true;
-					})
-					.map((m) =>
-						m.reactions ? { ...m, reactions: foldReactionsByAccount(m.reactions) } : m
-					);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					byConversation.set(conversationId, sortByTimestamp(deduped));
-					return { ...s, byConversation, loading: false };
-				});
-			} catch {
-				update((s) => ({ ...s, loading: false }));
-			}
+		setAccount(did: string | undefined) {
+			if (did === accountDid) return;
+			accountDid = did;
+			session = Symbol();
+			latest.clear();
+			store.set({ byConversation: new Map(), typingByConversation: new Map(), loading: false });
 		},
-		async fetchFromServer(conversationId: string) {
-			try {
-				const msgs = await api.fetchNewMessages(conversationId);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					// Merge: add any messages not already present (dedup both sides)
-					const existingIds = new Set(existing.map((m) => m.id));
-					const newMsgs = msgs
-						.filter((m) => {
-							if (existingIds.has(m.id)) return false;
-							existingIds.add(m.id); // prevent dupes within the batch too
-							return true;
-						})
-						.map((m) =>
-							m.reactions ? { ...m, reactions: foldReactionsByAccount(m.reactions) } : m
-						);
-					if (newMsgs.length > 0) {
-						byConversation.set(conversationId, sortByTimestamp([...existing, ...newMsgs]));
-					}
-					return { ...s, byConversation };
-				});
-			} catch (e) {
-				console.error('fetchFromServer failed:', e);
-			}
+		load: (cid: string) => refresh(cid, 'open'),
+		fetchFromServer: (cid: string) => refresh(cid, 'server'),
+		refreshLocal: (cid: string) => refresh(cid, 'local'),
+		async refreshCached(active?: string) {
+			const rooms = new Set(get(store).byConversation.keys());
+			if (active) rooms.add(active);
+			await Promise.all(Array.from(rooms, (cid) => refresh(cid, 'local')));
 		},
 		async send(conversationId: string, content: string) {
 			const optimistic: Message = {
-				id: `temp-${Date.now()}`,
+				id: `temp-${crypto.randomUUID()}`,
 				conversationId,
 				senderDid: '',
 				senderHandle: 'You',
@@ -89,41 +107,11 @@ function createMessagesStore() {
 				status: 'sending',
 				messageType: 'text'
 			};
-			update((s) => {
-				const byConversation = new Map(s.byConversation);
-				const existing = byConversation.get(conversationId) ?? [];
-				byConversation.set(conversationId, [...existing, optimistic]);
-				return { ...s, byConversation };
-			});
-			try {
-				const sent = await api.sendMessage(conversationId, content);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					byConversation.set(
-						conversationId,
-						existing.map((m) => (m.id === optimistic.id ? sent : m))
-					);
-					return { ...s, byConversation };
-				});
-			} catch (e) {
-				console.error('[catmos] sendMessage failed:', e);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					byConversation.set(
-						conversationId,
-						existing.map((m) =>
-							m.id === optimistic.id ? { ...m, status: 'failed' as const } : m
-						)
-					);
-					return { ...s, byConversation };
-				});
-			}
+			await submit(optimistic, () => api.sendMessage(conversationId, content));
 		},
 		async sendImage(conversationId: string, content: string, upload: PreparedImageUpload) {
 			const optimistic: Message = {
-				id: `temp-image-${Date.now()}`,
+				id: `temp-image-${crypto.randomUUID()}`,
 				conversationId,
 				senderDid: '',
 				senderHandle: 'You',
@@ -144,45 +132,15 @@ function createMessagesStore() {
 					localUrl: upload.previewUrl
 				}
 			};
-			update((s) => {
-				const byConversation = new Map(s.byConversation);
-				const existing = byConversation.get(conversationId) ?? [];
-				byConversation.set(conversationId, [...existing, optimistic]);
-				return { ...s, byConversation };
-			});
-			try {
-				const sent = await api.sendImage(
-					conversationId,
-					content,
-					upload.data,
-					upload.contentType,
-					upload.width,
-					upload.height,
-					upload.altText
-				);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					byConversation.set(
-						conversationId,
-						existing.map((m) => (m.id === optimistic.id ? sent : m))
-					);
-					return { ...s, byConversation };
-				});
-			} catch (e) {
-				console.error('[catmos] sendImage failed:', e);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					byConversation.set(
-						conversationId,
-						existing.map((m) =>
-							m.id === optimistic.id ? { ...m, status: 'failed' as const } : m
-						)
-					);
-					return { ...s, byConversation };
-				});
-			}
+			await submit(optimistic, () => api.sendImage(
+				conversationId,
+				content,
+				upload.data,
+				upload.contentType,
+				upload.width,
+				upload.height,
+				upload.altText
+			));
 		},
 		async sendVoice(
 			conversationId: string,
@@ -204,7 +162,7 @@ function createMessagesStore() {
 				transcript
 			};
 			const optimistic: Message = {
-				id: `temp-voice-${Date.now()}`,
+				id: `temp-voice-${crypto.randomUUID()}`,
 				conversationId,
 				senderDid: '',
 				senderHandle: 'You',
@@ -215,60 +173,14 @@ function createMessagesStore() {
 				audio: audioPayload,
 				audioAttachment: audioPayload
 			};
-			update((s) => {
-				const byConversation = new Map(s.byConversation);
-				const existing = byConversation.get(conversationId) ?? [];
-				byConversation.set(conversationId, [...existing, optimistic]);
-				return { ...s, byConversation };
-			});
-			try {
-				const sent = await api.sendVoice(
-					conversationId,
-					audioData,
-					contentType,
-					durationMs,
-					waveform,
-					transcript
-				);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					byConversation.set(
-						conversationId,
-						existing.map((m) => (m.id === optimistic.id ? sent : m))
-					);
-					return { ...s, byConversation };
-				});
-			} catch (e) {
-				console.error('[catmos] sendVoice failed:', e);
-				update((s) => {
-					const byConversation = new Map(s.byConversation);
-					const existing = byConversation.get(conversationId) ?? [];
-					byConversation.set(
-						conversationId,
-						existing.map((m) =>
-							m.id === optimistic.id ? { ...m, status: 'failed' as const } : m
-						)
-					);
-					return { ...s, byConversation };
-				});
-			}
-		},
-		addIncoming(message: Message) {
-			const normalized = message.reactions
-				? { ...message, reactions: foldReactionsByAccount(message.reactions) }
-				: message;
-			update((s) => {
-				const byConversation = new Map(s.byConversation);
-				const existing = byConversation.get(normalized.conversationId) ?? [];
-				if (!existing.find((m) => m.id === normalized.id)) {
-					byConversation.set(
-						normalized.conversationId,
-						sortByTimestamp([...existing, normalized])
-					);
-				}
-				return { ...s, byConversation };
-			});
+			await submit(optimistic, () => api.sendVoice(
+				conversationId,
+				audioData,
+				contentType,
+				durationMs,
+				waveform,
+				transcript
+			));
 		},
 		applyReaction(event: ReactionEvent) {
 			update((s) => {

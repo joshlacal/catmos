@@ -42,11 +42,13 @@
 	let unlistenReaction: (() => void) | null = null;
 	let unlistenTyping: (() => void) | null = null;
 	let unlistenGroupReset: (() => void) | null = null;
+	let unlistenMessagesChanged: (() => void) | null = null;
 	let unlistenQuarantined: (() => void) | null = null;
 	let unlistenQuarantineCleared: (() => void) | null = null;
 	let unlistenRecovery: (() => void) | null = null;
 	let subscribedConvoId: string | null = null;
 	let blockReconcileRan = false;
+	let subscription = Symbol();
 
 	function handleGlobalKeydown(e: KeyboardEvent) {
 		if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -71,12 +73,20 @@
 		window.addEventListener('keydown', handleGlobalKeydown);
 
 		listenForEvent<Message>('mls-incoming-message', (payload) => {
-			messages.addIncoming(payload);
+			void messages.refreshLocal(payload.conversationId);
 			saveCursor(payload.conversationId, payload.id);
 			notifyIncomingMessage(payload.senderHandle, payload.content, payload.conversationId);
 		}).then((unlisten) => {
 			unlistenMessage = unlisten;
 		});
+
+		listenForEvent<'ConversationsUpdated' | { MessagesUpdated?: { conversation_id: string } }>('mls://platform-change', (event) => {
+			if (event === 'ConversationsUpdated') {
+				void messages.refreshCached($selectedConversation?.id);
+			} else if (typeof event === 'object' && event.MessagesUpdated) {
+				void messages.refreshLocal(event.MessagesUpdated.conversation_id);
+			}
+		}).then((unlisten) => { unlistenMessagesChanged = unlisten; });
 
 		listenForEvent<ReactionEvent>('mls-reaction-event', (payload) => {
 			messages.applyReaction(payload);
@@ -131,6 +141,10 @@
 
 	async function subscribeToConversation(convoId: string, force = false) {
 		if (!force && subscribedConvoId === convoId) return;
+		const request = Symbol();
+		subscription = request;
+		const account = $auth.user?.did;
+		const isCurrent = () => subscription === request && $auth.user?.did === account && $selectedConversation?.id === convoId;
 		// On Tauri, the global WS started on login already covers this convo;
 		// spawning an extra per-convo WS here would just open a duplicate
 		// connection. Still tear down any prior per-convo handle and update
@@ -138,6 +152,7 @@
 		if (subscribedConvoId) {
 			await api.unsubscribeConversation(subscribedConvoId).catch(() => {});
 		}
+		if (!isCurrent()) return;
 		subscribedConvoId = convoId;
 
 		if (!isTauri) {
@@ -148,17 +163,21 @@
 				.subscribeConversation(
 					convoId,
 					(msg) => {
+						if (!isCurrent()) return;
 						const m = msg as Message;
-						messages.addIncoming(m);
+						void messages.refreshLocal(convoId);
 						saveCursor(convoId, m.id);
 						notifyIncomingMessage(m.senderHandle, m.content, convoId);
 					},
 					(event) => {
+						if (!isCurrent()) return;
 						const e = event as { type: string; data: unknown };
 						if (e?.type === 'reaction') {
 							messages.applyReaction(e.data as ReactionEvent);
 						} else if (e?.type === 'typing') {
 							messages.applyTyping(e.data as TypingEvent);
+						} else if (e?.type === 'messagesChanged') {
+							void messages.refreshCached(convoId);
 						} else if (e?.type === 'fetchNeeded') {
 							const reason = (e as { reason?: string }).reason ?? 'unknown';
 							console.warn(`[catmos] WS decrypt failed (${reason}), fetching via HTTP`);
@@ -166,6 +185,7 @@
 						}
 					},
 					(status) => {
+						if (!isCurrent()) return;
 						const s = status as { type?: string };
 						if (s?.type === 'connected' || s?.type === 'open') {
 							connection.setConnected();
@@ -180,6 +200,7 @@
 					connection.setDisconnected(String(e));
 				});
 		}
+		if (!isCurrent()) return;
 		connection.setConnected();
 		api.updateCursor(convoId, '').catch(() => {});
 		conversations.markConversationRead(convoId);
@@ -199,6 +220,7 @@
 	}
 
 	$effect(() => {
+		messages.setAccount($auth.user?.did);
 		if ($auth.user) {
 			// Open a single global WS so we receive events for every convo
 			// the user belongs to, not just the currently-selected one.
@@ -253,19 +275,28 @@
 	});
 
 	$effect(() => {
-		if (currentConversation) {
-			replyingTo = null;
-			const convoId = currentConversation.id;
+		const convoId = currentConversation?.id;
+		const did = $auth.user?.did;
+		let active = true;
+		replyingTo = null;
+		if (did && convoId) {
 			(async () => {
 				await messages.load(convoId);
+				if (!active) return;
 				await messages.fetchFromServer(convoId);
+				if (!active) return;
 				await subscribeToConversation(convoId);
-				// Pull-based seed for Layer 3 quarantine state. Covers the
-				// restart-with-pre-existing-quarantine case where no
-				// `mls://quarantined` event ever fires.
-				await quarantine.refresh(convoId);
+				if (active) await quarantine.refresh(convoId);
 			})();
 		}
+		return () => {
+			active = false;
+			subscription = Symbol();
+			if (subscribedConvoId) {
+				void api.unsubscribeConversation(subscribedConvoId).catch(() => {});
+				subscribedConvoId = null;
+			}
+		};
 	});
 
 	let activeQuarantine = $derived(
@@ -275,6 +306,7 @@
 	onDestroy(() => {
 		window.removeEventListener('keydown', handleGlobalKeydown);
 		unlistenMessage?.();
+		unlistenMessagesChanged?.();
 		unlistenReaction?.();
 		unlistenTyping?.();
 		unlistenGroupReset?.();
@@ -291,6 +323,9 @@
 			? ($messages.byConversation.get(currentConversation.id) ?? [])
 			: []
 	);
+	$effect(() => {
+		if (replyingTo && !currentMessages.some((message) => message.id === replyingTo?.messageId)) replyingTo = null;
+	});
 	let currentTypingUsers = $derived(
 		currentConversation
 			? ($messages.typingByConversation.get(currentConversation.id) ?? []).filter(

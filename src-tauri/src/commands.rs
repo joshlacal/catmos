@@ -1025,6 +1025,7 @@ pub async fn get_messages(
     state: State<'_, AppState>,
     conversation_id: String,
     before: Option<String>,
+    mark_read: Option<bool>,
 ) -> Result<Vec<Message>, String> {
     let did = require_authenticated_did(&state)?;
     if !state.mls_manager.is_opted_in(&did) {
@@ -1035,7 +1036,7 @@ pub async fn get_messages(
     let convo_id = conversation_id.clone();
     let rows = tokio::task::spawn_blocking(move || {
         let listed = mgr.list_messages(&did, &convo_id, before_seq, 50)?;
-        if before_seq.is_none() {
+        if before_seq.is_none() && mark_read.unwrap_or(true) {
             if let Some(max_seq) = listed.iter().map(|r| r.seq).max().filter(|s| *s > 0) {
                 let _ = mgr.advance_read_state(&did, &convo_id, max_seq as u64);
             }
