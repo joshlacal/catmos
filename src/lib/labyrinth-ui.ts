@@ -24,7 +24,7 @@ export const UPGRADEABLE_LABYRINTH_OAUTH_SCOPES = REQUIRED_LABYRINTH_OAUTH_SCOPE
 	(scope) => scope !== 'atproto'
 );
 
-export const LABYRINTH_PASSKEY_RP_ID = 'catbird.blue';
+export const LABYRINTH_PASSKEY_RP_ID = 'passkey.catbird.blue';
 export const LABYRINTH_PRF_DOMAIN_PREFIX = 'catbird.labyrinth.passkey-recovery.v1:';
 
 export interface KeyValueStorageLike {
@@ -330,27 +330,25 @@ export function evaluateSpacesGateForUi(
 	};
 }
 
-/**
- * Resolve the WebAuthn Relying Party ID so passkeys created on `catmos.catbird.blue`
- * share `rpId = "catbird.blue"` with iOS and Android synced passkeys, while remaining
- * valid on local development hosts (`localhost` / `127.0.0.1`).
- */
+// Production clients share the association-only host. Loopback gets its own credentials.
 export function resolveLabyrinthPasskeyRpId(hostname?: string | null): string {
-	const cleaned = typeof hostname === 'string' ? hostname.trim().toLowerCase() : '';
-	if (!cleaned || cleaned === LABYRINTH_PASSKEY_RP_ID || cleaned.endsWith(`.${LABYRINTH_PASSKEY_RP_ID}`)) {
-		return LABYRINTH_PASSKEY_RP_ID;
-	}
-	return cleaned;
+	const host = hostname?.trim().toLowerCase();
+	return host === 'localhost' || host === '127.0.0.1' || host === '[::1]'
+		? host : LABYRINTH_PASSKEY_RP_ID;
 }
 
-/**
- * Derive the deterministic 32-byte WebAuthn `user.id` (`SHA-256(canonicalDid)`),
- * matching Android `LabyrinthPasskeyManager.buildCreatePublicKeyCredentialRequestJson`.
- */
-export async function deriveLabyrinthPasskeyUserId(did: string): Promise<Uint8Array> {
-	const canonicalDid = normalizeAccountDid(did);
-	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalDid));
-	return new Uint8Array(digest);
+export function requireBackupEligiblePasskey(data: ArrayBuffer | undefined): void {
+	const bytes = data ? new Uint8Array(data) : null;
+	// WebAuthn authenticator data contains a 32-byte RP hash, flags, then a 32-bit counter.
+	// Require user presence (0x01), verification (0x04) and backup eligibility (0x08).
+	if (!bytes || bytes.length < 37 || (bytes[32] & 0x0d) !== 0x0d) {
+		throw new Error('Use a backup-eligible passkey with user verification, or use a recovery code.');
+	}
+}
+
+/** An opaque, independent user handle for each WebAuthn registration. */
+export function createLabyrinthPasskeyUserId(): Uint8Array {
+	return crypto.getRandomValues(new Uint8Array(32));
 }
 
 /**
@@ -422,6 +420,7 @@ export async function performPasskeyPrfAssertion(params: {
 		throw new Error('Passkey verification returned no credential.');
 	}
 
+	requireBackupEligiblePasskey((assertion.response as AuthenticatorAssertionResponse).authenticatorData);
 	const ext = assertion.getClientExtensionResults() as {
 		prf?: { results?: { first?: BufferSource } };
 	};

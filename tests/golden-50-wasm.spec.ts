@@ -1,17 +1,15 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { wasmPkgEntry } from '../scripts/wasm-package.ts';
 import { describe, it } from 'node:test';
 
-import {
-	initSync,
-	verifyGoldenManifest,
-	verifyGoldenTranscriptJson
-} from '../src/lib/wasm-pkg/catbird_mls_web.js';
+const { initSync, verifyGoldenManifest, verifyGoldenTranscriptJson }: typeof import('catbird-mls-web') =
+	await import(pathToFileURL(wasmPkgEntry).href);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const WASM_BINARY_PATH = path.resolve(__dirname, '../src/lib/wasm-pkg/catbird_mls_web_bg.wasm');
+const WASM_BINARY_PATH = path.join(path.dirname(wasmPkgEntry), 'catbird_mls_web_bg.wasm');
 const GOLDEN_DIR = process.env.T7_GOLDEN_CORPUS_DIR
 	? path.resolve(process.env.T7_GOLDEN_CORPUS_DIR)
 	: path.resolve(__dirname, '../../catbird-sim/fixtures/golden_50');
@@ -26,7 +24,7 @@ function ensureRealWasmLoaded(): void {
 }
 
 describe('T7-GOLDEN-50 real compiled catbird-mls-web WASM conformance (C5)', () => {
-	it('verifies MANIFEST.sha256 and replays all 50 golden transcripts through compiled Rust/SQLite WASM', () => {
+	it('checks manifest bytes and the recorded wire and state digests for all 50 transcripts in compiled WASM', () => {
 		ensureRealWasmLoaded();
 
 		const manifestPath = path.join(GOLDEN_DIR, 'MANIFEST.sha256');

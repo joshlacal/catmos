@@ -2190,7 +2190,7 @@ pub async fn labyrinth_revoke_device(
     state: State<'_, AppState>,
     did: String,
     target_device_id: String,
-) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
+) -> Result<catbird_mls::client::LabyrinthRevocationOutcome, String> {
     let mgr = state.mls_manager.clone();
     tokio::task::spawn_blocking(move || mgr.revoke_device(&did, &target_device_id))
         .await

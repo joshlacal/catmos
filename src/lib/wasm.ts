@@ -495,8 +495,8 @@ async function mintChatServiceAuthToken(sessionId: string, lxm: string): Promise
 		throw new Error(`getServiceAuth failed (${resp.status}): ${text}`);
 	}
 	const data = (await resp.json()) as { token?: string };
-	if (!data.token) {
-		throw new Error('getServiceAuth response missing token');
+	if (typeof data.token !== 'string' || !data.token.trim() || data.token === sessionId) {
+		throw new Error('getServiceAuth response missing a separate service token');
 	}
 	return data.token;
 }
@@ -1236,7 +1236,7 @@ export async function submitPreparedRequest(
 	const nsid = pathWithoutQuery.startsWith('/xrpc/')
 		? pathWithoutQuery.slice('/xrpc/'.length)
 		: '';
-	const isDirectChatDs = nsid.startsWith('blue.catbird.chat.');
+	const isDirectChatDs = nsid.startsWith('blue.catbird.chat.') || nsid.startsWith('blue.catbird.labyrinth.');
 
 	const url = isDirectChatDs ? `${HOME_DS_URL}${prepared.path}` : `${NEST_URL}${prepared.path}`;
 	const authToken = isDirectChatDs
@@ -2288,6 +2288,20 @@ export interface LabyrinthBackupStatusView {
 	};
 }
 
+export interface LabyrinthRevocationOutcomeView {
+	status: LabyrinthBackupStatusView;
+	rekeyed_recovery_code?: string | null;
+	rekeyed_passkey_ids: number[][];
+}
+
+export interface DeviceRevocationReportView {
+	target_device_id: string;
+	ds_revoked: boolean;
+	labyrinth_rotated: boolean;
+	new_epoch_seq?: number | null;
+	rekeyed_recovery_code?: string | null;
+}
+
 export interface OtcPairingOfferView {
 	six_digit_code: string;
 	formatted_code: string;
@@ -2305,7 +2319,10 @@ async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<Worke
 	const didHash = await accountDidHashHex(accountDid);
 	const dbKeyHex = await loadOrCreateDbKeyHex(didHash);
 	const savedAuth = readBrowserAuth();
-	const authToken = savedAuth && savedAuth.did === accountDid ? savedAuth.sessionId : null;
+	if (savedAuth && normalizeAccountDid(savedAuth.did) !== accountDid) {
+		throw new Error('The signed-in account changed before the encrypted chat client opened.');
+	}
+	const authToken = savedAuth?.sessionId ?? null;
 	const w = getWorker();
 	await w.openUnifiedClient({
 		accountDid,
@@ -2481,14 +2498,14 @@ export async function completeLabyrinthOtcPairing(
 export async function revokeLabyrinthDevice(
 	did: string,
 	targetDeviceId: string
-): Promise<LabyrinthBackupStatusView> {
+): Promise<LabyrinthRevocationOutcomeView> {
 	const currentDeviceId = await getCurrentLabyrinthDeviceId(did);
 	assertCanRevokeLabyrinthDevice(targetDeviceId, currentDeviceId);
 	if (isTauri) {
 		return tauriInvoke('labyrinth_revoke_device', { did, targetDeviceId });
 	}
 	const w = await ensureUnifiedBrowserClientOpen(did);
-	return (await w.revokeLabyrinthDevice(targetDeviceId)) as LabyrinthBackupStatusView;
+	return (await w.revokeLabyrinthDevice(targetDeviceId)) as LabyrinthRevocationOutcomeView;
 }
 
 export interface LiveOtcInitiationView {
@@ -2544,14 +2561,14 @@ export async function listRegisteredLabyrinthDevices(
 export async function revokeRegisteredLabyrinthDeviceLive(
 	did: string,
 	targetDeviceId: string
-): Promise<LabyrinthBackupStatusView> {
+): Promise<DeviceRevocationReportView> {
 	const currentDeviceId = await getCurrentLabyrinthDeviceId(did);
 	assertCanRevokeLabyrinthDevice(targetDeviceId, currentDeviceId);
 	if (isTauri) {
 		return tauriInvoke('labyrinth_revoke_device_live', { did, targetDeviceId });
 	}
 	const w = await ensureUnifiedBrowserClientOpen(did);
-	return (await w.revokeRegisteredDevice(targetDeviceId)) as LabyrinthBackupStatusView;
+	return (await w.revokeRegisteredDevice(targetDeviceId)) as DeviceRevocationReportView;
 }
 
 export async function startLiveLabyrinthOtcPairing(

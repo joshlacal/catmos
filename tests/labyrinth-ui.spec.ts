@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
 	assertCanRevokeLabyrinthDevice,
 	buildUpgradeAdditionalScopes,
-	deriveLabyrinthPasskeyUserId,
+	createLabyrinthPasskeyUserId,
 	deriveLabyrinthPrfSalt,
 	deriveSiblingBackfillSummary,
 	detectPasskeyPrfCapability,
@@ -20,6 +20,7 @@ import {
 	performPasskeyPrfAssertion,
 	REQUIRED_LABYRINTH_OAUTH_SCOPES,
 	resolveLabyrinthPasskeyRpId,
+	requireBackupEligiblePasskey,
 	scopeGranted,
 	setMlsOptedInForDid,
 	UPGRADEABLE_LABYRINTH_OAUTH_SCOPES
@@ -222,11 +223,22 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.match(mapWebAuthnErrorToMessage({ name: 'SecurityError' }), /origin|RP ID/i);
 	});
 
-	it('runs Passkey PRF assertion restore with cross-platform iOS/Android v1 DID salt, 32-byte SHA-256 user.id, and catbird.blue rpId', async () => {
+	it('requires verification and backup eligibility for a recovery passkey', () => {
+		const data = new Uint8Array(37);
+		for (const flags of [0, 1, 5, 8, 12]) {
+			data[32] = flags;
+			assert.throws(() => requireBackupEligiblePasskey(data.buffer), /backup-eligible/);
+		}
+		data[32] = 0x0d;
+		assert.doesNotThrow(() => requireBackupEligiblePasskey(data.buffer));
+		assert.throws(() => requireBackupEligiblePasskey(data.slice(0, 32).buffer));
+	});
+
+	it('runs Passkey PRF assertion restore with cross-platform iOS/Android v1 DID salt, random 32-byte user.id, and dedicated rpId', async () => {
 		assert.equal(LABYRINTH_PRF_DOMAIN_PREFIX, 'catbird.labyrinth.passkey-recovery.v1:');
-		assert.equal(LABYRINTH_PASSKEY_RP_ID, 'catbird.blue');
-		assert.equal(resolveLabyrinthPasskeyRpId('catmos.catbird.blue'), 'catbird.blue');
-		assert.equal(resolveLabyrinthPasskeyRpId('catbird.blue'), 'catbird.blue');
+		assert.equal(LABYRINTH_PASSKEY_RP_ID, 'passkey.catbird.blue');
+		assert.equal(resolveLabyrinthPasskeyRpId('catmos.catbird.blue'), 'passkey.catbird.blue');
+		assert.equal(resolveLabyrinthPasskeyRpId('catbird.blue'), 'passkey.catbird.blue');
 		assert.equal(resolveLabyrinthPasskeyRpId('localhost'), 'localhost');
 
 		const mixedPlcDid = 'DID:PLC:AbCdEf123#dev-9';
@@ -247,13 +259,9 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		);
 		assert.deepEqual(webSalt, new Uint8Array(expectedWebSaltBuf));
 
-		const userIdBytes = await deriveLabyrinthPasskeyUserId(mixedPlcDid);
-		const expectedUserIdBuf = await crypto.subtle.digest(
-			'SHA-256',
-			new TextEncoder().encode('did:plc:AbCdEf123')
-		);
+		const userIdBytes = createLabyrinthPasskeyUserId();
 		assert.equal(userIdBytes.byteLength, 32);
-		assert.deepEqual(userIdBytes, new Uint8Array(expectedUserIdBuf));
+		assert.notDeepEqual(userIdBytes, createLabyrinthPasskeyUserId());
 
 		const fakeCredId = new Uint8Array([1, 2, 3, 4, 5, 6]);
 		const fakePrfOut = new Uint8Array(32).fill(0x5a);
@@ -277,7 +285,7 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 						id: 'AQIDBAUG',
 						type: 'public-key',
 						rawId: fakeCredId.buffer,
-						response: {} as AuthenticatorAssertionResponse,
+						response: { authenticatorData: new Uint8Array(37).fill(0x0d, 32, 33).buffer } as AuthenticatorAssertionResponse,
 						authenticatorAttachment: 'platform',
 						getClientExtensionResults: () => ({
 							prf: {
@@ -292,7 +300,7 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 			}
 		});
 
-		assert.equal(capturedRpId, 'catbird.blue');
+		assert.equal(capturedRpId, 'passkey.catbird.blue');
 		assert.deepEqual(capturedSalt, saltA);
 		assert.deepEqual(res.credentialId, fakeCredId);
 		assert.deepEqual(res.prfOutput32, fakePrfOut);
@@ -386,8 +394,8 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 			'must contain zero fake or demo fallback DIDs (FC-01..FC-10)'
 		);
 		assert.ok(
-			markup.includes('deriveLabyrinthPasskeyUserId'),
-			'must derive 32-byte SHA-256(canonicalDid) WebAuthn user.id'
+			markup.includes('createLabyrinthPasskeyUserId'),
+			'must generate a random WebAuthn user.id per registration'
 		);
 		assert.ok(
 			!markup.includes('.slice(0, 64)'),

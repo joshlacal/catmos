@@ -23,11 +23,11 @@ use base64::Engine as _;
 use catbird_mls::blob_crypto::decrypt_blob;
 use catbird_mls::client::{
     account_did_hash_hex, normalize_account_did, CatbirdMlsClient, CatbirdMlsClientConfig,
-    CircleOwnerStateDto, DeviceRevocationReport, LabyrinthBackupStatus, LeaveConversationOutcome,
-    MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion, OtcPairingOffer,
-    PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader, PlatformHttpRequest,
-    PlatformHttpResponse, PlatformKeyStore, PlatformTransport, RegisteredDeviceInfo,
-    UploadedConversationAttachment, REQUIRED_LABYRINTH_OAUTH_SCOPES,
+    CircleOwnerStateDto, DeviceRevocationReport, LabyrinthBackupStatus, LabyrinthRevocationOutcome,
+    LeaveConversationOutcome, MailboxReadStateRecord, OtcInitiatedSession, OtcPairingCompletion,
+    OtcPairingOffer, PlatformChangeEvent, PlatformChangeObserver, PlatformHttpHeader,
+    PlatformHttpRequest, PlatformHttpResponse, PlatformKeyStore, PlatformTransport,
+    RegisteredDeviceInfo, UploadedConversationAttachment, REQUIRED_LABYRINTH_OAUTH_SCOPES,
 };
 use catbird_mls::payload_types::{MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload};
 use catbird_mls::MLSError;
@@ -668,52 +668,56 @@ impl PlatformTransport for TauriTransport {
                 if !has_auth {
                     if let Some(tok) = bearer {
                         let req_origin = origin_key(&request.url);
-                        if req_origin.is_some() && req_origin == origin_key(&pds_endpoint) {
-                            builder = builder.bearer_auth(tok);
-                        } else if req_origin.is_some()
-                            && req_origin == origin_key(&home_ds_endpoint)
-                        {
-                            if let Some(nsid) = extract_xrpc_nsid(&request.url)
-                                .filter(|n| n.starts_with("blue.catbird.chat."))
-                            {
-                                let sa_url = format!(
-                                    "{}/xrpc/com.atproto.server.getServiceAuth",
-                                    pds_endpoint.trim_end_matches('/')
-                                );
-                                let sa_resp = client
-                                    .get(&sa_url)
-                                    .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
-                                    .bearer_auth(&tok)
-                                    .send()
-                                    .await
-                                    .map_err(|e| {
-                                        MLSError::Internal(format!(
-                                            "mint getServiceAuth `{nsid}` failed: {e}"
-                                        ))
-                                    })?;
-                                if !sa_resp.status().is_success() {
-                                    let status = sa_resp.status().as_u16();
-                                    let text = sa_resp.text().await.unwrap_or_default();
-                                    return Err(MLSError::Internal(format!(
-                                        "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
-                                    )));
-                                }
-                                let sa_json: serde_json::Value =
-                                    sa_resp.json().await.map_err(|e| {
-                                        MLSError::Internal(format!(
-                                            "decode getServiceAuth `{nsid}` JSON: {e}"
-                                        ))
-                                    })?;
-                                let service_jwt = sa_json
-                                    .get("token")
-                                    .and_then(|v| v.as_str())
-                                    .ok_or_else(|| {
-                                        MLSError::Internal(format!(
-                                            "getServiceAuth `{nsid}` response missing token"
-                                        ))
-                                    })?;
-                                builder = builder.bearer_auth(service_jwt);
+                        let delivery_method = extract_xrpc_nsid(&request.url).filter(|nsid| {
+                            req_origin.is_some()
+                                && req_origin == origin_key(&home_ds_endpoint)
+                                && (nsid.starts_with("blue.catbird.chat.")
+                                    || nsid.starts_with("blue.catbird.labyrinth."))
+                        });
+                        if let Some(nsid) = delivery_method {
+                            let sa_url = format!(
+                                "{}/xrpc/com.atproto.server.getServiceAuth",
+                                pds_endpoint.trim_end_matches('/')
+                            );
+                            let sa_resp = client
+                                .get(&sa_url)
+                                .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
+                                .bearer_auth(&tok)
+                                .send()
+                                .await
+                                .map_err(|e| {
+                                    MLSError::Internal(format!(
+                                        "mint getServiceAuth `{nsid}` failed: {e}"
+                                    ))
+                                })?;
+                            if !sa_resp.status().is_success() {
+                                let status = sa_resp.status().as_u16();
+                                let text = sa_resp.text().await.unwrap_or_default();
+                                return Err(MLSError::Internal(format!(
+                                    "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
+                                )));
                             }
+                            let sa_json: serde_json::Value = sa_resp.json().await.map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "decode getServiceAuth `{nsid}` JSON: {e}"
+                                ))
+                            })?;
+                            let service_jwt = sa_json
+                                .get("token")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| {
+                                    MLSError::Internal(format!(
+                                        "getServiceAuth `{nsid}` response missing token"
+                                    ))
+                                })?;
+                            if service_jwt.is_empty() || service_jwt == tok {
+                                return Err(MLSError::Internal(
+                                    "PDS did not return a separate service token".to_string(),
+                                ));
+                            }
+                            builder = builder.bearer_auth(service_jwt);
+                        } else if req_origin.is_some() && req_origin == origin_key(&pds_endpoint) {
+                            builder = builder.bearer_auth(tok);
                         }
                     }
                 }
@@ -1076,7 +1080,7 @@ impl TauriMlsManager {
         &self,
         did: &str,
         target_device_id: &str,
-    ) -> Result<LabyrinthBackupStatus, String> {
+    ) -> Result<LabyrinthRevocationOutcome, String> {
         let client = self.open_or_get_client(did)?;
         client
             .revoke_labyrinth_device(target_device_id)
@@ -1822,6 +1826,70 @@ mod tests {
     const LIVE_PDS_URL: &str = "https://pds.catmos.test";
     const LIVE_DS_URL: &str = "https://ds.catmos.test";
     const LIVE_DS_DID: &str = "did:web:ds.catmos.test";
+
+    #[test]
+    fn backup_rpc_uses_a_service_token_even_when_the_origins_match() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let method = "blue.catbird.labyrinth.getRecoveryShareCapabilities";
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock = std::thread::spawn(move || {
+            let mut observed = Vec::new();
+            // Close each connection after its response. A regression that skips the token
+            // request still finishes the fixture when the capability request arrives.
+            loop {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&socket);
+                let mut start = String::new();
+                reader.read_line(&mut start).unwrap();
+                let mut authorization = String::new();
+                for line in reader.lines() {
+                    let line = line.unwrap();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("authorization") {
+                            authorization = value.trim().to_owned();
+                        }
+                    }
+                }
+                let minting = start.contains("/xrpc/com.atproto.server.getServiceAuth?");
+                let body = if minting {
+                    r#"{"token":"fixture-service-token"}"#
+                } else {
+                    "{}"
+                };
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                observed.push((start, authorization));
+                if !minting || observed.len() == 2 {
+                    return observed;
+                }
+            }
+        });
+
+        let transport = TauriTransport::new(None);
+        transport.configure_endpoints(&endpoint, &endpoint, LIVE_DS_DID);
+        transport.set_session_token(Some("fixture-account-token".into()));
+        let response = transport
+            .execute_http(PlatformHttpRequest {
+                method: "GET".into(),
+                url: format!("{endpoint}/xrpc/{method}"),
+                headers: vec![],
+                body: None,
+            })
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let observed = mock.join().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].0.contains("aud=did%3Aweb%3Ads.catmos.test"));
+        assert!(observed[0].0.contains(&format!("lxm={method}")));
+        assert_eq!(observed[0].1, "Bearer fixture-account-token");
+        assert!(observed[1].0.starts_with(&format!("GET /xrpc/{method} ")));
+        assert_eq!(observed[1].1, "Bearer fixture-service-token");
+    }
 
     #[derive(Default)]
     struct LiveMockState {

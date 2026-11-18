@@ -11,13 +11,14 @@
 		getLabyrinthStatus,
 		initiateLabyrinthOtcPairing,
 		isLabyrinthDevicePendingApproval,
+		isTauri,
 		listRegisteredLabyrinthDevices,
 		probePdsSpacesSupport,
 		registerLabyrinthPasskeyPrf,
 		respondLiveLabyrinthOtcPairing,
 		restoreWithLabyrinthPasskeyPrf,
 		restoreWithLabyrinthRecoveryCode,
-		revokeLabyrinthDevice,
+		revokeRegisteredLabyrinthDeviceLive,
 		setupLabyrinthRecoveryCode,
 		startLiveLabyrinthOtcPairing,
 		syncLabyrinthBackfill,
@@ -28,7 +29,7 @@
 	} from '#lib/wasm.ts';
 	import {
 		assertCanRevokeLabyrinthDevice,
-		deriveLabyrinthPasskeyUserId,
+		createLabyrinthPasskeyUserId,
 		deriveLabyrinthPrfSalt,
 		deriveSiblingBackfillSummary,
 		detectPasskeyPrfCapability,
@@ -39,6 +40,7 @@
 		performPasskeyPrfAssertion,
 		REQUIRED_LABYRINTH_OAUTH_SCOPES,
 		resolveLabyrinthPasskeyRpId,
+		requireBackupEligiblePasskey,
 		setMlsOptedInForDid
 	} from '#lib/labyrinth-ui.ts';
 
@@ -54,7 +56,8 @@
 	let optedIn = $state(false);
 	let status = $state<LabyrinthBackupStatusView | null>(null);
 	let currentDeviceId = $state<string | null>(null);
-	let generatedRecoveryCode = $state('');
+	let displayedCode = $state<{ did: string; code: string } | null>(null);
+	const generatedRecoveryCode = $derived(displayedCode?.did === activeDid ? displayedCode?.code : null);
 	let restoreCodeInput = $state('');
 	let otcOffer = $state<OtcPairingOfferView | null>(null);
 	let liveOtcSession = $state<LiveOtcInitiationView | null>(null);
@@ -65,10 +68,12 @@
 	let devicePendingApproval = $state(false);
 	let canRegisterPasskeyPrf = $state(false);
 	let passkeyReason = $state<string | null>(null);
+	const preferPasskey = $derived(canRegisterPasskeyPrf && (!isTauri || (status?.active_device_ids.length ?? 0) > 1));
 	let statusBanner = $state<string | null>(null);
 	let errorBanner = $state<string | null>(null);
 	let busy = $state(false);
 	let initializedForDid = $state<string | null>(null);
+	let accountSession = 0;
 
 	let pendingRevokeDeviceId = $state<string | null>(null);
 	let revokeDialogEl: HTMLDialogElement | undefined = $state(undefined);
@@ -86,13 +91,24 @@
 		return normalizeAccountDid(activeDid);
 	}
 
+	async function applyAccountStatus(did: string, session: number, next: LabyrinthBackupStatusView | null) {
+		if (activeDid !== did || session !== accountSession) return false;
+		const device = await getCurrentLabyrinthDeviceId(did);
+		if (activeDid !== did || session !== accountSession) return false;
+		status = next;
+		currentDeviceId = device;
+		return true;
+	}
+
 	async function refreshDeviceIdentityAndStatus(did: string) {
-		currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+		const session = accountSession;
+		const nextDeviceId = await getCurrentLabyrinthDeviceId(did);
 		const nextStatus = await getLabyrinthStatus(did);
+		let pendingApproval = false;
 		try {
-			devicePendingApproval = await isLabyrinthDevicePendingApproval(did);
+			pendingApproval = await isLabyrinthDevicePendingApproval(did);
 		} catch {
-			devicePendingApproval = false;
+			pendingApproval = false;
 		}
 		if (nextStatus) {
 			try {
@@ -104,15 +120,24 @@
 				// Keep local status snapshot when offline
 			}
 		}
+		if (activeDid !== did || session !== accountSession) return;
+		currentDeviceId = nextDeviceId;
+		devicePendingApproval = pendingApproval;
 		status = nextStatus;
 	}
 
 	async function loadAccountLabyrinthState(did: string) {
 		probingPds = true;
+		const session = accountSession;
 		try {
-			pdsSupportsSpaces = await probePdsSpacesSupport();
+			const supported = await probePdsSpacesSupport();
+			if (activeDid !== did || session !== accountSession) return;
+			pdsSupportsSpaces = supported;
+		} catch (err) {
+			if (activeDid === did && session === accountSession) errorBanner = String(err);
+			return;
 		} finally {
-			probingPds = false;
+			if (activeDid === did && session === accountSession) probingPds = false;
 		}
 		optedIn = isMlsOptedInForDid(did);
 		if (optedIn) {
@@ -139,6 +164,25 @@
 
 	$effect(() => {
 		const did = activeDid;
+		if (initializedForDid !== did) {
+			accountSession += 1;
+			displayedCode = null;
+			otcOffer = null;
+			liveOtcSession = null;
+			otcInput = '';
+			otcResponderSessionId = '';
+			otcResponderCode = '';
+			restoreCodeInput = '';
+			reindexConversationId = '';
+			pendingRevokeDeviceId = null;
+			currentDeviceId = null;
+			devicePendingApproval = false;
+			pdsSupportsSpaces = false;
+			optedIn = false;
+			status = null;
+			errorBanner = null;
+			statusBanner = null;
+		}
 		if (!did) {
 			initializedForDid = null;
 			pdsSupportsSpaces = false;
@@ -183,17 +227,19 @@
 			errorBanner = spacesGate.message;
 			return;
 		}
+		const session = accountSession;
 		busy = true;
 		errorBanner = null;
 		statusBanner = null;
 		let did = '';
 		try {
 			did = requireAuthenticatedDid();
-			status = await enableMlsAndEnroll(did, pdsSupportsSpaces, grantedScopes);
-			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+			const nextStatus = await enableMlsAndEnroll(did, pdsSupportsSpaces, grantedScopes);
+			if (!await applyAccountStatus(did, session, nextStatus)) return;
 			optedIn = true;
 			statusBanner = 'Encrypted Chat and Labyrinth 1.1 Spaces history enabled on this device.';
 		} catch (err) {
+			if (session !== accountSession) return;
 			if (did) {
 				setMlsOptedInForDid(did, false);
 			}
@@ -205,14 +251,16 @@
 	}
 
 	async function handleSyncBackfillNow() {
+		const session = accountSession;
 		busy = true;
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
-			status = await syncLabyrinthBackfill(did);
-			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+			const nextStatus = await syncLabyrinthBackfill(did);
+			if (!await applyAccountStatus(did, session, nextStatus)) return;
 			statusBanner = 'Synchronized sibling Space history batches.';
 		} catch (err) {
+			if (session !== accountSession) return;
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
@@ -224,7 +272,11 @@
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
-			generatedRecoveryCode = await setupLabyrinthRecoveryCode(did);
+			const session = accountSession;
+			displayedCode = null;
+			const code = await setupLabyrinthRecoveryCode(did);
+			if (activeDid !== did || session !== accountSession) return;
+			displayedCode = { did, code };
 			await refreshDeviceIdentityAndStatus(did);
 			statusBanner = '40-character GF(32) recovery code bound to your Labyrinth virtual device.';
 		} catch (err) {
@@ -237,15 +289,17 @@
 	async function handleRestoreRecoveryCode(event: SubmitEvent) {
 		event.preventDefault();
 		if (!restoreCodeInput.trim()) return;
+		const session = accountSession;
 		busy = true;
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
-			status = await restoreWithLabyrinthRecoveryCode(did, restoreCodeInput.trim());
-			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+			const nextStatus = await restoreWithLabyrinthRecoveryCode(did, restoreCodeInput.trim());
+			if (!await applyAccountStatus(did, session, nextStatus)) return;
 			restoreCodeInput = '';
-			statusBanner = `Restored Labyrinth mailbox and rotated to epoch ${status.epoch_seq}.`;
+			statusBanner = `Restored Labyrinth mailbox and rotated to epoch ${nextStatus.epoch_seq}.`;
 		} catch (err) {
+			if (session !== accountSession) return;
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
@@ -253,13 +307,14 @@
 	}
 
 	async function handleRegisterPasskeyPrf() {
+		const session = accountSession;
 		busy = true;
 		errorBanner = null;
 		try {
 			const canonicalDid = requireAuthenticatedDid();
 			const challenge = crypto.getRandomValues(new Uint8Array(32));
 			const prfSalt = await deriveLabyrinthPrfSalt(canonicalDid);
-			const userId = await deriveLabyrinthPasskeyUserId(canonicalDid);
+			const userId = createLabyrinthPasskeyUserId();
 			const rpId = resolveLabyrinthPasskeyRpId(
 				typeof window !== 'undefined' ? window.location.hostname : undefined
 			);
@@ -297,6 +352,7 @@
 				throw new Error('Passkey registration returned null credential.');
 			}
 
+			requireBackupEligiblePasskey((cred.response as AuthenticatorAttestationResponse).getAuthenticatorData?.());
 			const ext = cred.getClientExtensionResults() as {
 				prf?: { results?: { first?: ArrayBuffer } };
 			};
@@ -309,14 +365,16 @@
 				);
 			}
 
-			status = await registerLabyrinthPasskeyPrf(
+			if (activeDid !== canonicalDid || session !== accountSession) return;
+			const nextStatus = await registerLabyrinthPasskeyPrf(
 				canonicalDid,
 				new Uint8Array(cred.rawId),
 				prfBytes
 			);
-			currentDeviceId = await getCurrentLabyrinthDeviceId(canonicalDid);
+			if (!await applyAccountStatus(canonicalDid, session, nextStatus)) return;
 			statusBanner = 'Passkey PRF bound to your Labyrinth recovery keyring.';
 		} catch (err) {
+			if (session !== accountSession) return;
 			errorBanner = mapWebAuthnErrorToMessage(err);
 		} finally {
 			busy = false;
@@ -324,6 +382,7 @@
 	}
 
 	async function handleRestorePasskeyPrf() {
+		const session = accountSession;
 		busy = true;
 		errorBanner = null;
 		try {
@@ -331,10 +390,12 @@
 			const { credentialId, prfOutput32 } = await performPasskeyPrfAssertion({
 				did: canonicalDid
 			});
-			status = await restoreWithLabyrinthPasskeyPrf(canonicalDid, credentialId, prfOutput32);
-			currentDeviceId = await getCurrentLabyrinthDeviceId(canonicalDid);
-			statusBanner = `Restored Labyrinth mailbox via Passkey PRF (epoch ${status.epoch_seq}).`;
+			if (activeDid !== canonicalDid || session !== accountSession) return;
+			const nextStatus = await restoreWithLabyrinthPasskeyPrf(canonicalDid, credentialId, prfOutput32);
+			if (!await applyAccountStatus(canonicalDid, session, nextStatus)) return;
+			statusBanner = `Restored Labyrinth mailbox via Passkey PRF (epoch ${nextStatus.epoch_seq}).`;
 		} catch (err) {
+			if (session !== accountSession) return;
 			errorBanner = mapWebAuthnErrorToMessage(err);
 		} finally {
 			busy = false;
@@ -346,10 +407,13 @@
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
+			const session = accountSession;
 			const offer = await initiateLabyrinthOtcPairing(did);
+			if (activeDid !== did || session !== accountSession) return;
 			otcOffer = offer;
 			try {
 				const started = await startLiveLabyrinthOtcPairing(did, offer.six_digit_code);
+				if (activeDid !== did || session !== accountSession) return;
 				liveOtcSession = started;
 				otcOffer = {
 					six_digit_code: started.six_digit_code,
@@ -357,7 +421,7 @@
 				};
 				otcInput = started.six_digit_code;
 			} catch {
-				liveOtcSession = null;
+				if (activeDid === did && session === accountSession) liveOtcSession = null;
 			}
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
@@ -427,14 +491,16 @@
 	}
 
 	async function handleApproveSiblingDevice(deviceId: string) {
+		const session = accountSession;
 		busy = true;
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
-			status = await approveLabyrinthSiblingDevice(did, deviceId);
-			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
-			statusBanner = `Approved device ${deviceId} and shared mailbox epoch ${status.epoch_seq}.`;
+			const nextStatus = await approveLabyrinthSiblingDevice(did, deviceId);
+			if (!await applyAccountStatus(did, session, nextStatus)) return;
+			statusBanner = `Approved device ${deviceId} and shared mailbox epoch ${nextStatus.epoch_seq}.`;
 		} catch (err) {
+			if (session !== accountSession) return;
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
@@ -463,10 +529,18 @@
 		errorBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
+			const session = accountSession;
 			assertCanRevokeLabyrinthDevice(target, effectiveCurrentDeviceId);
-			status = await revokeLabyrinthDevice(did, target);
-			currentDeviceId = await getCurrentLabyrinthDeviceId(did);
-			statusBanner = `Revoked device ${target} and rotated mailbox to epoch ${status.epoch_seq}.`;
+			displayedCode = null;
+			const report = await revokeRegisteredLabyrinthDeviceLive(did, target);
+			if (activeDid !== did || session !== accountSession) return;
+			if (report.rekeyed_recovery_code) displayedCode = { did, code: report.rekeyed_recovery_code };
+			await refreshDeviceIdentityAndStatus(did);
+			if (activeDid === did) {
+				statusBanner = report.labyrinth_rotated
+					? `Revoked device ${target} and rotated the backup keys.`
+					: `Revoked device ${target}.`;
+			}
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
@@ -617,30 +691,22 @@
 		</section>
 
 	<section class="card" aria-labelledby="recovery-heading">
-		<h2 id="recovery-heading">40-Character Recovery Code &amp; Passkey PRF</h2>
-		<p>
-			Generate a 40-character GF(32) recovery code (corrects up to 3 typos) or bind a hardware
-			Passkey PRF virtual device so you can restore chat history if you lose all enrolled devices.
-		</p>
+		<h2 id="recovery-heading">Backup recovery</h2>
+		<p>Set up a backup-eligible passkey or save a recovery code to restore your history on a new device.</p>
 
-		<div class="button-row">
-			<button
-				type="button"
-				class="btn-primary"
-				disabled={!optedIn || busy}
-				onclick={handleGenerateRecoveryCode}
-			>
-				Generate 40-Character Recovery Code
-			</button>
-
-			<button
-				type="button"
-				class="btn-secondary"
-				disabled={!optedIn || !canRegisterPasskeyPrf || busy}
-				onclick={handleRegisterPasskeyPrf}
-			>
+		{#snippet registerPasskey()}
+			<button type="button" class={preferPasskey ? 'btn-primary' : 'btn-secondary'}
+				disabled={!optedIn || !canRegisterPasskeyPrf || busy} onclick={handleRegisterPasskeyPrf}>
 				Register Passkey PRF
 			</button>
+		{/snippet}
+		<div class="button-row">
+			{#if preferPasskey}{@render registerPasskey()}{/if}
+			<button type="button" class={preferPasskey ? 'btn-secondary' : 'btn-primary'}
+				disabled={!optedIn || busy} onclick={handleGenerateRecoveryCode}>
+				Generate 40-Character Recovery Code
+			</button>
+			{#if !preferPasskey}{@render registerPasskey()}{/if}
 
 			<button
 				type="button"

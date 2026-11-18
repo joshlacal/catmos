@@ -1,18 +1,11 @@
 import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
-import { existsSync } from 'node:fs';
+import { wasmPkgEntry } from './scripts/wasm-package.ts';
 import { resolve } from 'node:path';
 import { defineConfig } from 'vite';
 import { CATMOS_SVELTEKIT_CSP_DIRECTIVES } from './src/lib/csp.ts';
 
 const host = process.env.TAURI_DEV_HOST;
-const siblingWasmPkgEntry = resolve(
-	import.meta.dirname,
-	'../catbird-mls-web/pkg/catbird_mls_web.js'
-);
-const localWasmPkgEntry = resolve(import.meta.dirname, './src/lib/wasm-pkg/catbird_mls_web.js');
-const wasmPkgEntry = existsSync(siblingWasmPkgEntry) ? siblingWasmPkgEntry : localWasmPkgEntry;
-
 export default defineConfig({
 	plugins: [
 		sveltekit({

@@ -973,7 +973,7 @@ const api = {
 	},
 	initiateOtcPairing: async () => {
 		await wasmReady;
-		return plain(requireUnified().initiateOtcPairing());
+		return plain(await requireUnified().initiateOtcPairing());
 	},
 	startLiveOtcPairing: async (sixDigitCode: string) => {
 		await wasmReady;
@@ -998,10 +998,7 @@ const api = {
 	revokeLabyrinthDevice: async (targetDeviceId: string) => {
 		await wasmReady;
 		const client = requireUnified();
-		if (latestAuthToken) {
-			return plain(await client.revokeDevice(targetDeviceId));
-		}
-		return plain(client.revokeLabyrinthDevice(targetDeviceId));
+		return plain(await client.revokeLabyrinthDevice(targetDeviceId));
 	},
 	verifyAndReindexHistory: async (conversationId: string) => {
 		await wasmReady;

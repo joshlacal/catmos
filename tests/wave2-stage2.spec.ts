@@ -528,13 +528,8 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 				revokeRegisteredDevice: async (targetId: string) => {
 					callLog.push(`revoke:${targetId}`);
 					return {
-						backup_enabled: true,
-						mailbox_space_uri: `at:space://${did}/blue.catbird.labyrinth.mailbox/self`,
-						has_recovery_code: true,
-						has_passkey_prf: false,
-						epoch_seq: 3,
-						active_device_ids: [selfDeviceId],
-						current_device_id: selfDeviceId
+						target_device_id: targetId, ds_revoked: true, labyrinth_rotated: true,
+						new_epoch_seq: 3, rekeyed_recovery_code: 'fixture replacement code'
 					};
 				},
 				startLiveOtcPairing: async (code: string) => {
@@ -647,7 +642,8 @@ describe('Wave 2 Stage 2 — D-3 fail-closed deleteAccountData, Space attachment
 			/Cannot revoke this device from itself/
 		);
 		const revoked = await revokeRegisteredLabyrinthDeviceLive(did, siblingDeviceId);
-		assert.equal(revoked.epoch_seq, 3);
+		assert.equal(revoked.new_epoch_seq, 3);
+		assert.equal(revoked.rekeyed_recovery_code, 'fixture replacement code');
 
 		const reindexedCount = await verifyAndReindexLabyrinthHistory(did, 'convo-1');
 		assert.equal(reindexedCount, 17);

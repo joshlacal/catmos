@@ -13,6 +13,7 @@
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --project src/service-worker/tsconfig.json",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
+    "verify:inputs": "python3 scripts/verify-qualified-inputs.py",
     "tauri:build": "tauri build",
     "check:rust": "cd src-tauri && cargo check --locked",
     "check:android": "bash ./scripts/check-android.sh",
