@@ -330,11 +330,21 @@ export function evaluateSpacesGateForUi(
 	};
 }
 
-// Production clients share the association-only host. Loopback gets its own credentials.
-export function resolveLabyrinthPasskeyRpId(hostname?: string | null): string {
+// The association Worker names catmos.catbird.blue as a WebAuthn related origin.
+export function resolveLabyrinthPasskeyRpId(
+	hostname?: string | null,
+	protocol = typeof window !== 'undefined' ? window.location.protocol : 'https:'
+): string {
 	const host = hostname?.trim().toLowerCase();
-	return host === 'localhost' || host === '127.0.0.1' || host === '[::1]'
-		? host : LABYRINTH_PASSKEY_RP_ID;
+	if (!host) return LABYRINTH_PASSKEY_RP_ID;
+	const loopback = host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+	if (loopback && (protocol === 'https:' || protocol === 'http:')) return host;
+	if (protocol === 'https:' && (
+		host === LABYRINTH_PASSKEY_RP_ID ||
+		host.endsWith('.' + LABYRINTH_PASSKEY_RP_ID) ||
+		host === 'catmos.catbird.blue'
+	)) return LABYRINTH_PASSKEY_RP_ID;
+	throw new Error('Open Catmos in its supported web origin to use a recovery passkey, or use a recovery code here.');
 }
 
 export async function requireBackupEligiblePasskey(
@@ -689,8 +699,16 @@ export async function detectPasskeyPrfCapability(
 					PublicKeyCredential?: PublicKeyCredentialStaticLike;
 				}
 			).PublicKeyCredential
-		: undefined
+		: undefined,
+	location: Pick<Location, 'hostname' | 'protocol'> | undefined = typeof window !== 'undefined' ? window.location : undefined
 ): Promise<PasskeyPrfCapabilityResult> {
+	if (location) {
+		try {
+			resolveLabyrinthPasskeyRpId(location.hostname, location.protocol);
+		} catch (error) {
+			return { canRegisterPasskeyPrf: false, reason: String((error as Error).message) };
+		}
+	}
 	if (!pkc || typeof pkc.getClientCapabilities !== 'function') {
 		return {
 			canRegisterPasskeyPrf: false,

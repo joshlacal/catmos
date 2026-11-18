@@ -244,7 +244,12 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.equal(LABYRINTH_PRF_DOMAIN_PREFIX, 'catbird.labyrinth.passkey-recovery.v1:');
 		assert.equal(LABYRINTH_PASSKEY_RP_ID, 'passkey.catbird.blue');
 		assert.equal(resolveLabyrinthPasskeyRpId('catmos.catbird.blue'), 'passkey.catbird.blue');
-		assert.equal(resolveLabyrinthPasskeyRpId('catbird.blue'), 'passkey.catbird.blue');
+		assert.throws(() => resolveLabyrinthPasskeyRpId('catbird.blue'), /web origin/);
+		assert.throws(() => resolveLabyrinthPasskeyRpId('localhost', 'tauri:'), /web origin/);
+		assert.throws(() => resolveLabyrinthPasskeyRpId('catmos.catbird.blue', 'http:'), /web origin/);
+		assert.equal((await detectPasskeyPrfCapability(undefined, {
+			hostname: 'localhost', protocol: 'tauri:'
+		})).canRegisterPasskeyPrf, false);
 		assert.equal(resolveLabyrinthPasskeyRpId('localhost'), 'localhost');
 
 		const mixedPlcDid = 'DID:PLC:AbCdEf123#dev-9';
