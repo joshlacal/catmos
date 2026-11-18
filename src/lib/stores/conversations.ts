@@ -70,6 +70,7 @@ function createConversationsStore() {
 			}));
 		},
 		markConversationRead(conversationId: string) {
+			if (!currentState.items.find((room) => room.id === conversationId)?.unreadCount) return;
 			update((s) => ({
 				...s,
 				items: s.items.map((c) =>

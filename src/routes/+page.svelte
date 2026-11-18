@@ -246,6 +246,8 @@
 	});
 
 	let currentConversation = $derived($selectedConversation);
+	let selectedRoomId = $derived(currentConversation?.id);
+	let selectedAccountDid = $derived($auth.user?.did);
 
 	/** Resolve display name for 1:1 conversations using profile data. */
 	function resolvedDisplayName(convo: Conversation): string {
@@ -275,8 +277,8 @@
 	});
 
 	$effect(() => {
-		const convoId = currentConversation?.id;
-		const did = $auth.user?.did;
+		const convoId = selectedRoomId;
+		const did = selectedAccountDid;
 		let active = true;
 		replyingTo = null;
 		if (did && convoId) {
