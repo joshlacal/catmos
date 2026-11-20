@@ -1,10 +1,10 @@
-use base64::engine::general_purpose::STANDARD as B64;
+use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
 use base64::Engine;
 use catbird_atproto::jacquard_common::IntoStatic;
 use catbird_mls::payload_types::{MLSMessagePayload, MLSMessageType};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{Emitter, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -489,9 +489,122 @@ pub struct GroupMember {
     pub role: String,
 }
 
+const FIXED_UPGRADE_CALLBACK_HOST: &str = "catbird.blue";
+const FIXED_UPGRADE_CALLBACK_PATH: &str = "/oauth/permission-callback";
+
+fn generate_browser_nonce() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|e| format!("Failed to generate browser nonce: {e}"))?;
+    Ok(B64URL.encode(bytes))
+}
+
+fn build_desktop_login_url(
+    nest_url: &str,
+    identifier: &str,
+    redirect_to: &str,
+    browser_nonce: &str,
+    client_override: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "{}/auth/login?identifier={}&redirect_to={}&browser_nonce={}",
+        nest_url.trim_end_matches('/'),
+        urlencoding::encode(identifier),
+        urlencoding::encode(redirect_to),
+        urlencoding::encode(browser_nonce),
+    );
+    if let Some(client) = client_override.map(str::trim).filter(|c| !c.is_empty()) {
+        url.push_str("&client=");
+        url.push_str(&urlencoding::encode(client));
+    }
+    url
+}
+
+fn classify_pds_spaces_probe_response(status: u16, body: &[u8]) -> bool {
+    let err_code = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned));
+    if matches!(
+        err_code.as_deref(),
+        Some("XRPCNotSupported" | "MethodNotImplemented")
+    ) {
+        return false;
+    }
+    status == 200 || status == 400
+}
+
+fn parse_permission_callback_url(url: &reqwest::Url) -> Option<Result<String, String>> {
+    if url.scheme() != "https"
+        || url.host_str() != Some(FIXED_UPGRADE_CALLBACK_HOST)
+        || url.path() != FIXED_UPGRADE_CALLBACK_PATH
+    {
+        return None;
+    }
+    let mut code: Option<String> = None;
+    let mut error: Option<String> = None;
+    let mut error_description: Option<String> = None;
+    for (k, v) in url.query_pairs() {
+        match k.as_ref() {
+            "code" if !v.is_empty() => code = Some(v.into_owned()),
+            "error" if !v.is_empty() => error = Some(v.into_owned()),
+            "error_description" if !v.is_empty() => error_description = Some(v.into_owned()),
+            _ => {}
+        }
+    }
+    if let Some(err) = error {
+        let msg = match error_description {
+            Some(desc) => format!("{err}: {desc}"),
+            None => err,
+        };
+        return Some(Err(msg));
+    }
+    match code {
+        Some(c) => Some(Ok(c)),
+        None => Some(Err(
+            "Permission upgrade callback missing authorization code".to_string(),
+        )),
+    }
+}
+
+async fn exchange_oauth_code(
+    nest_url: &str,
+    code: &str,
+    browser_nonce: &str,
+) -> Result<String, String> {
+    let resp = reqwest::Client::new()
+        .post(format!("{}/auth/exchange", nest_url.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "code": code,
+            "browser_nonce": browser_nonce,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Authentication exchange request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Authentication exchange failed ({status}): {body}"));
+    }
+    let data: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to decode authentication exchange response: {e}"))?;
+    data["session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| "Authentication exchange response missing session_id".to_string())
+}
+
+enum CallbackOutcome {
+    Code(String),
+    SessionId(String),
+}
+
 #[tauri::command]
 pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
     let nest_url = crate::nest_url();
+    let browser_nonce = generate_browser_nonce()?;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -502,11 +615,15 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
         .port();
 
     let redirect_to = format!("http://127.0.0.1:{}/callback", port);
-    let login_url = format!(
-        "{}/auth/login?identifier={}&client=catmos&redirect_to={}",
-        nest_url,
-        urlencoding::encode(&identifier),
-        urlencoding::encode(&redirect_to)
+    // Default to the `catbird` OAuth client profile (which already declares all 6 Labyrinth/Spaces
+    // scopes on prod nest) unless `CATMOS_OAUTH_CLIENT` explicitly overrides it.
+    let client_override = std::env::var("CATMOS_OAUTH_CLIENT").ok();
+    let login_url = build_desktop_login_url(
+        &nest_url,
+        &identifier,
+        &redirect_to,
+        &browser_nonce,
+        client_override.as_deref(),
     );
 
     #[allow(deprecated)]
@@ -524,7 +641,18 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
         )
         .await
         {
-            Ok(Ok(session_id)) => {
+            Ok(Ok(CallbackOutcome::Code(code))) => {
+                match exchange_oauth_code(&nest_url, &code, &browser_nonce).await {
+                    Ok(session_id) => {
+                        let _ = app_handle.emit("oauth-callback", &session_id);
+                    }
+                    Err(e) => {
+                        log_catmos!("OAuth code exchange error: {}", e);
+                        let _ = app_handle.emit("oauth-error", &e);
+                    }
+                }
+            }
+            Ok(Ok(CallbackOutcome::SessionId(session_id))) => {
                 let _ = app_handle.emit("oauth-callback", &session_id);
             }
             Ok(Err(e)) => {
@@ -541,65 +669,368 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
     Ok(())
 }
 
-async fn wait_for_callback(listener: TcpListener) -> Result<String, String> {
+async fn wait_for_callback(listener: TcpListener) -> Result<CallbackOutcome, String> {
     const MAX_REQUEST_SIZE: usize = 8192;
 
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|e| format!("Accept failed: {}", e))?;
-
-    let mut buf = vec![0u8; MAX_REQUEST_SIZE];
-    let mut total = 0;
     loop {
-        if total >= MAX_REQUEST_SIZE {
-            return Err("OAuth callback request too large".to_string());
-        }
-        let n = stream
-            .read(&mut buf[total..])
+        let (mut stream, _) = listener
+            .accept()
             .await
-            .map_err(|e| format!("Read failed: {}", e))?;
-        if n == 0 {
-            break;
+            .map_err(|e| format!("Accept failed: {}", e))?;
+
+        let mut buf = vec![0u8; MAX_REQUEST_SIZE];
+        let mut total = 0;
+        loop {
+            if total >= MAX_REQUEST_SIZE {
+                return Err("OAuth callback request too large".to_string());
+            }
+            let n = stream
+                .read(&mut buf[total..])
+                .await
+                .map_err(|e| format!("Read failed: {}", e))?;
+            if n == 0 {
+                break;
+            }
+            total += n;
+            if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
         }
-        total += n;
-        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
+
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+        if req.parse(&buf[..total]).is_err() {
+            continue;
         }
+
+        let path = match req.path {
+            Some(p) => p,
+            None => continue,
+        };
+        let (route, query) = match path.split_once('?') {
+            Some((r, q)) => (r, Some(q)),
+            None => (path, None),
+        };
+        if route != "/callback" {
+            let not_found =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(not_found.as_bytes()).await;
+            let _ = stream.flush().await;
+            continue;
+        }
+
+        let query = query.ok_or("No query string in callback URL")?;
+        let mut code: Option<String> = None;
+        let mut session_id: Option<String> = None;
+        let mut error: Option<String> = None;
+        let mut error_description: Option<String> = None;
+        for param in query.split('&') {
+            if let Some(v) = param.strip_prefix("code=") {
+                let decoded = urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned();
+                if !decoded.is_empty() {
+                    code = Some(decoded);
+                }
+            } else if let Some(v) = param.strip_prefix("session_id=") {
+                let decoded = urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned();
+                if !decoded.is_empty() {
+                    session_id = Some(decoded);
+                }
+            } else if let Some(v) = param.strip_prefix("error=") {
+                let decoded = urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned();
+                if !decoded.is_empty() {
+                    error = Some(decoded);
+                }
+            } else if let Some(v) = param.strip_prefix("error_description=") {
+                let decoded = urlencoding::decode(v)
+                    .unwrap_or_else(|_| v.into())
+                    .into_owned();
+                if !decoded.is_empty() {
+                    error_description = Some(decoded);
+                }
+            }
+        }
+
+        let (html, outcome) = if let Some(err) = error {
+            let detail = match error_description {
+                Some(desc) => format!("{err}: {desc}"),
+                None => err,
+            };
+            (
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Sign-in cancelled</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#,
+                Err(detail),
+            )
+        } else if let Some(c) = code {
+            (
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Signed in</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#,
+                Ok(CallbackOutcome::Code(c)),
+            )
+        } else if let Some(sid) = session_id {
+            (
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Signed in</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#,
+                Ok(CallbackOutcome::SessionId(sid)),
+            )
+        } else {
+            (
+                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Sign-in failed</h1><p>Missing authorization code. Return to Catmos to retry.</p></div></body></html>"#,
+                Err("No authorization code or session_id in callback".to_string()),
+            )
+        };
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            html.len(),
+            html
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+        let _ = stream.flush().await;
+        return outcome;
+    }
+}
+
+#[tauri::command]
+pub async fn upgrade_oauth_scopes(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    additional_scopes: Vec<String>,
+) -> Result<AuthResponse, String> {
+    let current_did = require_authenticated_did(&state)?;
+    let current_session_id = require_auth_token(&state)?;
+    let nest_url = crate::nest_url();
+
+    let mut deduped: Vec<String> = Vec::new();
+    for raw in additional_scopes {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "atproto" || deduped.iter().any(|s| s == trimmed) {
+            continue;
+        }
+        deduped.push(trimmed.to_string());
+    }
+    if deduped.is_empty() {
+        return Err("No additional OAuth scopes requested for upgrade.".to_string());
     }
 
-    let mut headers = [httparse::EMPTY_HEADER; 16];
-    let mut req = httparse::Request::new(&mut headers);
-    req.parse(&buf[..total])
-        .map_err(|e| format!("HTTP parse error: {}", e))?;
+    let browser_nonce = generate_browser_nonce()?;
+    let http = reqwest::Client::new();
+    let start_resp = http
+        .post(format!("{}/auth/upgrade", nest_url.trim_end_matches('/')))
+        .bearer_auth(&current_session_id)
+        .json(&serde_json::json!({
+            "additional_scopes": deduped,
+            "browser_nonce": browser_nonce,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Permission upgrade initiation failed: {e}"))?;
 
-    let path = req.path.ok_or("No path in HTTP request")?;
-    let query = path
-        .split_once('?')
-        .map(|(_, q)| q)
-        .ok_or("No query string in callback URL")?;
+    if !start_resp.status().is_success() {
+        let status = start_resp.status();
+        let body = start_resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Permission upgrade initiation failed ({status}): {body}"
+        ));
+    }
 
-    let session_id = query
-        .split('&')
-        .find_map(|param| {
-            param.strip_prefix("session_id=").map(|v| {
-                urlencoding::decode(v)
-                    .unwrap_or_else(|_| v.into())
-                    .into_owned()
-            })
+    let start_json: serde_json::Value = start_resp
+        .json()
+        .await
+        .map_err(|e| format!("Decode /auth/upgrade response failed: {e}"))?;
+    let raw_auth_url = start_json["authorization_url"]
+        .as_str()
+        .map(str::trim)
+        .filter(|u| !u.is_empty() && !u.bytes().any(|b| b < 0x20 || b == 0x7f))
+        .ok_or_else(|| "Invalid authorization_url returned from /auth/upgrade".to_string())?;
+    let parsed_auth_url = reqwest::Url::parse(raw_auth_url)
+        .map_err(|e| format!("Malformed authorization_url from /auth/upgrade: {e}"))?;
+    if parsed_auth_url.scheme() != "https"
+        || !parsed_auth_url.username().is_empty()
+        || parsed_auth_url.password().is_some()
+    {
+        return Err("Insecure authorization_url returned from /auth/upgrade".to_string());
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
+    let tx_nav = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let tx_close = Arc::clone(&tx_nav);
+    let label = format!("oauth-upgrade-{}", uuid::Uuid::new_v4());
+
+    let popup = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed_auth_url))
+        .title("Grant Spaces Permissions")
+        .inner_size(540.0, 760.0)
+        .resizable(true)
+        .on_navigation(move |url| {
+            if let Some(result) = parse_permission_callback_url(url) {
+                if let Some(sender) = tx_nav.lock().ok().and_then(|mut g| g.take()) {
+                    let _ = sender.send(result);
+                }
+                return false;
+            }
+            true
         })
-        .ok_or_else(|| "No session_id in callback".to_string())?;
+        .build()
+        .map_err(|e| format!("Failed to open permission upgrade window: {e}"))?;
 
-    let html = r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Signed in</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#;
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html.len(),
-        html
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-    let _ = stream.flush().await;
+    popup.on_window_event(move |event| {
+        if matches!(event, WindowEvent::Destroyed) {
+            if let Some(sender) = tx_close.lock().ok().and_then(|mut g| g.take()) {
+                let _ = sender.send(Err("Permission upgrade cancelled.".to_string()));
+            }
+        }
+    });
 
-    Ok(session_id)
+    let code_result = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
+    if let Some(win) = tauri::Manager::get_webview_window(&app, &label) {
+        let _ = win.close();
+    }
+    let code = code_result
+        .map_err(|_| "Permission upgrade timed out".to_string())?
+        .map_err(|_| "Permission upgrade cancelled.".to_string())??;
+
+    // Exchange authorization code for candidate session
+    let ex_resp = http
+        .post(format!(
+            "{}/auth/upgrade/exchange",
+            nest_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&current_session_id)
+        .json(&serde_json::json!({
+            "code": code,
+            "browser_nonce": browser_nonce,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Permission upgrade exchange failed: {e}"))?;
+    if !ex_resp.status().is_success() {
+        let status = ex_resp.status();
+        let body = ex_resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Permission upgrade exchange failed ({status}): {body}"
+        ));
+    }
+    let ex_json: serde_json::Value = ex_resp
+        .json()
+        .await
+        .map_err(|e| format!("Decode /auth/upgrade/exchange failed: {e}"))?;
+    let candidate_session_id = ex_json["candidate_session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Permission upgrade exchange missing candidate_session_id".to_string())?
+        .to_string();
+    let ex_did = ex_json["did"].as_str().unwrap_or_default();
+    if !ex_did.eq_ignore_ascii_case(&current_did) {
+        return Err("Permission upgrade exchange DID mismatch.".to_string());
+    }
+
+    // Commit candidate session (with one retry on 5xx per nest contract)
+    let commit_url = format!("{}/auth/upgrade/commit", nest_url.trim_end_matches('/'));
+    let mut commit_resp = http
+        .post(&commit_url)
+        .bearer_auth(&candidate_session_id)
+        .send()
+        .await
+        .map_err(|e| format!("Permission upgrade commit failed: {e}"))?;
+    if commit_resp.status().is_server_error() {
+        commit_resp = http
+            .post(&commit_url)
+            .bearer_auth(&candidate_session_id)
+            .send()
+            .await
+            .map_err(|e| format!("Permission upgrade commit retry failed: {e}"))?;
+    }
+    if !commit_resp.status().is_success() {
+        let status = commit_resp.status();
+        let body = commit_resp.text().await.unwrap_or_default();
+        return Err(format!(
+            "Permission upgrade commit failed ({status}): {body}"
+        ));
+    }
+    let commit_json: serde_json::Value = commit_resp
+        .json()
+        .await
+        .map_err(|e| format!("Decode /auth/upgrade/commit failed: {e}"))?;
+    if commit_json["status"].as_str() != Some("committed") {
+        return Err("Permission upgrade commit returned unexpected status.".to_string());
+    }
+    let committed_session_id = commit_json["session_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| *s == candidate_session_id)
+        .ok_or_else(|| "Committed session_id did not match candidate_session_id.".to_string())?
+        .to_string();
+    let commit_did = commit_json["did"].as_str().unwrap_or_default();
+    if !commit_did.eq_ignore_ascii_case(&current_did) {
+        return Err("Committed session DID mismatch.".to_string());
+    }
+
+    // Fetch authoritative upgraded session info once
+    let session = fetch_session_info(&committed_session_id)
+        .await
+        .map_err(actionable_error)?;
+    state.set_session_auth(session.did.clone(), committed_session_id.clone());
+    state.mls_manager.set_account_did(Some(session.did.clone()));
+    state
+        .mls_manager
+        .set_session_token(Some(committed_session_id.clone()));
+
+    if let Ok(entry) = crate::native_keyring::entry("catmos", "session_id") {
+        let _ = entry.set_password(&committed_session_id);
+    }
+    if let Ok(entry) = crate::native_keyring::entry("catmos", "user_did") {
+        let _ = entry.set_password(&session.did);
+    }
+
+    Ok(AuthResponse {
+        did: session.did,
+        handle: session.handle,
+        display_name: None,
+        avatar: None,
+        granted_scopes: session.granted_scopes,
+    })
+}
+
+#[tauri::command]
+pub async fn labyrinth_probe_pds_spaces(state: State<'_, AppState>) -> Result<bool, String> {
+    let session_id = match state.current_token() {
+        Some(tok) if !tok.trim().is_empty() => tok,
+        _ => return Ok(false),
+    };
+    let nest_url = crate::nest_url();
+    let resp = match reqwest::Client::new()
+        .get(format!(
+            "{}/xrpc/com.atproto.space.getSpace",
+            nest_url.trim_end_matches('/')
+        ))
+        .bearer_auth(&session_id)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return Ok(false),
+    };
+    let status = resp.status().as_u16();
+    let body = resp.bytes().await.unwrap_or_default();
+    Ok(classify_pds_spaces_probe_response(status, &body))
+}
+
+#[tauri::command]
+pub async fn labyrinth_sync_backfill(
+    state: State<'_, AppState>,
+    did: String,
+) -> Result<Option<catbird_mls::client::LabyrinthBackupStatus>, String> {
+    let mgr = state.mls_manager.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = mgr.sync(&did);
+        let _ = mgr.flush_labyrinth_queue(&did);
+        mgr.status(&did)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))?
 }
 
 #[tauri::command]
@@ -612,6 +1043,7 @@ pub async fn complete_login(
         .map_err(actionable_error)?;
 
     state.set_session_auth(session.did.clone(), session_id.clone());
+    state.mls_manager.set_account_did(Some(session.did.clone()));
     state
         .mls_manager
         .set_session_token(Some(session_id.clone()));
@@ -666,6 +1098,7 @@ pub async fn try_restore_session(
                         log_catmos!("Stored session was rejected; clearing saved login: {}", e);
                         clear_saved_session_credentials();
                         state.clear_session_auth();
+                        state.mls_manager.set_account_did(None);
                         state.mls_manager.set_session_token(None);
                         return Ok(None);
                     }
@@ -688,6 +1121,7 @@ pub async fn try_restore_session(
             }
             log_catmos!("Restoring session for DID: {}", session.did);
             state.set_session_auth(session.did.clone(), sid.clone());
+            state.mls_manager.set_account_did(Some(session.did.clone()));
             state.mls_manager.set_session_token(Some(sid.clone()));
 
             // ctl #2: Only initialize MLS runtime + background sync if explicitly opted in.
@@ -731,6 +1165,7 @@ pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
         })
         .await;
     }
+    state.mls_manager.set_account_did(None);
     state.mls_manager.set_session_token(None);
     state.clear_session_auth();
     clear_saved_session_credentials();
@@ -778,6 +1213,7 @@ pub async fn delete_account_data(
     }
 
     stop_background_tasks_and_subscriptions(&state).await;
+    state.mls_manager.set_account_did(None);
     state.mls_manager.set_session_token(None);
     state.clear_session_auth();
     clear_saved_session_credentials();
@@ -2377,7 +2813,10 @@ pub async fn labyrinth_list_circle_owner_states(
 
 #[cfg(test)]
 mod tests {
-    use super::{cleanup_ws_handle, ui_message_from_row};
+    use super::{
+        build_desktop_login_url, classify_pds_spaces_probe_response, cleanup_ws_handle,
+        generate_browser_nonce, parse_permission_callback_url, ui_message_from_row,
+    };
     use catbird_mls::payload_types::{
         MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload,
     };
@@ -2473,5 +2912,78 @@ mod tests {
         assert!(handles.lock().await.contains_key("conversation"));
         cleanup_ws_handle(&handles, "conversation", &new_owner).await;
         assert!(!handles.lock().await.contains_key("conversation"));
+    }
+
+    #[test]
+    fn desktop_login_url_includes_43_char_browser_nonce_and_omits_client_by_default() {
+        let nonce = generate_browser_nonce().expect("browser nonce");
+        assert_eq!(nonce.len(), 43);
+        let default_url = build_desktop_login_url(
+            "https://api.catbird.blue",
+            "swan.place",
+            "http://127.0.0.1:43210/callback",
+            &nonce,
+            None,
+        );
+        assert!(default_url.contains("browser_nonce="));
+        assert!(!default_url.contains("client=catmos"));
+
+        let override_url = build_desktop_login_url(
+            "https://api.catbird.blue",
+            "swan.place",
+            "http://127.0.0.1:43210/callback",
+            &nonce,
+            Some("catmos"),
+        );
+        assert!(override_url.contains("&client=catmos"));
+    }
+
+    #[test]
+    fn spaces_probe_classifier_fails_closed_on_401_404_501_and_accepts_400_invalid_request() {
+        assert!(classify_pds_spaces_probe_response(
+            400,
+            br#"{"error":"InvalidRequest","message":"Missing required key space"}"#
+        ));
+        assert!(classify_pds_spaces_probe_response(200, b"{}"));
+        assert!(!classify_pds_spaces_probe_response(
+            401,
+            br#"{"error":"AuthRequired"}"#
+        ));
+        assert!(!classify_pds_spaces_probe_response(
+            404,
+            br#"{"error":"XRPCNotSupported"}"#
+        ));
+        assert!(!classify_pds_spaces_probe_response(
+            501,
+            br#"{"error":"MethodNotImplemented"}"#
+        ));
+        assert!(!classify_pds_spaces_probe_response(
+            400,
+            br#"{"error":"XRPCNotSupported"}"#
+        ));
+        assert!(!classify_pds_spaces_probe_response(500, b""));
+    }
+
+    #[test]
+    fn permission_callback_parser_matches_fixed_catbird_blue_callback_only() {
+        let ok_url =
+            reqwest::Url::parse("https://catbird.blue/oauth/permission-callback?code=abc123")
+                .unwrap();
+        assert_eq!(
+            parse_permission_callback_url(&ok_url),
+            Some(Ok("abc123".to_string()))
+        );
+
+        let err_url = reqwest::Url::parse(
+            "https://catbird.blue/oauth/permission-callback?error=access_denied&error_description=User%20cancelled",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_permission_callback_url(&err_url),
+            Some(Err("access_denied: User cancelled".to_string()))
+        );
+
+        let other_url = reqwest::Url::parse("https://swan.place/oauth/authorize?foo=bar").unwrap();
+        assert_eq!(parse_permission_callback_url(&other_url), None);
     }
 }

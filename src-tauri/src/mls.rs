@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use atproto_spaces::{
+    did_resolver::DidDocument,
     http_signature::sign_credential_request_minimal,
     is_valid_did,
     kem::{encode_p256_did_key, P256SecretKey},
@@ -296,9 +297,126 @@ fn store_seq_hash(space: &str, col: &str, rkey: &str, val: Option<&serde_json::V
     h.finish()
 }
 
+const PERSONAL_SPACE_READ_METHODS: &[&str] = &[
+    "com.atproto.space.getRecord",
+    "com.atproto.space.listRecords",
+    "com.atproto.space.listRepoOps",
+    "com.atproto.space.getRepo",
+    "com.atproto.space.getLatestCommit",
+    "com.atproto.space.getBlob",
+    "com.atproto.space.getSpace",
+    "com.atproto.space.listWriters",
+];
+
+fn validate_direct_pds_endpoint(pds_url: &str) -> Result<reqwest::Url, MLSError> {
+    let parsed = reqwest::Url::parse(pds_url)
+        .map_err(|e| MLSError::invalid_input(format!("invalid personal Space PDS URL: {e}")))?;
+    let scheme = parsed.scheme();
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| MLSError::invalid_input("personal Space PDS URL missing host"))?;
+    let is_loopback = matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1");
+    let scheme_ok = scheme == "https" || (cfg!(test) && scheme == "http" && is_loopback);
+    if !scheme_ok
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(MLSError::invalid_input(
+            "Invalid personal Space PDS endpoint",
+        ));
+    }
+    Ok(parsed)
+}
+
+pub(crate) fn personal_space_read_url(
+    request: &PlatformHttpRequest,
+    account_did: &str,
+    session_origin: &str,
+    pds_url: &str,
+) -> Result<String, MLSError> {
+    if !request.method.eq_ignore_ascii_case("GET") {
+        return Err(MLSError::invalid_input(
+            "Personal Space read does not match the signed-in account",
+        ));
+    }
+    let source = reqwest::Url::parse(&request.url).map_err(|_| {
+        MLSError::invalid_input("Personal Space read does not match the signed-in account")
+    })?;
+    let nsid = extract_xrpc_nsid(&request.url).ok_or_else(|| {
+        MLSError::invalid_input("Personal Space read does not match the signed-in account")
+    })?;
+    let audience = request
+        .headers
+        .iter()
+        .find(|h| h.name.eq_ignore_ascii_case("atproto-space-audience"))
+        .map(|h| h.value.as_str());
+    let query = source.query();
+    if origin_key(&request.url) != origin_key(session_origin)
+        || !PERSONAL_SPACE_READ_METHODS.contains(&nsid.as_str())
+        || audience != Some(account_did)
+        || query.is_none()
+    {
+        return Err(MLSError::invalid_input(
+            "Personal Space read does not match the signed-in account",
+        ));
+    }
+    let pds = validate_direct_pds_endpoint(pds_url)?;
+    let mut target = format!("{}/xrpc/{nsid}", pds.as_str().trim_end_matches('/'));
+    if let Some(q) = query {
+        target.push('?');
+        target.push_str(q);
+    }
+    Ok(target)
+}
+
+async fn resolve_did_pds_endpoint(client: &reqwest::Client, did: &str) -> Result<String, MLSError> {
+    let url = if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{}", urlencoding::encode(did))
+    } else if let Some(rest) = did.strip_prefix("did:web:") {
+        if rest.is_empty() || rest.contains('/') || rest.contains('?') || rest.contains('#') {
+            return Err(MLSError::invalid_input(format!(
+                "unsupported did:web for PDS lookup: {did}"
+            )));
+        }
+        let host = urlencoding::decode(rest).map_err(|_| {
+            MLSError::invalid_input(format!("invalid did:web host encoding: {did}"))
+        })?;
+        format!("https://{host}/.well-known/did.json")
+    } else {
+        return Err(MLSError::invalid_input(format!(
+            "unsupported DID method for PDS lookup: {did}"
+        )));
+    };
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| MLSError::Internal(format!("resolve DID document for {did}: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(MLSError::Internal(format!(
+            "resolve DID document for {did} returned HTTP {}",
+            resp.status().as_u16()
+        )));
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| MLSError::Internal(format!("read DID document for {did}: {e}")))?;
+    let doc = DidDocument::parse_json(did, &body)
+        .map_err(|e| MLSError::Internal(format!("parse DID document for {did}: {e}")))?;
+    doc.pds_endpoint()
+        .map(str::to_owned)
+        .map_err(|e| MLSError::Internal(format!("DID document for {did} missing PDS: {e}")))
+}
+
 pub struct TauriTransport {
     client: reqwest::Client,
+    direct_client: reqwest::Client,
     session_token: RwLock<Option<String>>,
+    account_did: RwLock<Option<String>>,
+    resolved_pds_cache: RwLock<HashMap<String, String>>,
     pds_endpoint: RwLock<String>,
     home_ds_endpoint: RwLock<String>,
     home_ds_did: RwLock<String>,
@@ -312,9 +430,17 @@ impl TauriTransport {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let direct_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             client,
+            direct_client,
             session_token: RwLock::new(None),
+            account_did: RwLock::new(None),
+            resolved_pds_cache: RwLock::new(HashMap::new()),
             pds_endpoint: RwLock::new(crate::nest_url()),
             home_ds_endpoint: RwLock::new("https://chat.catbird.blue".to_string()),
             home_ds_did: RwLock::new("did:web:chat.catbird.blue".to_string()),
@@ -347,6 +473,19 @@ impl TauriTransport {
     pub fn set_session_token(&self, token: Option<String>) {
         if let Ok(mut guard) = self.session_token.write() {
             *guard = token;
+        }
+    }
+
+    pub fn set_account_did(&self, did: Option<String>) {
+        if let Ok(mut guard) = self.account_did.write() {
+            *guard = did.map(|d| d.split('#').next().unwrap_or(&d).to_string());
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_resolved_pds_for_testing(&self, did: &str, pds_url: &str) {
+        if let Ok(mut cache) = self.resolved_pds_cache.write() {
+            cache.insert(did.to_string(), pds_url.to_string());
         }
     }
 
@@ -632,7 +771,15 @@ impl PlatformTransport for TauriTransport {
         }
 
         let client = self.client.clone();
+        let direct_client = self.direct_client.clone();
         let bearer = self.session_token.read().ok().and_then(|g| g.clone());
+        let account_did = self.account_did.read().ok().and_then(|g| g.clone());
+        let cached_pds = account_did.as_ref().and_then(|did| {
+            self.resolved_pds_cache
+                .read()
+                .ok()
+                .and_then(|cache| cache.get(did).cloned())
+        });
         let pds_endpoint = self
             .pds_endpoint
             .read()
@@ -649,7 +796,12 @@ impl PlatformTransport for TauriTransport {
             .map(|g| g.clone())
             .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
 
-        std::thread::spawn(move || {
+        let is_space_credential_read = request.headers.iter().any(|h| {
+            h.name.eq_ignore_ascii_case("authorization")
+                && h.value.starts_with("Atproto-Space-Credential ")
+        });
+
+        let (response, resolved_pds_update) = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -657,7 +809,33 @@ impl PlatformTransport for TauriTransport {
             rt.block_on(async move {
                 let method = reqwest::Method::from_bytes(request.method.as_bytes())
                     .map_err(|e| MLSError::invalid_input(format!("invalid HTTP method: {e}")))?;
-                let mut builder = client.request(method, &request.url);
+
+                // Personal Space reads carry `Atproto-Space-Credential` + RFC 9421 proof of
+                // possession headers that the BFF gateway strips, so route them directly to
+                // the signed-in account's resolved PDS (matching iOS PetrelPlatformTransport).
+                let mut resolved_pds_update: Option<(String, String)> = None;
+                let (effective_client, target_url) = if is_space_credential_read {
+                    let did = account_did.ok_or_else(|| {
+                        MLSError::invalid_input(
+                            "Personal Space read requires an authenticated account DID",
+                        )
+                    })?;
+                    let resolved_pds = match cached_pds {
+                        Some(pds) => pds,
+                        None => {
+                            let pds = resolve_did_pds_endpoint(&direct_client, &did).await?;
+                            resolved_pds_update = Some((did.clone(), pds.clone()));
+                            pds
+                        }
+                    };
+                    let direct_url =
+                        personal_space_read_url(&request, &did, &pds_endpoint, &resolved_pds)?;
+                    (&direct_client, direct_url)
+                } else {
+                    (&client, request.url.clone())
+                };
+
+                let mut builder = effective_client.request(method, &target_url);
                 let mut has_auth = false;
                 for h in &request.headers {
                     if h.name.eq_ignore_ascii_case("authorization") {
@@ -744,15 +922,24 @@ impl PlatformTransport for TauriTransport {
                     .await
                     .map_err(|e| MLSError::Internal(format!("read HTTP body: {e}")))?
                     .to_vec();
-                Ok(PlatformHttpResponse {
-                    status,
-                    headers,
-                    body,
-                })
+                Ok((
+                    PlatformHttpResponse {
+                        status,
+                        headers,
+                        body,
+                    },
+                    resolved_pds_update,
+                ))
             })
         })
         .join()
-        .map_err(|_| MLSError::Internal("HTTP transport worker panicked".to_string()))?
+        .map_err(|_| MLSError::Internal("HTTP transport worker panicked".to_string()))??;
+        if let Some((did, pds)) = resolved_pds_update {
+            if let Ok(mut cache) = self.resolved_pds_cache.write() {
+                cache.insert(did, pds);
+            }
+        }
+        Ok(response)
     }
 
     fn connect_realtime_stream(
@@ -872,6 +1059,10 @@ impl TauriMlsManager {
         self.transport.set_session_token(token);
     }
 
+    pub fn set_account_did(&self, did: Option<String>) {
+        self.transport.set_account_did(did);
+    }
+
     fn opt_in_marker_path(&self, did: &str) -> Result<PathBuf, String> {
         let normalized = normalize_account_did(did).map_err(|e| e.to_string())?;
         let did_hash = account_did_hash_hex(&normalized).map_err(|e| e.to_string())?;
@@ -939,6 +1130,7 @@ impl TauriMlsManager {
 
         self.transport
             .configure_endpoints(&pds_endpoint, &home_ds_endpoint, &home_ds_did);
+        self.transport.set_account_did(Some(normalized.clone()));
 
         #[cfg(test)]
         if let Some((ref live_tx, ref pds_url, ref ds_url, ref ds_did)) = self.live_test_transport {
@@ -1889,6 +2081,126 @@ mod tests {
         assert_eq!(observed[0].1, "Bearer fixture-account-token");
         assert!(observed[1].0.starts_with(&format!("GET /xrpc/{method} ")));
         assert_eq!(observed[1].1, "Bearer fixture-service-token");
+    }
+
+    #[test]
+    fn personal_space_read_rewrites_gateway_origin_to_direct_pds_and_preserves_headers() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let account_did = "did:plc:directspaceread123";
+        let direct_pds = TcpListener::bind("127.0.0.1:0").unwrap();
+        let direct_pds_url = format!("http://{}", direct_pds.local_addr().unwrap());
+
+        let mock_pds = std::thread::spawn(move || {
+            let (mut socket, _) = direct_pds.accept().unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut start = String::new();
+            reader.read_line(&mut start).unwrap();
+            let mut seen = HashMap::new();
+            for line in reader.lines() {
+                let line = line.unwrap();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once(':') {
+                    seen.insert(k.trim().to_ascii_lowercase(), v.trim().to_owned());
+                }
+            }
+            let body = r#"{"value":{"$type":"blue.catbird.labyrinth.epoch"}}"#;
+            write!(
+                socket,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+            (start, seen)
+        });
+
+        let transport = TauriTransport::new(None);
+        transport.configure_endpoints(
+            "https://api.catbird.blue",
+            "https://chat.catbird.blue",
+            "did:web:chat.catbird.blue",
+        );
+        transport.set_account_did(Some(account_did.into()));
+        transport.set_resolved_pds_for_testing(account_did, &direct_pds_url);
+
+        let query = "space=at%3A%2F%2Fdid%3Aplc%3Adirectspaceread123%2Fspace%2Fblue.catbird.labyrinth.mailbox%2Fself&repo=did%3Aplc%3Adirectspaceread123&collection=blue.catbird.labyrinth.epoch&rkey=000000000000";
+        let response = transport
+            .execute_http(PlatformHttpRequest {
+                method: "GET".into(),
+                url: format!("https://api.catbird.blue/xrpc/com.atproto.space.getRecord?{query}"),
+                headers: vec![
+                    PlatformHttpHeader {
+                        name: "Authorization".into(),
+                        value: "Atproto-Space-Credential cred.jwt.sig".into(),
+                    },
+                    PlatformHttpHeader {
+                        name: "Atproto-Space-Audience".into(),
+                        value: account_did.into(),
+                    },
+                    PlatformHttpHeader {
+                        name: "Signature-Input".into(),
+                        value: "sig1=(\"@method\" \"@target-uri\");created=1700000000".into(),
+                    },
+                    PlatformHttpHeader {
+                        name: "Signature".into(),
+                        value: "sig1=:dGVzdA==:".into(),
+                    },
+                    PlatformHttpHeader {
+                        name: "Accept-Signature".into(),
+                        value: "sig1=(\"atproto-space-record\")".into(),
+                    },
+                ],
+                body: None,
+            })
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let (start, headers) = mock_pds.join().unwrap();
+        assert!(start.starts_with(&format!("GET /xrpc/com.atproto.space.getRecord?{query} ")));
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Atproto-Space-Credential cred.jwt.sig")
+        );
+        assert_eq!(
+            headers.get("atproto-space-audience").map(String::as_str),
+            Some(account_did)
+        );
+        assert_eq!(
+            headers.get("signature").map(String::as_str),
+            Some("sig1=:dGVzdA==:")
+        );
+        assert!(headers.contains_key("signature-input"));
+        assert!(headers.contains_key("accept-signature"));
+    }
+
+    #[test]
+    fn personal_space_read_rejects_mismatched_audience() {
+        let req = PlatformHttpRequest {
+            method: "GET".into(),
+            url: "https://api.catbird.blue/xrpc/com.atproto.space.getRecord?space=at%3A%2F%2Fdid%3Aplc%3Aalice%2Fspace%2Fblue.catbird.labyrinth.mailbox%2Fself".into(),
+            headers: vec![
+                PlatformHttpHeader {
+                    name: "Authorization".into(),
+                    value: "Atproto-Space-Credential cred.jwt.sig".into(),
+                },
+                PlatformHttpHeader {
+                    name: "Atproto-Space-Audience".into(),
+                    value: "did:plc:bob".into(),
+                },
+            ],
+            body: None,
+        };
+        let err = personal_space_read_url(
+            &req,
+            "did:plc:alice",
+            "https://api.catbird.blue",
+            "https://swan.place",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("signed-in account"));
     }
 
     #[derive(Default)]

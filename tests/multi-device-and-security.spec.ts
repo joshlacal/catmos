@@ -612,7 +612,13 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 			assert.equal(workerOpened, false, 'must not open MLS worker when I15 gate rejects');
 			assert.equal(isMlsOptedInForDid(aliceDid), false);
 
-			// 3. PDS Spaces capability probe fails closed on 404/XRPCNotSupported and succeeds on 400 InvalidRequest
+			// 3. PDS Spaces capability probe fails closed on 401/404/501 and succeeds on 400 InvalidRequest
+			assert.equal(
+				await probePdsSpacesSupport(async () =>
+					new Response(JSON.stringify({ error: 'AuthRequired' }), { status: 401 })
+				),
+				false
+			);
 			assert.equal(
 				await probePdsSpacesSupport(async () =>
 					new Response(JSON.stringify({ error: 'XRPCNotSupported' }), { status: 501 })

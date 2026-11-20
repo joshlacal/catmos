@@ -139,7 +139,18 @@
 		} finally {
 			if (activeDid === did && session === accountSession) probingPds = false;
 		}
-		optedIn = isMlsOptedInForDid(did);
+		if (isTauri) {
+			try {
+				const existingStatus = await getLabyrinthStatus(did);
+				if (activeDid !== did || session !== accountSession) return;
+				optedIn = existingStatus !== null;
+				setMlsOptedInForDid(did, optedIn);
+			} catch {
+				optedIn = isMlsOptedInForDid(did);
+			}
+		} else {
+			optedIn = isMlsOptedInForDid(did);
+		}
 		if (optedIn) {
 			try {
 				await refreshDeviceIdentityAndStatus(did);
@@ -237,6 +248,7 @@
 			const nextStatus = await enableMlsAndEnroll(did, pdsSupportsSpaces, grantedScopes);
 			if (!await applyAccountStatus(did, session, nextStatus)) return;
 			optedIn = true;
+			await refreshDeviceIdentityAndStatus(did);
 			statusBanner = 'Encrypted Chat and Labyrinth 1.1 Spaces history enabled on this device.';
 		} catch (err) {
 			if (session !== accountSession) return;
@@ -296,6 +308,7 @@
 			const did = requireAuthenticatedDid();
 			const nextStatus = await restoreWithLabyrinthRecoveryCode(did, restoreCodeInput.trim());
 			if (!await applyAccountStatus(did, session, nextStatus)) return;
+			await refreshDeviceIdentityAndStatus(did);
 			restoreCodeInput = '';
 			statusBanner = `Restored Labyrinth mailbox and rotated to epoch ${nextStatus.epoch_seq}.`;
 		} catch (err) {

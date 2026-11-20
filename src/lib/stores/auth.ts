@@ -152,8 +152,17 @@ function createAuthStore() {
 				throw new Error('Cannot upgrade OAuth scopes without an authenticated session.');
 			}
 			if (isTauri) {
-				await this.startLogin(current.user.handle || current.user.did);
-				return;
+				update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
+				try {
+					const user = await api.upgradeOAuthScopesDesktop(scopes);
+					await fetchOwnProfile(user);
+					set({ user, loading: false, error: null, waitingForOAuth: false });
+					return;
+				} catch (e) {
+					const message = e instanceof Error ? e.message : String(e);
+					update((s) => ({ ...s, loading: false, error: message, waitingForOAuth: false }));
+					throw e;
+				}
 			}
 			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
 			try {

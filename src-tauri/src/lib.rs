@@ -121,6 +121,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::start_login,
             commands::complete_login,
+            commands::upgrade_oauth_scopes,
             commands::try_restore_session,
             commands::logout,
             commands::delete_account_data,
@@ -160,8 +161,10 @@ pub fn run() {
             commands::list_own_blocks,
             commands::get_quarantine_state,
             commands::confirm_manual_reset,
+            commands::labyrinth_probe_pds_spaces,
             commands::labyrinth_enable_and_enroll,
             commands::labyrinth_status,
+            commands::labyrinth_sync_backfill,
             commands::labyrinth_current_device_id,
             commands::labyrinth_setup_recovery_code,
             commands::labyrinth_restore_recovery_code,

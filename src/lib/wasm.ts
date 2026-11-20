@@ -691,10 +691,15 @@ export async function startLogin(identifier: string): Promise<void> {
 	const browserNonce = generateBrowserNonce();
 	sessionStorage.setItem(SS_PENDING_BROWSER_NONCE, browserNonce);
 
+	const isLoopback =
+		window.location.hostname === 'localhost' ||
+		window.location.hostname === '127.0.0.1' ||
+		window.location.hostname === '[::1]';
+	const clientParam = isLoopback ? '' : '&client=catmos';
 	const loginUrl =
 		`${NEST_URL}/auth/login` +
 		`?identifier=${encodeURIComponent(identifier)}` +
-		`&client=catmos` +
+		clientParam +
 		`&redirect_to=${encodeURIComponent(redirectTo)}` +
 		`&browser_nonce=${encodeURIComponent(browserNonce)}`;
 	window.location.href = loginUrl;
@@ -780,10 +785,32 @@ export async function probePdsSpacesSupport(
 			resp.status === 501 ||
 			errCode === 'XRPCNotSupported' ||
 			errCode === 'MethodNotImplemented';
-		return !notImplemented && resp.status < 500;
+		return !notImplemented && (resp.status === 200 || resp.status === 400);
 	} catch {
 		return false;
 	}
+}
+
+/**
+ * Run progressive OAuth scope upgrade (`POST /auth/upgrade` -> native popup callback
+ * -> `exchange` -> `commit`) inside the Tauri desktop host without touching prod `nest`.
+ */
+export async function upgradeOAuthScopesDesktop(
+	requestedScopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES
+): Promise<AuthState> {
+	const additionalScopes = buildUpgradeAdditionalScopes(requestedScopes);
+	if (additionalScopes.length === 0) {
+		throw new Error('No additional OAuth scopes requested for upgrade.');
+	}
+	const raw = await tauriInvoke<AuthState & { granted_scopes?: unknown }>('upgrade_oauth_scopes', {
+		additionalScopes
+	});
+	const grantedScopes = raw.grantedScopes ?? parseGrantedScopes(raw.granted_scopes);
+	return {
+		...raw,
+		did: normalizeAccountDid(raw.did),
+		grantedScopes
+	};
 }
 
 /**
@@ -2344,10 +2371,12 @@ export async function enableMlsAndEnroll(
 	const accountDid = normalizeAccountDid(did);
 	const plainScopes = Array.from(grantedScopes, (s) => String(s).trim()).filter(Boolean);
 	if (isTauri) {
-		return tauriInvoke('labyrinth_enable_and_enroll', {
+		const status = await tauriInvoke<LabyrinthBackupStatusView>('labyrinth_enable_and_enroll', {
 			did: accountDid,
 			grantedScopes: plainScopes
 		});
+		setMlsOptedInForDid(accountDid, true);
+		return status;
 	}
 	const gate = evaluateSpacesGateForUi(Boolean(pdsSupportsSpaces), plainScopes, accountDid);
 	if (!gate.eligible) {
@@ -2465,11 +2494,7 @@ export async function approveLabyrinthSiblingDevice(
 
 export async function syncLabyrinthBackfill(did: string): Promise<LabyrinthBackupStatusView | null> {
 	if (isTauri) {
-		try {
-			return await tauriInvoke<LabyrinthBackupStatusView>('labyrinth_sync_backfill', { did });
-		} catch {
-			return tauriInvoke<LabyrinthBackupStatusView>('labyrinth_status', { did });
-		}
+		return tauriInvoke<LabyrinthBackupStatusView>('labyrinth_sync_backfill', { did });
 	}
 	const w = await ensureUnifiedBrowserClientOpen(did);
 	await w.syncUnified();
