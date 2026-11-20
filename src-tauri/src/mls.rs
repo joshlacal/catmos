@@ -1343,8 +1343,28 @@ impl TauriMlsManager {
             .unwrap_or_else(|_| "https://chat.catbird.blue".to_string())
     }
 
+    /// If this device is still locally marked `pending_approval`, re-run idempotent
+    /// `enroll_device` so `catbird-mls` checks `getOwnDevices` on `chat.catbird.blue`.
+    /// Once an existing active device (e.g. iPhone) approves this device, this flips local
+    /// status to `active` and publishes `DirectRequestKeys` automatically.
+    /// Returns `true` if the device is STILL `pending_approval` on the delivery service.
+    fn refresh_pending_device_approval_if_needed(&self, client: &CatbirdMlsClient) -> bool {
+        if !client.is_device_pending_approval().unwrap_or(false) {
+            return false;
+        }
+        let scopes: Vec<String> = REQUIRED_LABYRINTH_OAUTH_SCOPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let _ = client.enroll_device(&scopes);
+        client.is_device_pending_approval().unwrap_or(false)
+    }
+
     pub fn sync(&self, did: &str) -> Result<u32, String> {
         let client = self.open_or_get_client(did)?;
+        if self.refresh_pending_device_approval_if_needed(&client) {
+            return Ok(0);
+        }
         let applied = client.sync().map_err(|e| e.to_string())?;
         let _ = client.fulfill_pending_group_leaves();
         Ok(applied)
@@ -1506,9 +1526,20 @@ impl TauriMlsManager {
         let client = self.open_or_get_client(did)?;
         let mut summary = LabyrinthArchiveRestoreSummary::default();
 
-        // Step 1: Run live sync first so `blue.catbird.chat.getConversations` populates
-        // `conversation_kind:<cid>` for every active conversation (and processes any pending Welcomes).
-        if let Err(err) = client.sync() {
+        // Step 0: If this device was enrolled in `pending_approval`, re-check whether an existing
+        // authorized device (e.g. iPhone) has approved it yet on `chat.catbird.blue`.
+        if self.refresh_pending_device_approval_if_needed(&client) {
+            let dev_label = self
+                .current_device_id(did)
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "this device".to_string());
+            summary.errors.push(format!(
+                "Device {dev_label} is still pending approval on chat.catbird.blue — your Labyrinth mailbox keys are unlocked, but the delivery service blocks conversation listing until approved. Open Catbird on your iPhone -> Settings -> Account & Security -> Devices, tap Approve for {dev_label}, then click Sync History Now."
+            ));
+        } else if let Err(err) = client.sync() {
+            // Step 1: Run live sync so `blue.catbird.chat.getConversations` populates
+            // `conversation_kind:<cid>` for every active conversation (and processes any pending Welcomes).
             summary.errors.push(format!("sync: {err}"));
         }
 

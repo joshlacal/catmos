@@ -75,6 +75,7 @@
 	let statusBanner = $state<string | null>(null);
 	let errorBanner = $state<string | null>(null);
 	let busy = $state(false);
+	let busyLabel = $state<string | null>(null);
 	let initializedForDid = $state<string | null>(null);
 	let accountSession = 0;
 
@@ -167,9 +168,15 @@
 	}
 
 	onMount(async () => {
-		const prfCap = await detectPasskeyPrfCapability();
-		canRegisterPasskeyPrf = prfCap.canRegisterPasskeyPrf;
-		passkeyReason = prfCap.reason;
+		if (isTauri) {
+			canRegisterPasskeyPrf = false;
+			passkeyReason =
+				'Passkey PRF (passkey.catbird.blue) is unavailable in the local desktop app origin; use your 40-character recovery code or approve this device from your iPhone.';
+		} else {
+			const prfCap = await detectPasskeyPrfCapability();
+			canRegisterPasskeyPrf = prfCap.canRegisterPasskeyPrf;
+			passkeyReason = prfCap.reason;
+		}
 
 		if (!activeDid && !$auth.loading) {
 			await auth.tryRestore();
@@ -269,20 +276,25 @@
 	async function handleSyncBackfillNow() {
 		const session = accountSession;
 		busy = true;
+		busyLabel = 'Checking device approval and syncing Labyrinth history…';
 		errorBanner = null;
 		statusBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
-			const summary = isTauri ? await restoreArchivedLabyrinthConversations(did) : null;
-			const nextStatus = await syncLabyrinthBackfill(did);
-			if (!await applyAccountStatus(did, session, nextStatus)) return;
-			await conversations.load();
-			if (summary) {
+			if (isTauri) {
+				const summary = await restoreArchivedLabyrinthConversations(did);
+				const nextStatus = await getLabyrinthStatus(did);
+				if (!await applyAccountStatus(did, session, nextStatus)) return;
+				await refreshDeviceIdentityAndStatus(did);
+				await conversations.load();
 				statusBanner = `Synced Labyrinth history: discovered ${summary.conversationsDiscovered} conversation(s), restored ${summary.messagesRestored} message(s) across ${summary.conversationsRestored} conversation(s).`;
 				if (summary.errors.length > 0) {
-					errorBanner = `Some conversations reported sync warnings: ${summary.errors.join(' | ')}`;
+					errorBanner = summary.errors.join(' | ');
 				}
 			} else {
+				const nextStatus = await syncLabyrinthBackfill(did);
+				if (!await applyAccountStatus(did, session, nextStatus)) return;
+				await conversations.load();
 				statusBanner = 'Synchronized sibling Space history batches.';
 			}
 		} catch (err) {
@@ -290,6 +302,7 @@
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
+			busyLabel = null;
 		}
 	}
 
@@ -317,7 +330,9 @@
 		if (!restoreCodeInput.trim()) return;
 		const session = accountSession;
 		busy = true;
+		busyLabel = 'Restoring Labyrinth keys from recovery code and syncing history (may take ~20s)…';
 		errorBanner = null;
+		statusBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
 			const nextStatus = await restoreWithLabyrinthRecoveryCode(did, restoreCodeInput.trim());
@@ -326,11 +341,15 @@
 			await conversations.load();
 			restoreCodeInput = '';
 			statusBanner = `Restored Labyrinth mailbox (epoch ${nextStatus.epoch_seq}) and synced archived conversations.`;
+			if (devicePendingApproval) {
+				errorBanner = `Mailbox keys restored, but device ${effectiveCurrentDeviceId ?? ''} is still pending approval on chat.catbird.blue. Approve it on your iPhone (Settings -> Account & Security -> Devices), then click Sync History Now.`;
+			}
 		} catch (err) {
 			if (session !== accountSession) return;
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
+			busyLabel = null;
 		}
 	}
 
@@ -434,17 +453,23 @@
 		}
 	}
 
+	function generateRandomSixDigitCode(): string {
+		const buf = new Uint32Array(1);
+		crypto.getRandomValues(buf);
+		return String(buf[0] % 1_000_000).padStart(6, '0');
+	}
+
 	async function handleOfferOtc() {
 		busy = true;
+		busyLabel = 'Starting 6-digit post-quantum OTC pairing session…';
 		errorBanner = null;
+		statusBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
 			const session = accountSession;
-			const offer = await initiateLabyrinthOtcPairing(did);
-			if (activeDid !== did || session !== accountSession) return;
-			otcOffer = offer;
+			const sixDigit = generateRandomSixDigitCode();
 			try {
-				const started = await startLiveLabyrinthOtcPairing(did, offer.six_digit_code);
+				const started = await startLiveLabyrinthOtcPairing(did, sixDigit);
 				if (activeDid !== did || session !== accountSession) return;
 				liveOtcSession = started;
 				otcOffer = {
@@ -452,13 +477,24 @@
 					formatted_code: started.formatted_code
 				};
 				otcInput = started.six_digit_code;
-			} catch {
-				if (activeDid === did && session === accountSession) liveOtcSession = null;
+				statusBanner =
+					'OTC pairing session started. Enter the Session ID and 6-digit code on your authorized iPhone, then click Pair Device below.';
+				return;
+			} catch (liveErr) {
+				if (devicePendingApproval) {
+					throw liveErr;
+				}
 			}
+			const offer = await initiateLabyrinthOtcPairing(did);
+			if (activeDid !== did || session !== accountSession) return;
+			otcOffer = offer;
+			liveOtcSession = null;
+			otcInput = offer.six_digit_code;
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
 			busy = false;
+			busyLabel = null;
 		}
 	}
 
@@ -655,19 +691,25 @@
 			</div>
 		</section>
 	{:else}
-		{#if devicePendingApproval || currentDeviceEntry?.status === 'pending_approval'}
-			<p class="banner warn" role="status">
-				This device is <strong>pending approval</strong> from an already-enrolled device. Approve it
-				from another active device, enter a 6-digit pairing code, or restore via Passkey PRF /
-				40-character recovery code to unlock prior history.
-			</p>
-		{/if}
-		{#if statusBanner}
-			<p class="banner ok" role="status">{statusBanner}</p>
-		{/if}
-		{#if errorBanner}
-			<p class="banner err" role="alert">{errorBanner}</p>
-		{/if}
+		<div class="banner-stack">
+			{#if busy && busyLabel}
+				<p class="banner info" role="status">{busyLabel}</p>
+			{/if}
+			{#if devicePendingApproval || currentDeviceEntry?.status === 'pending_approval'}
+				<p class="banner warn" role="status">
+					This device (<code>{effectiveCurrentDeviceId ?? 'pending'}</code>) is
+					<strong>pending approval</strong> on <code>chat.catbird.blue</code>. Open Catbird on your
+					iPhone &rarr; <strong>Settings &rarr; Account &amp; Security &rarr; Devices</strong> and
+					tap <strong>Approve</strong> for this device, then click <strong>Sync History Now</strong>.
+				</p>
+			{/if}
+			{#if statusBanner}
+				<p class="banner ok" role="status">{statusBanner}</p>
+			{/if}
+			{#if errorBanner}
+				<p class="banner err" role="alert">{errorBanner}</p>
+			{/if}
+		</div>
 
 		<section class="card" aria-labelledby="spaces-gate-heading">
 			<h2 id="spaces-gate-heading">ATProto Spaces &amp; Opt-In Status</h2>
@@ -1030,6 +1072,23 @@
 		gap: 20px;
 		overflow-y: auto;
 		height: 100%;
+	}
+
+	.banner-stack {
+		position: sticky;
+		top: 0;
+		z-index: 10;
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		background: var(--bg-primary, #0f1115);
+		padding-top: 4px;
+	}
+
+	.banner.info {
+		background: rgba(59, 130, 246, 0.14);
+		border: 1px solid rgba(59, 130, 246, 0.4);
+		color: var(--text-primary);
 	}
 
 	.header-row {
