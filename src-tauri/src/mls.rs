@@ -8,7 +8,8 @@
 //!   fresh sign-ins never open SQLite databases, upload KeyPackages, or probe PDS/DS endpoints
 //!   until explicit user opt-in.
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -992,6 +993,44 @@ impl PlatformChangeObserver for TauriChangeObserver {
 #[cfg(test)]
 type LiveTestTransportOverride = (Arc<dyn PlatformTransport>, String, String, String);
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LabyrinthArchiveRestoreSummary {
+    pub conversations_discovered: u32,
+    pub conversations_restored: u32,
+    pub messages_restored: u32,
+    pub errors: Vec<String>,
+}
+
+fn collect_archive_candidate_conversation_ids(
+    local_ids: impl IntoIterator<Item = String>,
+    account_meta_kind_keys: impl IntoIterator<Item = String>,
+    read_state_ids: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for id in local_ids {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            ids.insert(trimmed.to_owned());
+        }
+    }
+    for key in account_meta_kind_keys {
+        if let Some(cid) = key.strip_prefix("conversation_kind:") {
+            let trimmed = cid.trim();
+            if !trimmed.is_empty() {
+                ids.insert(trimmed.to_owned());
+            }
+        }
+    }
+    for id in read_state_ids {
+        let trimmed = id.trim();
+        if !trimmed.is_empty() {
+            ids.insert(trimmed.to_owned());
+        }
+    }
+    ids.into_iter().collect()
+}
+
 pub struct TauriMlsManager {
     data_dir: PathBuf,
     keystore: Arc<TauriKeyStore>,
@@ -1446,6 +1485,79 @@ impl TauriMlsManager {
             .map_err(|e| e.to_string())
     }
 
+    pub fn restore_conversation_from_owner_mailbox(
+        &self,
+        did: &str,
+        conversation_id: &str,
+    ) -> Result<u32, String> {
+        let client = self.open_or_get_client(did)?;
+        client
+            .restore_conversation_from_owner_mailbox(conversation_id)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Discovers existing conversations across live DS inventory (`sync()` -> `conversation_kind:*`),
+    /// local conversations, and personal `OwnerMailbox` read states, then pulls & decrypts their
+    /// archived Labyrinth message batches into the local SQLite database.
+    pub fn restore_archived_conversations(
+        &self,
+        did: &str,
+    ) -> Result<LabyrinthArchiveRestoreSummary, String> {
+        let client = self.open_or_get_client(did)?;
+        let mut summary = LabyrinthArchiveRestoreSummary::default();
+
+        // Step 1: Run live sync first so `blue.catbird.chat.getConversations` populates
+        // `conversation_kind:<cid>` for every active conversation (and processes any pending Welcomes).
+        if let Err(err) = client.sync() {
+            summary.errors.push(format!("sync: {err}"));
+        }
+
+        // Step 2: Gather candidate conversation IDs from all authoritative sources.
+        let local_ids: Vec<String> = client
+            .list_conversations(None, 500)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.conversation_id)
+            .collect();
+        let meta_keys: Vec<String> = client
+            .db()
+            .read_tx(|tx| tx.list_account_meta_prefix("conversation_kind:"))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        let read_state_ids: Vec<String> = match client.list_read_states() {
+            Ok(states) => states.into_iter().map(|s| s.conversation_id).collect(),
+            Err(err) => {
+                summary.errors.push(format!("list_read_states: {err}"));
+                Vec::new()
+            }
+        };
+
+        let candidates =
+            collect_archive_candidate_conversation_ids(local_ids, meta_keys, read_state_ids);
+        summary.conversations_discovered = candidates.len() as u32;
+
+        // Step 3: Pull & decrypt Labyrinth archive history for each discovered conversation.
+        for cid in candidates {
+            match client.restore_conversation_from_owner_mailbox(&cid) {
+                Ok(restored) => {
+                    if restored > 0 {
+                        summary.conversations_restored =
+                            summary.conversations_restored.saturating_add(1);
+                        summary.messages_restored =
+                            summary.messages_restored.saturating_add(restored);
+                    }
+                }
+                Err(err) => {
+                    summary.errors.push(format!("{cid}: {err}"));
+                }
+            }
+        }
+
+        Ok(summary)
+    }
+
     pub fn leave_conversation(
         &self,
         did: &str,
@@ -1822,17 +1934,34 @@ impl TauriMlsManager {
             .map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let members = client
+            let mut members = client
                 .list_members(&row.conversation_id)
                 .unwrap_or_default();
             let meta = client
                 .get_group_metadata(&row.conversation_id)
                 .ok()
                 .flatten();
-            let last_msg = client
-                .list_messages(&row.conversation_id, None, 1)
-                .ok()
-                .and_then(|mut v| v.pop());
+            let recent_msgs = client
+                .list_messages(
+                    &row.conversation_id,
+                    None,
+                    if members.is_empty() { 50 } else { 1 },
+                )
+                .unwrap_or_default();
+            if members.is_empty() && !recent_msgs.is_empty() {
+                let mut seen = BTreeSet::new();
+                for msg in &recent_msgs {
+                    let sender = msg.sender_did.trim();
+                    if !sender.is_empty() && seen.insert(sender.to_owned()) {
+                        members.push(sender.to_owned());
+                    }
+                }
+                let self_did = normalize_account_did(did).unwrap_or_else(|_| did.to_owned());
+                if !self_did.is_empty() && seen.insert(self_did.clone()) {
+                    members.push(self_did);
+                }
+            }
+            let last_msg = recent_msgs.into_iter().last();
             out.push((row, members, meta, last_msg));
         }
         Ok(out)
@@ -2697,5 +2826,31 @@ mod tests {
             .is_err());
         assert!(store.load_signature_keypair("key-1".to_string()).is_err());
         assert!(store.delete_account_keys("a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn archive_candidate_discovery_merges_and_deduplicates_all_sources() {
+        let ids = collect_archive_candidate_conversation_ids(
+            vec!["convo-local".to_string(), "convo-shared".to_string()],
+            vec![
+                "conversation_kind:convo-ds-only".to_string(),
+                "conversation_kind:convo-shared".to_string(),
+                "unrelated_meta:ignored".to_string(),
+            ],
+            vec![
+                "convo-readstate".to_string(),
+                "convo-ds-only".to_string(),
+                "  ".to_string(),
+            ],
+        );
+        assert_eq!(
+            ids,
+            vec![
+                "convo-ds-only".to_string(),
+                "convo-local".to_string(),
+                "convo-readstate".to_string(),
+                "convo-shared".to_string(),
+            ]
+        );
     }
 }

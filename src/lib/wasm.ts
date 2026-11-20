@@ -2624,6 +2624,39 @@ export async function respondLiveLabyrinthOtcPairing(
 	await w.respondLiveOtcPairing(sessionIdHex, sixDigitCode ?? null);
 }
 
+export interface LabyrinthArchiveRestoreSummary {
+	conversationsDiscovered: number;
+	conversationsRestored: number;
+	messagesRestored: number;
+	errors: string[];
+}
+
+export async function restoreArchivedLabyrinthConversations(
+	did: string
+): Promise<LabyrinthArchiveRestoreSummary> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_archived_conversations', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.syncUnified();
+	return {
+		conversationsDiscovered: 0,
+		conversationsRestored: 0,
+		messagesRestored: 0,
+		errors: []
+	};
+}
+
+export async function restoreLabyrinthConversationHistory(
+	did: string,
+	conversationId: string
+): Promise<number> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_conversation_history', { did, conversationId });
+	}
+	return verifyAndReindexLabyrinthHistory(did, conversationId);
+}
+
 export async function verifyAndReindexLabyrinthHistory(
 	did: string,
 	conversationId: string

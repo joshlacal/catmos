@@ -1,9 +1,11 @@
 <script lang="ts">
+	import { page } from '$app/state';
 	import { conversations } from '#lib/stores/conversations.ts';
 	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import { drafts } from '#lib/stores/drafts.ts';
 	import { profiles } from '#lib/stores/profiles.ts';
+	import { isMlsOptedInForDid } from '#lib/labyrinth-ui.ts';
 	import UserSearch from './UserSearch.svelte';
 	import type { SearchResult } from '#lib/wasm.ts';
 	import type { Conversation } from '#lib/tauri.ts';
@@ -25,6 +27,11 @@
 	} = $props();
 
 	let showCreateDialog = $state(false);
+	const isOptedIn = $derived.by(() => {
+		void page.url.pathname;
+		void $conversations.items.length;
+		return Boolean($auth.user?.did && isMlsOptedInForDid($auth.user.did));
+	});
 
 	// Open create dialog when requested externally
 	$effect(() => {
@@ -189,8 +196,18 @@
 
 		{#if $conversations.items.length === 0 && !$conversations.loading}
 			<div class="empty-conversations">
-				<p class="empty-text">No conversations yet</p>
-				<p class="empty-hint">Start a new chat to get going</p>
+				{#if $auth.user?.did && !isOptedIn}
+					<p class="empty-text">Encrypted Chat is off</p>
+					<p class="empty-hint">
+						Enable Encrypted Chat &amp; Labyrinth Backup to sync conversations and restore history
+						from your PDS.
+					</p>
+					<a href="/settings/labyrinth" class="empty-cta">Set Up &amp; Restore History</a>
+				{:else}
+					<p class="empty-text">No conversations yet</p>
+					<p class="empty-hint">Start a new chat or restore history from Labyrinth Backup</p>
+					<a href="/settings/labyrinth" class="empty-link">Labyrinth Backup &amp; Restore</a>
+				{/if}
 			</div>
 		{/if}
 	</div>
@@ -483,6 +500,35 @@
 		color: var(--text-tertiary);
 		font-size: 13px;
 		margin-top: 4px;
+	}
+
+	.empty-cta {
+		margin-top: 14px;
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		padding: 8px 14px;
+		border-radius: var(--radius-md);
+		background: var(--accent);
+		color: var(--text-on-accent);
+		font-size: 13px;
+		font-weight: 600;
+		text-decoration: none;
+	}
+
+	.empty-cta:hover {
+		opacity: 0.92;
+	}
+
+	.empty-link {
+		margin-top: 10px;
+		font-size: 12px;
+		color: var(--text-link);
+		text-decoration: none;
+	}
+
+	.empty-link:hover {
+		text-decoration: underline;
 	}
 
 	.sidebar-footer {

@@ -1032,12 +1032,67 @@ pub async fn labyrinth_sync_backfill(
 ) -> Result<Option<catbird_mls::client::LabyrinthBackupStatus>, String> {
     let mgr = state.mls_manager.clone();
     tokio::task::spawn_blocking(move || {
-        let _ = mgr.sync(&did);
-        let _ = mgr.flush_labyrinth_queue(&did);
+        match mgr.restore_archived_conversations(&did) {
+            Ok(summary) => {
+                log_catmos!(
+                    "labyrinth_sync_backfill: discovered={}, restored_convos={}, restored_msgs={}, errors={:?}",
+                    summary.conversations_discovered,
+                    summary.conversations_restored,
+                    summary.messages_restored,
+                    summary.errors
+                );
+            }
+            Err(e) => {
+                log_catmos!("labyrinth_sync_backfill archive restore warning: {e}");
+            }
+        }
+        if let Err(e) = mgr.flush_labyrinth_queue(&did) {
+            log_catmos!("labyrinth_sync_backfill flush warning: {e}");
+        }
         mgr.status(&did)
     })
     .await
     .map_err(|e| format!("task join error: {e}"))?
+}
+
+#[tauri::command]
+pub async fn labyrinth_restore_archived_conversations(
+    state: State<'_, AppState>,
+    did: String,
+) -> Result<crate::mls::LabyrinthArchiveRestoreSummary, String> {
+    let mgr = state.mls_manager.clone();
+    let summary = tokio::task::spawn_blocking(move || mgr.restore_archived_conversations(&did))
+        .await
+        .map_err(|e| format!("task join error: {e}"))??;
+    log_catmos!(
+        "labyrinth_restore_archived_conversations: discovered={}, restored_convos={}, restored_msgs={}, errors={:?}",
+        summary.conversations_discovered,
+        summary.conversations_restored,
+        summary.messages_restored,
+        summary.errors
+    );
+    Ok(summary)
+}
+
+#[tauri::command]
+pub async fn labyrinth_restore_conversation_history(
+    state: State<'_, AppState>,
+    did: String,
+    conversation_id: String,
+) -> Result<u32, String> {
+    let mgr = state.mls_manager.clone();
+    let cid = conversation_id.trim().to_string();
+    let count = tokio::task::spawn_blocking(move || {
+        mgr.restore_conversation_from_owner_mailbox(&did, &cid)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+    log_catmos!(
+        "labyrinth_restore_conversation_history: convo={}, restored_msgs={}",
+        conversation_id.trim(),
+        count
+    );
+    Ok(count)
 }
 
 #[tauri::command]
@@ -2560,9 +2615,31 @@ pub async fn labyrinth_restore_recovery_code(
     recovery_code_input: String,
 ) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
     let mgr = state.mls_manager.clone();
-    tokio::task::spawn_blocking(move || mgr.restore_recovery_code(&did, &recovery_code_input))
-        .await
-        .map_err(|e| format!("task join error: {e}"))?
+    let did_for_restore = did.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        let status = mgr.restore_recovery_code(&did_for_restore, &recovery_code_input)?;
+        let _ = mgr.set_opted_in(&did_for_restore, true);
+        match mgr.restore_archived_conversations(&did_for_restore) {
+            Ok(summary) => {
+                log_catmos!(
+                    "post-recovery-code archive restore: discovered={}, restored_convos={}, restored_msgs={}, errors={:?}",
+                    summary.conversations_discovered,
+                    summary.conversations_restored,
+                    summary.messages_restored,
+                    summary.errors
+                );
+            }
+            Err(e) => {
+                log_catmos!("post-recovery-code archive restore warning: {e}");
+            }
+        }
+        Ok::<_, String>(status)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+    start_kp_monitor(&state, did.clone()).await;
+    start_sync_loop(&state, did).await;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2586,9 +2663,31 @@ pub async fn labyrinth_restore_passkey_prf(
     prf_output32: Vec<u8>,
 ) -> Result<catbird_mls::client::LabyrinthBackupStatus, String> {
     let mgr = state.mls_manager.clone();
-    tokio::task::spawn_blocking(move || mgr.restore_passkey_prf(&did, credential_id, prf_output32))
-        .await
-        .map_err(|e| format!("task join error: {e}"))?
+    let did_for_restore = did.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        let status = mgr.restore_passkey_prf(&did_for_restore, credential_id, prf_output32)?;
+        let _ = mgr.set_opted_in(&did_for_restore, true);
+        match mgr.restore_archived_conversations(&did_for_restore) {
+            Ok(summary) => {
+                log_catmos!(
+                    "post-passkey archive restore: discovered={}, restored_convos={}, restored_msgs={}, errors={:?}",
+                    summary.conversations_discovered,
+                    summary.conversations_restored,
+                    summary.messages_restored,
+                    summary.errors
+                );
+            }
+            Err(e) => {
+                log_catmos!("post-passkey archive restore warning: {e}");
+            }
+        }
+        Ok::<_, String>(status)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+    start_kp_monitor(&state, did.clone()).await;
+    start_sync_loop(&state, did).await;
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2698,9 +2797,31 @@ pub async fn labyrinth_complete_otc(
     six_digit_code: String,
 ) -> Result<catbird_mls::client::OtcPairingCompletion, String> {
     let mgr = state.mls_manager.clone();
-    tokio::task::spawn_blocking(move || mgr.complete_otc(&did, &six_digit_code))
-        .await
-        .map_err(|e| format!("task join error: {e}"))?
+    let did_for_otc = did.clone();
+    let completion = tokio::task::spawn_blocking(move || {
+        let res = mgr.complete_otc(&did_for_otc, &six_digit_code)?;
+        let _ = mgr.set_opted_in(&did_for_otc, true);
+        match mgr.restore_archived_conversations(&did_for_otc) {
+            Ok(summary) => {
+                log_catmos!(
+                    "post-otc archive restore: discovered={}, restored_convos={}, restored_msgs={}, errors={:?}",
+                    summary.conversations_discovered,
+                    summary.conversations_restored,
+                    summary.messages_restored,
+                    summary.errors
+                );
+            }
+            Err(e) => {
+                log_catmos!("post-otc archive restore warning: {e}");
+            }
+        }
+        Ok::<_, String>(res)
+    })
+    .await
+    .map_err(|e| format!("task join error: {e}"))??;
+    start_kp_monitor(&state, did.clone()).await;
+    start_sync_loop(&state, did).await;
+    Ok(completion)
 }
 
 #[tauri::command]

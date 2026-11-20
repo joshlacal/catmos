@@ -165,6 +165,8 @@ pub fn run() {
             commands::labyrinth_enable_and_enroll,
             commands::labyrinth_status,
             commands::labyrinth_sync_backfill,
+            commands::labyrinth_restore_archived_conversations,
+            commands::labyrinth_restore_conversation_history,
             commands::labyrinth_current_device_id,
             commands::labyrinth_setup_recovery_code,
             commands::labyrinth_restore_recovery_code,

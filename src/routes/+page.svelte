@@ -2,6 +2,7 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
+	import { isMlsOptedInForDid } from '#lib/labyrinth-ui.ts';
 	import {
 		conversations,
 		selectedConversation,
@@ -560,7 +561,21 @@
 				<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
 			</svg>
 			<h2>Welcome to Catmos</h2>
-			<p>Select a conversation or start a new one</p>
+			{#if $auth.user?.did && !isMlsOptedInForDid($auth.user.did)}
+				<p>
+					Encrypted Chat &amp; Labyrinth Backup is off by default on fresh sign-in. Enable it to
+					sync conversations and restore your encrypted PDS history.
+				</p>
+				<a
+					href="/settings/labyrinth"
+					class="btn btn-primary"
+					style="display: inline-block; margin-top: 16px; text-decoration: none;"
+				>
+					Set Up Encrypted Chat &amp; Restore History
+				</a>
+			{:else}
+				<p>Select a conversation or start a new one</p>
+			{/if}
 		</div>
 	</div>
 {/if}

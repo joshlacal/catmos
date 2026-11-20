@@ -2,6 +2,7 @@
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { auth } from '#lib/stores/auth.ts';
+	import { conversations } from '#lib/stores/conversations.ts';
 	import { normalizeAccountDid, tryNormalizeAccountDid } from '#lib/did.ts';
 	import {
 		approveLabyrinthSiblingDevice,
@@ -16,6 +17,8 @@
 		probePdsSpacesSupport,
 		registerLabyrinthPasskeyPrf,
 		respondLiveLabyrinthOtcPairing,
+		restoreArchivedLabyrinthConversations,
+		restoreLabyrinthConversationHistory,
 		restoreWithLabyrinthPasskeyPrf,
 		restoreWithLabyrinthRecoveryCode,
 		revokeRegisteredLabyrinthDeviceLive,
@@ -249,6 +252,7 @@
 			if (!await applyAccountStatus(did, session, nextStatus)) return;
 			optedIn = true;
 			await refreshDeviceIdentityAndStatus(did);
+			await conversations.load();
 			statusBanner = 'Encrypted Chat and Labyrinth 1.1 Spaces history enabled on this device.';
 		} catch (err) {
 			if (session !== accountSession) return;
@@ -266,11 +270,21 @@
 		const session = accountSession;
 		busy = true;
 		errorBanner = null;
+		statusBanner = null;
 		try {
 			const did = requireAuthenticatedDid();
+			const summary = isTauri ? await restoreArchivedLabyrinthConversations(did) : null;
 			const nextStatus = await syncLabyrinthBackfill(did);
 			if (!await applyAccountStatus(did, session, nextStatus)) return;
-			statusBanner = 'Synchronized sibling Space history batches.';
+			await conversations.load();
+			if (summary) {
+				statusBanner = `Synced Labyrinth history: discovered ${summary.conversationsDiscovered} conversation(s), restored ${summary.messagesRestored} message(s) across ${summary.conversationsRestored} conversation(s).`;
+				if (summary.errors.length > 0) {
+					errorBanner = `Some conversations reported sync warnings: ${summary.errors.join(' | ')}`;
+				}
+			} else {
+				statusBanner = 'Synchronized sibling Space history batches.';
+			}
 		} catch (err) {
 			if (session !== accountSession) return;
 			errorBanner = err instanceof Error ? err.message : String(err);
@@ -309,8 +323,9 @@
 			const nextStatus = await restoreWithLabyrinthRecoveryCode(did, restoreCodeInput.trim());
 			if (!await applyAccountStatus(did, session, nextStatus)) return;
 			await refreshDeviceIdentityAndStatus(did);
+			await conversations.load();
 			restoreCodeInput = '';
-			statusBanner = `Restored Labyrinth mailbox and rotated to epoch ${nextStatus.epoch_seq}.`;
+			statusBanner = `Restored Labyrinth mailbox (epoch ${nextStatus.epoch_seq}) and synced archived conversations.`;
 		} catch (err) {
 			if (session !== accountSession) return;
 			errorBanner = err instanceof Error ? err.message : String(err);
@@ -408,7 +423,9 @@
 			if (activeDid !== canonicalDid || session !== accountSession) return;
 			const nextStatus = await restoreWithLabyrinthPasskeyPrf(canonicalDid, credentialId, prfOutput32);
 			if (!await applyAccountStatus(canonicalDid, session, nextStatus)) return;
-			statusBanner = `Restored Labyrinth mailbox via Passkey PRF (epoch ${nextStatus.epoch_seq}).`;
+			await refreshDeviceIdentityAndStatus(canonicalDid);
+			await conversations.load();
+			statusBanner = `Restored Labyrinth mailbox via Passkey PRF (epoch ${nextStatus.epoch_seq}) and synced archived conversations.`;
 		} catch (err) {
 			if (session !== accountSession) return;
 			errorBanner = mapWebAuthnErrorToMessage(err);
@@ -468,6 +485,25 @@
 		}
 	}
 
+	async function handleRestoreConversationFromArchive() {
+		if (!reindexConversationId.trim()) return;
+		busy = true;
+		errorBanner = null;
+		try {
+			const did = requireAuthenticatedDid();
+			const targetConvo = reindexConversationId.trim();
+			const restored = await restoreLabyrinthConversationHistory(did, targetConvo);
+			await refreshDeviceIdentityAndStatus(did);
+			await conversations.load();
+			reindexConversationId = '';
+			statusBanner = `Restored ${restored} message(s) from Labyrinth for conversation ${targetConvo}.`;
+		} catch (err) {
+			errorBanner = err instanceof Error ? err.message : String(err);
+		} finally {
+			busy = false;
+		}
+	}
+
 	async function handleVerifyAndReindexHistory(event: SubmitEvent) {
 		event.preventDefault();
 		if (!reindexConversationId.trim()) return;
@@ -478,6 +514,7 @@
 			const targetConvo = reindexConversationId.trim();
 			const reindexed = await verifyAndReindexLabyrinthHistory(did, targetConvo);
 			await refreshDeviceIdentityAndStatus(did);
+			await conversations.load();
 			reindexConversationId = '';
 			statusBanner = `Verified and re-indexed ${reindexed} message(s) for conversation ${targetConvo}.`;
 		} catch (err) {
@@ -496,8 +533,9 @@
 			const did = requireAuthenticatedDid();
 			const res = await completeLabyrinthOtcPairing(did, otcInput.trim());
 			await refreshDeviceIdentityAndStatus(did);
+			await conversations.load();
 			otcInput = '';
-			statusBanner = `Completed hybrid PQ CPace + ML-KEM-768 pairing (epoch ${res.new_epoch_seq}).`;
+			statusBanner = `Completed hybrid PQ CPace + ML-KEM-768 pairing (epoch ${res.new_epoch_seq}) and synced archived conversations.`;
 		} catch (err) {
 			errorBanner = err instanceof Error ? err.message : String(err);
 		} finally {
@@ -852,6 +890,14 @@
 					bind:value={reindexConversationId}
 					disabled={!optedIn || busy}
 				/>
+				<button
+					type="button"
+					class="btn-primary"
+					disabled={!optedIn || busy || !reindexConversationId.trim()}
+					onclick={handleRestoreConversationFromArchive}
+				>
+					Restore from Labyrinth
+				</button>
 				<button type="submit" class="btn-secondary" disabled={!optedIn || busy}>
 					Verify &amp; Re-Index History
 				</button>
