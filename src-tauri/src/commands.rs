@@ -569,9 +569,11 @@ async fn exchange_oauth_code(
     nest_url: &str,
     code: &str,
     browser_nonce: &str,
+    callback_origin: &str,
 ) -> Result<String, String> {
     let resp = reqwest::Client::new()
         .post(format!("{}/auth/exchange", nest_url.trim_end_matches('/')))
+        .header("Origin", callback_origin)
         .json(&serde_json::json!({
             "code": code,
             "browser_nonce": browser_nonce,
@@ -614,7 +616,8 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
         .map_err(|e| format!("Failed to get port: {}", e))?
         .port();
 
-    let redirect_to = format!("http://127.0.0.1:{}/callback", port);
+    let callback_origin = format!("http://127.0.0.1:{}", port);
+    let redirect_to = format!("{}/callback", callback_origin);
     // Default to the `catbird` OAuth client profile (which already declares all 6 Labyrinth/Spaces
     // scopes on prod nest) unless `CATMOS_OAUTH_CLIENT` explicitly overrides it.
     let client_override = std::env::var("CATMOS_OAUTH_CLIENT").ok();
@@ -642,7 +645,8 @@ pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<()
         .await
         {
             Ok(Ok(CallbackOutcome::Code(code))) => {
-                match exchange_oauth_code(&nest_url, &code, &browser_nonce).await {
+                match exchange_oauth_code(&nest_url, &code, &browser_nonce, &callback_origin).await
+                {
                     Ok(session_id) => {
                         let _ = app_handle.emit("oauth-callback", &session_id);
                     }
@@ -892,11 +896,14 @@ pub async fn upgrade_oauth_scopes(
         .map_err(|_| "Permission upgrade cancelled.".to_string())??;
 
     // Exchange authorization code for candidate session
+    // nest's POST /auth/upgrade/exchange requires Origin: https://catbird.blue matching the fixed
+    // permission callback URL.
     let ex_resp = http
         .post(format!(
             "{}/auth/upgrade/exchange",
             nest_url.trim_end_matches('/')
         ))
+        .header("Origin", "https://catbird.blue")
         .bearer_auth(&current_session_id)
         .json(&serde_json::json!({
             "code": code,
@@ -2985,5 +2992,42 @@ mod tests {
 
         let other_url = reqwest::Url::parse("https://swan.place/oauth/authorize?foo=bar").unwrap();
         assert_eq!(parse_permission_callback_url(&other_url), None);
+    }
+
+    #[tokio::test]
+    async fn exchange_oauth_code_sends_matching_origin_header() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_origin = "http://127.0.0.1:42424";
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"session_id\":\"sess-ok-123456\"}";
+            socket.write_all(resp.as_bytes()).await.unwrap();
+            req
+        });
+
+        let session_id = super::exchange_oauth_code(
+            &format!("http://{}", addr),
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+            expected_origin,
+        )
+        .await
+        .expect("exchange should succeed");
+        assert_eq!(session_id, "sess-ok-123456");
+
+        let raw_req = server.await.unwrap();
+        assert!(
+            raw_req
+                .lines()
+                .any(|l| l.eq_ignore_ascii_case(&format!("origin: {expected_origin}"))),
+            "POST /auth/exchange must send Origin header matching callback origin; got:\n{raw_req}"
+        );
     }
 }
