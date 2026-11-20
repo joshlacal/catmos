@@ -276,7 +276,8 @@
 	async function handleSyncBackfillNow() {
 		const session = accountSession;
 		busy = true;
-		busyLabel = 'Checking device approval and syncing Labyrinth history…';
+		busyLabel =
+			'Checking device approval and decrypting Labyrinth history from your PDS (first restore may take 1–2 minutes)…';
 		errorBanner = null;
 		statusBanner = null;
 		try {
@@ -1081,13 +1082,13 @@
 		display: flex;
 		flex-direction: column;
 		gap: 8px;
-		background: var(--bg-primary, #0f1115);
-		padding-top: 4px;
+		background: var(--bg-app);
+		padding: 6px 0;
 	}
 
 	.banner.info {
-		background: rgba(59, 130, 246, 0.14);
-		border: 1px solid rgba(59, 130, 246, 0.4);
+		background: color-mix(in srgb, var(--accent) 14%, var(--bg-card));
+		border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
 		color: var(--text-primary);
 	}
 
@@ -1151,24 +1152,29 @@
 		padding: 12px 16px;
 		border-radius: var(--radius-sm);
 		font-size: 14px;
+		line-height: 1.45;
 		margin: 0;
+		overflow-wrap: anywhere;
+		word-break: break-word;
+		max-height: 200px;
+		overflow-y: auto;
 	}
 
 	.banner.ok {
-		background: color-mix(in srgb, var(--accent) 14%, transparent);
-		border: 1px solid var(--accent);
+		background: color-mix(in srgb, var(--success) 14%, var(--bg-card));
+		border: 1px solid color-mix(in srgb, var(--success) 55%, transparent);
 		color: var(--text-primary);
 	}
 
 	.banner.warn {
-		background: rgba(217, 119, 6, 0.14);
-		border: 1px solid rgba(217, 119, 6, 0.5);
+		background: color-mix(in srgb, var(--warning) 16%, var(--bg-card));
+		border: 1px solid color-mix(in srgb, var(--warning) 55%, transparent);
 		color: var(--text-primary);
 	}
 
 	.banner.err {
-		background: rgba(220, 38, 38, 0.14);
-		border: 1px solid rgba(220, 38, 38, 0.5);
+		background: color-mix(in srgb, var(--danger) 14%, var(--bg-card));
+		border: 1px solid color-mix(in srgb, var(--danger) 55%, transparent);
 		color: var(--text-primary);
 	}
 
@@ -1326,13 +1332,13 @@
 	}
 
 	.device-pill.active {
-		background: rgba(52, 199, 89, 0.15);
-		color: #4ade80;
+		background: color-mix(in srgb, var(--success) 16%, transparent);
+		color: color-mix(in srgb, var(--success) 75%, var(--text-primary));
 	}
 
 	.device-pill.pending {
-		background: rgba(217, 119, 6, 0.18);
-		color: #fbbf24;
+		background: color-mix(in srgb, var(--warning) 18%, transparent);
+		color: color-mix(in srgb, var(--warning) 65%, var(--text-primary));
 	}
 
 	.device-pill.dormant {
@@ -1363,9 +1369,9 @@
 	}
 
 	.btn-danger {
-		background: rgba(220, 38, 38, 0.16);
-		color: #f87171;
-		border: 1px solid rgba(220, 38, 38, 0.45);
+		background: color-mix(in srgb, var(--danger) 14%, transparent);
+		color: var(--danger);
+		border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
 	}
 
 	button:disabled {

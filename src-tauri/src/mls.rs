@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use atproto_spaces::{
     did_resolver::DidDocument,
@@ -372,6 +372,45 @@ pub(crate) fn personal_space_read_url(
     Ok(target)
 }
 
+/// D1-safe fallback URL for `com.atproto.identity.resolveDid` when the account's
+/// PDS (e.g. Swan) does not expose `resolveDid` (returns 404/501).
+///
+/// Strictly restricted to `home_ds_did` (which the client already contacts
+/// directly for MLS delivery RPCs); foreign `did:web:*` sequencers ALWAYS return
+/// `None` so Space interest is never leaked to a foreign host.
+pub(crate) fn home_ds_resolve_did_fallback_url(
+    request: &PlatformHttpRequest,
+    pds_endpoint: &str,
+    home_ds_endpoint: &str,
+    home_ds_did: &str,
+) -> Option<String> {
+    if !request.method.eq_ignore_ascii_case("GET") {
+        return None;
+    }
+    if origin_key(&request.url) != origin_key(pds_endpoint) {
+        return None;
+    }
+    if extract_xrpc_nsid(&request.url).as_deref() != Some("com.atproto.identity.resolveDid") {
+        return None;
+    }
+    if !home_ds_did.starts_with("did:web:") {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(&request.url).ok()?;
+    let requested_did = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "did")
+        .map(|(_, v)| v.into_owned())?;
+    if requested_did.trim() != home_ds_did {
+        return None;
+    }
+    let endpoint = validate_direct_pds_endpoint(home_ds_endpoint).ok()?;
+    Some(format!(
+        "{}/.well-known/did.json",
+        endpoint.as_str().trim_end_matches('/')
+    ))
+}
+
 async fn resolve_did_pds_endpoint(client: &reqwest::Client, did: &str) -> Result<String, MLSError> {
     let url = if did.starts_with("did:plc:") {
         format!("https://plc.directory/{}", urlencoding::encode(did))
@@ -390,26 +429,63 @@ async fn resolve_did_pds_endpoint(client: &reqwest::Client, did: &str) -> Result
             "unsupported DID method for PDS lookup: {did}"
         )));
     };
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| MLSError::Internal(format!("resolve DID document for {did}: {e}")))?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        MLSError::Internal(format!(
+            "resolve DID document for {did}: {}",
+            format_reqwest_error(&e)
+        ))
+    })?;
     if !resp.status().is_success() {
         return Err(MLSError::Internal(format!(
             "resolve DID document for {did} returned HTTP {}",
             resp.status().as_u16()
         )));
     }
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| MLSError::Internal(format!("read DID document for {did}: {e}")))?;
+    let body = resp.bytes().await.map_err(|e| {
+        MLSError::Internal(format!(
+            "read DID document for {did}: {}",
+            format_reqwest_error(&e)
+        ))
+    })?;
     let doc = DidDocument::parse_json(did, &body)
         .map_err(|e| MLSError::Internal(format!("parse DID document for {did}: {e}")))?;
     doc.pds_endpoint()
         .map(str::to_owned)
         .map_err(|e| MLSError::Internal(format!("DID document for {did} missing PDS: {e}")))
+}
+
+/// Persistent multi-threaded Tokio runtime dedicated to `TauriTransport`'s
+/// `reqwest::Client` pools.
+///
+/// Driving a shared `reqwest::Client` on ephemeral per-request runtimes kills
+/// Hyper's background HTTP/2 / keep-alive connection drivers as soon as the
+/// first request finishes, causing subsequent pooled requests to the same host
+/// to fail immediately with `error sending request for url (...)`. Keeping one
+/// process-global runtime avoids both dead pooled connections and Tokio's
+/// drop-in-async-context panic.
+fn tauri_http_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("catmos-http")
+            .enable_all()
+            .build()
+            .expect("build persistent TauriTransport HTTP runtime")
+    })
+}
+
+fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let mut parts = vec![err.to_string()];
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        let msg = cause.to_string();
+        if parts.last().map(|prev| prev != &msg).unwrap_or(true) {
+            parts.push(msg);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
 }
 
 pub struct TauriTransport {
@@ -428,11 +504,13 @@ pub struct TauriTransport {
 impl TauriTransport {
     pub fn new(offline_pds_spaces_override: Option<bool>) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         let direct_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
@@ -801,140 +879,201 @@ impl PlatformTransport for TauriTransport {
             h.name.eq_ignore_ascii_case("authorization")
                 && h.value.starts_with("Atproto-Space-Credential ")
         });
+        let home_ds_did_fallback_url = home_ds_resolve_did_fallback_url(
+            &request,
+            &pds_endpoint,
+            &home_ds_endpoint,
+            &home_ds_did,
+        );
 
-        let (response, resolved_pds_update) = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| MLSError::Internal(format!("build transport runtime: {e}")))?;
-            rt.block_on(async move {
-                let method = reqwest::Method::from_bytes(request.method.as_bytes())
-                    .map_err(|e| MLSError::invalid_input(format!("invalid HTTP method: {e}")))?;
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        tauri_http_runtime().spawn(async move {
+            let outcome: Result<(PlatformHttpResponse, Option<(String, String)>), MLSError> =
+                async move {
+                    let method =
+                        reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|e| {
+                            MLSError::invalid_input(format!("invalid HTTP method: {e}"))
+                        })?;
 
-                // Personal Space reads carry `Atproto-Space-Credential` + RFC 9421 proof of
-                // possession headers that the BFF gateway strips, so route them directly to
-                // the signed-in account's resolved PDS (matching iOS PetrelPlatformTransport).
-                let mut resolved_pds_update: Option<(String, String)> = None;
-                let (effective_client, target_url) = if is_space_credential_read {
-                    let did = account_did.ok_or_else(|| {
-                        MLSError::invalid_input(
-                            "Personal Space read requires an authenticated account DID",
-                        )
-                    })?;
-                    let resolved_pds = match cached_pds {
-                        Some(pds) => pds,
-                        None => {
-                            let pds = resolve_did_pds_endpoint(&direct_client, &did).await?;
-                            resolved_pds_update = Some((did.clone(), pds.clone()));
-                            pds
-                        }
+                    // Personal Space reads carry `Atproto-Space-Credential` + RFC 9421 proof of
+                    // possession headers that the BFF gateway strips, so route them directly to
+                    // the signed-in account's resolved PDS (matching iOS PetrelPlatformTransport).
+                    let mut resolved_pds_update: Option<(String, String)> = None;
+                    let (effective_client, target_url) = if is_space_credential_read {
+                        let did = account_did.ok_or_else(|| {
+                            MLSError::invalid_input(
+                                "Personal Space read requires an authenticated account DID",
+                            )
+                        })?;
+                        let resolved_pds = match cached_pds {
+                            Some(pds) => pds,
+                            None => {
+                                let pds = resolve_did_pds_endpoint(&direct_client, &did).await?;
+                                resolved_pds_update = Some((did.clone(), pds.clone()));
+                                pds
+                            }
+                        };
+                        let direct_url =
+                            personal_space_read_url(&request, &did, &pds_endpoint, &resolved_pds)?;
+                        (&direct_client, direct_url)
+                    } else {
+                        (&client, request.url.clone())
                     };
-                    let direct_url =
-                        personal_space_read_url(&request, &did, &pds_endpoint, &resolved_pds)?;
-                    (&direct_client, direct_url)
-                } else {
-                    (&client, request.url.clone())
-                };
 
-                let mut builder = effective_client.request(method, &target_url);
-                let mut has_auth = false;
-                for h in &request.headers {
-                    if h.name.eq_ignore_ascii_case("authorization") {
-                        has_auth = true;
+                    let mut builder = effective_client.request(method, &target_url);
+                    let mut has_auth = false;
+                    for h in &request.headers {
+                        if h.name.eq_ignore_ascii_case("authorization") {
+                            has_auth = true;
+                        }
+                        builder = builder.header(&h.name, &h.value);
                     }
-                    builder = builder.header(&h.name, &h.value);
-                }
-                if !has_auth {
-                    if let Some(tok) = bearer {
-                        let req_origin = origin_key(&request.url);
-                        let delivery_method = extract_xrpc_nsid(&request.url).filter(|nsid| {
-                            req_origin.is_some()
-                                && req_origin == origin_key(&home_ds_endpoint)
-                                && (nsid.starts_with("blue.catbird.chat.")
-                                    || nsid.starts_with("blue.catbird.labyrinth."))
-                        });
-                        if let Some(nsid) = delivery_method {
-                            let sa_url = format!(
-                                "{}/xrpc/com.atproto.server.getServiceAuth",
-                                pds_endpoint.trim_end_matches('/')
-                            );
-                            let sa_resp = client
-                                .get(&sa_url)
-                                .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
-                                .bearer_auth(&tok)
-                                .send()
-                                .await
-                                .map_err(|e| {
-                                    MLSError::Internal(format!(
-                                        "mint getServiceAuth `{nsid}` failed: {e}"
-                                    ))
-                                })?;
-                            if !sa_resp.status().is_success() {
-                                let status = sa_resp.status().as_u16();
-                                let text = sa_resp.text().await.unwrap_or_default();
-                                return Err(MLSError::Internal(format!(
-                                    "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
-                                )));
+                    if !has_auth {
+                        if let Some(tok) = bearer {
+                            let req_origin = origin_key(&request.url);
+                            let delivery_method = extract_xrpc_nsid(&request.url).filter(|nsid| {
+                                req_origin.is_some()
+                                    && req_origin == origin_key(&home_ds_endpoint)
+                                    && (nsid.starts_with("blue.catbird.chat.")
+                                        || nsid.starts_with("blue.catbird.labyrinth."))
+                            });
+                            if let Some(nsid) = delivery_method {
+                                let sa_url = format!(
+                                    "{}/xrpc/com.atproto.server.getServiceAuth",
+                                    pds_endpoint.trim_end_matches('/')
+                                );
+                                let sa_resp = client
+                                    .get(&sa_url)
+                                    .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
+                                    .bearer_auth(&tok)
+                                    .send()
+                                    .await
+                                    .map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "mint getServiceAuth `{nsid}` failed: {}",
+                                            format_reqwest_error(&e)
+                                        ))
+                                    })?;
+                                if !sa_resp.status().is_success() {
+                                    let status = sa_resp.status().as_u16();
+                                    let text = sa_resp.text().await.unwrap_or_default();
+                                    return Err(MLSError::Internal(format!(
+                                        "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
+                                    )));
+                                }
+                                let sa_json: serde_json::Value =
+                                    sa_resp.json().await.map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "decode getServiceAuth `{nsid}` JSON: {}",
+                                            format_reqwest_error(&e)
+                                        ))
+                                    })?;
+                                let service_jwt = sa_json
+                                    .get("token")
+                                    .and_then(|v| v.as_str())
+                                    .ok_or_else(|| {
+                                        MLSError::Internal(format!(
+                                            "getServiceAuth `{nsid}` response missing token"
+                                        ))
+                                    })?;
+                                if service_jwt.is_empty() || service_jwt == tok {
+                                    return Err(MLSError::Internal(
+                                        "PDS did not return a separate service token".to_string(),
+                                    ));
+                                }
+                                builder = builder.bearer_auth(service_jwt);
+                            } else if req_origin.is_some()
+                                && req_origin == origin_key(&pds_endpoint)
+                            {
+                                builder = builder.bearer_auth(tok);
                             }
-                            let sa_json: serde_json::Value = sa_resp.json().await.map_err(|e| {
-                                MLSError::Internal(format!(
-                                    "decode getServiceAuth `{nsid}` JSON: {e}"
-                                ))
-                            })?;
-                            let service_jwt = sa_json
-                                .get("token")
-                                .and_then(|v| v.as_str())
-                                .ok_or_else(|| {
-                                    MLSError::Internal(format!(
-                                        "getServiceAuth `{nsid}` response missing token"
-                                    ))
-                                })?;
-                            if service_jwt.is_empty() || service_jwt == tok {
-                                return Err(MLSError::Internal(
-                                    "PDS did not return a separate service token".to_string(),
-                                ));
-                            }
-                            builder = builder.bearer_auth(service_jwt);
-                        } else if req_origin.is_some() && req_origin == origin_key(&pds_endpoint) {
-                            builder = builder.bearer_auth(tok);
                         }
                     }
-                }
-                if let Some(body) = request.body {
-                    builder = builder.body(body);
-                }
-                let resp = builder
-                    .send()
-                    .await
-                    .map_err(|e| MLSError::Internal(format!("HTTP transport failed: {e}")))?;
-                let status = resp.status().as_u16();
-                let headers = resp
-                    .headers()
-                    .iter()
-                    .filter_map(|(k, v)| {
-                        v.to_str().ok().map(|val| PlatformHttpHeader {
-                            name: k.as_str().to_string(),
-                            value: val.to_string(),
+                    if let Some(body) = request.body {
+                        builder = builder.body(body);
+                    }
+                    let resp = builder.send().await.map_err(|e| {
+                        MLSError::Internal(format!(
+                            "HTTP transport failed: {}",
+                            format_reqwest_error(&e)
+                        ))
+                    })?;
+                    let status = resp.status().as_u16();
+                    if matches!(status, 404 | 501) {
+                        if let Some(fallback_url) = home_ds_did_fallback_url {
+                            if let Ok(fb_resp) = direct_client.get(&fallback_url).send().await {
+                                if fb_resp.status().is_success() {
+                                    let fb_status = fb_resp.status().as_u16();
+                                    let fb_headers = fb_resp
+                                        .headers()
+                                        .iter()
+                                        .filter_map(|(k, v)| {
+                                            v.to_str().ok().map(|val| PlatformHttpHeader {
+                                                name: k.as_str().to_string(),
+                                                value: val.to_string(),
+                                            })
+                                        })
+                                        .collect();
+                                    if let Ok(fb_bytes) = fb_resp.bytes().await {
+                                        let id_matches =
+                                            serde_json::from_slice::<serde_json::Value>(&fb_bytes)
+                                                .ok()
+                                                .and_then(|v| {
+                                                    v.get("id")
+                                                        .and_then(|id| id.as_str())
+                                                        .map(|id| id == home_ds_did)
+                                                })
+                                                .unwrap_or(false);
+                                        if id_matches {
+                                            return Ok((
+                                                PlatformHttpResponse {
+                                                    status: fb_status,
+                                                    headers: fb_headers,
+                                                    body: fb_bytes.to_vec(),
+                                                },
+                                                resolved_pds_update,
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let headers = resp
+                        .headers()
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            v.to_str().ok().map(|val| PlatformHttpHeader {
+                                name: k.as_str().to_string(),
+                                value: val.to_string(),
+                            })
                         })
-                    })
-                    .collect();
-                let body = resp
-                    .bytes()
-                    .await
-                    .map_err(|e| MLSError::Internal(format!("read HTTP body: {e}")))?
-                    .to_vec();
-                Ok((
-                    PlatformHttpResponse {
-                        status,
-                        headers,
-                        body,
-                    },
-                    resolved_pds_update,
-                ))
-            })
-        })
-        .join()
-        .map_err(|_| MLSError::Internal("HTTP transport worker panicked".to_string()))??;
+                        .collect();
+                    let body = resp
+                        .bytes()
+                        .await
+                        .map_err(|e| {
+                            MLSError::Internal(format!(
+                                "read HTTP body: {}",
+                                format_reqwest_error(&e)
+                            ))
+                        })?
+                        .to_vec();
+                    Ok((
+                        PlatformHttpResponse {
+                            status,
+                            headers,
+                            body,
+                        },
+                        resolved_pds_update,
+                    ))
+                }
+                .await;
+            let _ = tx.send(outcome);
+        });
+        let (response, resolved_pds_update) = rx
+            .recv()
+            .map_err(|_| MLSError::Internal("HTTP transport worker panicked".to_string()))??;
         if let Some((did, pds)) = resolved_pds_update {
             if let Ok(mut cache) = self.resolved_pds_cache.write() {
                 cache.insert(did, pds);
@@ -2885,6 +3024,146 @@ mod tests {
                 "convo-readstate".to_string(),
                 "convo-shared".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn tauri_transport_reuses_pooled_keepalive_connections_across_sequential_calls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = Arc::clone(&accepted);
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            accepted_server.fetch_add(1, Ordering::SeqCst);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("set timeout");
+            for i in 0..4usize {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = stream.read(&mut tmp).expect("read request");
+                    assert!(n > 0, "unexpected EOF before request {i}");
+                    buf.extend_from_slice(&tmp[..n]);
+                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let body = format!("{{\"seq\":{i}}}");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).expect("write response");
+                stream.flush().expect("flush");
+            }
+        });
+
+        let transport = TauriTransport::new(None);
+        // First 2 requests from a plain thread, next 2 from inside an active Tokio runtime.
+        for i in 0..2usize {
+            let resp = transport
+                .execute_http(PlatformHttpRequest {
+                    method: "GET".to_string(),
+                    url: format!("http://{addr}/ping/{i}"),
+                    headers: vec![],
+                    body: None,
+                })
+                .expect("sequential pooled HTTP request must succeed");
+            assert_eq!(resp.status, 200);
+            assert_eq!(
+                String::from_utf8(resp.body).unwrap(),
+                format!("{{\"seq\":{i}}}")
+            );
+        }
+
+        let caller_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("caller rt");
+        caller_rt.block_on(async {
+            for i in 2..4usize {
+                let resp = transport
+                    .execute_http(PlatformHttpRequest {
+                        method: "GET".to_string(),
+                        url: format!("http://{addr}/ping/{i}"),
+                        headers: vec![],
+                        body: None,
+                    })
+                    .expect("nested-runtime pooled HTTP request must succeed");
+                assert_eq!(resp.status, 200);
+                assert_eq!(
+                    String::from_utf8(resp.body).unwrap(),
+                    format!("{{\"seq\":{i}}}")
+                );
+            }
+        });
+
+        server.join().expect("server thread");
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "all 4 requests should reuse the single keep-alive pooled connection"
+        );
+    }
+
+    #[test]
+    fn home_ds_resolve_did_fallback_only_matches_configured_home_ds_and_preserves_d1() {
+        let own_ds_req = PlatformHttpRequest {
+            method: "GET".to_string(),
+            url: "https://api.catbird.blue/xrpc/com.atproto.identity.resolveDid?did=did%3Aweb%3Achat.catbird.blue".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        assert_eq!(
+            home_ds_resolve_did_fallback_url(
+                &own_ds_req,
+                "https://api.catbird.blue",
+                "https://chat.catbird.blue",
+                "did:web:chat.catbird.blue",
+            ),
+            Some("https://chat.catbird.blue/.well-known/did.json".to_string())
+        );
+
+        // Foreign did:web:* must NEVER fall back directly (preserves D1).
+        let foreign_ds_req = PlatformHttpRequest {
+            method: "GET".to_string(),
+            url: "https://api.catbird.blue/xrpc/com.atproto.identity.resolveDid?did=did%3Aweb%3Aforeign.example.com".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        assert_eq!(
+            home_ds_resolve_did_fallback_url(
+                &foreign_ds_req,
+                "https://api.catbird.blue",
+                "https://chat.catbird.blue",
+                "did:web:chat.catbird.blue",
+            ),
+            None
+        );
+
+        // Non-resolveDid XRPCs and non-GET requests never match.
+        let other_req = PlatformHttpRequest {
+            method: "GET".to_string(),
+            url: "https://api.catbird.blue/xrpc/com.atproto.space.getSpace?did=did%3Aweb%3Achat.catbird.blue".to_string(),
+            headers: vec![],
+            body: None,
+        };
+        assert_eq!(
+            home_ds_resolve_did_fallback_url(
+                &other_req,
+                "https://api.catbird.blue",
+                "https://chat.catbird.blue",
+                "did:web:chat.catbird.blue",
+            ),
+            None
         );
     }
 }
