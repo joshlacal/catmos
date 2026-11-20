@@ -1243,9 +1243,12 @@ impl TauriMlsManager {
                 .map(|s| (*s).to_string())
                 .collect()
         });
+        let was_opted_in = self.is_opted_in(did);
         let client = self.open_or_get_client(did)?;
         if let Err(err) = client.enroll_device(&scopes) {
-            let _ = self.set_opted_in(did, false);
+            if !was_opted_in {
+                let _ = self.set_opted_in(did, false);
+            }
             return Err(err.to_string());
         }
         self.set_opted_in(did, true)?;
