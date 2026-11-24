@@ -128,10 +128,6 @@ export async function startLogin(identifier: string): Promise<void> {
 	return invoke('start_login', { identifier });
 }
 
-export async function completeLogin(sessionId: string): Promise<AuthState> {
-	return invoke('complete_login', { sessionId });
-}
-
 export async function tryRestoreSession(): Promise<AuthState | null> {
 	return invoke('try_restore_session');
 }

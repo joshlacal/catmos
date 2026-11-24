@@ -1,5 +1,4 @@
-pub use catbird_atproto::catbird;
-pub use catbird_atproto::types;
+mod auth;
 mod commands;
 pub mod mls;
 #[cfg(test)]
@@ -8,17 +7,12 @@ pub mod mls;
 pub(crate) mod native_archive_auth;
 mod native_keyring;
 mod recovery;
-mod session_restore;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use tauri::Manager;
 use tokio::sync::Mutex;
-
-pub(crate) fn nest_url() -> String {
-    std::env::var("NEST_URL").unwrap_or_else(|_| "https://api.catbird.blue".to_string())
-}
 
 fn resolve_data_dir() -> std::path::PathBuf {
     #[cfg(target_os = "android")]
@@ -51,7 +45,10 @@ impl WsHandle {
 
 pub struct AppState {
     pub mls_manager: Arc<mls::TauriMlsManager>,
-    pub(crate) session_auth: RwLock<Option<(String, String)>>,
+    /// DID of the signed-in account.
+    pub(crate) session_did: RwLock<Option<String>>,
+    /// The OAuth client, opened on first use because it needs the OS keyring.
+    auth: std::sync::Mutex<Option<Arc<auth::DesktopAuth>>>,
     pub ws_handles: Arc<Mutex<HashMap<String, WsHandle>>>,
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -59,36 +56,38 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub(crate) fn set_session_auth(&self, did: String, session_id: String) {
-        if let Ok(mut guard) = self.session_auth.write() {
-            *guard = Some((did, session_id));
+    pub(crate) fn set_session_did(&self, did: String) {
+        if let Ok(mut guard) = self.session_did.write() {
+            *guard = Some(did);
         }
     }
 
     pub(crate) fn clear_session_auth(&self) {
-        if let Ok(mut guard) = self.session_auth.write() {
+        if let Ok(mut guard) = self.session_did.write() {
             *guard = None;
         }
     }
 
     pub(crate) fn current_did(&self) -> Option<String> {
-        self.session_auth
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(|(did, _)| did.clone()))
+        self.session_did.read().ok().and_then(|g| g.clone())
     }
 
-    pub(crate) fn current_token(&self) -> Option<String> {
-        self.session_auth
-            .read()
-            .ok()
-            .and_then(|g| g.as_ref().map(|(_, tok)| tok.clone()))
-            .or_else(|| {
-                crate::native_keyring::entry("catmos", "session_id")
-                    .and_then(|e| e.get_password())
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-            })
+    /// The desktop OAuth client. Fails, without signing anyone out, while
+    /// the OS keyring cannot be reached.
+    pub(crate) fn auth(&self) -> Result<Arc<auth::DesktopAuth>, String> {
+        let mut guard = self
+            .auth
+            .lock()
+            .map_err(|_| "sign-in state is unavailable".to_string())?;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let opened = Arc::new(auth::DesktopAuth::open(
+            &self.data_dir,
+            &mls::TauriMlsManager::home_ds_did(),
+        )?);
+        *guard = Some(Arc::clone(&opened));
+        Ok(opened)
     }
 }
 
@@ -108,7 +107,8 @@ pub fn run() {
     let mls_manager = Arc::new(mls::TauriMlsManager::new(data_dir.clone()));
     let app_state = AppState {
         mls_manager,
-        session_auth: RwLock::new(None),
+        session_did: RwLock::new(None),
+        auth: std::sync::Mutex::new(None),
         ws_handles: Arc::new(Mutex::new(HashMap::new())),
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
@@ -120,8 +120,6 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::start_login,
-            commands::complete_login,
-            commands::upgrade_oauth_scopes,
             commands::try_restore_session,
             commands::logout,
             commands::delete_account_data,

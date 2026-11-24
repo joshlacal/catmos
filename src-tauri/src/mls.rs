@@ -488,10 +488,51 @@ fn format_reqwest_error(err: &reqwest::Error) -> String {
     parts.join(": ")
 }
 
+pub(crate) type AuthFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'a>>;
+
+/// Signs requests for the signed-in account. The app supplies its OAuth
+/// session; tests supply a fixture.
+pub(crate) trait AccountAuth: Send + Sync {
+    /// A token the account's server mints for one method of one service.
+    fn service_token<'a>(&'a self, audience: &'a str, method: &'a str) -> AuthFuture<'a, String>;
+
+    /// Sends an XRPC call to the account's own server with its credentials and
+    /// returns the response as received, error statuses included.
+    fn pds_exchange<'a>(
+        &'a self,
+        request: &'a PlatformHttpRequest,
+    ) -> AuthFuture<'a, PlatformHttpResponse>;
+}
+
+async fn platform_response(resp: reqwest::Response) -> Result<PlatformHttpResponse, MLSError> {
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str().ok().map(|val| PlatformHttpHeader {
+                name: k.as_str().to_string(),
+                value: val.to_string(),
+            })
+        })
+        .collect();
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| MLSError::Internal(format!("read HTTP body: {}", format_reqwest_error(&e))))?
+        .to_vec();
+    Ok(PlatformHttpResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
 pub struct TauriTransport {
     client: reqwest::Client,
     direct_client: reqwest::Client,
-    session_token: RwLock<Option<String>>,
+    account_auth: RwLock<Option<Arc<dyn AccountAuth>>>,
     account_did: RwLock<Option<String>>,
     resolved_pds_cache: RwLock<HashMap<String, String>>,
     pds_endpoint: RwLock<String>,
@@ -517,10 +558,10 @@ impl TauriTransport {
         Self {
             client,
             direct_client,
-            session_token: RwLock::new(None),
+            account_auth: RwLock::new(None),
             account_did: RwLock::new(None),
             resolved_pds_cache: RwLock::new(HashMap::new()),
-            pds_endpoint: RwLock::new(crate::nest_url()),
+            pds_endpoint: RwLock::new(String::new()),
             home_ds_endpoint: RwLock::new("https://chat.catbird.blue".to_string()),
             home_ds_did: RwLock::new("did:web:chat.catbird.blue".to_string()),
             offline_pds_spaces_override: RwLock::new(offline_pds_spaces_override),
@@ -549,9 +590,23 @@ impl TauriTransport {
         }
     }
 
-    pub fn set_session_token(&self, token: Option<String>) {
-        if let Ok(mut guard) = self.session_token.write() {
-            *guard = token;
+    pub(crate) fn set_pds_endpoint(&self, pds_endpoint: &str) {
+        if let Ok(mut g) = self.pds_endpoint.write() {
+            *g = pds_endpoint.trim_end_matches('/').to_string();
+        }
+    }
+
+    pub(crate) fn pds_endpoint(&self) -> String {
+        self.pds_endpoint
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Installs or removes the signed-in account's request signer.
+    pub(crate) fn set_account_auth(&self, auth: Option<Arc<dyn AccountAuth>>) {
+        if let Ok(mut guard) = self.account_auth.write() {
+            *guard = auth;
         }
     }
 
@@ -851,7 +906,7 @@ impl PlatformTransport for TauriTransport {
 
         let client = self.client.clone();
         let direct_client = self.direct_client.clone();
-        let bearer = self.session_token.read().ok().and_then(|g| g.clone());
+        let account_auth = self.account_auth.read().ok().and_then(|g| g.clone());
         let account_did = self.account_did.read().ok().and_then(|g| g.clone());
         let cached_pds = account_did.as_ref().and_then(|did| {
             self.resolved_pds_cache
@@ -863,7 +918,7 @@ impl PlatformTransport for TauriTransport {
             .pds_endpoint
             .read()
             .map(|g| g.clone())
-            .unwrap_or_else(|_| crate::nest_url());
+            .unwrap_or_default();
         let home_ds_endpoint = self
             .home_ds_endpoint
             .read()
@@ -920,153 +975,87 @@ impl PlatformTransport for TauriTransport {
                         (&client, request.url.clone())
                     };
 
-                    let mut builder = effective_client.request(method, &target_url);
-                    let mut has_auth = false;
-                    for h in &request.headers {
-                        if h.name.eq_ignore_ascii_case("authorization") {
-                            has_auth = true;
+                    let has_auth = request
+                        .headers
+                        .iter()
+                        .any(|h| h.name.eq_ignore_ascii_case("authorization"));
+                    let req_origin = origin_key(&request.url);
+                    let xrpc_nsid = extract_xrpc_nsid(&request.url);
+                    let delivery_method = xrpc_nsid.clone().filter(|nsid| {
+                        req_origin.is_some()
+                            && req_origin == origin_key(&home_ds_endpoint)
+                            && (nsid.starts_with("blue.catbird.chat.")
+                                || nsid.starts_with("blue.catbird.labyrinth."))
+                    });
+                    let account_auth = account_auth.filter(|_| !has_auth);
+
+                    // Calls to the account's own server go through its OAuth session, which
+                    // signs each one with the session's DPoP key and keeps the token fresh.
+                    let own_server_call = delivery_method.is_none()
+                        && xrpc_nsid.is_some()
+                        && req_origin.is_some()
+                        && req_origin == origin_key(&pds_endpoint);
+                    let response = match account_auth {
+                        Some(auth) if own_server_call => {
+                            auth.pds_exchange(&request).await.map_err(|e| {
+                                MLSError::Internal(format!("HTTP transport failed: {e}"))
+                            })?
                         }
-                        builder = builder.header(&h.name, &h.value);
-                    }
-                    if !has_auth {
-                        if let Some(tok) = bearer {
-                            let req_origin = origin_key(&request.url);
-                            let delivery_method = extract_xrpc_nsid(&request.url).filter(|nsid| {
-                                req_origin.is_some()
-                                    && req_origin == origin_key(&home_ds_endpoint)
-                                    && (nsid.starts_with("blue.catbird.chat.")
-                                        || nsid.starts_with("blue.catbird.labyrinth."))
-                            });
-                            if let Some(nsid) = delivery_method {
-                                let sa_url = format!(
-                                    "{}/xrpc/com.atproto.server.getServiceAuth",
-                                    pds_endpoint.trim_end_matches('/')
-                                );
-                                let sa_resp = client
-                                    .get(&sa_url)
-                                    .query(&[("aud", home_ds_did.as_str()), ("lxm", nsid.as_str())])
-                                    .bearer_auth(&tok)
-                                    .send()
-                                    .await
-                                    .map_err(|e| {
-                                        MLSError::Internal(format!(
-                                            "mint getServiceAuth `{nsid}` failed: {}",
-                                            format_reqwest_error(&e)
-                                        ))
-                                    })?;
-                                if !sa_resp.status().is_success() {
-                                    let status = sa_resp.status().as_u16();
-                                    let text = sa_resp.text().await.unwrap_or_default();
-                                    return Err(MLSError::Internal(format!(
-                                        "getServiceAuth `{nsid}` returned HTTP {status}: {text}"
-                                    )));
-                                }
-                                let sa_json: serde_json::Value =
-                                    sa_resp.json().await.map_err(|e| {
-                                        MLSError::Internal(format!(
-                                            "decode getServiceAuth `{nsid}` JSON: {}",
-                                            format_reqwest_error(&e)
-                                        ))
-                                    })?;
-                                let service_jwt = sa_json
-                                    .get("token")
-                                    .and_then(|v| v.as_str())
-                                    .ok_or_else(|| {
-                                        MLSError::Internal(format!(
-                                            "getServiceAuth `{nsid}` response missing token"
-                                        ))
-                                    })?;
-                                if service_jwt.is_empty() || service_jwt == tok {
-                                    return Err(MLSError::Internal(
-                                        "PDS did not return a separate service token".to_string(),
-                                    ));
-                                }
-                                builder = builder.bearer_auth(service_jwt);
-                            } else if req_origin.is_some()
-                                && req_origin == origin_key(&pds_endpoint)
-                            {
-                                builder = builder.bearer_auth(tok);
+                        account_auth => {
+                            let mut builder = effective_client.request(method, &target_url);
+                            for h in &request.headers {
+                                builder = builder.header(&h.name, &h.value);
                             }
+                            if let (Some(auth), Some(nsid)) = (account_auth, delivery_method) {
+                                // The delivery service accepts only a token the account's
+                                // server minted for this one method. There is no fallback.
+                                let audience =
+                                    format!("{home_ds_did}#{}", crate::auth::DELIVERY_SERVICE_ID);
+                                let service_jwt =
+                                    auth.service_token(&audience, &nsid).await.map_err(|e| {
+                                        MLSError::Internal(format!(
+                                            "mint getServiceAuth `{nsid}` failed: {e}"
+                                        ))
+                                    })?;
+                                builder = builder.bearer_auth(service_jwt);
+                            }
+                            if let Some(body) = request.body {
+                                builder = builder.body(body);
+                            }
+                            let resp = builder.send().await.map_err(|e| {
+                                MLSError::Internal(format!(
+                                    "HTTP transport failed: {}",
+                                    format_reqwest_error(&e)
+                                ))
+                            })?;
+                            platform_response(resp).await?
                         }
-                    }
-                    if let Some(body) = request.body {
-                        builder = builder.body(body);
-                    }
-                    let resp = builder.send().await.map_err(|e| {
-                        MLSError::Internal(format!(
-                            "HTTP transport failed: {}",
-                            format_reqwest_error(&e)
-                        ))
-                    })?;
-                    let status = resp.status().as_u16();
-                    if matches!(status, 404 | 501) {
+                    };
+
+                    if matches!(response.status, 404 | 501) {
                         if let Some(fallback_url) = home_ds_did_fallback_url {
                             if let Ok(fb_resp) = direct_client.get(&fallback_url).send().await {
                                 if fb_resp.status().is_success() {
-                                    let fb_status = fb_resp.status().as_u16();
-                                    let fb_headers = fb_resp
-                                        .headers()
-                                        .iter()
-                                        .filter_map(|(k, v)| {
-                                            v.to_str().ok().map(|val| PlatformHttpHeader {
-                                                name: k.as_str().to_string(),
-                                                value: val.to_string(),
-                                            })
+                                    if let Ok(fallback) = platform_response(fb_resp).await {
+                                        let id_matches = serde_json::from_slice::<serde_json::Value>(
+                                            &fallback.body,
+                                        )
+                                        .ok()
+                                        .and_then(|v| {
+                                            v.get("id")
+                                                .and_then(|id| id.as_str())
+                                                .map(|id| id == home_ds_did)
                                         })
-                                        .collect();
-                                    if let Ok(fb_bytes) = fb_resp.bytes().await {
-                                        let id_matches =
-                                            serde_json::from_slice::<serde_json::Value>(&fb_bytes)
-                                                .ok()
-                                                .and_then(|v| {
-                                                    v.get("id")
-                                                        .and_then(|id| id.as_str())
-                                                        .map(|id| id == home_ds_did)
-                                                })
-                                                .unwrap_or(false);
+                                        .unwrap_or(false);
                                         if id_matches {
-                                            return Ok((
-                                                PlatformHttpResponse {
-                                                    status: fb_status,
-                                                    headers: fb_headers,
-                                                    body: fb_bytes.to_vec(),
-                                                },
-                                                resolved_pds_update,
-                                            ));
+                                            return Ok((fallback, resolved_pds_update));
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    let headers = resp
-                        .headers()
-                        .iter()
-                        .filter_map(|(k, v)| {
-                            v.to_str().ok().map(|val| PlatformHttpHeader {
-                                name: k.as_str().to_string(),
-                                value: val.to_string(),
-                            })
-                        })
-                        .collect();
-                    let body = resp
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            MLSError::Internal(format!(
-                                "read HTTP body: {}",
-                                format_reqwest_error(&e)
-                            ))
-                        })?
-                        .to_vec();
-                    Ok((
-                        PlatformHttpResponse {
-                            status,
-                            headers,
-                            body,
-                        },
-                        resolved_pds_update,
-                    ))
+                    Ok((response, resolved_pds_update))
                 }
                 .await;
             let _ = tx.send(outcome);
@@ -1233,8 +1222,39 @@ impl TauriMlsManager {
         self.observer.set_app_handle(handle);
     }
 
-    pub fn set_session_token(&self, token: Option<String>) {
-        self.transport.set_session_token(token);
+    /// Binds the transport to the signed-in account: its own server and the
+    /// signer for requests sent there. `None` signs the transport out.
+    pub(crate) fn set_account_auth(&self, account: Option<(String, Arc<dyn AccountAuth>)>) {
+        match account {
+            Some((pds_endpoint, auth)) => {
+                self.transport.set_pds_endpoint(&pds_endpoint);
+                self.transport.set_account_auth(Some(auth));
+            }
+            None => {
+                self.transport.set_account_auth(None);
+                self.transport.set_pds_endpoint("");
+            }
+        }
+    }
+
+    /// The signed-in account's own server. `CATMOS_PDS_URL` overrides it for
+    /// local development.
+    fn account_pds_endpoint(&self) -> Result<String, String> {
+        if let Ok(url) = std::env::var("CATMOS_PDS_URL") {
+            return Ok(url);
+        }
+        let current = self.transport.pds_endpoint();
+        if !current.is_empty() {
+            return Ok(current);
+        }
+        #[cfg(test)]
+        {
+            Ok("https://pds.catmos.test".to_string())
+        }
+        #[cfg(not(test))]
+        {
+            Err("Not authenticated".to_string())
+        }
     }
 
     pub fn set_account_did(&self, did: Option<String>) {
@@ -1304,7 +1324,7 @@ impl TauriMlsManager {
             .unwrap_or_else(|_| "https://chat.catbird.blue".to_string());
         let home_ds_did = std::env::var("CATMOS_MLS_DS_DID")
             .unwrap_or_else(|_| "did:web:chat.catbird.blue".to_string());
-        let pds_endpoint = std::env::var("CATMOS_PDS_URL").unwrap_or_else(|_| crate::nest_url());
+        let pds_endpoint = self.account_pds_endpoint()?;
 
         self.transport
             .configure_endpoints(&pds_endpoint, &home_ds_endpoint, &home_ds_did);
@@ -1798,7 +1818,7 @@ impl TauriMlsManager {
         let normalized = normalize_account_did(did).map_err(|e| e.to_string())?;
         let did_hash = account_did_hash_hex(&normalized).map_err(|e| e.to_string())?;
         let device_id = self.load_or_create_device_id(&did_hash)?;
-        let pds_endpoint = std::env::var("CATMOS_PDS_URL").unwrap_or_else(|_| crate::nest_url());
+        let pds_endpoint = self.account_pds_endpoint()?;
         let home_ds_endpoint = Self::home_ds_endpoint();
 
         let pop_key = {
@@ -2313,52 +2333,78 @@ mod tests {
     const LIVE_DS_URL: &str = "https://ds.catmos.test";
     const LIVE_DS_DID: &str = "did:web:ds.catmos.test";
 
-    #[test]
-    fn backup_rpc_uses_a_service_token_even_when_the_origins_match() {
-        use std::io::{BufRead, BufReader, Write};
-        use std::net::TcpListener;
+    struct FixtureAuth {
+        seen: Mutex<Vec<(String, String)>>,
+    }
 
-        let method = "blue.catbird.labyrinth.getRecoveryShareCapabilities";
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let mock = std::thread::spawn(move || {
-            let mut observed = Vec::new();
-            // Close each connection after its response. A regression that skips the token
-            // request still finishes the fixture when the capability request arrives.
-            loop {
-                let (mut socket, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(&socket);
-                let mut start = String::new();
-                reader.read_line(&mut start).unwrap();
-                let mut authorization = String::new();
-                for line in reader.lines() {
-                    let line = line.unwrap();
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some((key, value)) = line.split_once(':') {
-                        if key.eq_ignore_ascii_case("authorization") {
-                            authorization = value.trim().to_owned();
-                        }
-                    }
+    impl AccountAuth for FixtureAuth {
+        fn service_token<'a>(
+            &'a self,
+            audience: &'a str,
+            method: &'a str,
+        ) -> AuthFuture<'a, String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((audience.to_owned(), method.to_owned()));
+            Box::pin(async { Ok("fixture-service-token".to_owned()) })
+        }
+
+        fn pds_exchange<'a>(
+            &'a self,
+            request: &'a PlatformHttpRequest,
+        ) -> AuthFuture<'a, PlatformHttpResponse> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(("pds".to_owned(), request.url.clone()));
+            Box::pin(async {
+                Ok(PlatformHttpResponse {
+                    status: 400,
+                    headers: vec![],
+                    body: br#"{"error":"InvalidRequest"}"#.to_vec(),
+                })
+            })
+        }
+    }
+
+    fn serve_once(listener: std::net::TcpListener) -> std::thread::JoinHandle<(String, String)> {
+        use std::io::{BufRead, BufReader, Write};
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&socket);
+            let mut start = String::new();
+            reader.read_line(&mut start).unwrap();
+            let mut authorization = String::new();
+            for line in reader.lines() {
+                let line = line.unwrap();
+                if line.is_empty() {
+                    break;
                 }
-                let minting = start.contains("/xrpc/com.atproto.server.getServiceAuth?");
-                let body = if minting {
-                    r#"{"token":"fixture-service-token"}"#
-                } else {
-                    "{}"
-                };
-                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
-                observed.push((start, authorization));
-                if !minting || observed.len() == 2 {
-                    return observed;
+                if let Some((key, value)) = line.split_once(':') {
+                    if key.eq_ignore_ascii_case("authorization") {
+                        authorization = value.trim().to_owned();
+                    }
                 }
             }
-        });
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+            (start, authorization)
+        })
+    }
 
+    #[test]
+    fn backup_rpc_uses_a_service_token_even_when_the_origins_match() {
+        let method = "blue.catbird.labyrinth.getRecoveryShareCapabilities";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock = serve_once(listener);
+
+        let auth = Arc::new(FixtureAuth {
+            seen: Mutex::new(Vec::new()),
+        });
         let transport = TauriTransport::new(None);
         transport.configure_endpoints(&endpoint, &endpoint, LIVE_DS_DID);
-        transport.set_session_token(Some("fixture-account-token".into()));
+        transport.set_account_auth(Some(auth.clone()));
         let response = transport
             .execute_http(PlatformHttpRequest {
                 method: "GET".into(),
@@ -2368,13 +2414,55 @@ mod tests {
             })
             .unwrap();
         assert_eq!(response.status, 200);
-        let observed = mock.join().unwrap();
-        assert_eq!(observed.len(), 2);
-        assert!(observed[0].0.contains("aud=did%3Aweb%3Ads.catmos.test"));
-        assert!(observed[0].0.contains(&format!("lxm={method}")));
-        assert_eq!(observed[0].1, "Bearer fixture-account-token");
-        assert!(observed[1].0.starts_with(&format!("GET /xrpc/{method} ")));
-        assert_eq!(observed[1].1, "Bearer fixture-service-token");
+        let (start, authorization) = mock.join().unwrap();
+        assert!(start.starts_with(&format!("GET /xrpc/{method} ")));
+        assert_eq!(authorization, "Bearer fixture-service-token");
+        // The audience names the delivery service's entry in its DID document,
+        // which is what an `rpc:` permission and the service both match on.
+        assert_eq!(
+            *auth.seen.lock().unwrap(),
+            [(format!("{LIVE_DS_DID}#atproto_mls"), method.to_owned())]
+        );
+    }
+
+    #[test]
+    fn own_server_calls_go_through_the_account_session_and_keep_error_bodies() {
+        let auth = Arc::new(FixtureAuth {
+            seen: Mutex::new(Vec::new()),
+        });
+        let transport = TauriTransport::new(None);
+        transport.configure_endpoints(LIVE_PDS_URL, LIVE_DS_URL, LIVE_DS_DID);
+        transport.set_account_auth(Some(auth.clone()));
+        let url = format!("{LIVE_PDS_URL}/xrpc/com.atproto.repo.getRecord?repo=did%3Aplc%3Aabc");
+        let response = transport
+            .execute_http(PlatformHttpRequest {
+                method: "GET".into(),
+                url: url.clone(),
+                headers: vec![],
+                body: None,
+            })
+            .unwrap();
+        assert_eq!(response.status, 400);
+        assert_eq!(response.body, br#"{"error":"InvalidRequest"}"#);
+        assert_eq!(*auth.seen.lock().unwrap(), [("pds".to_owned(), url)]);
+    }
+
+    #[test]
+    fn a_signed_out_transport_sends_no_credentials() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mock = serve_once(listener);
+        let transport = TauriTransport::new(None);
+        transport.configure_endpoints(&endpoint, &endpoint, LIVE_DS_DID);
+        transport
+            .execute_http(PlatformHttpRequest {
+                method: "GET".into(),
+                url: format!("{endpoint}/xrpc/blue.catbird.chat.getDevices"),
+                headers: vec![],
+                body: None,
+            })
+            .unwrap();
+        assert_eq!(mock.join().unwrap().1, "");
     }
 
     #[test]

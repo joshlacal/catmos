@@ -32,7 +32,12 @@ bytes = "1.12.1"
 dirs = "7.0.0"
 ciborium = "0.2.2"
 catbird_mls = { path = "../../catbird-mls" }
-catbird-atproto = { path = "../../catbird-atproto" }
+petrel = { path = "../../Petrel/rust/petrel", features = ["file-store"] }
+petrel-core = { path = "../../Petrel/rust/petrel-core" }
+petrel-api = { path = "../../Petrel/rust/petrel-api", features = ["app_bsky", "com_atproto"] }
+petrel-catbird = { path = "../../PetrelCatbird/rust/petrel-catbird" }
+http = "1"
+url = "2.5"
 atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
 
 urlencoding = "2.1.3"
@@ -49,6 +54,8 @@ tempfile = "3.27.0"
 # as well as live `CatbirdMlsClient::open` against the Nov-12 Space auth fixture.
 catbird_mls = { path = "../../catbird-mls", features = ["test-utils"] }
 labyrinth = { path = "../../labyrinth" }
+# catbird-mls's shared test support (included by path in lib.rs) still names these types.
+catbird-atproto = { path = "../../catbird-atproto" }
 multibase = "0.9"
 p256 = { version = "0.13", features = ["ecdsa"] }
 serde_ipld_dagcbor = "0.6"
