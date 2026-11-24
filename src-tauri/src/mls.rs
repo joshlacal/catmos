@@ -1037,16 +1037,17 @@ impl PlatformTransport for TauriTransport {
                             if let Ok(fb_resp) = direct_client.get(&fallback_url).send().await {
                                 if fb_resp.status().is_success() {
                                     if let Ok(fallback) = platform_response(fb_resp).await {
-                                        let id_matches = serde_json::from_slice::<serde_json::Value>(
-                                            &fallback.body,
-                                        )
-                                        .ok()
-                                        .and_then(|v| {
-                                            v.get("id")
-                                                .and_then(|id| id.as_str())
-                                                .map(|id| id == home_ds_did)
-                                        })
-                                        .unwrap_or(false);
+                                        let id_matches =
+                                            serde_json::from_slice::<serde_json::Value>(
+                                                &fallback.body,
+                                            )
+                                            .ok()
+                                            .and_then(|v| {
+                                                v.get("id")
+                                                    .and_then(|id| id.as_str())
+                                                    .map(|id| id == home_ds_did)
+                                            })
+                                            .unwrap_or(false);
                                         if id_matches {
                                             return Ok((fallback, resolved_pds_update));
                                         }

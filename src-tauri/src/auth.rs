@@ -18,8 +18,8 @@ use http::{HeaderMap, Method, Response};
 use petrel::identity::{HickoryResolver, IdentityOptions, IdentityResolver};
 use petrel::net::{ReqwestTransport, SharedTransport};
 use petrel::oauth::{
-    ClientAuth, OAuthClient, OAuthConfig, OAuthError, OAuthIdentityAdapter, OAuthStartOptions,
-    OAuthTarget, PendingOAuthFlow,
+    ClientAuth, OAuthClient, OAuthConfig, OAuthError, OAuthIdentityAdapter, OAuthIdentityResolver,
+    OAuthStartOptions, OAuthTarget, PendingOAuthFlow,
 };
 use petrel::service_auth::ServiceRef;
 use petrel::storage::{FileSecretStore, SessionStore, StoreError};
@@ -166,6 +166,9 @@ pub(crate) struct DesktopAuth {
     store: SessionStore,
     redirect_uri: Url,
     loopback_port: Option<u16>,
+    /// Lets calls reach a loopback server. Set only by tests that run the
+    /// account's server on this machine.
+    allow_loopback: bool,
     pds_by_did: RwLock<HashMap<String, Url>>,
 }
 
@@ -175,6 +178,13 @@ impl DesktopAuth {
     pub(crate) fn open(data_dir: &Path, delivery_service_did: &str) -> Result<Self, String> {
         let settings = Settings::from_env(delivery_service_did)?;
         let key = load_or_create_store_key()?;
+        // The store refuses a path that passes through a symbolic link, and
+        // a home directory can be one.
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| format!("Could not create the data directory: {e}"))?;
+        let data_dir = data_dir
+            .canonicalize()
+            .map_err(|e| format!("Could not resolve the data directory: {e}"))?;
         let secrets = FileSecretStore::open(data_dir.join("oauth"), &key)
             .map_err(|e| format!("Could not open the saved sign-in store: {e}"))?;
         let store = SessionStore::new(Arc::new(secrets), STORE_NAMESPACE)
@@ -189,20 +199,37 @@ impl DesktopAuth {
         let config = settings
             .config()
             .map_err(|e| format!("Invalid OAuth client configuration: {e}"))?;
-        let client = OAuthClient::new(
-            Arc::clone(&transport),
+        Self::assemble(
+            transport,
             Arc::new(OAuthIdentityAdapter::new(resolver)),
-            store.clone(),
+            store,
             config,
+            settings.redirect_uri,
+            settings.loopback_port,
+            false,
         )
-        .map_err(|e| format!("Invalid OAuth client configuration: {e}"))?;
+    }
 
+    /// Builds the client from its parts. `open` supplies the real network,
+    /// keyring and configuration; tests supply local servers.
+    fn assemble(
+        transport: SharedTransport,
+        identity: Arc<dyn OAuthIdentityResolver>,
+        store: SessionStore,
+        config: OAuthConfig,
+        redirect_uri: Url,
+        loopback_port: Option<u16>,
+        allow_loopback: bool,
+    ) -> Result<Self, String> {
+        let client = OAuthClient::new(Arc::clone(&transport), identity, store.clone(), config)
+            .map_err(|e| format!("Invalid OAuth client configuration: {e}"))?;
         Ok(Self {
             transport,
             client: Arc::new(client),
             store,
-            redirect_uri: settings.redirect_uri,
-            loopback_port: settings.loopback_port,
+            redirect_uri,
+            loopback_port,
+            allow_loopback,
             pds_by_did: RwLock::new(HashMap::new()),
         })
     }
@@ -379,6 +406,7 @@ impl DesktopAuth {
         options.headers = headers;
         options.transport.timeout = Some(PDS_TIMEOUT);
         options.transport.max_response_bytes = Some(MAX_PDS_RESPONSE_BYTES);
+        options.transport.allow_loopback = self.allow_loopback;
         client
             .exchange(method, nsid, params, body, &options)
             .await
@@ -400,9 +428,15 @@ impl SessionSigner {
 
 /// Headers the XRPC client sets itself from the method, body and session.
 fn is_managed_header(name: &str) -> bool {
-    ["authorization", "dpop", "content-type", "content-length", "host"]
-        .iter()
-        .any(|managed| name.eq_ignore_ascii_case(managed))
+    [
+        "authorization",
+        "dpop",
+        "content-type",
+        "content-length",
+        "host",
+    ]
+    .iter()
+    .any(|managed| name.eq_ignore_ascii_case(managed))
 }
 
 impl AccountAuth for SessionSigner {
@@ -499,6 +533,10 @@ fn load_or_create_store_key() -> Result<[u8; 32], String> {
         Err(error) => Err(format!("The system keyring is unavailable: {error}")),
     }
 }
+
+#[cfg(test)]
+#[path = "auth_e2e_tests.rs"]
+mod e2e_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,9 +1,9 @@
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use catbird_mls::payload_types::{MLSMessagePayload, MLSMessageType};
+use petrel::xrpc::{CallOptions, XrpcBody, XrpcClient};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use petrel::xrpc::{CallOptions, XrpcBody, XrpcClient};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -481,7 +481,7 @@ const CALLBACK_PAGE_CANCELLED: &str = r#"<!DOCTYPE html><html><body style="font-
 
 /// What the callback listener makes of one request line's query string.
 #[derive(Debug, PartialEq, Eq)]
-enum CallbackQuery {
+pub(crate) enum CallbackQuery {
     /// Not an answer to this sign-in: keep listening.
     Ignore,
     /// The authorization server's answer, to hand to the OAuth client.
@@ -491,7 +491,7 @@ enum CallbackQuery {
 /// Accepts only a callback that names this sign-in's `state`. Anything else
 /// on the loopback port (another local process, a stale tab) is ignored, so
 /// it cannot end the wait.
-fn classify_callback_query(query: &str, expected_state: &str) -> CallbackQuery {
+pub(crate) fn classify_callback_query(query: &str, expected_state: &str) -> CallbackQuery {
     let mut state_matches = false;
     let mut has_code = false;
     let mut has_error = false;
@@ -541,7 +541,12 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
             req.path
                 .and_then(|path| path.split_once('?'))
                 .filter(|(route, _)| *route == "/callback")
-                .map(|(_, query)| (query.to_string(), classify_callback_query(query, expected_state)))
+                .map(|(_, query)| {
+                    (
+                        query.to_string(),
+                        classify_callback_query(query, expected_state),
+                    )
+                })
         } else {
             None
         };
@@ -742,7 +747,9 @@ async fn activate_session(
     signed_in: SignedIn,
 ) -> AuthResponse {
     state.set_session_did(signed_in.did.clone());
-    state.mls_manager.set_account_did(Some(signed_in.did.clone()));
+    state
+        .mls_manager
+        .set_account_did(Some(signed_in.did.clone()));
     state.mls_manager.set_account_auth(Some((
         signed_in.pds.clone(),
         Arc::new(SessionSigner::new(Arc::clone(auth), signed_in.did.clone())),
@@ -802,7 +809,10 @@ pub async fn try_restore_session(
         }
         Ok(None) => Ok(None),
         Err(AuthFailure::SignedOut(reason)) => {
-            log_catmos!("Stored session is no longer usable; clearing saved login: {}", reason);
+            log_catmos!(
+                "Stored session is no longer usable; clearing saved login: {}",
+                reason
+            );
             sign_out_locally(&state);
             Ok(None)
         }
@@ -2601,7 +2611,10 @@ mod tests {
     fn callback_listener_accepts_only_this_sign_ins_state() {
         let state = "49152.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         assert_eq!(
-            classify_callback_query(&format!("code=abc&state={state}&iss=https%3A%2F%2Fas"), state),
+            classify_callback_query(
+                &format!("code=abc&state={state}&iss=https%3A%2F%2Fas"),
+                state
+            ),
             CallbackQuery::Answer { denied: false }
         );
         assert_eq!(
@@ -2616,7 +2629,10 @@ mod tests {
             classify_callback_query(&format!("state={state}"), state),
             CallbackQuery::Ignore
         );
-        assert_eq!(classify_callback_query("code=abc", state), CallbackQuery::Ignore);
+        assert_eq!(
+            classify_callback_query("code=abc", state),
+            CallbackQuery::Ignore
+        );
     }
 
     #[tokio::test]

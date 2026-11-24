@@ -57,6 +57,8 @@ labyrinth = { path = "../../labyrinth" }
 # catbird-mls's shared test support (included by path in lib.rs) still names these types.
 catbird-atproto = { path = "../../catbird-atproto" }
 multibase = "0.9"
+# Spawns Petrel's Swift OAuth server and client assertion backend for the opt-in sign-in test.
+petrel-e2e = { path = "../../Petrel/rust/petrel-e2e" }
 p256 = { version = "0.13", features = ["ecdsa"] }
 serde_ipld_dagcbor = "0.6"
 
