@@ -1,4 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { DisplayEmbed } from './message-embed.ts';
+
+export type { DisplayEmbed };
 
 export interface Conversation {
 	id: string;
@@ -35,6 +38,8 @@ export interface Message {
 	image?: ImageAttachment;
 	audio?: AudioAttachment;
 	audioAttachment?: AudioAttachment;
+	/** Post, link or GIF card in the wire shape `{ type, data }`. */
+	embed?: DisplayEmbed;
 	reactions?: Record<string, string[]>;
 }
 

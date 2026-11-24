@@ -1778,19 +1778,11 @@ impl TauriMlsManager {
         iv: &[u8],
         expected_sha256_hex: &str,
     ) -> Result<Vec<u8>, String> {
-        let mut parts = locator.splitn(3, '|');
-        let space_raw = parts
-            .next()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| "invalid Space attachment locator: missing space URI".to_string())?;
-        let repo_did = parts
-            .next()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| "invalid Space attachment locator: missing repo DID".to_string())?;
-        let cid = parts
-            .next()
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| "invalid Space attachment locator: missing CID".to_string())?;
+        let (space_raw, repo_did, cid) = split_attachment_locator(locator).ok_or_else(|| {
+            format!(
+                "invalid Space attachment locator `{locator}`: expected \"{{spaceURI}}|{{repoDID}}|{{cid}}\" or \"{{spaceURI}}/{{repoDID}}#{{cid}}\""
+            )
+        })?;
         if !is_valid_did(repo_did) {
             return Err(format!("invalid Space attachment writer DID: {repo_did}"));
         }
@@ -3163,6 +3155,59 @@ mod tests {
                 "https://chat.catbird.blue",
                 "did:web:chat.catbird.blue",
             ),
+            None
+        );
+    }
+}
+
+/// Split a Space attachment locator into `(spaceURI, repoDID, cid)`.
+///
+/// Accepts both shapes Catbird iOS reads (`MLSSpaceBlobLocator.parse`):
+/// `"{spaceURI}|{repoDID}|{cid}"` and `"{spaceURI}/{repoDID}#{cid}"`.
+pub(crate) fn split_attachment_locator(locator: &str) -> Option<(&str, &str, &str)> {
+    let trimmed = locator.trim();
+    if trimmed.contains('|') {
+        let mut parts = trimmed.splitn(3, '|');
+        let (space, repo, cid) = (parts.next()?, parts.next()?, parts.next()?);
+        return (!space.trim().is_empty() && !repo.trim().is_empty() && !cid.trim().is_empty())
+            .then_some((space, repo, cid));
+    }
+    let (before_hash, cid) = trimmed.split_once('#')?;
+    let (space, repo) = before_hash.rsplit_once('/')?;
+    (!space.is_empty() && !repo.is_empty() && !cid.is_empty()).then_some((space, repo, cid))
+}
+
+#[cfg(test)]
+mod attachment_locator_tests {
+    use super::split_attachment_locator;
+
+    const SPACE: &str =
+        "at://did:web:chat.catbird.blue/space/blue.catbird.labyrinth.conversation/abc";
+
+    #[test]
+    fn splits_pipe_locator() {
+        let raw = format!("{SPACE}|did:plc:writer|bafkreicid");
+        assert_eq!(
+            split_attachment_locator(&raw),
+            Some((SPACE, "did:plc:writer", "bafkreicid"))
+        );
+    }
+
+    #[test]
+    fn splits_hash_locator() {
+        let raw = format!("{SPACE}/did:plc:writer#bafkreicid");
+        assert_eq!(
+            split_attachment_locator(&raw),
+            Some((SPACE, "did:plc:writer", "bafkreicid"))
+        );
+    }
+
+    #[test]
+    fn rejects_bare_cid_and_empty_parts() {
+        assert_eq!(split_attachment_locator("bafkreicid"), None);
+        assert_eq!(split_attachment_locator("||"), None);
+        assert_eq!(
+            split_attachment_locator(&format!("{SPACE}/did:plc:writer#")),
             None
         );
     }

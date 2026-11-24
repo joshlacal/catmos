@@ -83,8 +83,46 @@
 		return p?.displayName || p?.handle || replyAccountDid || replyRef.senderDid;
 	});
 
-	// Detect Bluesky post URLs in message content
+	// Structured post/link/GIF card sent by Catbird iOS or Catmos.
+	let embed = $derived(message.embed ?? null);
+	let embedPostUri = $derived(
+		embed?.type === 'post' && typeof embed.data.uri === 'string' ? embed.data.uri : null
+	);
+	let linkEmbed = $derived.by(() => {
+		if (embed?.type !== 'link' || typeof embed.data.url !== 'string') return null;
+		if (!/^https?:\/\//i.test(embed.data.url)) return null;
+		const d = embed.data;
+		let domain = typeof d.domain === 'string' ? d.domain : '';
+		if (!domain) {
+			try {
+				domain = new URL(d.url as string).hostname;
+			} catch {
+				domain = '';
+			}
+		}
+		return {
+			url: d.url as string,
+			title: typeof d.title === 'string' ? d.title : null,
+			description: typeof d.description === 'string' ? d.description : null,
+			domain
+		};
+	});
+	let gifEmbed = $derived.by(() => {
+		if (embed?.type !== 'gif') return null;
+		const d = embed.data;
+		const mp4 = d.mp4_url ?? d.mp4URL;
+		if (typeof mp4 !== 'string' || !/^https:\/\//i.test(mp4)) return null;
+		return {
+			mp4,
+			title: typeof d.title === 'string' ? d.title : 'GIF',
+			width: Number(d.width ?? 0) || 1,
+			height: Number(d.height ?? 0) || 1
+		};
+	});
+
+	// Detect Bluesky post URLs in message content (a structured post embed wins)
 	let blueskyUrl = $derived.by(() => {
+		if (embedPostUri) return embedPostUri;
 		if (!rawContent) return null;
 		const bskyMatch = rawContent.match(
 			/https:\/\/bsky\.app\/profile\/[^\s/]+\/post\/[a-zA-Z0-9]+/
@@ -176,6 +214,26 @@
 				{/if}
 				{#if blueskyUrl}
 					<BlueskyEmbed url={blueskyUrl} />
+				{/if}
+				{#if linkEmbed}
+					<a class="link-card" href={linkEmbed.url} target="_blank" rel="noopener noreferrer">
+						{#if linkEmbed.title}<span class="link-card-title">{linkEmbed.title}</span>{/if}
+						{#if linkEmbed.description}<span class="link-card-desc">{linkEmbed.description}</span>{/if}
+						<span class="link-card-domain">{linkEmbed.domain || linkEmbed.url}</span>
+					</a>
+				{/if}
+				{#if gifEmbed}
+					<video
+						class="gif-embed"
+						src={gifEmbed.mp4}
+						title={gifEmbed.title}
+						aria-label={gifEmbed.title}
+						style={`aspect-ratio: ${gifEmbed.width} / ${gifEmbed.height};`}
+						autoplay
+						loop
+						muted
+						playsinline
+					></video>
 				{/if}
 				<div class="bubble-meta">
 					<span class="bubble-time">{formatTime(message.timestamp)}</span>
@@ -491,5 +549,41 @@
 	/* ── Failed state ── */
 	.message-row.failed .bubble {
 		opacity: 0.6;
+	}
+
+	.link-card {
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+		margin-top: 6px;
+		padding: 8px 10px;
+		border: 1px solid var(--border, rgba(127, 127, 127, 0.3));
+		border-radius: 10px;
+		color: inherit;
+		text-decoration: none;
+		max-width: 320px;
+	}
+	.link-card-title {
+		font-weight: 600;
+	}
+	.link-card-desc {
+		font-size: 0.85em;
+		opacity: 0.8;
+		display: -webkit-box;
+		-webkit-line-clamp: 2;
+		line-clamp: 2;
+		-webkit-box-orient: vertical;
+		overflow: hidden;
+	}
+	.link-card-domain {
+		font-size: 0.8em;
+		color: var(--text-link, inherit);
+	}
+	.gif-embed {
+		display: block;
+		width: 100%;
+		max-width: 280px;
+		border-radius: 10px;
+		margin-top: 6px;
 	}
 </style>

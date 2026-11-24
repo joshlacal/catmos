@@ -211,6 +211,7 @@ fn rfc3339_from_ms(ms: i64) -> String {
 pub(crate) fn ui_message_from_row(row: catbird_mls::storage::MessageRow) -> Message {
     let mut image: Option<ImageAttachment> = None;
     let mut audio: Option<AudioAttachment> = None;
+    let mut display_embed: Option<serde_json::Value> = None;
     let mut message_type = "text".to_string();
     let content: String;
 
@@ -260,6 +261,7 @@ pub(crate) fn ui_message_from_row(row: catbird_mls::storage::MessageRow) -> Mess
                     transcript: aud.transcript,
                 });
             } else {
+                display_embed = display_embed_json(&embed);
                 content = payload.text.unwrap_or_default();
             }
         } else {
@@ -290,7 +292,21 @@ pub(crate) fn ui_message_from_row(row: catbird_mls::storage::MessageRow) -> Mess
         image,
         audio,
         audio_attachment,
+        embed: display_embed,
     }
+}
+
+/// Embed kinds the UI renders as cards. Everything else (images, audio,
+/// group invitations) has a dedicated projection or none.
+const DISPLAY_EMBED_KINDS: [&str; 3] = ["post", "link", "gif"];
+
+fn display_embed_json(
+    embed: &catbird_mls::payload_types::MLSEmbedData,
+) -> Option<serde_json::Value> {
+    if !DISPLAY_EMBED_KINDS.contains(&embed.kind.as_str()) || !embed.data.is_object() {
+        return None;
+    }
+    Some(serde_json::json!({ "type": embed.kind, "data": embed.data }))
 }
 
 fn ui_conversation_from_row(
@@ -443,6 +459,10 @@ pub struct Message {
     pub audio: Option<AudioAttachment>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_attachment: Option<AudioAttachment>,
+    /// Display-only rich embed (`post`, `link`, `gif`) in the Catbird wire
+    /// shape `{"type": kind, "data": {...snake_case...}}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2951,6 +2971,89 @@ mod tests {
     use catbird_mls::storage::MessageRow;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn row_with_payload(payload_json: String) -> MessageRow {
+        MessageRow {
+            message_id: "msg-embed-1".to_string(),
+            conversation_id: "01900000-0000-7000-8000-000000000001".to_string(),
+            group_id: vec![1, 2, 3, 4],
+            seq: 3,
+            epoch: 1,
+            sender_did: "did:plc:bob".to_string(),
+            sender_device_id: "00000000-0000-4000-8000-000000000002".to_string(),
+            plaintext_json: payload_json,
+            created_at_ms: 1_763_120_000_000,
+            is_own: false,
+        }
+    }
+
+    #[test]
+    fn ui_message_from_row_projects_post_link_and_gif_embeds() {
+        // Shape Catbird iOS sends for a quoted Bluesky post with no text.
+        let post = MLSEmbedData {
+            kind: "post".to_string(),
+            data: serde_json::json!({
+                "uri": "at://did:plc:carol/app.bsky.feed.post/3kabc",
+                "cid": "bafyreipost",
+                "author_did": "did:plc:carol",
+            }),
+        };
+        let msg = ui_message_from_row(row_with_payload(
+            serde_json::to_string(&MLSMessagePayload::text_with_embed("", post)).unwrap(),
+        ));
+        assert_eq!(msg.message_type, "text");
+        let embed = msg.embed.expect("post embed projected");
+        assert_eq!(embed["type"], "post");
+        assert_eq!(
+            embed["data"]["uri"],
+            "at://did:plc:carol/app.bsky.feed.post/3kabc"
+        );
+        // Serialized for the Svelte side under the camelCase `embed` key.
+        let wire = serde_json::to_value(ui_message_from_row(row_with_payload(
+            serde_json::to_string(&MLSMessagePayload::text_with_embed(
+                "see",
+                MLSEmbedData {
+                    kind: "link".to_string(),
+                    data: serde_json::json!({ "url": "https://example.com", "title": "Ex" }),
+                },
+            ))
+            .unwrap(),
+        )))
+        .unwrap();
+        assert_eq!(wire["embed"]["type"], "link");
+        assert_eq!(wire["embed"]["data"]["url"], "https://example.com");
+
+        let gif = ui_message_from_row(row_with_payload(
+            serde_json::to_string(&MLSMessagePayload::text_with_embed(
+                "",
+                MLSEmbedData {
+                    kind: "gif".to_string(),
+                    data: serde_json::json!({
+                        "tenor_url": "https://tenor.com/x",
+                        "mp4_url": "https://media.tenor.com/x.mp4"
+                    }),
+                },
+            ))
+            .unwrap(),
+        ));
+        assert_eq!(
+            gif.embed.expect("gif embed")["data"]["mp4_url"],
+            "https://media.tenor.com/x.mp4"
+        );
+
+        // Kinds without a card are not projected.
+        let invite = ui_message_from_row(row_with_payload(
+            serde_json::to_string(&MLSMessagePayload::text_with_embed(
+                "hi",
+                MLSEmbedData {
+                    kind: "groupInvitation".to_string(),
+                    data: serde_json::json!({}),
+                },
+            ))
+            .unwrap(),
+        ));
+        assert!(invite.embed.is_none());
+    }
 
     #[test]
     fn ui_message_from_row_projects_space_image_and_voice_embeds() {

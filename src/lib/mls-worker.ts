@@ -1,6 +1,7 @@
 // Runs inside a dedicated Worker — has access to OPFS SAH for synchronous SQLite I/O.
 import { expose } from 'comlink';
 import init, * as wasm from 'catbird-mls-web';
+import { decodeBase64Bytes, extractMessageDetails } from './message-embed.ts';
 
 // Initialize the WASM binary when the worker starts.
 // Stored as a module-level promise — each exposed method awaits it before calling WASM.
@@ -37,18 +38,6 @@ function bytesToHex(bytes: number[] | Uint8Array | undefined | null): string {
 	return arr.map((b) => Number(b & 0xff).toString(16).padStart(2, '0')).join('');
 }
 
-function decodeBase64Bytes(input: string): Uint8Array {
-	const normalized = input.trim().replace(/-/g, '+').replace(/_/g, '/');
-	if (!normalized) return new Uint8Array();
-	const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-	const bin = atob(padded);
-	const out = new Uint8Array(bin.length);
-	for (let i = 0; i < bin.length; i += 1) {
-		out[i] = bin.charCodeAt(i);
-	}
-	return out;
-}
-
 function encodeBase64Bytes(bytes: Uint8Array | number[]): string {
 	const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 	let bin = '';
@@ -77,110 +66,10 @@ function decodeSha256Bytes(sha256: string): Uint8Array | null {
 	}
 }
 
-function extractMessageDetails(plaintextJson: string): {
-	messageType: string;
-	content: string;
-	image?: {
-		blobId: string;
-		keyB64: string;
-		ivB64: string;
-		sha256: string;
-		contentType: string;
-		size: number;
-		width: number;
-		height: number;
-		altText?: string;
-		blurhash?: string;
-	};
-	audio?: {
-		blobId: string;
-		key: Uint8Array;
-		iv: Uint8Array;
-		keyB64: string;
-		ivB64: string;
-		sha256: string;
-		contentType: string;
-		size: number;
-		durationMs: number;
-		waveform: number[];
-		transcript?: string;
-	};
-} {
-	try {
-		const parsed = JSON.parse(plaintextJson) as Record<string, unknown>;
-		let messageType =
-			typeof parsed.messageType === 'string'
-				? parsed.messageType
-				: typeof parsed.type === 'string'
-					? parsed.type
-					: 'text';
-		const content =
-			typeof parsed.text === 'string'
-				? parsed.text
-				: typeof parsed.content === 'string'
-					? parsed.content
-					: typeof parsed.embed === 'object' && parsed.embed !== null
-						? ''
-						: plaintextJson;
-
-		const embed =
-			typeof parsed.embed === 'object' && parsed.embed !== null
-				? (parsed.embed as Record<string, unknown>)
-				: null;
-		if (embed?.type === 'image') {
-			messageType = 'image';
-			return {
-				messageType,
-				content,
-				image: {
-					blobId: String(embed.blobId ?? ''),
-					keyB64: String(embed.key ?? embed.keyB64 ?? ''),
-					ivB64: String(embed.iv ?? embed.ivB64 ?? ''),
-					sha256: String(embed.sha256 ?? ''),
-					contentType: String(embed.contentType ?? 'image/jpeg'),
-					size: Number(embed.size ?? 0),
-					width: Number(embed.width ?? 0),
-					height: Number(embed.height ?? 0),
-					altText: typeof embed.altText === 'string' ? embed.altText : undefined,
-					blurhash: typeof embed.blurhash === 'string' ? embed.blurhash : undefined
-				}
-			};
-		}
-		if (embed?.type === 'audio') {
-			messageType = 'voice';
-			const keyB64 = String(embed.key ?? embed.keyB64 ?? '');
-			const ivB64 = String(embed.iv ?? embed.ivB64 ?? '');
-			const waveformRaw = Array.isArray(embed.waveform)
-				? embed.waveform.map((n) => Number(n)).filter((n) => Number.isFinite(n))
-				: [];
-			return {
-				messageType,
-				content,
-				audio: {
-					blobId: String(embed.blobId ?? ''),
-					key: decodeBase64Bytes(keyB64),
-					iv: decodeBase64Bytes(ivB64),
-					keyB64,
-					ivB64,
-					sha256: String(embed.sha256 ?? ''),
-					contentType: String(embed.contentType ?? 'audio/webm;codecs=opus'),
-					size: Number(embed.size ?? 0),
-					durationMs: Number(embed.durationMs ?? 0),
-					waveform: waveformRaw,
-					transcript: typeof embed.transcript === 'string' ? embed.transcript : undefined
-				}
-			};
-		}
-		return { messageType, content };
-	} catch {
-		return { messageType: 'text', content: plaintextJson };
-	}
-}
-
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function mapMessageRowToUi(rawRow: any) {
 	const row = plain(rawRow);
-	const { messageType, content, image, audio } = extractMessageDetails(
+	const { messageType, content, image, audio, embed } = extractMessageDetails(
 		String(row.plaintext_json ?? '')
 	);
 	const createdMs = Number(row.created_at_ms ?? Date.now());
@@ -197,7 +86,8 @@ function mapMessageRowToUi(rawRow: any) {
 		isOwn,
 		messageType,
 		...(image ? { image } : {}),
-		...(audio ? { audio, audioAttachment: audio } : {})
+		...(audio ? { audio, audioAttachment: audio } : {}),
+		...(embed ? { embed } : {})
 	};
 }
 
