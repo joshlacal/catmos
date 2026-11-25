@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <title>Catmos</title>
+  <defs>
+    <linearGradient id="catbird-bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#5192FF"/>
+      <stop offset="100%" stop-color="#7FAEFF"/>
+    </linearGradient>
+  </defs>
+  <rect width="108" height="108" rx="24" fill="url(#catbird-bg)"/>
+  <g transform="translate(54 55) scale(1.38) translate(-53.99 -53.76)">
+    <path fill="#A6ABB3" d="M48.85,30.75 L55.32,32.66 L61.71,36.50 L66.43,41.29 L70.82,48.01 L87.20,53.28 L71.86,60.47 L69.30,68.14 L66.59,72.94 L63.55,75.34 L58.91,76.77 L49.80,76.30 L38.46,71.98 L27.27,63.35 L21.36,54.24 L20.48,47.05 L23.83,40.81 L31.35,34.10 L40.30,30.75 Z"/>
+    <path fill="#1C1C1E" d="M58.90,48.40 L87.50,53.80 L62.00,61.10 Z"/>
+    <path fill="#1C1C1E" d="M38.78,45.93 a6.95,6.95 0 1,0 13.90,0 a6.95,6.95 0 1,0 -13.90,0 Z"/>
+    <path fill="#FFFFFF" d="M46.13,43.61 a2.40,2.40 0 1,0 4.80,0 a2.40,2.40 0 1,0 -4.80,0 Z"/>
+  </g>
+</svg>

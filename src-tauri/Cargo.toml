@@ -9,43 +9,70 @@ name = "catmos_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2.7.4", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
-tauri-plugin-shell = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
-keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
-tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
-futures-util = "0.3"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+tauri = { version = "2.12.5", features = [] }
+tauri-plugin-shell = "2.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", features = ["full"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["query", "json", "rustls"] }
+keyring = { package = "keyring-core", version = "1.0.1" }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+futures-util = "0.3.34"
+chrono = { version = "0.4.45", features = ["serde"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 rusqlite = { version = "=0.37.0", default-features = false }
-base64 = "0.22"
-async-trait = "0.1"
-tracing = "0.1"
-bytes = "1"
+base64 = "0.23.1"
+async-trait = "0.1.92"
+tracing = "0.1.44"
+bytes = "1.12.1"
 
-dirs = "6"
-ciborium = "0.2"
+dirs = "7.0.0"
+ciborium = "0.2.2"
 catbird_mls = { path = "../../catbird-mls" }
-catbird-atproto = { path = "../../catbird-atproto" }
+petrel = { path = "../../Petrel/rust/petrel", features = ["file-store"] }
+petrel-core = { path = "../../Petrel/rust/petrel-core" }
+petrel-api = { path = "../../Petrel/rust/petrel-api", features = ["app_bsky", "com_atproto"] }
+petrel-catbird = { path = "../../PetrelCatbird/rust/petrel-catbird" }
+http = "1"
+url = "2.5"
+atproto-spaces = { path = "../../catbird-atproto/atproto-spaces" }
 
 urlencoding = "2.1.3"
-httparse = "1"
-getrandom = "0.2"
-hex = "0.4"
-anyhow = "1"
-rand = "0.8"
-sha2 = "0.10"
-tempfile = "3"
-fs2 = "0.4"
+httparse = "1.10.1"
+getrandom = "0.4.3"
+hex = "0.4.3"
+anyhow = "1.0.104"
+rand = "0.10.3"
+sha2 = "0.11.1"
+tempfile = "3.27.0"
+
+[dev-dependencies]
+# Unit tests open catbird-mls's explicit offline archive harness (`open_offline_archive_for_test`)
+# as well as live `CatbirdMlsClient::open` against the Nov-12 Space auth fixture.
+catbird_mls = { path = "../../catbird-mls", features = ["test-utils"] }
+labyrinth = { path = "../../labyrinth" }
+# catbird-mls's shared test support (included by path in lib.rs) still names these types.
+catbird-atproto = { path = "../../catbird-atproto" }
+multibase = "0.9"
+# Spawns Petrel's Swift OAuth server and client assertion backend for the opt-in sign-in test.
+petrel-e2e = { path = "../../Petrel/rust/petrel-e2e" }
+p256 = { version = "0.13", features = ["ecdsa"] }
+serde_ipld_dagcbor = "0.6"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher"] }
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
-rusqlite = { version = "=0.37.0", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = "1.0.0"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = "1.1.0"

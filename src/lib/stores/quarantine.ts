@@ -16,8 +16,8 @@ import type {
 	QuarantineState,
 	QuarantineEnteredEvent,
 	QuarantineClearedEvent
-} from '$lib/tauri';
-import { getQuarantineState as fetchQuarantineState } from '$lib/wasm';
+} from '#lib/tauri.ts';
+import { getQuarantineState as fetchQuarantineState } from '#lib/wasm.ts';
 
 type QuarantineMap = Record<string, QuarantineState>;
 
@@ -96,7 +96,7 @@ export function quarantineReasonCopy(reasonTag: string): string {
 		case 'multi_peer_bad_commits':
 			return 'Multiple participants sent invalid commits.';
 		case 'repeated_framing_failures':
-			return 'Recent messages could not be decoded — likely a buggy client.';
+			return 'Recent messages could not be decoded. Likely a buggy client.';
 		default:
 			return 'A participant may be sending invalid messages.';
 	}

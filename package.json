@@ -10,32 +10,43 @@
     "predev": "bash scripts/generate-brand.sh",
     "prebuild": "bash scripts/generate-brand.sh",
     "brand:gen": "bash scripts/generate-brand.sh",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && tsc --project src/service-worker/tsconfig.json",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
+    "verify:inputs": "python3 scripts/verify-qualified-inputs.py",
     "tauri:build": "tauri build",
     "check:rust": "cd src-tauri && cargo check --locked",
     "check:android": "bash ./scripts/check-android.sh",
     "check:linux": "cd src-tauri && cargo check --target x86_64-unknown-linux-gnu",
     "check:windows": "cd src-tauri && cargo check --target x86_64-pc-windows-msvc",
     "build:wasm": "bash ../catbird-mls-web/build.sh",
-    "build:wasm:dev": "bash ../catbird-mls-web/build-dev.sh"
+    "build:wasm:dev": "bash ../catbird-mls-web/build-dev.sh",
+    "test": "node --experimental-strip-types --test tests/*.spec.ts"
   },
   "devDependencies": {
-    "@sveltejs/adapter-static": "^3.0.0",
-    "@sveltejs/kit": "^2.0.0",
-    "@sveltejs/vite-plugin-svelte": "^5.0.0",
-    "@tauri-apps/cli": "^2.0.0",
-    "@types/node": "^25.2.2",
-    "svelte": "^5.0.0",
-    "svelte-check": "^4.0.0",
-    "typescript": "^5.0.0",
-    "vite": "^6.0.0"
+    "@sveltejs/adapter-static": "4.0.0",
+    "@sveltejs/kit": "3.1.0",
+    "@sveltejs/vite-plugin-svelte": "7.3.1",
+    "@tauri-apps/cli": "2.12.4",
+    "@types/node": "24.19.2",
+    "svelte": "5.57.2",
+    "svelte-check": "4.7.7",
+    "typescript": "6.0.3",
+    "vite": "8.3.5",
+    "@opentelemetry/api": "1.10.0"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-deep-link": "^2.4.7",
-    "@tauri-apps/plugin-shell": "^2.0.0",
-    "comlink": "^4.4.2"
+    "@tauri-apps/api": "2.12.4",
+    "@tauri-apps/plugin-deep-link": "2.6.2",
+    "@tauri-apps/plugin-shell": "2.5.0",
+    "comlink": "4.4.2"
+  },
+  "engines": {
+    "node": ">=24.22.1 <25",
+    "npm": ">=12.2.1 <13"
+  },
+  "packageManager": "npm@12.2.1",
+  "imports": {
+    "#lib/*": "./src/lib/*"
   }
 }

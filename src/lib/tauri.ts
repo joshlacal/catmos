@@ -1,16 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
+import type { DisplayEmbed } from './message-embed.ts';
+
+export type { DisplayEmbed };
 
 export interface Conversation {
 	id: string;
 	/** Current MLS group identifier (hex). Changes on group reset. */
-	groupId: string;
+	groupId?: string;
 	displayName: string;
 	description?: string;
 	members: string[];
-	/** Immutable projection kind from the browser/WASM conversation API. */
-	conversationKind?: 'direct' | 'group' | string;
-	/** Server MemberView roster, including creator and role. */
-	memberViews?: ConversationMember[];
 	lastMessage?: string;
 	lastMessageAt?: string;
 	unreadCount: number;
@@ -25,24 +24,22 @@ export interface Conversation {
 	avatarDataUrl?: string;
 }
 
-export interface ConversationMember {
-	did: string;
-	role: 'admin' | 'member' | string;
-}
-
 export interface Message {
+	sequenceNumber?: number;
 	id: string;
 	conversationId: string;
 	senderDid: string;
 	senderHandle: string;
 	content: string;
 	timestamp: string;
-	/** Canonical conversation sequence; absent or zero means not yet confirmed. */
-	sequenceNumber?: number;
 	status: 'sending' | 'sent' | 'delivered' | 'read' | 'failed';
+	isOwn?: boolean;
 	messageType?: 'text' | 'image' | 'voice' | 'system' | 'event';
 	image?: ImageAttachment;
+	audio?: AudioAttachment;
 	audioAttachment?: AudioAttachment;
+	/** Post, link or GIF card in the wire shape `{ type, data }`. */
+	embed?: DisplayEmbed;
 	reactions?: Record<string, string[]>;
 }
 
@@ -62,8 +59,10 @@ export interface ImageAttachment {
 
 export interface AudioAttachment {
 	blobId: string;
-	key: Uint8Array;
-	iv: Uint8Array;
+	key: Uint8Array | number[];
+	iv: Uint8Array | number[];
+	keyB64?: string;
+	ivB64?: string;
 	sha256: string;
 	contentType: string;
 	size: number;
@@ -108,6 +107,7 @@ export interface AuthState {
 	handle: string;
 	displayName?: string;
 	avatar?: string;
+	grantedScopes?: string[];
 }
 
 export interface GroupMember {
@@ -128,16 +128,20 @@ export async function startLogin(identifier: string): Promise<void> {
 	return invoke('start_login', { identifier });
 }
 
-export async function completeLogin(sessionId: string): Promise<AuthState> {
-	return invoke('complete_login', { sessionId });
-}
-
 export async function tryRestoreSession(): Promise<AuthState | null> {
 	return invoke('try_restore_session');
 }
 
 export async function logout(): Promise<void> {
 	return invoke('logout');
+}
+
+export async function retireCurrentDevice(): Promise<void> {
+	return invoke('retire_current_device');
+}
+
+export async function deleteAccountData(): Promise<void> {
+	return invoke('delete_account_data');
 }
 
 export async function getConversations(): Promise<Conversation[]> {

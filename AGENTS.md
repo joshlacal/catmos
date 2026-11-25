@@ -6,6 +6,10 @@ Catmos is an E2EE group messaging app on AT Protocol, available as both a Tauri 
 
 ## Build & Development
 
+Use Node 24.22.1 LTS and npm 12.2.1 (see `.node-version` and `packageManager`). SvelteKit 3 configuration lives in `vite.config.ts`; `#lib/*` imports are declared in `package.json`. TypeScript stays on 6.0.3 because the current Svelte tooling declares support through version 6.
+
+For an isolated sibling workspace whose brand docs live elsewhere, set `CATBIRD_BRAND_TOKENS` to the absolute `Catbird.pkl` path before running build/dev commands.
+
 ### Desktop (Tauri)
 
 ```bash
@@ -38,16 +42,19 @@ The WASM backend is `catbird-mls-web`, which lives in its own sibling repo at th
 
 ```bash
 # Build WASM package (release, with wasm-opt if available)
-cd ../catbird-mls-web && ./build.sh
+cd ../catbird-mls-web && ./build.sh        # or: npm run build:wasm
 
 # Build WASM package (dev mode, faster, debug symbols)
-cd ../catbird-mls-web && ./build-dev.sh
+cd ../catbird-mls-web && ./build-dev.sh    # or: npm run build:wasm:dev
 
 # Run the SvelteKit frontend pointing at the WASM backend
 cd catmos && npm run dev
+
+# Frontend unit tests (Node test runner over tests/*.spec.ts)
+cd catmos && npm test
 ```
 
-Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through `vite.config.ts` (bundling) + `svelte.config.js` `kit.alias` (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract.
+Build output lives in `catbird-mls-web/pkg/` (gitignored). catmos resolves `import … from 'catbird-mls-web'` through the `resolve.alias` in `vite.config.ts` (bundling) and the `paths` entry in `tsconfig.json` (type-checking), both pointing at that `pkg/` directory. There is no hand-declared `.d.ts` shim — the wasm-pack-generated `catbird_mls_web.d.ts` is the single source of truth for the WASM contract. The candidate desktop build checks the actual Cargo-resolved sibling manifests, sealed source revisions, package-manager locks and compiled WebAssembly package against `scripts/qualified-inputs.json` before invoking the frontend bundler. Use `npm run verify:inputs` to run the same check directly. The candidate package is local; publication is a separate release step.
 
 The SvelteKit frontend auto-detects Tauri vs browser at runtime via `$lib/wasm.ts`.
 
@@ -57,30 +64,34 @@ The SvelteKit frontend auto-detects Tauri vs browser at runtime via `$lib/wasm.t
 
 ```
 src-tauri/src/
-├── main.rs          # Tauri app entry point
-├── lib.rs           # Library with IPC command registration
-├── commands.rs      # IPC commands (create_group, send_message, etc.)
-├── storage.rs       # SQLCipher local storage
-├── credentials.rs   # AT Protocol credential management
-├── keychain.rs      # OS keychain integration
-├── api_client.rs    # AT Protocol API client
-├── websocket.rs     # Real-time message delivery
-├── blue.rs          # Blue namespace types
-├── blue/            # AT Protocol lexicon types
-└── catbird/         # Catbird-specific types
+├── main.rs              # Tauri app entry point
+├── lib.rs               # IPC command registration; MLSOrchestrator wiring
+├── commands.rs          # IPC commands (create_group, send_message, etc.)
+├── mls.rs               # Clean-slate CatbirdMlsClient + Labyrinth 1.1 manager (TauriTransport, TauriKeyStore, ctl #2 opt-in gate)
+├── mls_proxy.rs         # atproto-proxy header value (ATPROTO_PROXY_HEADER / ATPROTO_PROXY_DID, default did:web:chat.catbird.blue#atproto_mls)
+├── storage.rs           # SQLCipher local storage
+├── credentials.rs       # AT Protocol credential management
+├── keychain.rs          # OS keychain integration
+├── native_keyring.rs    # Maintained keyring backends (pre-upgrade identifiers)
+├── keys.rs              # Per-DID content-root keys for field-level encryption
+├── api_client.rs        # AT Protocol API client
+├── websocket.rs         # Real-time message delivery
+├── quarantine_observer.rs # MLS quarantine event observer
+├── recovery.rs          # Shared recovery categories (transport ↔ UI)
+└── session_restore.rs   # Session-restore failure classification
 ```
 
 ### Web WASM Backend (`../catbird-mls-web/`)
 
-Single-crate WASM wrapper exposing `#[wasm_bindgen]` entry points directly, compiled to WebAssembly via wasm-pack. catmos consumes the generated `pkg/` output via a Vite alias + SvelteKit `kit.alias`; no hand-declared shim is needed.
+Single-crate WASM wrapper exposing `#[wasm_bindgen]` entry points directly, compiled to WebAssembly via wasm-pack. catmos consumes the generated `pkg/` output through the Vite `resolve.alias` in `vite.config.ts` (bundling) and the `paths` entry in `tsconfig.json` (type-checking); no hand-declared shim is needed.
 
-Storage model is a unified encrypted SQLite database (OPFS-backed via `wa-sqlite`), shared across credentials, conversation state, and MLS group state — there's no separate IndexedDB layer.
+Storage model is one encrypted SQLite database (`sqlite-wasm-rs` with `sqlite3mc`, on the OPFS SyncAccessHandle-pool VFS), shared across credentials, conversation state, and MLS group state — there's no separate IndexedDB layer.
 
 | Feature | Desktop (Tauri) | Web (catbird-mls-web) |
 |---------|----------------|------------------------|
-| Client construction | Direct Rust via `MLSOrchestrator` | `catbird_mls_init({ baseUrl, storagePrefix?, dbPrefix? })` |
+| Client construction | `MLSOrchestrator` (`lib.rs`) plus `CatbirdMlsClient` per account (`mls.rs`) | `catbird_mls_init({ baseUrl, storagePrefix?, dbPrefix? })`, or `WasmMlsClient` for the clean-slate client |
 | Auth | `keyring` → OS keychain | `catbird_mls_set_auth(did, token)` → localStorage |
-| Storage | SQLCipher via `rusqlite` | OPFS SQLite (wa-sqlite) |
+| Storage | SQLCipher via `rusqlite` | OPFS SQLite (`sqlite-wasm-rs` + `sqlite3mc`) |
 | WebSocket | `tokio-tungstenite` | `catbird_mls_subscribe` → browser WebSocket via `web-sys` |
 | HTTP | `reqwest` (native) | `reqwest` (browser fetch backend) |
 
@@ -111,7 +122,7 @@ src/
     └── mls-worker.ts            # Dedicated Worker that owns the WASM instance
 ```
 
-WASM types come from `../catbird-mls-web/pkg/catbird_mls_web.d.ts` via the `kit.alias` in `svelte.config.js`.
+WASM types come from `../catbird-mls-web/pkg/catbird_mls_web.d.ts` via the `paths` entry in `tsconfig.json`.
 
 ### Runtime Detection
 
@@ -134,10 +145,10 @@ Frontend calls backend via the unified bridge (17 commands):
 
 ### Rust (Desktop — `src-tauri/`)
 - **tauri** 2 - Desktop app framework
-- **catbird_mls** - Shared MLS orchestrator (path dependency: `../../catbird-mls`)
+- **catbird_mls** - Shared MLS core (path dependency: `../../catbird-mls`); `mls.rs` wraps its `CatbirdMlsClient`
+- **catbird-atproto** - Generated AT Protocol / Catbird lexicon types (path dependency: `../../catbird-atproto`)
 - **rusqlite** with `bundled-sqlcipher` - Encrypted local storage
-- **atrium-api** - AT Protocol SDK
-- **keyring** - OS-native credential storage
+- **keyring-core** (as `keyring`) - OS-native credential storage
 - **tokio-tungstenite** - WebSocket for real-time delivery
 
 ### Rust (Web — `../catbird-mls-web/`)
@@ -146,7 +157,7 @@ Lives in its own sibling repo. catmos does not take a Rust dependency on it — 
 
 Notable crate-level pieces (see catbird-mls-web's own AGENTS.md for detail):
 - **wasm-bindgen** / **js-sys** / **web-sys** — WASM ↔ JS interop
-- **wa-sqlite** — OPFS-backed synchronous SQLite for unified encrypted storage (credentials + conversation state + MLS groups in one DB)
+- **sqlite-wasm-rs** (`sqlite3mc`) on the OPFS SyncAccessHandle-pool VFS — unified encrypted storage (credentials + conversation state + MLS groups in one DB)
 - **reqwest** (default-features off) — HTTP via browser fetch
 - **console-error-panic-hook** — better panic messages in the browser console
 
@@ -158,9 +169,15 @@ Notable crate-level pieces (see catbird-mls-web's own AGENTS.md for detail):
 
 ## Relationship to catbird-mls
 
-- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../catbird-mls`). The orchestrator + MLSContext are linked into the Tauri binary; no UniFFI.
+- **Catmos Desktop**: depends on `catbird-mls` directly as a Rust path dep (`src-tauri/Cargo.toml` → `../../catbird-mls`). The unified `CatbirdMlsClient` is linked into the Tauri binary; no UniFFI.
 - **Catmos Web**: does *not* depend on `catbird-mls` directly. The WASM work lives in the sibling `catbird-mls-web` crate, which owns its own `wasm_bindgen` surface and its own adapted storage/network layers. catmos only consumes the generated `pkg/` artifacts.
 - **Catbird iOS**: bridges to `catbird-mls` via UniFFI Swift bindings (outside catmos's scope).
+
+## Labyrinth and Spaces gate
+
+- MLS chat is default-off per account (`ctl #2`). The frontend records the opt-in with `isMlsOptedInForDid` / `setMlsOptedInForDid` (`src/lib/labyrinth-ui.ts`); the desktop gate is `<data_dir>/mls-opt-in/<sha256(normalized_did)>.enabled` (`src-tauri/src/mls.rs`), and before opt-in a desktop sign-in opens no MLS database, uploads no KeyPackages and probes no PDS/DS endpoint.
+- `REQUIRED_LABYRINTH_OAUTH_SCOPES` in `src/lib/labyrinth-ui.ts` mirrors the 7 allowlisted `nest` + `catbird_mls` Labyrinth/device scopes: `atproto`, `blob:*/*`, `repo:blue.catbird.labyrinth.mailboxKeys`, `repo:blue.catbird.chat.device?action=create`, `repo:blue.catbird.chat.deviceRevocation?action=create`, and the two explicit Labyrinth Space scopes (`space:blue.catbird.labyrinth.mailbox?action=…&manage=delete` including `circleOwnerState` + `readState`, and `space:blue.catbird.labyrinth.conversation?action=…&collection=blue.catbird.labyrinth.mek` including `authorRedaction`; exact strings in the file).
+- `evaluateSpacesGateForUi(pdsSupportsSpaces, grantedScopes)` returns `missingScopes` and a user message. A session granted only the retired `space:blue.catbird.labyrinth.mailbox?manage=create&manage=delete` and `space:blue.catbird.labyrinth.conversation?authority=*` forms reports both Space scopes missing and must re-authorize; `tests/labyrinth-ui.spec.ts` pins this. Change the strings only together with `catbird-mls`, CatbirdMLSCore, Android and nest.
 
 ## Known Issues
 

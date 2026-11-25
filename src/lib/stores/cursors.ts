@@ -1,3 +1,6 @@
+import { get } from 'svelte/store';
+import { auth } from './auth';
+
 /**
  * Persists per-conversation WebSocket subscription cursors (last-seen message ID)
  * so that on restart, subscriptions can resume from where they left off.
@@ -5,96 +8,44 @@
  * - Desktop (Tauri): persists to localStorage (survives restarts)
  * - Web (browser): persists to sessionStorage (cleared on tab close)
  *
- * Keys are namespaced by DID + convoId to prevent data leakage across accounts.
+ * Keys are namespaced by DID + convoId + generation suffix to prevent data leakage across accounts.
  */
 
-/**
- * Browser storage generation pin. Bumping this invalidates every browser-side
- * MLS namespace at once (cursors, active DID, MLS storage coordinates, tab lock).
- */
-export const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09-device-identity-v1';
-export const CURSOR_PREFIX = `catbird_ws_cursor${CLEAN_STORAGE_SUFFIX}`;
-export const SS_ACTIVE_DID = `catbird_mls_active_did${CLEAN_STORAGE_SUFFIX}`;
+const CURSOR_PREFIX = 'catbird_ws_cursor';
+const CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+const SS_ACTIVE_DID = 'catbird_mls_active_did';
 
 /** True when running inside Tauri desktop shell. */
 const isTauri: boolean =
   typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__ !== 'undefined';
 
-function getStorage(): Storage | null {
-  if (typeof window === 'undefined') return null;
+function getStorage(): Storage {
   return isTauri ? localStorage : sessionStorage;
 }
 
 function storageKey(did: string, convoId: string): string {
-  return `${CURSOR_PREFIX}:${did}:${convoId}`;
+  return `${CURSOR_PREFIX}:${did}:${convoId}${CLEAN_STORAGE_SUFFIX}`;
 }
 
-function cursorRegistryKey(did: string): string {
-  return `catbird_mls:${did}:cursor_registry${CLEAN_STORAGE_SUFFIX}`;
-}
-
-/** Set the active DID across storage layers for the current runtime. */
-export function setAuthoritativeActiveDid(did: string): void {
-  if (typeof window === 'undefined') return;
-  const normalized = did.trim();
-  if (isTauri) {
-    localStorage.setItem(SS_ACTIVE_DID, normalized);
-  }
-  sessionStorage.setItem(SS_ACTIVE_DID, normalized);
-}
-
-/** Clear the active DID across storage layers for the current runtime. */
-export function clearAuthoritativeActiveDid(): void {
-  if (typeof window === 'undefined') return;
-  if (isTauri) {
-    localStorage.removeItem(SS_ACTIVE_DID);
-  }
-  sessionStorage.removeItem(SS_ACTIVE_DID);
-}
-
-/** Read the current DID from the exact active DID session key (written by persistBrowserAuth / setAuthoritativeActiveDid). */
+/**
+ * Read the current authoritative DID.
+ *
+ * Uses the authoritative auth store user DID or the generation-scoped
+ * sessionStorage active DID. Never falls back to unsuffixed legacy
+ * localStorage keys (e.g. `catbird_active_did` / `catbird_mls_user_did`).
+ */
 function getCurrentDid(): string | null {
-  if (typeof window === 'undefined') return null;
-  if (isTauri) {
-    return (
-      localStorage.getItem(SS_ACTIVE_DID) ??
-      sessionStorage.getItem(SS_ACTIVE_DID)
-    );
+  const authState = get(auth);
+  if (authState?.user?.did) {
+    return authState.user.did;
   }
-  return sessionStorage.getItem(SS_ACTIVE_DID);
-}
-
-function getRegisteredConvoIds(storage: Storage, did: string): string[] {
-  const raw = storage.getItem(cursorRegistryKey(did));
-  if (!raw) return [];
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(`Clean storage corrupted cursor registry for ${did}: ${String(e)}`);
+  if (typeof sessionStorage !== 'undefined') {
+    const did = sessionStorage.getItem(SS_ACTIVE_DID);
+    if (did && did.startsWith('did:')) {
+      return did;
+    }
   }
-  if (!Array.isArray(parsed) || !parsed.every((id) => typeof id === 'string')) {
-    throw new Error(`Clean storage invalid cursor registry structure for ${did}`);
-  }
-  return parsed as string[];
-}
-
-function addConvoToRegistry(storage: Storage, did: string, convoId: string): void {
-  const list = getRegisteredConvoIds(storage, did);
-  if (!list.includes(convoId)) {
-    list.push(convoId);
-    storage.setItem(cursorRegistryKey(did), JSON.stringify(list));
-  }
-}
-
-function removeConvoFromRegistry(storage: Storage, did: string, convoId: string): void {
-  const list = getRegisteredConvoIds(storage, did);
-  const filtered = list.filter((id) => id !== convoId);
-  if (filtered.length > 0) {
-    storage.setItem(cursorRegistryKey(did), JSON.stringify(filtered));
-  } else {
-    storage.removeItem(cursorRegistryKey(did));
-  }
+  return null;
 }
 
 /**
@@ -103,10 +54,12 @@ function removeConvoFromRegistry(storage: Storage, did: string, convoId: string)
  */
 export function saveCursor(convoId: string, cursor: string): void {
   const did = getCurrentDid();
-  const storage = getStorage();
-  if (!did || !storage) return;
-  addConvoToRegistry(storage, did, convoId);
-  storage.setItem(storageKey(did, convoId), cursor);
+  if (!did) return;
+  try {
+    getStorage().setItem(storageKey(did, convoId), cursor);
+  } catch {
+    // Storage full or unavailable -- degrade silently
+  }
 }
 
 /**
@@ -114,9 +67,12 @@ export function saveCursor(convoId: string, cursor: string): void {
  */
 export function getCursor(convoId: string): string | null {
   const did = getCurrentDid();
-  const storage = getStorage();
-  if (!did || !storage) return null;
-  return storage.getItem(storageKey(did, convoId));
+  if (!did) return null;
+  try {
+    return getStorage().getItem(storageKey(did, convoId));
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -124,47 +80,30 @@ export function getCursor(convoId: string): string | null {
  */
 export function removeCursor(convoId: string): void {
   const did = getCurrentDid();
-  const storage = getStorage();
-  if (!did || !storage) return;
-  storage.removeItem(storageKey(did, convoId));
-  removeConvoFromRegistry(storage, did, convoId);
-}
-
-/**
- * Clear saved cursors for a DID, scanning storage keys only if its registry is corrupt.
- */
-export function clearAllCursorsForDid(did: string): void {
-  if (typeof window === 'undefined') return;
-  for (const s of [sessionStorage, localStorage]) {
-    let convoIds: string[] = [];
-    try {
-      convoIds = getRegisteredConvoIds(s, did);
-    } catch {
-      const owner = `${CURSOR_PREFIX}:${did}`;
-      // A cursor key is `${owner}:${convoId}` and a convoId never contains ':',
-      // so trimming the last segment must land exactly on this DID's owner prefix:
-      // clearing `did:web:x` must not touch the neighboring `did:web:x:user`.
-      // Reverse order: removing index i only shifts down the indices above it,
-      // which have already been visited. A forward loop would skip keys.
-      for (let index = s.length - 1; index >= 0; index -= 1) {
-        const key = s.key(index);
-        if (key && key.slice(0, key.lastIndexOf(':')) === owner) {
-          s.removeItem(key);
-        }
-      }
-    }
-    for (const id of convoIds) {
-      s.removeItem(storageKey(did, id));
-    }
-    s.removeItem(cursorRegistryKey(did));
+  if (!did) return;
+  try {
+    getStorage().removeItem(storageKey(did, convoId));
+  } catch {
+    // ignore
   }
 }
 
 /**
- * Clear all saved cursors for the current user without storage iteration.
+ * Clear all saved cursors for the current user.
  */
 export function clearAllCursors(): void {
   const did = getCurrentDid();
   if (!did) return;
-  clearAllCursorsForDid(did);
+  const storage = getStorage();
+  const prefix = `${CURSOR_PREFIX}:${did}:`;
+  const keysToRemove: string[] = [];
+  for (let i = 0; i < storage.length; i++) {
+    const key = storage.key(i);
+    if (key?.startsWith(prefix)) {
+      keysToRemove.push(key);
+    }
+  }
+  for (const key of keysToRemove) {
+    storage.removeItem(key);
+  }
 }

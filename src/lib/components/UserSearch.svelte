@@ -1,128 +1,270 @@
 <script lang="ts">
-	import { searchUsers, checkOptInStatus, type SearchResult } from '$lib/wasm';
+	import { onDestroy } from 'svelte';
+	import { searchUsers, checkOptInStatus, type SearchResult } from '#lib/wasm.ts';
+	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
+	import Avatar from './Avatar.svelte';
+	import Icon from './Icon.svelte';
 
-	let { selected = $bindable([]) }: { selected: SearchResult[] } = $props();
+	let {
+		selected = $bindable<SearchResult[]>([]),
+		mode = 'multiple',
+		inputId = 'user-search-input',
+		placeholder = 'Search by Bluesky name or handle...',
+		excludeDids = []
+	}: {
+		selected: SearchResult[];
+		mode?: 'single' | 'multiple';
+		inputId?: string;
+		placeholder?: string;
+		excludeDids?: string[];
+	} = $props();
 
 	let query = $state('');
 	let results = $state<SearchResult[]>([]);
 	let searching = $state(false);
+	let searched = $state(false);
+	let searchError = $state('');
+	let lastSearchedQuery = $state('');
 	let optInMap = $state<Record<string, boolean>>({});
 	let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+	let searchSeq = 0;
+
+	const excludeSet = $derived(
+		new Set(excludeDids.map((did) => stripDidFragment(did)).filter(Boolean))
+	);
+	const visibleResults = $derived(
+		results.filter((user) => !excludeSet.has(stripDidFragment(user.did) || user.did))
+	);
+
+	function optInKey(did: string): string {
+		return stripDidFragment(did) || did;
+	}
 
 	function isSelected(did: string): boolean {
-		return selected.some((s) => s.did === did);
+		return selected.some((s) => isSameAccountDid(s.did, did));
 	}
 
 	function toggleUser(user: SearchResult) {
 		if (isSelected(user.did)) {
-			selected = selected.filter((s) => s.did !== user.did);
+			selected = selected.filter((s) => !isSameAccountDid(s.did, user.did));
+			return;
+		}
+		if (mode === 'single') {
+			selected = [user];
 		} else {
 			selected = [...selected, user];
 		}
 	}
 
 	function removeUser(did: string) {
-		selected = selected.filter((s) => s.did !== did);
+		selected = selected.filter((s) => !isSameAccountDid(s.did, did));
 	}
 
-	async function doSearch(q: string) {
-		if (!q.trim()) {
+	function clearQuery() {
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+			debounceTimer = null;
+		}
+		searchSeq += 1;
+		query = '';
+		results = [];
+		searching = false;
+		searched = false;
+		searchError = '';
+		lastSearchedQuery = '';
+	}
+
+	async function doSearch(rawQuery: string) {
+		const trimmed = rawQuery.trim();
+		const seq = ++searchSeq;
+
+		if (!trimmed) {
 			results = [];
+			searching = false;
+			searched = false;
+			searchError = '';
+			lastSearchedQuery = '';
 			return;
 		}
+
 		searching = true;
+		searchError = '';
+		lastSearchedQuery = trimmed;
+
+		let fetched: SearchResult[] = [];
 		try {
-			results = await searchUsers(q);
+			fetched = await searchUsers(trimmed);
+			if (seq !== searchSeq) return;
+			results = fetched;
+			searched = true;
 		} catch {
+			if (seq !== searchSeq) return;
 			results = [];
+			searched = true;
+			searchError = 'Could not search Bluesky accounts. Try again.';
 		} finally {
-			searching = false;
+			if (seq === searchSeq) {
+				searching = false;
+			}
 		}
+
+		if (seq !== searchSeq || fetched.length === 0) return;
+
 		try {
-			const dids = results.map((r) => r.did).filter((d) => !(d in optInMap));
-			if (dids.length > 0) {
-				const statuses = await checkOptInStatus(dids);
-				const newMap = { ...optInMap };
-				for (const s of statuses) {
-					newMap[s.did] = s.optedIn;
+			const didsToCheck = fetched
+				.map((r) => optInKey(r.did))
+				.filter((d) => !(d in optInMap) && !excludeSet.has(d));
+			if (didsToCheck.length > 0) {
+				const statuses = await checkOptInStatus(didsToCheck);
+				if (seq !== searchSeq) return;
+				const nextMap = { ...optInMap };
+				for (const status of statuses) {
+					nextMap[optInKey(status.did)] = status.optedIn;
 				}
-				optInMap = newMap;
+				optInMap = nextMap;
 			}
 		} catch {
-			// Non-fatal
+			// Opt-in check is non-fatal
 		}
 	}
 
-	function onInput() {
-		if (debounceTimer) clearTimeout(debounceTimer);
-		debounceTimer = setTimeout(() => doSearch(query), 300);
+	function handleInput() {
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+			debounceTimer = null;
+		}
+		if (!query.trim()) {
+			searchSeq += 1;
+			results = [];
+			searching = false;
+			searched = false;
+			searchError = '';
+			lastSearchedQuery = '';
+			return;
+		}
+		const targetQuery = query;
+		debounceTimer = setTimeout(() => {
+			debounceTimer = null;
+			doSearch(targetQuery);
+		}, 250);
 	}
+
+	onDestroy(() => {
+		if (debounceTimer) {
+			clearTimeout(debounceTimer);
+			debounceTimer = null;
+		}
+		searchSeq += 1;
+	});
 </script>
 
 <div class="user-search">
 	{#if selected.length > 0}
-		<div class="selected-chips">
+		<ul role="list" class="selected-chips" aria-label="Selected recipients">
 			{#each selected as user (user.did)}
-				<span class="chip">
-					<span class="chip-name">{user.displayName ?? user.handle}</span>
-					<button class="chip-remove" onclick={() => removeUser(user.did)} title="Remove">
-						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-							<line x1="18" y1="6" x2="6" y2="18" />
-							<line x1="6" y1="6" x2="18" y2="18" />
-						</svg>
+				<li class="chip">
+					<Avatar
+						src={user.avatar ?? null}
+						name={user.displayName ?? user.handle}
+						id={user.did}
+						size={20}
+						shape="circle"
+					/>
+					<span class="chip-name">{user.displayName || `@${user.handle}`}</span>
+					<button
+						type="button"
+						class="chip-remove"
+						onclick={() => removeUser(user.did)}
+						aria-label={`Remove ${user.displayName || user.handle}`}
+					>
+						<Icon name="x" size={13} />
 					</button>
-				</span>
+				</li>
 			{/each}
-		</div>
+		</ul>
 	{/if}
 
-	<input
-		type="text"
-		class="search-input"
-		placeholder="Search by name or handle..."
-		bind:value={query}
-		oninput={onInput}
-	/>
+	<div class="search-input-wrap">
+		<span class="search-icon" aria-hidden="true">
+			<Icon name="search" size={16} />
+		</span>
+		<input
+			id={inputId}
+			type="search"
+			class="search-input"
+			{placeholder}
+			bind:value={query}
+			oninput={handleInput}
+			autocomplete="off"
+			autocorrect="off"
+			autocapitalize="none"
+			spellcheck="false"
+			enterkeyhint="search"
+		/>
+		{#if query.length > 0}
+			<button
+				type="button"
+				class="search-clear"
+				onclick={clearQuery}
+				aria-label="Clear search"
+			>
+				<Icon name="x" size={15} />
+			</button>
+		{/if}
+	</div>
 
 	{#if searching}
-		<div class="search-status">Searching...</div>
-	{/if}
-
-	{#if results.length > 0}
-		<div class="search-results">
-			{#each results as user (user.did)}
-				<button
-					type="button"
-					class="search-result"
-					class:selected-result={isSelected(user.did)}
-					onclick={() => toggleUser(user)}
-				>
-					<div class="result-avatar">
-						{#if user.avatar}
-							<img src={user.avatar} alt="" class="avatar-img" />
-						{:else}
-							<span class="avatar-letter">
-								{(user.displayName ?? user.handle).charAt(0).toUpperCase()}
+		<div class="search-status">
+			<progress class="catmos-progress search-progress" aria-label="Searching accounts"></progress>
+			<span>Searching accounts...</span>
+		</div>
+	{:else if searchError}
+		<p class="search-error" role="alert">{searchError}</p>
+	{:else if visibleResults.length > 0}
+		<ul role="list" class="search-results" aria-label="Account search results">
+			{#each visibleResults as user (user.did)}
+				{@const active = isSelected(user.did)}
+				<li>
+					<button
+						type="button"
+						class="search-result"
+						class:selected-result={active}
+						aria-pressed={active}
+						onclick={() => toggleUser(user)}
+					>
+						<Avatar
+							src={user.avatar ?? null}
+							name={user.displayName ?? user.handle}
+							id={user.did}
+							size={36}
+							shape="circle"
+						/>
+						<span class="result-info">
+							<span class="result-top">
+								<span class="result-name">{user.displayName || user.handle}</span>
+							</span>
+							<span class="result-meta">
+								<span class="result-handle">@{user.handle}</span>
+								{#if optInMap[optInKey(user.did)] === true}
+									<span class="meta-sep" aria-hidden="true">·</span>
+									<span class="optin-status ready">Encrypted ready</span>
+								{:else if optInMap[optInKey(user.did)] === false}
+									<span class="meta-sep" aria-hidden="true">·</span>
+									<span class="optin-status unavailable">Not set up for Catmos</span>
+								{/if}
+							</span>
+						</span>
+						{#if active}
+							<span class="check-icon" aria-hidden="true">
+								<Icon name="check" size={16} />
 							</span>
 						{/if}
-					</div>
-					<div class="result-info">
-						<span class="result-name">{user.displayName ?? user.handle}</span>
-						<span class="result-handle">@{user.handle}</span>
-					</div>
-					{#if optInMap[user.did] === true}
-						<span class="optin-badge yes">MLS</span>
-					{:else if optInMap[user.did] === false}
-						<span class="optin-badge no">No MLS</span>
-					{/if}
-					{#if isSelected(user.did)}
-						<svg class="check-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-							<polyline points="20 6 9 17 4 12" />
-						</svg>
-					{/if}
-				</button>
+					</button>
+				</li>
 			{/each}
-		</div>
+		</ul>
+	{:else if searched && lastSearchedQuery}
+		<p class="search-empty">No Bluesky accounts found for "{lastSearchedQuery}".</p>
 	{/if}
 </div>
 
@@ -130,85 +272,172 @@
 	.user-search {
 		display: flex;
 		flex-direction: column;
-		gap: 8px;
+		gap: var(--space-2);
 	}
 
 	.selected-chips {
+		list-style: none;
 		display: flex;
 		flex-wrap: wrap;
-		gap: 6px;
+		gap: var(--space-1);
 	}
 
 	.chip {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		padding: 4px 10px;
-		background: var(--accent);
-		color: var(--text-on-accent);
+		gap: var(--space-1);
+		min-block-size: max(1.875rem, var(--touch-min));
+		padding-inline: var(--space-1) var(--space-2);
+		padding-block: var(--space-fine);
+		background: var(--bg-surface);
+		border: 1px solid var(--border-strong);
+		color: var(--text-primary);
 		border-radius: var(--radius-full);
-		font-size: 12px;
-		font-weight: 600;
+		font-size: var(--text-sm);
+		font-weight: 500;
+		max-inline-size: 100%;
+	}
+
+	.chip-name {
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		max-inline-size: 14rem;
 	}
 
 	.chip-remove {
-		background: none;
-		border: none;
-		color: rgba(255, 255, 255, 0.7);
-		cursor: pointer;
-		padding: 0;
-		display: flex;
+		display: inline-flex;
 		align-items: center;
+		justify-content: center;
+		min-inline-size: max(1.5rem, var(--touch-min));
+		min-block-size: max(1.5rem, var(--touch-min));
+		margin-inline-end: calc(-1 * var(--space-1));
+		border-radius: var(--radius-full);
+		color: var(--text-secondary);
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
 	}
 
 	.chip-remove:hover {
-		color: white;
+		background: var(--bg-hover);
+		color: var(--text-primary);
+	}
+
+	.search-input-wrap {
+		position: relative;
+		display: flex;
+		align-items: center;
+		background: var(--bg-input);
+		border: 1px solid var(--border-input);
+		border-radius: var(--radius-sm);
+		transition: border-color var(--dur-fast) var(--ease-out);
+	}
+
+	.search-input-wrap:focus-within {
+		border-color: var(--focus-ring);
+	}
+
+	.search-icon {
+		display: inline-flex;
+		align-items: center;
+		padding-inline-start: var(--space-3);
+		color: var(--text-muted);
+		pointer-events: none;
 	}
 
 	.search-input {
-		display: block;
-		width: 100%;
-		padding: 10px 14px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
+		flex: 1;
+		min-inline-size: 0;
+		min-block-size: max(2.5rem, var(--touch-min));
+		padding-inline: var(--space-2) var(--space-3);
+		padding-block: var(--space-2);
 		color: var(--text-primary);
-		font-family: inherit;
-		font-size: 14px;
-		transition: border-color var(--transition-fast);
-	}
-
-	.search-input:focus {
-		border-color: var(--accent);
+		font-size: var(--text-body);
 		outline: none;
 	}
 
 	.search-input::placeholder {
-		color: var(--text-tertiary);
+		color: var(--text-muted);
+	}
+
+	.search-input::-webkit-search-cancel-button {
+		-webkit-appearance: none;
+	}
+
+	.search-clear {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-inline-size: max(2rem, var(--touch-min));
+		min-block-size: max(2rem, var(--touch-min));
+		margin-inline-end: var(--space-1);
+		border-radius: var(--radius-xs);
+		color: var(--text-secondary);
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
+	}
+
+	.search-clear:hover {
+		background: var(--bg-hover);
+		color: var(--text-primary);
 	}
 
 	.search-status {
-		font-size: 12px;
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding-block: var(--space-2);
+		font-size: var(--text-sm);
 		color: var(--text-secondary);
-		padding: 2px 0;
+	}
+
+	.search-progress {
+		inline-size: 1rem;
+		block-size: 1rem;
+		border-width: 2px;
+	}
+
+	.search-error {
+		font-size: var(--text-sm);
+		color: var(--danger-text);
+		padding-block: var(--space-1);
+	}
+
+	.search-empty {
+		font-size: var(--text-sm);
+		color: var(--text-secondary);
+		padding: var(--space-3);
+		text-align: center;
+		background: var(--bg-surface);
+		border-radius: var(--radius-sm);
+		border: 1px solid var(--border);
 	}
 
 	.search-results {
-		max-height: 200px;
+		list-style: none;
+		max-block-size: 14.5rem;
 		overflow-y: auto;
 		border-radius: var(--radius-sm);
 		border: 1px solid var(--border);
-		background: var(--bg-input);
+		background: var(--bg-surface);
+	}
+
+	.search-results li + li {
+		border-block-start: 1px solid var(--border);
 	}
 
 	.search-result {
 		display: flex;
 		align-items: center;
-		gap: 10px;
-		padding: 10px 12px;
+		gap: var(--space-3);
 		width: 100%;
-		text-align: left;
-		transition: background var(--transition-fast);
+		min-block-size: max(3.25rem, var(--touch-min));
+		padding-inline: var(--space-3);
+		padding-block: var(--space-2);
+		text-align: start;
+		transition: background-color var(--dur-fast) var(--ease-out);
 	}
 
 	.search-result:hover {
@@ -219,71 +448,71 @@
 		background: var(--bg-selected);
 	}
 
-	.result-avatar {
-		width: 32px;
-		height: 32px;
-		border-radius: var(--radius-full);
-		overflow: hidden;
-		flex-shrink: 0;
-		background: var(--accent);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-
-	.avatar-img {
-		width: 100%;
-		height: 100%;
-		object-fit: cover;
-	}
-
-	.avatar-letter {
-		color: var(--text-on-accent);
-		font-weight: 600;
-		font-size: 14px;
-	}
-
 	.result-info {
 		flex: 1;
-		min-width: 0;
+		min-inline-size: 0;
 		display: flex;
 		flex-direction: column;
+		gap: 2px;
+	}
+
+	.result-top {
+		display: flex;
+		align-items: baseline;
+		gap: var(--space-2);
+		min-inline-size: 0;
 	}
 
 	.result-name {
 		color: var(--text-primary);
-		font-size: 13px;
+		font-size: var(--text-body);
 		font-weight: 600;
+		line-height: 1.3;
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
 
+	.result-meta {
+		display: flex;
+		align-items: baseline;
+		flex-wrap: wrap;
+		gap: var(--space-1);
+		font-size: var(--text-sm);
+		line-height: 1.35;
+	}
+
 	.result-handle {
 		color: var(--text-secondary);
-		font-size: 12px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		max-inline-size: 100%;
 	}
 
-	.optin-badge {
-		font-size: 10px;
-		padding: 2px 7px;
-		border-radius: var(--radius-full);
-		font-weight: 700;
-		flex-shrink: 0;
-		letter-spacing: 0.02em;
+	.meta-sep {
+		color: var(--text-muted);
 	}
 
-	.optin-badge.yes {
-		background: rgba(52, 199, 89, 0.15);
-		color: var(--success);
+	.optin-status {
+		font-size: var(--text-sm);
+		font-weight: 500;
+		white-space: nowrap;
 	}
 
-	.optin-badge.no {
-		background: rgba(255, 59, 48, 0.15);
-		color: var(--danger);
+	.optin-status.ready {
+		color: var(--success-text);
+	}
+
+	.optin-status.unavailable {
+		color: var(--text-muted);
 	}
 
 	.check-icon {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--text-link);
 		flex-shrink: 0;
 	}
 </style>

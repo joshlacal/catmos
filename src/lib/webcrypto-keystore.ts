@@ -1,0 +1,358 @@
+/**
+ * Browser WebCrypto + IndexedDB key custody (`Spec §6.5`, `Gate 9`, `modern-web-guidance: client-side-encryption`).
+ *
+ * - Generates a 256-bit non-extractable `AES-GCM` `CryptoKey` (`extractable: false`)
+ *   and persists the `CryptoKey` handle in `IndexedDB` via structured cloning.
+ * - Wraps the 32-byte `sqlite3mc` DB key (and 32-byte content-root key) with a
+ *   fresh 12-byte random IV (`crypto.getRandomValues(new Uint8Array(12))`) and
+ *   domain-separated `additionalData` (`"catbird-mls-db-key:" + didHash`).
+ * - Coordinates per-account reads/writes through exclusive Web Locks without lock
+ *   stealing, normalizes cross-realm `Uint8Array` views, and zeroizes plaintext
+ *   key buffers after wrapping.
+ * - Proactively purges any legacy `mls_db_key` / `content_root_key` / `mls.content.root.`
+ *   entries from `sessionStorage` and `localStorage` so zero raw keys reside in DOM storage.
+ */
+
+import { normalizeAccountDid } from './did.ts';
+
+export const WEBCRYPTO_DB_NAME = 'catbird_mls_webcrypto_v2';
+export const WEBCRYPTO_STORE_NAME = 'keystore';
+const LEGACY_KEYRING_DB_NAME = 'catbird_mls_keyring';
+const LEGACY_KEYRING_STORE_NAME = 'keys';
+
+export interface WrappedSecretEnvelope {
+	iv: Uint8Array;
+	ciphertext: Uint8Array;
+}
+
+/**
+ * Ephemeral in-memory object store used ONLY in headless Node unit tests where
+ * `globalThis.indexedDB` is undefined. Never touches `localStorage` or `sessionStorage`,
+ * and stores the exact same non-extractable `CryptoKey` objects.
+ */
+const memoryKeyStoreFallback = new Map<string, unknown>();
+
+export function resetKeyStoreMemoryFallbackForTests(): void {
+	memoryKeyStoreFallback.clear();
+}
+
+function toUint8Array(input: unknown): Uint8Array | null {
+	if (input instanceof Uint8Array) {
+		return input;
+	}
+	if (input instanceof ArrayBuffer) {
+		return new Uint8Array(input);
+	}
+	if (ArrayBuffer.isView(input)) {
+		return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+	}
+	return null;
+}
+
+async function withAccountKeyStoreLock<T>(didHash: string, fn: () => Promise<T>): Promise<T> {
+	if (
+		typeof navigator !== 'undefined' &&
+		navigator.locks &&
+		typeof navigator.locks.request === 'function'
+	) {
+		return navigator.locks.request(
+			`catbird-mls-keystore:${didHash}`,
+			{ mode: 'exclusive' },
+			async () => fn()
+		);
+	}
+	return fn();
+}
+
+function purgeLegacyWebStorageKeys(): void {
+	const scrub = (storage: Storage | undefined) => {
+		if (!storage) return;
+		const keysToRemove: string[] = [];
+		for (let i = 0; i < storage.length; i++) {
+			const key = storage.key(i);
+			if (
+				key &&
+				(/mls_db_key/i.test(key) ||
+					/content_root_key/i.test(key) ||
+					key.startsWith('mls.content.root.'))
+			) {
+				keysToRemove.push(key);
+			}
+		}
+		for (const key of keysToRemove) {
+			storage.removeItem(key);
+		}
+	};
+
+	if (typeof sessionStorage !== 'undefined') scrub(sessionStorage);
+	if (typeof localStorage !== 'undefined') scrub(localStorage);
+}
+
+function openKeyStoreDb(): Promise<IDBDatabase | null> {
+	if (typeof indexedDB === 'undefined') {
+		return Promise.resolve(null);
+	}
+	return new Promise((resolve, reject) => {
+		const req = indexedDB.open(WEBCRYPTO_DB_NAME, 1);
+		req.onupgradeneeded = () => {
+			const db = req.result;
+			if (!db.objectStoreNames.contains(WEBCRYPTO_STORE_NAME)) {
+				db.createObjectStore(WEBCRYPTO_STORE_NAME);
+			}
+		};
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error ?? new Error('Failed to open WebCrypto IndexedDB'));
+		req.onblocked = () => reject(new Error('WebCrypto IndexedDB open blocked'));
+	});
+}
+
+async function storeGet<T>(key: string): Promise<T | undefined> {
+	const db = await openKeyStoreDb();
+	if (!db) {
+		return memoryKeyStoreFallback.get(key) as T | undefined;
+	}
+	try {
+		return await new Promise<T | undefined>((resolve, reject) => {
+			const tx = db.transaction(WEBCRYPTO_STORE_NAME, 'readonly');
+			const req = tx.objectStore(WEBCRYPTO_STORE_NAME).get(key);
+			let val: T | undefined;
+			req.onsuccess = () => {
+				val = req.result as T | undefined;
+			};
+			req.onerror = () => reject(req.error ?? new Error(`IndexedDB get failed: ${key}`));
+			tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB get aborted: ${key}`));
+			tx.oncomplete = () => resolve(val);
+		});
+	} finally {
+		db.close();
+	}
+}
+
+async function storePutIfAbsent<T>(key: string, candidate: T): Promise<T> {
+	const db = await openKeyStoreDb();
+	if (!db) {
+		if (!memoryKeyStoreFallback.has(key)) {
+			memoryKeyStoreFallback.set(key, candidate);
+		}
+		return memoryKeyStoreFallback.get(key) as T;
+	}
+	try {
+		await new Promise<void>((resolve, reject) => {
+			const tx = db.transaction(WEBCRYPTO_STORE_NAME, 'readwrite');
+			const store = tx.objectStore(WEBCRYPTO_STORE_NAME);
+			const getReq = store.get(key);
+			getReq.onsuccess = () => {
+				if (getReq.result === undefined) {
+					store.add(candidate, key);
+				}
+			};
+			getReq.onerror = () => reject(getReq.error ?? new Error(`IndexedDB inspect failed: ${key}`));
+			tx.onabort = () => reject(tx.error ?? new Error(`IndexedDB write aborted: ${key}`));
+			tx.oncomplete = () => resolve();
+		});
+		const committed = await storeGet<T>(key);
+		if (committed === undefined) {
+			throw new Error(`IndexedDB readback returned undefined for ${key}`);
+		}
+		return committed;
+	} finally {
+		db.close();
+	}
+}
+
+async function purgeLegacyKeyringEntry(legacySanitizedDid?: string): Promise<void> {
+	if (!legacySanitizedDid || typeof indexedDB === 'undefined') return;
+	try {
+		const db = await new Promise<IDBDatabase | null>((resolve) => {
+			const req = indexedDB.open(LEGACY_KEYRING_DB_NAME, 1);
+			req.onupgradeneeded = () => {
+				const candidate = req.result;
+				if (!candidate.objectStoreNames.contains(LEGACY_KEYRING_STORE_NAME)) {
+					candidate.createObjectStore(LEGACY_KEYRING_STORE_NAME);
+				}
+			};
+			req.onsuccess = () => resolve(req.result);
+			req.onerror = () => resolve(null);
+			req.onblocked = () => resolve(null);
+		});
+		if (!db) return;
+		try {
+			if (!db.objectStoreNames.contains(LEGACY_KEYRING_STORE_NAME)) return;
+			await new Promise<void>((resolve) => {
+				const tx = db.transaction(LEGACY_KEYRING_STORE_NAME, 'readwrite');
+				tx.objectStore(LEGACY_KEYRING_STORE_NAME).delete(`mls_db_key_${legacySanitizedDid}`);
+				tx.oncomplete = () => resolve();
+				tx.onabort = () => resolve();
+				tx.onerror = () => resolve();
+			});
+		} finally {
+			db.close();
+		}
+	} catch {
+		// Best-effort cleanup of retired keyring store
+	}
+}
+
+export async function deleteAccountKeyStoreEntries(
+	didHash: string,
+	legacySanitizedDid?: string
+): Promise<void> {
+	purgeLegacyWebStorageKeys();
+	const normalized = didHash.trim();
+	if (!normalized) return;
+
+	await withAccountKeyStoreLock(normalized, async () => {
+		const keys = [
+			`kek:${normalized}`,
+			`wrapped:db:${normalized}`,
+			`wrapped:content:${normalized}`
+		];
+		const db = await openKeyStoreDb();
+		if (!db) {
+			for (const k of keys) memoryKeyStoreFallback.delete(k);
+		} else {
+			try {
+				await new Promise<void>((resolve, reject) => {
+					const tx = db.transaction(WEBCRYPTO_STORE_NAME, 'readwrite');
+					const store = tx.objectStore(WEBCRYPTO_STORE_NAME);
+					for (const k of keys) store.delete(k);
+					tx.onabort = () => reject(tx.error ?? new Error('IndexedDB delete aborted'));
+					tx.oncomplete = () => resolve();
+				});
+			} finally {
+				db.close();
+			}
+		}
+		await purgeLegacyKeyringEntry(legacySanitizedDid);
+	});
+}
+
+function isNonExtractableAesGcmKey(val: unknown): val is CryptoKey {
+	if (typeof val !== 'object' || val === null) return false;
+	const k = val as CryptoKey;
+	return (
+		k.extractable === false &&
+		typeof k.algorithm === 'object' &&
+		k.algorithm !== null &&
+		k.algorithm.name === 'AES-GCM'
+	);
+}
+
+async function getOrCreateAccountWrappingKey(didHash: string): Promise<CryptoKey> {
+	const kekId = `kek:${didHash}`;
+	const existing = await storeGet<unknown>(kekId);
+	if (existing !== undefined) {
+		if (!isNonExtractableAesGcmKey(existing)) {
+			throw new Error(`Corrupt or extractable CryptoKey stored at ${kekId}`);
+		}
+		return existing;
+	}
+
+	const freshKek = await crypto.subtle.generateKey(
+		{ name: 'AES-GCM', length: 256 },
+		false,
+		['encrypt', 'decrypt']
+	);
+	const committed = await storePutIfAbsent<CryptoKey>(kekId, freshKek);
+	if (!isNonExtractableAesGcmKey(committed)) {
+		throw new Error(`Committed CryptoKey at ${kekId} failed non-extractable validation`);
+	}
+	return committed;
+}
+
+export async function inspectWrappingCryptoKey(didHash: string): Promise<CryptoKey | undefined> {
+	return storeGet<CryptoKey>(`kek:${didHash.trim()}`);
+}
+
+export async function loadOrCreateWrappedSecretBytes(
+	didHash: string,
+	purpose: 'db' | 'content'
+): Promise<Uint8Array> {
+	purgeLegacyWebStorageKeys();
+	const normalized = didHash.trim();
+	if (!normalized) {
+		throw new Error('didHash must not be empty');
+	}
+
+	return withAccountKeyStoreLock(normalized, async () => {
+		const kek = await getOrCreateAccountWrappingKey(normalized);
+		const recordId = `wrapped:${purpose}:${normalized}`;
+		const aad = new TextEncoder().encode(`catbird-mls-${purpose}-key:${normalized}`);
+
+		let wrappedRaw = await storeGet<unknown>(recordId);
+		if (!wrappedRaw) {
+			const rawSecret = crypto.getRandomValues(new Uint8Array(32));
+			try {
+				const iv = crypto.getRandomValues(new Uint8Array(12));
+				const ctBuf = await crypto.subtle.encrypt(
+					{
+						name: 'AES-GCM',
+						iv: iv as BufferSource,
+						additionalData: aad as BufferSource
+					},
+					kek,
+					rawSecret as BufferSource
+				);
+				wrappedRaw = await storePutIfAbsent<WrappedSecretEnvelope>(recordId, {
+					iv,
+					ciphertext: new Uint8Array(ctBuf)
+				});
+			} finally {
+				rawSecret.fill(0);
+			}
+		}
+
+		if (typeof wrappedRaw !== 'object' || wrappedRaw === null) {
+			throw new Error(`Corrupt wrapped key envelope for ${recordId}`);
+		}
+		const candidate = wrappedRaw as Record<string, unknown>;
+		const ivBytes = toUint8Array(candidate.iv);
+		const ctBytes = toUint8Array(candidate.ciphertext);
+		if (!ivBytes || ivBytes.byteLength !== 12) {
+			throw new Error(`Invalid 12-byte AES-GCM IV for ${recordId}`);
+		}
+		if (!ctBytes || ctBytes.byteLength !== 48) {
+			throw new Error(`Invalid AES-GCM ciphertext length for ${recordId}`);
+		}
+
+		const ptBuf = await crypto.subtle.decrypt(
+			{
+				name: 'AES-GCM',
+				iv: new Uint8Array(ivBytes) as BufferSource,
+				additionalData: aad as BufferSource
+			},
+			kek,
+			new Uint8Array(ctBytes) as BufferSource
+		);
+		const bytes = new Uint8Array(ptBuf);
+		if (bytes.byteLength !== 32) {
+			bytes.fill(0);
+			throw new Error(`Unwrapped key length mismatch for ${recordId}: ${bytes.byteLength}`);
+		}
+		return bytes;
+	});
+}
+
+/**
+ * Load or create the 64-character hex `sqlite3mc` key for `catbird-mls/<didHash>.db`,
+ * wrapped under a non-extractable `AES-GCM` `CryptoKey` in `IndexedDB` (`Gate 9`).
+ */
+export async function loadOrCreateDbKeyHex(didHash: string): Promise<string> {
+	const bytes = await loadOrCreateWrappedSecretBytes(didHash, 'db');
+	try {
+		return Array.from(bytes)
+			.map((b) => b.toString(16).padStart(2, '0'))
+			.join('');
+	} finally {
+		bytes.fill(0);
+	}
+}
+
+/** Compute canonical 64-char lowercase hex SHA-256 of normalized DID (`I8`). */
+export async function accountDidHashHex(did: string): Promise<string> {
+	const normalized = normalizeAccountDid(did);
+	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(normalized));
+	return Array.from(new Uint8Array(digest))
+		.map((b) => b.toString(16).padStart(2, '0'))
+		.join('');
+}

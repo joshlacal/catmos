@@ -1,86 +1,128 @@
 <script lang="ts">
-  let {
-    senderName,
-    preview,
-    onCancel
-  }: {
-    senderName: string;
-    preview: string;
-    onCancel: () => void;
-  } = $props();
+	import type { Message } from '#lib/wasm.ts';
+	import { stripDidFragment } from '#lib/did.ts';
+	import { profiles, resolveProfileName } from '#lib/stores/profiles.ts';
+	import { extractMessagePreview } from '#lib/stores/conversations.ts';
+	import Icon from './Icon.svelte';
 
-  let truncated = $derived(
-    preview.length > 100 ? preview.slice(0, 100) + '...' : preview
-  );
+	let {
+		message,
+		onCancel
+	}: {
+		message: Message;
+		onCancel: () => void;
+	} = $props();
+
+	let senderAccountDid = $derived(stripDidFragment(message.senderDid));
+
+	$effect(() => {
+		if (senderAccountDid) {
+			profiles.resolveProfiles([senderAccountDid]);
+		}
+	});
+
+	let senderName = $derived.by(() => {
+		if (!senderAccountDid) return stripDidFragment(message.senderHandle) || 'Unknown';
+		const cached = $profiles.cache.get(senderAccountDid);
+		if (cached) {
+			return resolveProfileName($profiles.cache, senderAccountDid);
+		}
+		const cleanHandle = stripDidFragment(message.senderHandle);
+		if (cleanHandle && !cleanHandle.startsWith('did:')) {
+			return cleanHandle.startsWith('@') ? cleanHandle : `@${cleanHandle}`;
+		}
+		return resolveProfileName($profiles.cache, senderAccountDid);
+	});
+
+	let previewText = $derived.by(() => {
+		const plain = extractMessagePreview(message.content);
+		if (plain) {
+			return plain.length > 140 ? `${plain.slice(0, 140)}...` : plain;
+		}
+		if (message.image) return message.image.altText || 'Photo';
+		if (message.audio ?? message.audioAttachment) return 'Voice message';
+		if (message.embed?.type === 'post') return 'Shared post';
+		if (message.embed?.type === 'link') {
+			const title = message.embed.data.title;
+			return typeof title === 'string' && title.trim() ? title.trim() : 'Shared link';
+		}
+		if (message.embed?.type === 'gif') return 'GIF';
+		return 'Message';
+	});
 </script>
 
-<div class="reply-preview">
-  <div class="reply-content">
-    <span class="reply-sender">{senderName}</span>
-    <span class="reply-text">{truncated}</span>
-  </div>
-  <button class="reply-cancel" onclick={onCancel} aria-label="Cancel reply">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <line x1="18" y1="6" x2="6" y2="18" />
-      <line x1="6" y1="6" x2="18" y2="18" />
-    </svg>
-  </button>
+<div class="reply-preview" role="region" aria-label="Replying to message">
+	<div class="reply-content">
+		<span class="reply-sender">Replying to {senderName}</span>
+		<span class="reply-text">{previewText}</span>
+	</div>
+	<button
+		type="button"
+		class="reply-cancel"
+		onclick={onCancel}
+		aria-label="Cancel reply"
+		title="Cancel reply"
+	>
+		<Icon name="x" size={16} />
+	</button>
 </div>
 
 <style>
-  .reply-preview {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    margin: 0 20px;
-    background: var(--bg-hover);
-    border-left: 3px solid var(--accent);
-    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
-  }
+	.reply-preview {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		padding-block: var(--space-2);
+		padding-inline: var(--space-3);
+		margin-block-end: var(--space-2);
+		background: var(--bg-surface);
+		border-inline-start: 3px solid var(--accent-fill);
+		border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+	}
 
-  .reply-content {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
+	.reply-content {
+		flex: 1;
+		min-inline-size: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 2px;
+	}
 
-  .reply-sender {
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--text-link);
-  }
+	.reply-sender {
+		font-size: var(--text-sm);
+		font-weight: 600;
+		line-height: 1.35;
+		color: var(--text-link);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
 
-  .reply-text {
-    font-size: 12px;
-    color: var(--text-secondary);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
+	.reply-text {
+		font-size: var(--text-sm);
+		line-height: 1.38;
+		color: var(--text-secondary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
 
-  .reply-cancel {
-    flex-shrink: 0;
-    width: 24px;
-    height: 24px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-tertiary);
-    transition: all var(--transition-fast);
-  }
+	.reply-cancel {
+		flex-shrink: 0;
+		min-inline-size: max(1.75rem, var(--touch-min));
+		min-block-size: max(1.75rem, var(--touch-min));
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		border-radius: var(--radius-sm);
+		color: var(--text-secondary);
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
+	}
 
-  .reply-cancel:hover {
-    color: var(--text-primary);
-    background: var(--bg-active);
-  }
-
-  @media (max-width: 768px) {
-    .reply-preview {
-      margin: 0 12px;
-    }
-  }
+	.reply-cancel:hover {
+		color: var(--text-primary);
+		background: var(--bg-hover);
+	}
 </style>

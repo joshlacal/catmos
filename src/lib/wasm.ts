@@ -6,10 +6,8 @@
  * - Browser: routes calls through a Web Worker (comlink) so that WASM gets
  *   OPFS Synchronous Access Handle for MLS SQLite crypto.
  *
- * Session credentials (did, token) live in sessionStorage
+ * Session credentials (did, token) and MLS DB key all live in sessionStorage
  * on the main thread (cleared on tab close to limit XSS exposure).
- * MLS DB encryption key and content root key live exclusively in durable localStorage
- * and are bound to the DID-scoped CleanStorageRecord.
  * Credential keys are namespaced by DID to prevent data leakage when multiple
  * users log in on the same browser. The Worker receives them via explicit
  * setAuth / init calls.
@@ -37,7 +35,7 @@ export type {
 	QuarantineEnteredEvent,
 	QuarantineClearedEvent,
 	QuarantineState
-} from './tauri';
+} from './tauri.ts';
 
 import type {
 	Conversation,
@@ -52,17 +50,26 @@ import type {
 	SearchHit,
 	OptInStatus,
 	GroupMetadataView
-} from './tauri';
+} from './tauri.ts';
 
 import { wrap, proxy, type Remote } from 'comlink';
-import type { WorkerApi } from './mls-worker';
+import type { WorkerApi } from './mls-worker.ts';
+import { normalizeAccountDid, stripDidFragment } from './did.ts';
+import { normalizeSessionId } from './oauth-callback.ts';
 import {
-	CLEAN_STORAGE_SUFFIX,
-	SS_ACTIVE_DID,
-	clearAllCursorsForDid,
-	setAuthoritativeActiveDid,
-	clearAuthoritativeActiveDid
-} from './stores/cursors';
+	accountDidHashHex,
+	deleteAccountKeyStoreEntries,
+	loadOrCreateDbKeyHex,
+	loadOrCreateWrappedSecretBytes
+} from './webcrypto-keystore.ts';
+import {
+	assertCanRevokeLabyrinthDevice,
+	buildUpgradeAdditionalScopes,
+	evaluateSpacesGateForUi,
+	isMlsOptedInForDid,
+	REQUIRED_LABYRINTH_OAUTH_SCOPES,
+	setMlsOptedInForDid
+} from './labyrinth-ui.ts';
 
 // ---------------------------------------------------------------------------
 // Environment detection
@@ -96,350 +103,143 @@ async function tauriInvoke<T>(cmd: string, args?: Record<string, unknown>): Prom
 // ---------------------------------------------------------------------------
 
 let _worker: Remote<WorkerApi> | null = null;
-let _rawWorker: Worker | null = null;
+let _rawWorker: { terminate(): void } | null = null;
+let _workerDid: string | null = null;
+let _wasmReady: Promise<void> | null = null;
+let _workerFactory: (() => { worker: Remote<WorkerApi>; rawWorker?: { terminate(): void } }) | null = null;
+
+/** Test-only hook allowing Node lifecycle tests to supply a Worker harness. */
+export function __setWorkerFactoryForTests(
+	factory: (() => { worker: Remote<WorkerApi>; rawWorker?: { terminate(): void } }) | null
+): void {
+	_workerFactory = factory;
+}
+
+/** Test-only hook returning the active worker DID and readiness state. */
+export function __getWorkerStateForTests(): {
+	hasWorker: boolean;
+	workerDid: string | null;
+	hasWasmReady: boolean;
+} {
+	return {
+		hasWorker: _worker !== null,
+		workerDid: _workerDid,
+		hasWasmReady: _wasmReady !== null
+	};
+}
+
+function terminateWorkerInstance(): void {
+	if (_rawWorker) {
+		try {
+			_rawWorker.terminate();
+		} catch (e) {
+			console.warn('[catmos] Worker termination notice:', e);
+		}
+		_rawWorker = null;
+	}
+	_worker = null;
+	_workerDid = null;
+	_wasmReady = null;
+}
 
 function getWorker(): Remote<WorkerApi> {
 	if (!_worker) {
-		_rawWorker = new Worker(new URL('./mls-worker.ts', import.meta.url), { type: 'module' });
-		_worker = wrap<WorkerApi>(_rawWorker);
+		if (_workerFactory) {
+			const created = _workerFactory();
+			_worker = created.worker;
+			_rawWorker = created.rawWorker ?? { terminate() {} };
+		} else {
+			const raw = new Worker(new URL('./mls-worker.ts', import.meta.url), { type: 'module' });
+			_rawWorker = raw;
+			_worker = wrap<WorkerApi>(raw);
+		}
 	}
 	return _worker;
 }
 
-/** Terminate the MLS worker and drop both handles. */
-function terminateWorker(): void {
-	_rawWorker?.terminate();
-	_rawWorker = null;
-	_worker = null;
+// ---------------------------------------------------------------------------
+// MLS DB key management: Non-extractable WebCrypto IndexedDB key custody
+//
+// All 32-byte (256-bit) `sqlite3mc` DB keys and content-root keys are wrapped
+// under per-account `extractable: false` AES-GCM-256 `CryptoKey` handles in
+// `webcrypto-keystore.ts` (`catbird_mls_webcrypto_v2`) with domain-separated AAD.
+// ---------------------------------------------------------------------------
+
+/** Sanitize a DID for deterministic legacy storage filenames when cleaning up. */
+export function sanitizeDid(did: string): string {
+	const trimmed = stripDidFragment(did);
+	if (!trimmed) {
+		throw new Error('Cannot derive MLS storage identity from an empty DID');
+	}
+	return trimmed.replace(/[:.]/g, '_');
 }
 
-// ---------------------------------------------------------------------------
-// Clean storage constants & generation derivation
-// ---------------------------------------------------------------------------
+/** Return the per-DID `dbPrefix` (`catbird_mls_<sanitized_did>`). */
+export function mlsDbPrefixForDid(did: string): string {
+	return `catbird_mls_${sanitizeDid(did)}`;
+}
 
-// The generation pin itself lives in ./stores/cursors (a leaf module with no
-// imports) so cursor keys, the tab lock name, and MLS storage coordinates can
-// never drift onto different generations.
-export { CLEAN_STORAGE_SUFFIX, SS_ACTIVE_DID };
-export const CLEAN_STORAGE_GENERATION_TOKEN = `mls-state${CLEAN_STORAGE_SUFFIX}`;
-export const CONTENT_ROOT_PREFIX = 'mls.content.root.';
-const LEGACY_CLEAN_STORAGE_SUFFIX = '-clean-v2-openmls-v09';
+/** Return the per-DID SQLite database filename (`catbird_mls_<sanitized_did>-app.db`). */
+export function mlsDbFileNameForDid(did: string): string {
+	return `${mlsDbPrefixForDid(did)}-app.db`;
+}
+
+/** Return the per-DID keyring key ID (`mls_db_key_<sanitized_did>`). */
+export function mlsKeyIdForDid(did: string): string {
+	return `mls_db_key_${sanitizeDid(did)}`;
+}
 
 /**
- * One-shot removal of the previous storage generation's keys.
- *
- * Two guards keep this off the live generation, whose keys end in
- * `-device-identity-v1`: the `endsWith` test for suffixed keys, and the trailing
- * `:` on the cursor prefix, since a cursor key carries its suffix mid-key.
- * Reverse order: removing index i only shifts down already-visited indices.
+ * Get or create the per-DID 64-character hex MLS DB encryption key backed by
+ * non-extractable WebCrypto AES-GCM wrapping in IndexedDB (`webcrypto-keystore.ts`).
  */
-function purgeLegacyCleanStorage(storage: Storage): void {
-	for (let index = storage.length - 1; index >= 0; index -= 1) {
-		const key = storage.key(index);
-		if (
-			key &&
-			((key.endsWith(LEGACY_CLEAN_STORAGE_SUFFIX) &&
-				(key.startsWith('catbird_mls:') ||
-					key.startsWith('catbird_mls_active_did') ||
-					key.startsWith(CONTENT_ROOT_PREFIX))) ||
-				key.startsWith(`catbird_ws_cursor${LEGACY_CLEAN_STORAGE_SUFFIX}:`))
-		) {
-			storage.removeItem(key);
-		}
+export async function getOrCreateMlsDbKey(targetDid?: string): Promise<string> {
+	const resolvedDid = stripDidFragment(
+		targetDid ??
+			(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null) ??
+			''
+	);
+	if (!resolvedDid) {
+		throw new Error('getOrCreateMlsDbKey requires a valid authenticated DID');
 	}
-}
 
-if (!isTauri && typeof window !== 'undefined') {
-	purgeLegacyCleanStorage(localStorage);
-	purgeLegacyCleanStorage(sessionStorage);
-}
-
-export interface CleanStorageRecord {
-	generation: string;
-	normalizedDid: string;
-	didDigest: string;
-	storagePrefix: string;
-	dbPrefix: string;
-	dbIdentity: string;
-	mlsDbKeyLabel: string;
-	mlsDbKeyVerifier: string;
-	contentRootKeyLabel: string;
-	contentRootKeyVerifier: string;
-	creatorToken: string;
-	state: 'creating' | 'complete';
-	createdAt: number;
-	completedAt?: number;
-}
-
-/** Return a per-DID namespaced key for browser storage. */
-export function didKey(did: string, suffix: string): string {
-	return `catbird_mls:${did}:${suffix}${CLEAN_STORAGE_SUFFIX}`;
-}
-
-/** localStorage read that yields null when there is no window (SSR). */
-function localGet(key: string): string | null {
-	return typeof window === 'undefined' ? null : localStorage.getItem(key);
-}
-
-function isNonEmptyString(value: unknown): boolean {
-	return typeof value === 'string' && value.length > 0;
-}
-
-export async function sha256Hex(input: string): Promise<string> {
-	const bytes = new TextEncoder().encode(input);
-	const digest = await crypto.subtle.digest('SHA-256', bytes);
-	return Array.from(new Uint8Array(digest))
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
-}
-
-export async function sha256HexBytes(bytes: Uint8Array): Promise<string> {
-	const digest = await crypto.subtle.digest('SHA-256', bytes as BufferSource);
-	return Array.from(new Uint8Array(digest))
-		.map((b) => b.toString(16).padStart(2, '0'))
-		.join('');
-}
-
-export async function contentRootStorageKey(userDid: string): Promise<string> {
-	const normalizedDid = userDid.trim();
-	return `${CONTENT_ROOT_PREFIX}${await sha256Hex(normalizedDid)}${CLEAN_STORAGE_SUFFIX}`;
-}
-
-export async function deriveDidStorageCoordinates(did: string): Promise<{
-	normalizedDid: string;
-	didDigest: string;
-	storagePrefix: string;
-	dbPrefix: string;
-	dbIdentity: string;
-	recordKey: string;
-	mlsDbKeyLabel: string;
-	contentRootKeyLabel: string;
-	cursorRegistryKey: string;
-}> {
-	const normalizedDid = did.trim();
-	const didDigest = await sha256Hex(normalizedDid);
-	const storagePrefix = `catbird_mls_${didDigest}${CLEAN_STORAGE_SUFFIX}`;
-	const dbPrefix = `catbird-mls-${didDigest}${CLEAN_STORAGE_SUFFIX}`;
-	const dbIdentity = `${dbPrefix}-app.db`;
-	const recordKey = didKey(normalizedDid, 'init_record');
-	const mlsDbKeyLabel = didKey(normalizedDid, 'mls_db_key');
-	const contentRootKeyLabel = `${CONTENT_ROOT_PREFIX}${didDigest}${CLEAN_STORAGE_SUFFIX}`;
-	const cursorRegistryKey = didKey(normalizedDid, 'cursor_registry');
-
-	return {
-		normalizedDid,
-		didDigest,
-		storagePrefix,
-		dbPrefix,
-		dbIdentity,
-		recordKey,
-		mlsDbKeyLabel,
-		contentRootKeyLabel,
-		cursorRegistryKey
-	};
-}
-
-async function withMlsLock<T>(fn: () => Promise<T>): Promise<T> {
-	if (typeof navigator === 'undefined' || !navigator.locks) {
-		throw new Error(
-			'Web Locks API is required for browser MLS storage coordination; fail closed without mutation'
-		);
+	const keyId = mlsKeyIdForDid(resolvedDid);
+	const legacySessionKey = didKey(resolvedDid, 'mls_db_key');
+	if (typeof sessionStorage !== 'undefined') {
+		sessionStorage.removeItem(keyId);
+		sessionStorage.removeItem(legacySessionKey);
 	}
-	const lockName = `catbird_mls_lifecycle_lock${CLEAN_STORAGE_SUFFIX}`;
-	return navigator.locks.request(lockName, { mode: 'exclusive' }, fn) as Promise<T>;
+
+	const didHash = await accountDidHashHex(resolvedDid);
+	return loadOrCreateDbKeyHex(didHash);
 }
 
-let _activeDid: string | null = null;
-let _lastAttemptedDid: string | null = null;
+// ---------------------------------------------------------------------------
+// MLS field-level encryption: per-DID content root key (WebCrypto IndexedDB)
+//
+// Wrapped under the non-extractable AES-GCM CryptoKey in `webcrypto-keystore.ts`
+// (`Gate 9` — zero keys in `localStorage` or `sessionStorage`).
+// ---------------------------------------------------------------------------
 
-export async function ensureMlsInitialized(did: string): Promise<void> {
-	if (isTauri) return;
-	const {
-		normalizedDid,
-		recordKey,
-		mlsDbKeyLabel,
-		contentRootKeyLabel,
-		storagePrefix,
-		dbPrefix,
-		dbIdentity,
-		didDigest
-	} = await deriveDidStorageCoordinates(did);
+async function loadOrCreateContentRootKey(userDid: string): Promise<Uint8Array> {
+	const didHash = await accountDidHashHex(userDid);
+	return loadOrCreateWrappedSecretBytes(didHash, 'content');
+}
 
-	_lastAttemptedDid = normalizedDid;
-
-	await withMlsLock(async () => {
-		if (_activeDid === normalizedDid) return;
-		const rawRecord = localGet(recordKey);
-		let record: CleanStorageRecord | null = null;
-		if (rawRecord !== null) {
-			try {
-				record = JSON.parse(rawRecord) as CleanStorageRecord;
-			} catch {
-				throw new Error(
-					'Clean storage invalid initialization record format; explicit reset required'
-				);
-			}
-		}
-
-		if (record) {
-			if (record.state === 'creating') {
-				throw new Error(
-					'Clean storage initialization incomplete (creating marker present); explicit reset required'
-				);
-			}
-			if (record.state === 'complete') {
-				if (
-					record.generation !== CLEAN_STORAGE_GENERATION_TOKEN ||
-					record.normalizedDid !== normalizedDid ||
-					record.didDigest !== didDigest ||
-					record.storagePrefix !== storagePrefix ||
-					record.dbPrefix !== dbPrefix ||
-					record.dbIdentity !== dbIdentity ||
-					record.mlsDbKeyLabel !== mlsDbKeyLabel ||
-					record.contentRootKeyLabel !== contentRootKeyLabel ||
-					!isNonEmptyString(record.mlsDbKeyVerifier) ||
-					!isNonEmptyString(record.contentRootKeyVerifier) ||
-					!isNonEmptyString(record.creatorToken) ||
-					typeof record.createdAt !== 'number'
-				) {
-					throw new Error('Clean storage record binding mismatch; explicit reset required');
-				}
-				const dbKey = localGet(record.mlsDbKeyLabel);
-				if (!dbKey || !/^[0-9a-fA-F]{64}$/.test(dbKey)) {
-					throw new Error(
-						'Clean storage mixed state: complete record but missing or invalid key material; explicit reset required'
-					);
-				}
-				const computedDbKeyVerifier = await sha256Hex(dbKey);
-				if (computedDbKeyVerifier !== record.mlsDbKeyVerifier) {
-					throw new Error(
-						'Clean storage mixed state: database key verifier mismatch; explicit reset required'
-					);
-				}
-
-				const contentRootB64 = localGet(record.contentRootKeyLabel);
-				if (!contentRootB64) {
-					throw new Error(
-						'Clean storage mixed state: complete record but missing content root key; explicit reset required'
-					);
-				}
-				let contentRootBytes: Uint8Array;
-				try {
-					contentRootBytes = Uint8Array.from(atob(contentRootB64), (c) => c.charCodeAt(0));
-				} catch {
-					throw new Error(
-						'Clean storage corrupted content root key: fail closed without mutation'
-					);
-				}
-				if (contentRootBytes.length !== 32) {
-					throw new Error(`Invalid content root key length: ${contentRootBytes.length}`);
-				}
-				const computedCrVerifier = await sha256HexBytes(contentRootBytes);
-				if (computedCrVerifier !== record.contentRootKeyVerifier) {
-					throw new Error(
-						'Clean storage mixed state: content root key verifier mismatch; explicit reset required'
-					);
-				}
-
-				const w = getWorker();
-				await w.init({
-					baseUrl: NEST_URL,
-					storagePrefix: record.storagePrefix,
-					dbPrefix: record.dbPrefix,
-					mlsDbKey: dbKey,
-					initRecord: 'complete',
-					actorDid: normalizedDid,
-					boundDid: normalizedDid,
-					record
-				});
-
-				await w.setContentRootKey(contentRootBytes);
-				_activeDid = normalizedDid;
-				return;
-			}
-			throw new Error(
-				`Clean storage invalid initialization record state: ${String(record.state)}`
-			);
-		}
-
-		// Record absent: verify no orphaned keys exist
-		const existingDbKey = localGet(mlsDbKeyLabel);
-		if (existingDbKey !== null) {
-			throw new Error(
-				'Clean storage mixed state: key material exists without initialization record; explicit reset required'
-			);
-		}
-		const existingCrKey = localGet(contentRootKeyLabel);
-		if (existingCrKey !== null) {
-			throw new Error(
-				'Clean storage mixed state: content root key exists without initialization record; explicit reset required'
-			);
-		}
-
-		// Read-only preflight probe in worker BEFORE any localStorage/key mutation
-		const w = getWorker();
-		await w.probeFreshCreation(storagePrefix, dbPrefix);
-
-		// Fresh first creation
-		const creatorToken = crypto.randomUUID();
-
-		const dbKeyBytes = new Uint8Array(32);
-		crypto.getRandomValues(dbKeyBytes);
-		const dbKey = Array.from(dbKeyBytes)
-			.map((b) => b.toString(16).padStart(2, '0'))
-			.join('');
-
-		const contentRootBytes = new Uint8Array(32);
-		crypto.getRandomValues(contentRootBytes);
-		const contentRootB64 = btoa(String.fromCharCode(...contentRootBytes));
-
-		const mlsDbKeyVerifier = await sha256Hex(dbKey);
-		const contentRootKeyVerifier = await sha256HexBytes(contentRootBytes);
-
-		const newRecord: CleanStorageRecord = {
-			generation: CLEAN_STORAGE_GENERATION_TOKEN,
-			normalizedDid,
-			didDigest,
-			storagePrefix,
-			dbPrefix,
-			dbIdentity,
-			mlsDbKeyLabel,
-			mlsDbKeyVerifier,
-			contentRootKeyLabel,
-			contentRootKeyVerifier,
-			creatorToken,
-			state: 'creating',
-			createdAt: Date.now()
-		};
-
-		if (typeof window !== 'undefined') {
-			localStorage.setItem(recordKey, JSON.stringify(newRecord));
-			localStorage.setItem(mlsDbKeyLabel, dbKey);
-			localStorage.setItem(contentRootKeyLabel, contentRootB64);
-		}
-
-		await w.init({
-			baseUrl: NEST_URL,
-			storagePrefix,
-			dbPrefix,
-			mlsDbKey: dbKey,
-			initRecord: 'creating',
-			creatorToken,
-			actorDid: normalizedDid,
-			boundDid: normalizedDid,
-			record: newRecord
-		});
-
-		await w.setContentRootKey(contentRootBytes);
-
-		newRecord.state = 'complete';
-		newRecord.completedAt = Date.now();
-		if (typeof window !== 'undefined') {
-			localStorage.setItem(recordKey, JSON.stringify(newRecord));
-		}
-
-		_activeDid = normalizedDid;
-	});
+/**
+ * Push the per-DID content root key into the WASM module. Called once per
+ * session after `setAuth` resolves so that subsequent `setup()` and any
+ * message encrypt/decrypt has the key bound.
+ *
+ * Propagates errors on failure to enforce fail-closed security (no legacy
+ * plaintext fallback).
+ */
+async function installContentRootKey(did: string): Promise<void> {
+	const key = await loadOrCreateContentRootKey(did);
+	const w = getWorker();
+	await (
+		w as unknown as { setContentRootKey: (k: Uint8Array) => Promise<void> }
+	).setContentRootKey(key);
 }
 
 // ---------------------------------------------------------------------------
@@ -455,26 +255,315 @@ const NEST_URL = (() => {
 	return 'https://api.catbird.blue';
 })();
 
+const HOME_DS_DID = 'did:web:chat.catbird.blue';
+const HOME_DS_URL = 'https://chat.catbird.blue';
+const UUID_V4_LOWER_RE =
+	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+export const BROWSER_DEVICE_ID_PREFIX = 'catmos.mls.deviceId.';
+const LEGACY_BROWSER_DEVICE_ID_PREFIX = 'catmos_mls_device_id_';
+
+export function readBrowserDeviceId(didHash: string): string | null {
+	const normalizedHash = didHash.trim();
+	if (!normalizedHash) return null;
+	const canonicalKey = `${BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`;
+	const legacyKey = `${LEGACY_BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`;
+	try {
+		if (typeof localStorage !== 'undefined') {
+			const existing = localStorage.getItem(canonicalKey)?.trim().toLowerCase();
+			if (existing && UUID_V4_LOWER_RE.test(existing)) {
+				return existing;
+			}
+			const legacy = localStorage.getItem(legacyKey)?.trim().toLowerCase();
+			if (legacy && UUID_V4_LOWER_RE.test(legacy)) {
+				localStorage.setItem(canonicalKey, legacy);
+				localStorage.removeItem(legacyKey);
+				return legacy;
+			}
+		}
+	} catch {
+		// Ignore storage access errors (private browsing / Node test harness)
+	}
+	return null;
+}
+
+export function wipeBrowserDeviceId(didHash: string): void {
+	const normalizedHash = didHash.trim();
+	if (!normalizedHash) return;
+	try {
+		if (typeof localStorage !== 'undefined') {
+			localStorage.removeItem(`${BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`);
+			localStorage.removeItem(`${LEGACY_BROWSER_DEVICE_ID_PREFIX}${normalizedHash}`);
+		}
+	} catch {
+		// Ignore storage removal errors
+	}
+}
+
+export function getOrCreateBrowserDeviceId(didHash: string): string {
+	const existing = readBrowserDeviceId(didHash);
+	if (existing) {
+		return existing;
+	}
+	const generated = crypto.randomUUID().toLowerCase();
+	const storageKey = `${BROWSER_DEVICE_ID_PREFIX}${didHash.trim()}`;
+	try {
+		if (typeof localStorage !== 'undefined') {
+			localStorage.setItem(storageKey, generated);
+		}
+	} catch {
+		// Ignore storage write errors
+	}
+	return generated;
+}
+
+interface OpfsFileHandleLike {
+	kind?: string;
+	name?: string;
+	getFile?: () => Promise<{ slice: (start?: number, end?: number) => { arrayBuffer: () => Promise<ArrayBuffer> } }>;
+}
+
+interface OpfsDirectoryHandleLike {
+	kind?: string;
+	name?: string;
+	getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<OpfsDirectoryHandleLike>;
+	removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
+	entries?: () => AsyncIterable<[string, OpfsFileHandleLike | OpfsDirectoryHandleLike]>;
+	values?: () => AsyncIterable<OpfsFileHandleLike | OpfsDirectoryHandleLike>;
+}
+
+function sahPoolHeaderMatchesAccount(
+	headerPath: string,
+	didHash: string,
+	legacyDbBaseName: string | null
+): boolean {
+	const clean = headerPath.replace(/^\/+/, '').trim();
+	if (!clean) return false;
+	const targetPrefix = `catbird-mls/${didHash}.db`;
+	const barePrefix = `${didHash}.db`;
+	if (
+		clean === targetPrefix ||
+		clean.startsWith(`${targetPrefix}-`) ||
+		clean === barePrefix ||
+		clean.startsWith(`${barePrefix}-`)
+	) {
+		return true;
+	}
+	if (
+		legacyDbBaseName &&
+		(clean === legacyDbBaseName ||
+			clean.startsWith(`${legacyDbBaseName}-`) ||
+			clean.endsWith(`/${legacyDbBaseName}`) ||
+			clean.includes(`/${legacyDbBaseName}-`))
+	) {
+		return true;
+	}
+	return false;
+}
+
+async function listDirectoryEntries(
+	dir: OpfsDirectoryHandleLike
+): Promise<Array<[string, OpfsFileHandleLike | OpfsDirectoryHandleLike]>> {
+	const out: Array<[string, OpfsFileHandleLike | OpfsDirectoryHandleLike]> = [];
+	if (typeof dir.entries === 'function') {
+		for await (const pair of dir.entries()) {
+			out.push(pair);
+		}
+		return out;
+	}
+	if (typeof dir.values === 'function') {
+		for await (const entry of dir.values()) {
+			if (entry && typeof entry.name === 'string') {
+				out.push([entry.name, entry]);
+			}
+		}
+	}
+	return out;
+}
+
+/**
+ * Purge an account's SQLite database files from OPFS (both direct files and
+ * `sqlite-wasm-vfs` `.opfs-sahpool/.opaque` pool slots matching `<didHash>.db`),
+ * leaving any other account's OPFS files untouched.
+ *
+ * Must be called AFTER `terminateWorkerInstance()` so all `SyncAccessHandle`
+ * file locks held by the dedicated Worker have been released.
+ */
+export async function purgeAccountOpfsDatabase(
+	didHash: string,
+	did?: string,
+	opfsRootProvider?: () => Promise<OpfsDirectoryHandleLike | null>
+): Promise<number> {
+	const normalizedHash = didHash.trim();
+	if (!normalizedHash) return 0;
+
+	let root: OpfsDirectoryHandleLike | null = null;
+	try {
+		if (opfsRootProvider) {
+			root = await opfsRootProvider();
+		} else if (
+			typeof navigator !== 'undefined' &&
+			navigator.storage &&
+			typeof navigator.storage.getDirectory === 'function'
+		) {
+			root = (await navigator.storage.getDirectory()) as unknown as OpfsDirectoryHandleLike;
+		}
+	} catch {
+		return 0;
+	}
+	if (!root) return 0;
+
+	const legacyBase = did && stripDidFragment(did) ? mlsDbFileNameForDid(did) : null;
+	const suffixes = ['', '-journal', '-wal', '-shm'];
+	let removedCount = 0;
+
+	const tryRemoveDirect = async (dir: OpfsDirectoryHandleLike, baseName: string) => {
+		for (const suffix of suffixes) {
+			try {
+				await dir.removeEntry(`${baseName}${suffix}`);
+				removedCount += 1;
+			} catch {
+				// Entry not present
+			}
+		}
+	};
+
+	await tryRemoveDirect(root, `${normalizedHash}.db`);
+	if (legacyBase) {
+		await tryRemoveDirect(root, legacyBase);
+	}
+
+	try {
+		const subDir = await root.getDirectoryHandle('catbird-mls', { create: false });
+		await tryRemoveDirect(subDir, `${normalizedHash}.db`);
+		if (legacyBase) {
+			await tryRemoveDirect(subDir, legacyBase);
+		}
+	} catch {
+		// No direct `catbird-mls/` directory in OPFS root
+	}
+
+	// Inspect `sqlite-wasm-vfs` OpfsSAHPool `.opfs-sahpool/.opaque` slot headers (first 512 bytes)
+	for (const poolDirName of ['.opfs-sahpool', 'opfs-sahpool']) {
+		try {
+			const poolDir = await root.getDirectoryHandle(poolDirName, { create: false });
+			const opaqueDir = await poolDir.getDirectoryHandle('.opaque', { create: false });
+			const entries = await listDirectoryEntries(opaqueDir);
+			const decoder = new TextDecoder();
+			for (const [slotName, handle] of entries) {
+				if (!handle || handle.kind === 'directory') continue;
+				const fileHandle = handle as OpfsFileHandleLike;
+				if (typeof fileHandle.getFile !== 'function') continue;
+				try {
+					const file = await fileHandle.getFile();
+					const headerBuf = await file.slice(0, 516).arrayBuffer();
+					if (headerBuf.byteLength === 0) continue;
+					const headerBytes = new Uint8Array(headerBuf, 0, Math.min(512, headerBuf.byteLength));
+					const nulIdx = headerBytes.indexOf(0);
+					const pathSlice = nulIdx >= 0 ? headerBytes.subarray(0, nulIdx) : headerBytes;
+					const associatedPath = decoder.decode(pathSlice);
+					if (sahPoolHeaderMatchesAccount(associatedPath, normalizedHash, legacyBase)) {
+						await opaqueDir.removeEntry(slotName);
+						removedCount += 1;
+					}
+				} catch {
+					// Slot busy or concurrently removed
+				}
+			}
+		} catch {
+			// Pool directory not initialized yet
+		}
+	}
+
+	return removedCount;
+}
+
+async function mintChatServiceAuthToken(sessionId: string, lxm: string): Promise<string> {
+	const params = new URLSearchParams({
+		aud: HOME_DS_DID,
+		lxm
+	});
+	const resp = await fetch(`${NEST_URL}/xrpc/com.atproto.server.getServiceAuth?${params.toString()}`, {
+		method: 'GET',
+		headers: {
+			Accept: 'application/json',
+			Authorization: `Bearer ${sessionId}`
+		}
+	});
+	if (!resp.ok) {
+		const text = await resp.text();
+		throw new Error(`getServiceAuth failed (${resp.status}): ${text}`);
+	}
+	const data = (await resp.json()) as { token?: string };
+	if (typeof data.token !== 'string' || !data.token.trim() || data.token === sessionId) {
+		throw new Error('getServiceAuth response missing a separate service token');
+	}
+	return data.token;
+}
+
+export async function bffFetch(
+	path: string,
+	init: RequestInit = {},
+	sessionId?: string
+): Promise<Response> {
+	const headers = new Headers(init.headers ?? {});
+	if (sessionId) {
+		headers.set('Authorization', `Bearer ${sessionId}`);
+	}
+	return fetch(`${NEST_URL}${path}`, {
+		...init,
+		headers
+	});
+}
+
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 /**
- * Initialize the WASM Worker with MLS config and verify clean storage.
+ * Initialize the WASM Worker with per-DID MLS config.
+ *
+ * Requires a non-empty authenticated `did` — never opens a generic
+ * `catbird-mls-app.db` with a generic key. If a Worker was already running for
+ * a different DID, terminates it and reinitializes for `did` so the Worker
+ * opens `catbird_mls_<sanitized_did>-app.db` with `mls_db_key_<sanitized_did>`.
  */
 export async function initWasm(did?: string): Promise<void> {
 	if (isTauri) return;
-	if (did) {
-		await ensureMlsInitialized(did);
-		return;
+
+	const resolvedDid = (
+		did ??
+		(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null) ??
+		''
+	).trim();
+	if (!resolvedDid) {
+		throw new Error(
+			'initWasm requires a non-empty authenticated DID; refusing to open generic un-namespaced storage'
+		);
 	}
-	const saved = readBrowserAuth();
-	if (saved?.did) {
-		await ensureMlsInitialized(saved.did);
-		return;
+
+	if (_workerDid && _workerDid !== resolvedDid) {
+		terminateWorkerInstance();
 	}
-	getWorker();
+
+	if (_worker && _workerDid === resolvedDid && _wasmReady) {
+		return _wasmReady;
+	}
+
+	const runInit = (async () => {
+		try {
+			await ensureUnifiedBrowserClientOpen(resolvedDid);
+			_workerDid = resolvedDid;
+		} catch (err) {
+			terminateWorkerInstance();
+			throw err;
+		}
+	})();
+
+	_wasmReady = runInit;
+	return runInit;
 }
+
 // ---------------------------------------------------------------------------
 // Event listeners (Tauri IPC events on desktop, no-op in browser)
 // ---------------------------------------------------------------------------
@@ -498,14 +587,84 @@ export async function listenForEvent<T>(
 // Browser session storage helpers (per-DID namespace isolation)
 // ---------------------------------------------------------------------------
 
+/** Base keys -- the DID key is unnamespaced (bootstrap). */
+const SS_ACTIVE_DID = 'catbird_mls_active_did';
+const SS_PENDING_BROWSER_NONCE = 'catbird_mls_pending_browser_nonce';
+const SS_PENDING_UPGRADE_NONCE = 'catbird_mls_pending_upgrade_nonce';
+const SS_PENDING_UPGRADE_DID = 'catbird_mls_pending_upgrade_did';
+const SS_PENDING_UPGRADE_RETURN_TO = 'catbird_mls_pending_upgrade_return_to';
+const OAUTH_CODE_FORMAT_RE = /^[A-Za-z0-9._~+/-]{8,512}={0,2}$/;
+
+function parseGrantedScopes(raw: unknown): string[] {
+	if (!Array.isArray(raw)) return [];
+	return raw
+		.filter((entry): entry is string => typeof entry === 'string')
+		.map((s) => s.trim())
+		.filter(Boolean);
+}
+
+function sanitizeReturnPath(rawPath: string | null | undefined): string {
+	const trimmed = typeof rawPath === 'string' ? rawPath.trim() : '';
+	if (!trimmed || !trimmed.startsWith('/') || trimmed.startsWith('//') || /[\u0000-\u001f\u007f\\]/.test(trimmed)) {
+		return '/settings/labyrinth';
+	}
+	return trimmed;
+}
+
+/** Generate a cryptographically secure 32-byte unpadded base64url challenge nonce (43 chars). */
+export function generateBrowserNonce(): string {
+	const bytes = new Uint8Array(32);
+	crypto.getRandomValues(bytes);
+	let binary = '';
+	for (let i = 0; i < bytes.length; i++) {
+		binary += String.fromCharCode(bytes[i]);
+	}
+	return btoa(binary)
+		.replace(/\+/g, '-')
+		.replace(/\//g, '_')
+		.replace(/=+$/, '');
+}
+
+/** Clear any pending browser OAuth nonce from sessionStorage. */
+export function clearPendingOAuthLogin(): void {
+	if (typeof sessionStorage === 'undefined') return;
+	sessionStorage.removeItem(SS_PENDING_BROWSER_NONCE);
+}
+
+export function hasPendingOAuthUpgrade(): boolean {
+	if (typeof sessionStorage === 'undefined') return false;
+	return Boolean(sessionStorage.getItem(SS_PENDING_UPGRADE_NONCE));
+}
+
+export function clearPendingOAuthUpgrade(): void {
+	if (typeof sessionStorage === 'undefined') return;
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_NONCE);
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_DID);
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_RETURN_TO);
+}
+
+export function consumePendingUpgradeReturnPath(): string {
+	if (typeof sessionStorage === 'undefined') return '/settings/labyrinth';
+	const raw = sessionStorage.getItem(SS_PENDING_UPGRADE_RETURN_TO);
+	sessionStorage.removeItem(SS_PENDING_UPGRADE_RETURN_TO);
+	return sanitizeReturnPath(raw);
+}
+
+/** Return a per-DID namespaced key for browser sessionStorage. */
+function didKey(did: string, suffix: string): string {
+	return `catbird_mls:${did}:${suffix}`;
+}
+
 /** Persist auth credentials in sessionStorage, namespaced by DID. */
-function persistBrowserAuth(did: string, sessionId: string): void {
-	sessionStorage.setItem(SS_ACTIVE_DID, did);
-	sessionStorage.setItem(didKey(did, 'session_id'), sessionId);
+export function persistBrowserAuth(did: string, sessionId: string): void {
+	const canonicalDid = normalizeAccountDid(did);
+	sessionStorage.setItem(SS_ACTIVE_DID, canonicalDid);
+	sessionStorage.setItem(didKey(canonicalDid, 'session_id'), sessionId);
 }
 
 /** Read stored session for the active DID. Returns null if nothing saved. */
-function readBrowserAuth(): { did: string; sessionId: string } | null {
+export function readBrowserAuth(): { did: string; sessionId: string } | null {
+	if (typeof sessionStorage === 'undefined') return null;
 	const did = sessionStorage.getItem(SS_ACTIVE_DID);
 	if (!did) return null;
 	const sessionId = sessionStorage.getItem(didKey(did, 'session_id'));
@@ -514,75 +673,513 @@ function readBrowserAuth(): { did: string; sessionId: string } | null {
 }
 
 /** Clear the active DID's credentials from sessionStorage. */
-function clearBrowserAuth(): void {
+export function clearBrowserAuth(): void {
+	if (typeof sessionStorage === 'undefined') return;
 	const did = sessionStorage.getItem(SS_ACTIVE_DID);
 	if (did) {
 		sessionStorage.removeItem(didKey(did, 'session_id'));
 	}
 	sessionStorage.removeItem(SS_ACTIVE_DID);
+	clearPendingOAuthUpgrade();
+}
+
+/** Abandons a pending desktop sign-in, so finishing it in the browser signs no one in. */
+export async function cancelLogin(): Promise<void> {
+	if (isTauri) {
+		return tauriInvoke('cancel_login');
+	}
 }
 
 export async function startLogin(identifier: string): Promise<void> {
 	if (isTauri) {
 		return tauriInvoke('start_login', { identifier });
 	}
-	const { hostname, port } = window.location;
-	let callbackBase: string;
-	if (hostname === 'localhost' || hostname === '127.0.0.1') {
-		callbackBase = `http://127.0.0.1:${port || '80'}`;
-	} else {
-		callbackBase = window.location.origin;
-	}
-	const redirectTo = `${callbackBase}/auth/callback/`;
+	const redirectTo = `${window.location.origin}/auth/callback`;
+	const browserNonce = generateBrowserNonce();
+	sessionStorage.setItem(SS_PENDING_BROWSER_NONCE, browserNonce);
+
+	const isLoopback =
+		window.location.hostname === 'localhost' ||
+		window.location.hostname === '127.0.0.1' ||
+		window.location.hostname === '[::1]';
+	const clientParam = isLoopback ? '' : '&client=catmos';
 	const loginUrl =
 		`${NEST_URL}/auth/login` +
 		`?identifier=${encodeURIComponent(identifier)}` +
-		`&client=catmos` +
-		`&redirect_to=${encodeURIComponent(redirectTo)}`;
+		clientParam +
+		`&redirect_to=${encodeURIComponent(redirectTo)}` +
+		`&browser_nonce=${encodeURIComponent(browserNonce)}`;
 	window.location.href = loginUrl;
 }
 
-export async function completeLogin(sessionId: string): Promise<AuthState> {
-	if (isTauri) {
-		const state = await tauriInvoke<AuthState>('complete_login', { sessionId });
-		setAuthoritativeActiveDid(state.did);
-		return state;
+/**
+ * Exchange a one-time OAuth code for a session ID using the single-use browser nonce.
+ * Consumes and clears the pending nonce immediately upon attempt.
+ */
+export async function exchangeOAuthCode(code: string): Promise<string> {
+	if (!code || typeof code !== 'string' || !OAUTH_CODE_FORMAT_RE.test(code)) {
+		clearPendingOAuthLogin();
+		throw new Error('Invalid OAuth authorization code.');
 	}
-	const resp = await fetch(`${NEST_URL}/auth/session`, {
-		headers: { Authorization: `Bearer ${sessionId}` }
+	const browserNonce = sessionStorage.getItem(SS_PENDING_BROWSER_NONCE);
+	// Single-use: clear pending nonce immediately
+	clearPendingOAuthLogin();
+
+	if (!browserNonce) {
+		throw new Error('Missing or expired browser login nonce. Please try signing in again.');
+	}
+
+	const resp = await fetch(`${NEST_URL}/auth/exchange`, {
+		method: 'POST',
+		headers: {
+			'Content-Type': 'application/json'
+		},
+		body: JSON.stringify({
+			code,
+			browser_nonce: browserNonce
+		})
 	});
-	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
-	const info = await resp.json();
-	const did: string = info.did;
-	const handle: string = info.handle ?? did;
 
-	// Ensure MLS DB is initialized under Web Lock for this DID
-	await ensureMlsInitialized(did);
+	if (!resp.ok) {
+		const errText = await resp.text().catch(() => '');
+		throw new Error(`Authentication exchange failed (${resp.status}): ${errText || resp.statusText}`);
+	}
 
-	// Push credentials to Worker and run MLS setup
-	const w = getWorker();
-	await w.setAuth(did, sessionId);
-	await w.setup();
+	const data = await resp.json();
+	if (!data || typeof data.session_id !== 'string' || !data.session_id.trim()) {
+		throw new Error('Invalid exchange response from auth gateway: missing session_id');
+	}
 
-	// Persist session on main thread only after clean init & setup succeed
-	persistBrowserAuth(did, sessionId);
-	replenishKeyPackages();
-	startKeyPackageReplenishment();
-
-	return { did, handle };
+	return normalizeSessionId(data.session_id);
 }
 
+/**
+ * Probe whether the authenticated account's PDS implements `com.atproto.space.*` (`I15`),
+ * matching `catbird-mls/src/client/spaces_gate.rs:272-290` (`getSpace` probe).
+ * Fails closed (`false`) when unauthenticated or on network / 5xx errors.
+ */
+export async function probePdsSpacesSupport(
+	fetchImpl: typeof fetch = fetch
+): Promise<boolean> {
+	if (isTauri) {
+		try {
+			return await tauriInvoke<boolean>('labyrinth_probe_pds_spaces');
+		} catch {
+			// Tauri desktop evaluates `probe_and_check_spaces_eligibility` directly in Rust during enrollment;
+			// fall back to authenticated BFF probe when no dedicated IPC probe command is registered.
+		}
+	}
+	const saved = readBrowserAuth();
+	if (!saved) return false;
+	try {
+		const resp = await fetchImpl(`${NEST_URL}/xrpc/com.atproto.space.getSpace`, {
+			method: 'GET',
+			headers: {
+				Authorization: `Bearer ${saved.sessionId}`
+			}
+		});
+		let errCode = '';
+		try {
+			const parsed = (await resp.json()) as { error?: unknown };
+			if (typeof parsed?.error === 'string') {
+				errCode = parsed.error;
+			}
+		} catch {
+			// Non-JSON body is acceptable when status indicates support
+		}
+		const notImplemented =
+			resp.status === 404 ||
+			resp.status === 501 ||
+			errCode === 'XRPCNotSupported' ||
+			errCode === 'MethodNotImplemented';
+		return !notImplemented && (resp.status === 200 || resp.status === 400);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Validate the account the desktop backend reports on its `oauth-signed-in`
+ * event after it has completed the OAuth flow.
+ */
+export function parseDesktopSignIn(payload: unknown): AuthState {
+	if (typeof payload !== 'object' || payload === null) {
+		throw new Error('Invalid desktop sign-in payload');
+	}
+	const raw = payload as Record<string, unknown>;
+	if (typeof raw.did !== 'string') {
+		throw new Error('Desktop sign-in payload is missing the account DID');
+	}
+	const did = normalizeAccountDid(raw.did);
+	const handle =
+		typeof raw.handle === 'string' && raw.handle.trim() ? raw.handle.trim().slice(0, 253) : did;
+	return {
+		did,
+		handle,
+		grantedScopes: parseGrantedScopes(raw.grantedScopes ?? raw.granted_scopes)
+	};
+}
+
+/**
+ * Initiate progressive OAuth scope upgrade (`POST /auth/upgrade`) on `nest`
+ * for `REQUIRED_LABYRINTH_OAUTH_SCOPES` (excluding `'atproto'`, which is carried
+ * forward from the active session).
+ */
+export async function startOAuthScopeUpgrade(
+	requestedScopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES,
+	options: {
+		returnTo?: string;
+		fetchImpl?: typeof fetch;
+		navigate?: (authorizationUrl: string) => void;
+	} = {}
+): Promise<string> {
+	const saved = readBrowserAuth();
+	if (!saved) {
+		throw new Error('Cannot upgrade OAuth permissions without an active authenticated session.');
+	}
+	const additionalScopes = buildUpgradeAdditionalScopes(requestedScopes);
+	if (additionalScopes.length === 0) {
+		throw new Error(
+			'Active session is missing base atproto scope; please sign out and sign in again.'
+		);
+	}
+
+	const browserNonce = generateBrowserNonce();
+	sessionStorage.setItem(SS_PENDING_UPGRADE_NONCE, browserNonce);
+	sessionStorage.setItem(SS_PENDING_UPGRADE_DID, saved.did);
+	sessionStorage.setItem(
+		SS_PENDING_UPGRADE_RETURN_TO,
+		sanitizeReturnPath(options.returnTo ?? '/settings/labyrinth')
+	);
+
+	const doFetch = options.fetchImpl ?? fetch;
+	let resp: Response;
+	try {
+		resp = await doFetch(`${NEST_URL}/auth/upgrade`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${saved.sessionId}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				additional_scopes: additionalScopes,
+				browser_nonce: browserNonce
+			})
+		});
+	} catch (err) {
+		clearPendingOAuthUpgrade();
+		throw err;
+	}
+
+	if (!resp.ok) {
+		clearPendingOAuthUpgrade();
+		const errText = await resp.text().catch(() => '');
+		throw new Error(
+			`Permission upgrade initiation failed (${resp.status}): ${errText || resp.statusText}`
+		);
+	}
+
+	const data = (await resp.json()) as { authorization_url?: unknown };
+	const rawAuthUrl = typeof data?.authorization_url === 'string' ? data.authorization_url.trim() : '';
+	if (!rawAuthUrl || /[\u0000-\u001f\u007f]/.test(rawAuthUrl)) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Invalid authorization_url returned from /auth/upgrade');
+	}
+
+	let parsedAuthUrl: URL;
+	try {
+		parsedAuthUrl = new URL(rawAuthUrl);
+	} catch {
+		clearPendingOAuthUpgrade();
+		throw new Error('Malformed authorization_url returned from /auth/upgrade');
+	}
+	if (parsedAuthUrl.protocol !== 'https:' || parsedAuthUrl.username || parsedAuthUrl.password) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Insecure authorization_url returned from /auth/upgrade');
+	}
+
+	const authHref = parsedAuthUrl.toString();
+	if (options.navigate) {
+		options.navigate(authHref);
+	} else if (typeof window !== 'undefined' && window.location) {
+		window.location.href = authHref;
+	}
+	return authHref;
+}
+
+/**
+ * Complete progressive OAuth scope upgrade (`POST /auth/upgrade/exchange` ->
+ * `POST /auth/upgrade/commit` -> session promotion), fenced to the active DID.
+ */
+export async function completeOAuthScopeUpgrade(
+	code: string,
+	options: {
+		fetchImpl?: typeof fetch;
+	} = {}
+): Promise<AuthState> {
+	if (!code || typeof code !== 'string' || !OAUTH_CODE_FORMAT_RE.test(code)) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Invalid OAuth upgrade authorization code.');
+	}
+
+	const browserNonce =
+		typeof sessionStorage !== 'undefined'
+			? sessionStorage.getItem(SS_PENDING_UPGRADE_NONCE)
+			: null;
+	const expectedDidRaw =
+		typeof sessionStorage !== 'undefined'
+			? sessionStorage.getItem(SS_PENDING_UPGRADE_DID)
+			: null;
+	// Single-use: clear nonce and expected DID immediately (preserve returnTo for caller navigation)
+	if (typeof sessionStorage !== 'undefined') {
+		sessionStorage.removeItem(SS_PENDING_UPGRADE_NONCE);
+		sessionStorage.removeItem(SS_PENDING_UPGRADE_DID);
+	}
+
+	if (!browserNonce || !expectedDidRaw) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Missing or expired OAuth permission upgrade nonce.');
+	}
+
+	const saved = readBrowserAuth();
+	if (!saved) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Session expired or signed out during OAuth permission upgrade.');
+	}
+
+	const canonicalDid = normalizeAccountDid(saved.did);
+	if (canonicalDid !== normalizeAccountDid(expectedDidRaw)) {
+		clearPendingOAuthUpgrade();
+		throw new Error('Active account changed during OAuth permission upgrade.');
+	}
+
+	const doFetch = options.fetchImpl ?? fetch;
+	const exResp = await doFetch(`${NEST_URL}/auth/upgrade/exchange`, {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${saved.sessionId}`,
+			'Content-Type': 'application/json'
+		},
+		body: JSON.stringify({
+			code,
+			browser_nonce: browserNonce
+		})
+	});
+	if (!exResp.ok) {
+		const errText = await exResp.text().catch(() => '');
+		throw new Error(
+			`Permission upgrade exchange failed (${exResp.status}): ${errText || exResp.statusText}`
+		);
+	}
+
+	const exData = (await exResp.json()) as {
+		candidate_session_id?: unknown;
+		did?: unknown;
+		granted_scopes?: unknown;
+	};
+	const candidateSessionId = normalizeSessionId(exData?.candidate_session_id);
+	const exDid = typeof exData?.did === 'string' ? normalizeAccountDid(exData.did) : '';
+	if (exDid !== canonicalDid) {
+		throw new Error('Permission upgrade exchange DID mismatch.');
+	}
+
+	let commitResp = await doFetch(`${NEST_URL}/auth/upgrade/commit`, {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${candidateSessionId}`
+		}
+	});
+	if (commitResp.status >= 500) {
+		// Retryable side-effect failure (e.g. push registry CAS) per nest `upgrade_commit` contract
+		commitResp = await doFetch(`${NEST_URL}/auth/upgrade/commit`, {
+			method: 'POST',
+			headers: {
+				Authorization: `Bearer ${candidateSessionId}`
+			}
+		});
+	}
+	if (!commitResp.ok) {
+		const errText = await commitResp.text().catch(() => '');
+		throw new Error(
+			`Permission upgrade commit failed (${commitResp.status}): ${errText || commitResp.statusText}`
+		);
+	}
+
+	const commitData = (await commitResp.json()) as {
+		status?: unknown;
+		session_id?: unknown;
+		did?: unknown;
+		granted_scopes?: unknown;
+	};
+	if (commitData?.status !== 'committed') {
+		throw new Error('Permission upgrade commit returned unexpected status.');
+	}
+	const committedSessionId = normalizeSessionId(commitData.session_id);
+	if (committedSessionId !== candidateSessionId) {
+		throw new Error('Committed session_id did not match candidate session_id.');
+	}
+	const commitDid = typeof commitData.did === 'string' ? normalizeAccountDid(commitData.did) : '';
+	if (commitDid !== canonicalDid) {
+		throw new Error('Committed session DID mismatch.');
+	}
+
+	// Re-verify session was not logged out or switched while commit was in flight
+	const stillActive = readBrowserAuth();
+	if (!stillActive || stillActive.sessionId !== saved.sessionId || normalizeAccountDid(stillActive.did) !== canonicalDid) {
+		throw new Error('Active session changed while committing permission upgrade.');
+	}
+
+	const committedScopes = parseGrantedScopes(commitData.granted_scopes);
+	const sessionResp = await doFetch(`${NEST_URL}/auth/session`, {
+		method: 'GET',
+		headers: {
+			Authorization: `Bearer ${committedSessionId}`
+		}
+	});
+	if (!sessionResp.ok) {
+		throw new Error(`Failed to verify upgraded session: ${sessionResp.status}`);
+	}
+	const sessionInfo = (await sessionResp.json()) as {
+		did?: unknown;
+		handle?: unknown;
+		granted_scopes?: unknown;
+	};
+	const verifiedDid =
+		typeof sessionInfo?.did === 'string' ? normalizeAccountDid(sessionInfo.did) : '';
+	if (verifiedDid !== canonicalDid) {
+		throw new Error('Upgraded session verification DID mismatch.');
+	}
+	const grantedScopes =
+		Array.isArray(sessionInfo?.granted_scopes)
+			? parseGrantedScopes(sessionInfo.granted_scopes)
+			: committedScopes;
+	const handle = typeof sessionInfo?.handle === 'string' && sessionInfo.handle ? sessionInfo.handle : canonicalDid;
+
+	persistBrowserAuth(canonicalDid, committedSessionId);
+	if (isMlsOptedInForDid(canonicalDid) && _worker && _workerDid === canonicalDid) {
+		await _worker.setAuth(canonicalDid, committedSessionId);
+	}
+
+	return {
+		did: canonicalDid,
+		handle,
+		grantedScopes
+	};
+}
+
+export async function completeLogin(sessionId: string): Promise<AuthState> {
+	const validatedSessionId = normalizeSessionId(sessionId);
+	if (isTauri) {
+		throw new Error('The desktop app completes sign-in in its backend.');
+	}
+	const resp = await bffFetch('/auth/session', { method: 'GET' }, validatedSessionId);
+	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
+	const info = await resp.json();
+	const rawDid = typeof info?.did === 'string' ? info.did : '';
+	if (!stripDidFragment(rawDid)) {
+		throw new Error('Invalid session response from auth gateway: missing did');
+	}
+	const did = normalizeAccountDid(rawDid);
+	const handle: string = info.handle ?? did;
+	const grantedScopes = parseGrantedScopes(info?.granted_scopes);
+
+	try {
+		// 1. Persist browser auth first so active DID is established
+		persistBrowserAuth(did, validatedSessionId);
+		// ctl #2: Chat/Spaces off by default — zero MLS DB opens, PDS/DS calls, or KeyPackage uploads on fresh sign-in
+		if (!isMlsOptedInForDid(did)) {
+			return { did, handle, grantedScopes };
+		}
+		// 2. Initialize WASM Worker for `did` (terminating any Worker bound to a different DID)
+		await initWasm(did);
+		// 3. Push credentials and complete MLS setup on the DID-scoped Worker
+		const w = getWorker();
+		await w.setAuth(did, validatedSessionId);
+		await installContentRootKey(did);
+		await w.setup();
+
+		replenishKeyPackages();
+		startKeyPackageReplenishment();
+
+		return { did, handle, grantedScopes };
+	} catch (error) {
+		if (_replenishInterval) {
+			clearInterval(_replenishInterval);
+			_replenishInterval = null;
+		}
+		clearBrowserAuth();
+		try {
+			if (_worker) {
+				try {
+					await (
+						_worker as unknown as { clearContentRootKey: () => Promise<void> }
+					).clearContentRootKey();
+				} catch (e) {
+					console.warn('[catmos] clearContentRootKey failed during activation rollback:', e);
+				}
+				await _worker.clearAuth();
+			}
+		} finally {
+			terminateWorkerInstance();
+		}
+		throw error;
+	}
+}
 /**
  * Set auth credentials for the WASM MLS module.
  * Called by catmos's auth store after completing OAuth.
  */
 export async function setAuth(did: string, token: string): Promise<void> {
 	if (isTauri) return;
-	await ensureMlsInitialized(did);
-	const w = getWorker();
-	await w.setAuth(did, token);
-	persistBrowserAuth(did, token);
+	try {
+		persistBrowserAuth(did, token);
+		await initWasm(did);
+		const w = getWorker();
+		await w.setAuth(did, token);
+		// Install the per-DID content root key after auth so the field-level
+		// encryption layer is bound before any subsequent message flow.
+		await installContentRootKey(did);
+	} catch (error) {
+		clearBrowserAuth();
+		try {
+			if (_worker) {
+				try {
+					await (
+						_worker as unknown as { clearContentRootKey: () => Promise<void> }
+					).clearContentRootKey();
+				} catch (e) {
+					console.warn('[catmos] clearContentRootKey failed during setAuth rollback:', e);
+				}
+				await _worker.clearAuth();
+			}
+		} finally {
+			terminateWorkerInstance();
+		}
+		throw error;
+	}
 }
+
+/** Run one deferred reset/history recovery pass in the browser worker. */
+export async function runDeferredRecovery(): Promise<unknown> {
+	if (isTauri) throw new Error('deferred recovery is owned by the Tauri orchestrator');
+	const w = getWorker();
+	return w.runDeferredRecovery();
+}
+
+/** Start the crate-owned browser recovery timer after setup/auth. */
+export async function startBackgroundRecovery(intervalMs = 30_000): Promise<void> {
+	if (isTauri) return;
+	const w = getWorker();
+	await w.startBackgroundTasks(intervalMs);
+}
+
+/** Stop the crate-owned browser recovery timer before logout/tenant switch. */
+export async function stopBackgroundRecovery(): Promise<void> {
+	if (isTauri) return;
+	const w = getWorker();
+	await w.stopBackgroundTasks();
+}
+
 /**
  * Install a browser-owned non-exporting Ed25519 signer for canonical chat
  * preparation. The CryptoKey is passed to the worker as a structured-clone
@@ -661,10 +1258,18 @@ export async function submitPreparedRequest(
 		throw new Error('Session changed: prepared request actor DID does not match current session');
 	}
 
-	const url = `${NEST_URL}${prepared.path}`;
+	const pathWithoutQuery = prepared.path.split('?')[0] ?? '';
+	const nsid = pathWithoutQuery.startsWith('/xrpc/')
+		? pathWithoutQuery.slice('/xrpc/'.length)
+		: '';
+	const isDirectChatDs = nsid.startsWith('blue.catbird.chat.') || nsid.startsWith('blue.catbird.labyrinth.');
+
+	const url = isDirectChatDs ? `${HOME_DS_URL}${prepared.path}` : `${NEST_URL}${prepared.path}`;
+	const authToken = isDirectChatDs
+		? await mintChatServiceAuthToken(saved.sessionId, nsid)
+		: saved.sessionId;
 	const headers: Record<string, string> = {
-		Authorization: `Bearer ${saved.sessionId}`,
-		'atproto-proxy': 'did:web:chat.catbird.blue#atproto_mls'
+		Authorization: `Bearer ${authToken}`
 	};
 	if (prepared.body) {
 		headers['Content-Type'] = 'application/json';
@@ -697,140 +1302,285 @@ export async function submitPreparedRequest(
  */
 export async function clearAuth(): Promise<void> {
 	if (isTauri) return;
-	await getWorker().clearAuth();
 	clearBrowserAuth();
+	if (!_worker) return;
+	const w = _worker;
+	// Drop the in-memory content root key from the WASM layer first; the
+	// localStorage entry is intentionally preserved so re-login from the
+	// same browser profile resumes the same HMAC chain seed.
+	try {
+		await (
+			w as unknown as { clearContentRootKey: () => Promise<void> }
+		).clearContentRootKey();
+	} catch (e) {
+		console.warn('[catmos] clearContentRootKey failed:', e);
+	}
+	await w.clearAuth();
 }
 
 export async function tryRestoreSession(): Promise<AuthState | null> {
 	if (isTauri) {
-		const state = await tauriInvoke<AuthState | null>('try_restore_session');
-		if (state?.did) {
-			setAuthoritativeActiveDid(state.did);
-		} else {
-			clearAuthoritativeActiveDid();
-		}
-		return state;
+		const raw = await tauriInvoke<(AuthState & { granted_scopes?: unknown }) | null>(
+			'try_restore_session'
+		);
+		if (!raw) return null;
+		const grantedScopes = raw.grantedScopes ?? parseGrantedScopes(raw.granted_scopes);
+		return {
+			...raw,
+			did: normalizeAccountDid(raw.did),
+			grantedScopes
+		};
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return null;
 	const { sessionId } = saved;
 
-	const resp = await fetch(`${NEST_URL}/auth/session`, {
-		headers: { Authorization: `Bearer ${sessionId}` }
-	});
-	if (!resp.ok) {
-		if (resp.status === 401 || resp.status === 403) {
-			clearBrowserAuth();
-			return null;
+	try {
+		const resp = await bffFetch('/auth/session', { method: 'GET' }, sessionId);
+		if (!resp.ok) {
+			if (resp.status === 401 || resp.status === 403) {
+				clearBrowserAuth();
+				terminateWorkerInstance();
+				return null;
+			}
+			throw new Error(`Failed to restore session: ${resp.status}`);
 		}
-		throw new Error(`Failed to restore session: ${resp.status}`);
+		const info = await resp.json();
+		const rawDid = typeof info?.did === 'string' ? info.did.trim() : '';
+		if (!stripDidFragment(rawDid)) {
+			throw new Error('Invalid restored session response: missing did');
+		}
+		const restoredDid = normalizeAccountDid(rawDid);
+		const grantedScopes = parseGrantedScopes(info?.granted_scopes);
+
+		persistBrowserAuth(restoredDid, sessionId);
+		if (!isMlsOptedInForDid(restoredDid)) {
+			return { did: restoredDid, handle: info.handle ?? restoredDid, grantedScopes };
+		}
+		await initWasm(restoredDid);
+
+		// Push restored credentials to Worker
+		const w = getWorker();
+		await w.setAuth(restoredDid, sessionId);
+		await installContentRootKey(restoredDid);
+		await w.setup();
+
+		replenishKeyPackages();
+		startKeyPackageReplenishment();
+
+		return { did: restoredDid, handle: info.handle ?? restoredDid, grantedScopes };
+	} catch (error) {
+		if (_replenishInterval) {
+			clearInterval(_replenishInterval);
+			_replenishInterval = null;
+		}
+		clearBrowserAuth();
+		try {
+			if (_worker) {
+				try {
+					await (
+						_worker as unknown as { clearContentRootKey: () => Promise<void> }
+					).clearContentRootKey();
+				} catch (e) {
+					console.warn('[catmos] clearContentRootKey failed during restore rollback:', e);
+				}
+				await _worker.clearAuth();
+			}
+		} finally {
+			terminateWorkerInstance();
+		}
+		throw error;
 	}
-	const info = await resp.json();
-
-	// Ensure MLS DB is initialized under Web Lock for this DID
-	await ensureMlsInitialized(info.did);
-
-	// Push restored credentials to Worker
-	const w = getWorker();
-	await w.setAuth(info.did, sessionId);
-	await w.setup();
-
-	// Replenish key packages (setup skips upload on returning sessions)
-	replenishKeyPackages();
-	startKeyPackageReplenishment();
-
-	return { did: info.did, handle: info.handle ?? info.did };
 }
 
-export async function logout(): Promise<void> {
+async function withBoundedTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<null>((resolve) => {
+				timer = setTimeout(() => resolve(null), timeoutMs);
+			})
+		]);
+	} finally {
+		if (timer !== null) {
+			clearTimeout(timer);
+		}
+	}
+}
+
+async function withRequiredTimeout<T>(
+	promise: Promise<T>,
+	timeoutMs: number,
+	operationLabel: string
+): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | null = null;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					reject(new Error(`${operationLabel} timed out after ${timeoutMs}ms`));
+				}, timeoutMs);
+			})
+		]);
+	} finally {
+		if (timer !== null) {
+			clearTimeout(timer);
+		}
+	}
+}
+
+export interface AccountCleanupOptions {
+	opfsRootProvider?: () => Promise<OpfsDirectoryHandleLike | null>;
+	retireTimeoutMs?: number;
+}
+
+export async function logout(options?: AccountCleanupOptions): Promise<void> {
+	const retireTimeoutMs = options?.retireTimeoutMs ?? 3_000;
 	if (isTauri) {
-		clearAuthoritativeActiveDid();
+		await withBoundedTimeout(
+			tauriInvoke('retire_current_device').catch(() => undefined),
+			retireTimeoutMs
+		);
 		return tauriInvoke('logout');
 	}
 
-	stopKeyPackageReplenishment();
+	const activeDid = stripDidFragment(readBrowserAuth()?.did ?? _workerDid ?? '');
+
+	// Clear key package replenishment interval before tearing down Worker
+	if (_replenishInterval) {
+		clearInterval(_replenishInterval);
+		_replenishInterval = null;
+	}
+
+	// Best-effort bounded (~3s) device retirement BEFORE wiping local device keys & OPFS DB
 	try {
-		if (_worker) await _worker.clearAuth();
+		if (_worker) {
+			const w = _worker;
+			await withBoundedTimeout(
+				(async () => {
+					try {
+						await w.stopBackgroundTasks();
+					} catch {
+						// Ignore timer stop warning
+					}
+					try {
+						await w.retireCurrentDevice();
+					} catch (e) {
+						console.warn('[catmos] retireCurrentDevice skipped or failed during logout:', e);
+					}
+					try {
+						await w.clearContentRootKey();
+					} catch {
+						// Ignore root key clear warning
+					}
+					try {
+						await w.clearAuth();
+					} catch {
+						// Ignore auth clear warning
+					}
+					try {
+						await w.closeUnifiedClient();
+					} catch {
+						// Ignore close warning
+					}
+				})(),
+				retireTimeoutMs
+			);
+		}
 	} finally {
-		// clearBrowserAuth() looks the credential key up via SS_ACTIVE_DID, so the
-		// credential must be cleared before the active DID is dropped.
-		clearBrowserAuth();
-		clearAuthoritativeActiveDid();
-		terminateWorker();
-		_activeDid = null;
+		terminateWorkerInstance();
+	}
+
+	clearBrowserAuth();
+	if (typeof sessionStorage !== 'undefined') {
+		clearPendingOAuthLogin();
+	}
+
+	if (activeDid) {
+		const didHash = await accountDidHashHex(activeDid);
+		wipeBrowserDeviceId(didHash);
+		await deleteAccountKeyStoreEntries(didHash, sanitizeDid(activeDid));
+		await purgeAccountOpfsDatabase(didHash, activeDid, options?.opfsRootProvider);
 	}
 }
 
-/**
- * Explicit reset of Clean Chat / OpenMLS 0.9 browser storage.
- * Awaits worker reset & OPFS database unlink, terminates the worker,
- * clears exact clean keys for the bound DID, and deletes the initialization record marker last.
- */
-export async function resetCleanStorage(did?: string): Promise<void> {
-	if (isTauri) return;
+export async function deleteAccountData(
+	did?: string,
+	options?: AccountCleanupOptions
+): Promise<void> {
+	const targetDid = stripDidFragment(did ?? readBrowserAuth()?.did ?? _workerDid ?? '');
+	const timeoutMs = options?.retireTimeoutMs ?? 5_000;
 
-	const restartReplenishmentOnFailure = stopKeyPackageReplenishment();
-
-	const targetDid =
-		did ??
-		_lastAttemptedDid ??
-		_activeDid ??
-		readBrowserAuth()?.did ??
-		(typeof window !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
-	if (!targetDid) {
-		terminateWorker();
-		_activeDid = null;
-		_lastAttemptedDid = null;
+	if (isTauri) {
+		await tauriInvoke('delete_account_data', targetDid ? { did: targetDid } : undefined);
+		if (targetDid) {
+			setMlsOptedInForDid(targetDid, false);
+		}
 		return;
 	}
 
-	const {
-		normalizedDid,
-		recordKey,
-		mlsDbKeyLabel,
-		contentRootKeyLabel,
-		storagePrefix,
-		dbPrefix
-	} = await deriveDidStorageCoordinates(targetDid);
-
-	await withMlsLock(async () => {
-		// Reset is the gate: a busy Rust database lease rejects before auth,
-		// content-key, signer, or OPFS state is changed.
-		const w = getWorker();
+	// Fail-closed (`D-3`): remote OwnerMailbox, PDS mailboxKeys, mls-ds, and owned Space
+	// deletes MUST succeed before we tear down the worker, opt-in flag, session, or local DB.
+	// Any timeout or failure to open the unified worker rejects rather than resolving null.
+	const optedIn = Boolean(targetDid && isMlsOptedInForDid(targetDid));
+	if (!_worker && optedIn) {
+		await withRequiredTimeout(
+			ensureUnifiedBrowserClientOpen(targetDid),
+			timeoutMs,
+			'deleteAccountData(openUnifiedClient)'
+		);
+	}
+	if (optedIn && !_worker) {
+		throw new Error(
+			'deleteAccountData failed: unified MLS worker unavailable; refusing to wipe local state before remote delete succeeds'
+		);
+	}
+	if (_worker) {
+		const w = _worker;
+		await withRequiredTimeout(
+			w.deleteAccountData(),
+			timeoutMs,
+			'deleteAccountData(remoteDelete)'
+		);
 		try {
-			await w.resetCleanStorage({
-				storagePrefix,
-				dbPrefix,
-				boundDid: normalizedDid
-			});
-		} catch (error) {
-			if (restartReplenishmentOnFailure) startKeyPackageReplenishment();
-			throw error;
+			await w.clearContentRootKey?.();
+		} catch {
+			// Ignore post-delete cleanup warnings
 		}
-
-		terminateWorker();
-		_activeDid = null;
-		_lastAttemptedDid = null;
-
-		// Delete exact keys for this DID ONLY
-		if (typeof window !== 'undefined') {
-			localStorage.removeItem(contentRootKeyLabel);
-			localStorage.removeItem(mlsDbKeyLabel);
-			localStorage.removeItem(didKey(normalizedDid, 'session_id'));
-			sessionStorage.removeItem(didKey(normalizedDid, 'session_id'));
-			sessionStorage.removeItem(didKey(normalizedDid, 'mls_db_key'));
-
-			// Exact cursor cleanup via cursor registry (no Storage enumeration)
-			clearAllCursorsForDid(normalizedDid);
-
-			if (sessionStorage.getItem(SS_ACTIVE_DID) === normalizedDid) {
-				sessionStorage.removeItem(SS_ACTIVE_DID);
-			}
-
-			// Remove initialization record marker LAST
-			localStorage.removeItem(recordKey);
+		try {
+			await w.clearAuth?.();
+		} catch {
+			// Ignore post-delete cleanup warnings
 		}
-	});
+		try {
+			await w.closeUnifiedClient?.();
+		} catch {
+			// Ignore post-delete cleanup warnings
+		}
+	}
+
+	if (_replenishInterval) {
+		clearInterval(_replenishInterval);
+		_replenishInterval = null;
+	}
+	terminateWorkerInstance();
+
+	if (targetDid) {
+		setMlsOptedInForDid(targetDid, false);
+	}
+	clearBrowserAuth();
+	if (typeof sessionStorage !== 'undefined') {
+		clearPendingOAuthLogin();
+	}
+
+	if (targetDid) {
+		const didHash = await accountDidHashHex(targetDid);
+		wipeBrowserDeviceId(didHash);
+		await deleteAccountKeyStoreEntries(didHash, sanitizeDid(targetDid));
+		await purgeAccountOpfsDatabase(didHash, targetDid, options?.opfsRootProvider);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -858,14 +1608,6 @@ function startKeyPackageReplenishment(): void {
 	}, 5 * 60 * 1000);
 }
 
-/** Stop periodic replenishment; returns whether it had been running. */
-function stopKeyPackageReplenishment(): boolean {
-	if (!_replenishInterval) return false;
-	clearInterval(_replenishInterval);
-	_replenishInterval = null;
-	return true;
-}
-
 // ---------------------------------------------------------------------------
 // Conversations
 // ---------------------------------------------------------------------------
@@ -889,7 +1631,7 @@ export async function createGroup(
 	// Ensure fresh key packages before group creation
 	await replenishKeyPackages();
 	const w = getWorker();
-	return w.createConversation(name, memberDids) as Promise<Conversation>;
+	return w.createConversation(name, memberDids, description) as Promise<Conversation>;
 }
 
 export async function subscribeConversation(
@@ -975,12 +1717,12 @@ export async function sendImage(
 	return w.sendImage(conversationId, content, data, contentType, width, height, altText) as Promise<Message>;
 }
 
-export async function getMessages(conversationId: string, before?: string): Promise<Message[]> {
+export async function getMessages(conversationId: string, before?: string, markRead = true): Promise<Message[]> {
 	if (isTauri) {
-		return tauriInvoke('get_messages', { conversationId, before });
+		return tauriInvoke('get_messages', { conversationId, before, markRead });
 	}
 	const w = getWorker();
-	return w.getMessages(conversationId, before) as Promise<Message[]>;
+	return w.getMessages(conversationId, before, markRead) as Promise<Message[]>;
 }
 
 export async function getImageAttachment(
@@ -1115,8 +1857,8 @@ export async function searchMessages(query: string): Promise<SearchHit[]> {
 	}
 	// Web fallback: client-side search through loaded messages
 	const { get } = await import('svelte/store');
-	const { messages } = await import('$lib/stores/messages');
-	const { conversations } = await import('$lib/stores/conversations');
+	const { messages } = await import('#lib/stores/messages.ts');
+	const { conversations } = await import('#lib/stores/conversations.ts');
 	const state = get(messages);
 	const convoState = get(conversations);
 	const lowerQuery = query.toLowerCase();
@@ -1321,12 +2063,15 @@ export async function reportSpam(
 	if (!saved) throw new Error('Not authenticated');
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
 	if (reason) body.reason = reason;
-	const resp = await fetch(`${NEST_URL}/xrpc/blue.catbird.chat.reportSpam`, {
+	const serviceJwt = await mintChatServiceAuthToken(
+		saved.sessionId,
+		'blue.catbird.chat.reportSpam'
+	);
+	const resp = await fetch(`${HOME_DS_URL}/xrpc/blue.catbird.chat.reportSpam`, {
 		method: 'POST',
 		headers: {
 			'Content-Type': 'application/json',
-			Authorization: `Bearer ${saved.sessionId}`,
-			'atproto-proxy': 'did:web:chat.catbird.blue#atproto_mls'
+			Authorization: `Bearer ${serviceJwt}`
 		},
 		body: JSON.stringify(body)
 	});
@@ -1476,20 +2221,28 @@ export async function sendVoice(
 
 export async function fetchAndDecryptBlob(
 	blobId: string,
-	key: Uint8Array,
-	iv: Uint8Array,
+	key: Uint8Array | number[],
+	iv: Uint8Array | number[],
 	sha256: string
 ): Promise<Uint8Array> {
+	const keyArr = key instanceof Uint8Array ? Array.from(key) : key;
+	const ivArr = iv instanceof Uint8Array ? Array.from(iv) : iv;
 	if (isTauri) {
-		return tauriInvoke('fetch_and_decrypt_blob', {
+		const bytes = await tauriInvoke<number[]>('fetch_and_decrypt_blob', {
 			blobId,
-			key: Array.from(key),
-			iv: Array.from(iv),
+			key: keyArr,
+			iv: ivArr,
 			sha256
 		});
+		return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 	}
 	const w = getWorker();
-	return w.fetchAndDecryptBlob(blobId, key, iv, sha256) as Promise<Uint8Array>;
+	return w.fetchAndDecryptBlob(
+		blobId,
+		key instanceof Uint8Array ? key : new Uint8Array(key),
+		iv instanceof Uint8Array ? iv : new Uint8Array(iv),
+		sha256
+	) as Promise<Uint8Array>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1527,4 +2280,478 @@ export async function confirmManualReset(conversationId: string): Promise<void> 
 		return tauriInvoke('confirm_manual_reset', { conversationId });
 	}
 	throw new Error('confirmManualReset is not yet implemented in browser builds');
+}
+
+// ---------------------------------------------------------------------------
+// Unified Clean-Slate Labyrinth 1.1 & Spaces Eligibility (`Spec §6.3`, `D4`, `I15`, `I16`)
+// ---------------------------------------------------------------------------
+
+export interface LabyrinthDeviceMetadataView {
+	device_id: string;
+	device_name?: string;
+	status?: 'active' | 'pending_approval' | 'dormant';
+	pending_approval?: boolean;
+	is_current?: boolean;
+	last_active_at?: string | null;
+	dormant_at?: string | null;
+}
+
+export interface LabyrinthBackupStatusView {
+	backup_enabled: boolean;
+	mailbox_space_uri: string;
+	has_recovery_code: boolean;
+	has_passkey_prf: boolean;
+	epoch_seq: number;
+	active_device_ids: string[];
+	pending_device_ids?: string[];
+	current_device_id?: string;
+	devices?: LabyrinthDeviceMetadataView[];
+	backfill?: {
+		state?: string;
+		synced_batches?: number;
+		total_batches?: number | null;
+		last_synced_at?: string | null;
+	};
+}
+
+export interface LabyrinthRevocationOutcomeView {
+	status: LabyrinthBackupStatusView;
+	rekeyed_recovery_code?: string | null;
+	rekeyed_passkey_ids: number[][];
+}
+
+export interface DeviceRevocationReportView {
+	target_device_id: string;
+	ds_revoked: boolean;
+	labyrinth_rotated: boolean;
+	new_epoch_seq?: number | null;
+	rekeyed_recovery_code?: string | null;
+}
+
+export interface OtcPairingOfferView {
+	six_digit_code: string;
+	formatted_code: string;
+}
+
+export interface OtcPairingCompletionView {
+	session_id: number[];
+	initiator_mlkem768_ek_len: number;
+	responder_mlkem768_ct_len: number;
+	new_epoch_seq: number;
+}
+
+async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<WorkerApi>> {
+	const accountDid = normalizeAccountDid(did);
+	const didHash = await accountDidHashHex(accountDid);
+	const dbKeyHex = await loadOrCreateDbKeyHex(didHash);
+	const savedAuth = readBrowserAuth();
+	if (savedAuth && normalizeAccountDid(savedAuth.did) !== accountDid) {
+		throw new Error('The signed-in account changed before the encrypted chat client opened.');
+	}
+	const authToken = savedAuth?.sessionId ?? null;
+	const w = getWorker();
+	await w.openUnifiedClient({
+		accountDid,
+		deviceId: getOrCreateBrowserDeviceId(didHash),
+		homeDsDid: HOME_DS_DID,
+		homeDsEndpoint: HOME_DS_URL,
+		pdsEndpoint: NEST_URL,
+		dbKeyHex,
+		authToken
+	});
+	return w;
+}
+
+export async function enableMlsAndEnroll(
+	did: string,
+	pdsSupportsSpaces = false,
+	grantedScopes: readonly string[] = []
+): Promise<LabyrinthBackupStatusView> {
+	const accountDid = normalizeAccountDid(did);
+	const plainScopes = Array.from(grantedScopes, (s) => String(s).trim()).filter(Boolean);
+	if (isTauri) {
+		const status = await tauriInvoke<LabyrinthBackupStatusView>('labyrinth_enable_and_enroll', {
+			did: accountDid,
+			grantedScopes: plainScopes
+		});
+		setMlsOptedInForDid(accountDid, true);
+		return status;
+	}
+	const gate = evaluateSpacesGateForUi(Boolean(pdsSupportsSpaces), plainScopes, accountDid);
+	if (!gate.eligible) {
+		throw new Error(gate.message);
+	}
+	setMlsOptedInForDid(accountDid, true);
+	try {
+		const w = await ensureUnifiedBrowserClientOpen(accountDid);
+		await w.enrollUnifiedDevice(Boolean(pdsSupportsSpaces), plainScopes);
+		startKeyPackageReplenishment();
+		await w.startBackgroundTasks(30_000);
+		return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+	} catch (err) {
+		setMlsOptedInForDid(accountDid, false);
+		throw err;
+	}
+}
+
+export async function getLabyrinthStatus(did: string): Promise<LabyrinthBackupStatusView | null> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_status', { did });
+	}
+	if (!isMlsOptedInForDid(did)) return null;
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+}
+
+export async function setupLabyrinthRecoveryCode(did: string): Promise<string> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_setup_recovery_code', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.setupRecoveryCode();
+}
+
+export async function restoreWithLabyrinthRecoveryCode(
+	did: string,
+	recoveryCodeInput: string
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_recovery_code', { did, recoveryCodeInput });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.restoreWithRecoveryCode(recoveryCodeInput)) as LabyrinthBackupStatusView;
+}
+
+export async function getCurrentLabyrinthDeviceId(did: string): Promise<string | null> {
+	const accountDid = stripDidFragment(did);
+	if (!accountDid) return null;
+	if (isTauri) {
+		try {
+			const id = await tauriInvoke<string | null>('labyrinth_current_device_id', {
+				did: accountDid
+			});
+			return id ? id.trim() : null;
+		} catch {
+			return null;
+		}
+	}
+	const didHash = await accountDidHashHex(accountDid);
+	const stored = readBrowserDeviceId(didHash);
+	if (stored) return stored;
+	if (_worker) {
+		try {
+			return await _worker.currentDeviceId();
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+
+export async function registerLabyrinthPasskeyPrf(
+	did: string,
+	credentialId: Uint8Array,
+	prfOutput32: Uint8Array
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_register_passkey_prf', {
+			did,
+			credentialId: Array.from(credentialId),
+			prfOutput32: Array.from(prfOutput32)
+		});
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.registerPasskeyPrf(credentialId, prfOutput32)) as LabyrinthBackupStatusView;
+}
+
+export async function restoreWithLabyrinthPasskeyPrf(
+	did: string,
+	credentialId: Uint8Array,
+	prfOutput32: Uint8Array
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_passkey_prf', {
+			did,
+			credentialId: Array.from(credentialId),
+			prfOutput32: Array.from(prfOutput32)
+		});
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.restoreWithPasskeyPrf(credentialId, prfOutput32)) as LabyrinthBackupStatusView;
+}
+
+export async function approveLabyrinthSiblingDevice(
+	did: string,
+	targetDeviceId: string
+): Promise<LabyrinthBackupStatusView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_approve_device', { did, targetDeviceId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.approveSiblingDevice(targetDeviceId)) as LabyrinthBackupStatusView;
+}
+
+export async function syncLabyrinthBackfill(did: string): Promise<LabyrinthBackupStatusView | null> {
+	if (isTauri) {
+		return tauriInvoke<LabyrinthBackupStatusView>('labyrinth_sync_backfill', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.syncUnified();
+	return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
+}
+
+export async function initiateLabyrinthOtcPairing(did: string): Promise<OtcPairingOfferView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_initiate_otc', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.initiateOtcPairing()) as OtcPairingOfferView;
+}
+
+export async function completeLabyrinthOtcPairing(
+	did: string,
+	sixDigitCode: string
+): Promise<OtcPairingCompletionView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_complete_otc', { did, sixDigitCode });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.completeOtcPairing(sixDigitCode)) as OtcPairingCompletionView;
+}
+
+export async function revokeLabyrinthDevice(
+	did: string,
+	targetDeviceId: string
+): Promise<LabyrinthRevocationOutcomeView> {
+	const currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+	assertCanRevokeLabyrinthDevice(targetDeviceId, currentDeviceId);
+	if (isTauri) {
+		return tauriInvoke('labyrinth_revoke_device', { did, targetDeviceId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.revokeLabyrinthDevice(targetDeviceId)) as LabyrinthRevocationOutcomeView;
+}
+
+export interface LiveOtcInitiationView {
+	session_id_hex: string;
+	formatted_code: string;
+	six_digit_code: string;
+}
+
+export interface ReadStateView {
+	conversation_id: string;
+	last_read_seq: number;
+	updated_at?: string;
+}
+
+export interface CircleOwnerStateView {
+	circle_id: string;
+	name: string;
+	description?: string | null;
+	member_dids: string[];
+	acl_tombstone_dids?: string[];
+	updated_at: string;
+	record_cid?: string | null;
+}
+
+export interface CircleOwnerStateMergeUpdate {
+	circle_id: string;
+	name?: string | null;
+	description?: string | null;
+	add_member_dids?: string[];
+	remove_member_dids?: string[];
+	updated_at?: string | null;
+}
+
+export async function isLabyrinthDevicePendingApproval(did: string): Promise<boolean> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_is_device_pending_approval', { did });
+	}
+	if (!isMlsOptedInForDid(did)) return false;
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.isDevicePendingApproval();
+}
+
+export async function listRegisteredLabyrinthDevices(
+	did: string
+): Promise<LabyrinthDeviceMetadataView[]> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_list_devices', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.listRegisteredDevices()) as LabyrinthDeviceMetadataView[];
+}
+
+export async function revokeRegisteredLabyrinthDeviceLive(
+	did: string,
+	targetDeviceId: string
+): Promise<DeviceRevocationReportView> {
+	const currentDeviceId = await getCurrentLabyrinthDeviceId(did);
+	assertCanRevokeLabyrinthDevice(targetDeviceId, currentDeviceId);
+	if (isTauri) {
+		return tauriInvoke('labyrinth_revoke_device_live', { did, targetDeviceId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.revokeRegisteredDevice(targetDeviceId)) as DeviceRevocationReportView;
+}
+
+export async function startLiveLabyrinthOtcPairing(
+	did: string,
+	sixDigitCode: string
+): Promise<LiveOtcInitiationView> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_start_otc', { did, sixDigitCode });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.startLiveOtcPairing(sixDigitCode)) as LiveOtcInitiationView;
+}
+
+export async function respondLiveLabyrinthOtcPairing(
+	did: string,
+	sessionIdHex: string,
+	sixDigitCode?: string
+): Promise<void> {
+	if (isTauri) {
+		await tauriInvoke('labyrinth_respond_otc', {
+			did,
+			sessionIdHex,
+			sixDigitCode: sixDigitCode ?? null
+		});
+		return;
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.respondLiveOtcPairing(sessionIdHex, sixDigitCode ?? null);
+}
+
+export interface LabyrinthArchiveRestoreSummary {
+	conversationsDiscovered: number;
+	conversationsRestored: number;
+	messagesRestored: number;
+	errors: string[];
+}
+
+export async function restoreArchivedLabyrinthConversations(
+	did: string
+): Promise<LabyrinthArchiveRestoreSummary> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_archived_conversations', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	await w.syncUnified();
+	return {
+		conversationsDiscovered: 0,
+		conversationsRestored: 0,
+		messagesRestored: 0,
+		errors: []
+	};
+}
+
+export async function restoreLabyrinthConversationHistory(
+	did: string,
+	conversationId: string
+): Promise<number> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_restore_conversation_history', { did, conversationId });
+	}
+	return verifyAndReindexLabyrinthHistory(did, conversationId);
+}
+
+export async function verifyAndReindexLabyrinthHistory(
+	did: string,
+	conversationId: string
+): Promise<number> {
+	if (isTauri) {
+		return tauriInvoke('labyrinth_verify_and_reindex_history', { did, conversationId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.verifyAndReindexHistory(conversationId);
+}
+
+export async function getReadState(
+	did: string,
+	conversationId: string
+): Promise<ReadStateView | null> {
+	if (isTauri) {
+		return tauriInvoke('get_read_state', { did, conversationId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.getReadState(conversationId)) as ReadStateView | null;
+}
+
+export async function advanceReadState(
+	did: string,
+	conversationId: string,
+	candidateSeq: number
+): Promise<ReadStateView> {
+	if (isTauri) {
+		return tauriInvoke('advance_read_state', { did, conversationId, candidateSeq });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.advanceReadState(conversationId, candidateSeq)) as ReadStateView;
+}
+
+export async function listReadStates(did: string): Promise<ReadStateView[]> {
+	if (isTauri) {
+		return tauriInvoke('list_read_states', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.listReadStates()) as ReadStateView[];
+}
+
+export async function getCircleOwnerState(
+	did: string,
+	circleId: string
+): Promise<CircleOwnerStateView | null> {
+	if (isTauri) {
+		return tauriInvoke('get_circle_owner_state', { did, circleId });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.getCircleOwnerState(circleId)) as CircleOwnerStateView | null;
+}
+
+export async function putCircleOwnerState(
+	did: string,
+	state: CircleOwnerStateView,
+	swapRecordCid?: string | null
+): Promise<string> {
+	if (isTauri) {
+		return tauriInvoke('put_circle_owner_state', {
+			did,
+			state,
+			swapRecordCid: swapRecordCid ?? null
+		});
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return w.putCircleOwnerState(state, swapRecordCid ?? null);
+}
+
+export async function mergeCircleOwnerState(
+	did: string,
+	update: CircleOwnerStateMergeUpdate
+): Promise<CircleOwnerStateView> {
+	if (isTauri) {
+		return tauriInvoke('merge_circle_owner_state', { did, update });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.mergeCircleOwnerState(update)) as CircleOwnerStateView;
+}
+
+export async function clearCircleAclTombstone(
+	did: string,
+	circleId: string,
+	memberDid: string
+): Promise<CircleOwnerStateView> {
+	if (isTauri) {
+		return tauriInvoke('clear_circle_acl_tombstone', { did, circleId, memberDid });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.clearCircleAclTombstone(circleId, memberDid)) as CircleOwnerStateView;
+}
+
+export async function listCircleOwnerStates(did: string): Promise<CircleOwnerStateView[]> {
+	if (isTauri) {
+		return tauriInvoke('list_circle_owner_states', { did });
+	}
+	const w = await ensureUnifiedBrowserClientOpen(did);
+	return (await w.listCircleOwnerStates()) as CircleOwnerStateView[];
 }

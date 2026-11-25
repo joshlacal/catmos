@@ -1,0 +1,140 @@
+name: Desktop sign-in
+
+# Builds the Tauri backend against its sibling checkouts and signs the desktop
+# auth module in against Petrel's Swift OAuth example server and client
+# assertion backend (CAB), run locally in the job. The sign-in test fails
+# rather than skips here (PETREL_E2E_REQUIRED=1).
+
+'on':
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-auth-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  # Sibling checkouts the backend builds against (src-tauri/Cargo.toml path
+  # dependencies). Move these together when a dependency changes.
+  PETREL_REF: a4d5d480d709e2d3a3195884f9cbbeff878ce5f3
+  PETREL_CATBIRD_REF: 09bc34c06120fcfe5da4cdce6de639c5fb295994
+  CATBIRD_MLS_REF: d0ef581ff62dced92807d9117668aee2e4b865b2
+  CATBIRD_ATPROTO_REF: 6a179680c1ab3e84c5866cdeb5035a4663b4cc09
+  LABYRINTH_REF: ccf596d66cb6760d1f1593154db247eb5f5190d2
+
+jobs:
+  rust:
+    name: Desktop backend tests, with sign-in against the Swift OAuth and CAB servers
+    runs-on: ubuntu-24.04
+    container: swift:6.1.2-jammy@sha256:5910655d205a5a54b0b9efdf72c4066a8de1932513fdc81793e2544b5d5a0709
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      PETREL_E2E_REQUIRED: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: always
+      # Fetch git dependencies with the git CLI so the jacquard mirror below
+      # applies, and retry slow transfers.
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_NET_RETRY: '10'
+      GIT_HTTP_LOW_SPEED_LIMIT: '1000'
+      GIT_HTTP_LOW_SPEED_TIME: '60'
+    steps:
+      - name: Install system dependencies
+        # The Swift image ships without the Tauri (WebKitGTK) and SQLCipher
+        # build dependencies. Same resolver retry as Petrel's Rust workflow.
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if apt-get update && apt-get install -y --no-install-recommends \
+                build-essential cmake curl git pkg-config libssl-dev \
+                libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+                libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev libglib2.0-dev; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt} failed; retrying in $((attempt * 15))s"
+            if [ "${attempt}" -eq 2 ]; then
+              printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" > /etc/resolv.conf
+            fi
+            sleep $((attempt * 15))
+          done
+          echo "apt-get could not install system dependencies after 6 attempts" >&2
+          exit 1
+      - name: Verify pinned Swift
+        run: test "$(swift --version | head -n 1)" = 'Swift version 6.1.2 (swift-6.1.2-RELEASE)'
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          path: catmos
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/Petrel
+          ref: ${{ env.PETREL_REF }}
+          path: Petrel
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/PetrelCatbird
+          ref: ${{ env.PETREL_CATBIRD_REF }}
+          path: PetrelCatbird
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/catbird-mls
+          ref: ${{ env.CATBIRD_MLS_REF }}
+          path: catbird-mls
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/catbird-atproto
+          ref: ${{ env.CATBIRD_ATPROTO_REF }}
+          path: catbird-atproto
+          persist-credentials: false
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: joshlacal/labyrinth
+          ref: ${{ env.LABYRINTH_REF }}
+          path: labyrinth
+          persist-credentials: false
+      - name: Fetch jacquard from its GitHub mirror
+        # catbird-atproto pins jacquard on tangled.org, which stalls or resets
+        # clones. joshlacal/jacquard carries the pinned rev; Cargo.lock is
+        # unchanged.
+        run: git config --global url."https://github.com/joshlacal/jacquard".insteadOf "https://tangled.org/nonbinary.computer/jacquard"
+      - name: Build the Swift test servers
+        run: |
+          swift build --package-path Petrel/Server --product petrel-oauth-server-example
+          swift build --package-path Petrel/Server --product petrel-cab-server
+          bin_dir=$(swift build --package-path Petrel/Server --show-bin-path)
+          printf 'PETREL_E2E_SERVER_BIN_DIR=%s\n' "$bin_dir" >> "$GITHUB_ENV"
+      - name: Install checksum-pinned rustup
+        run: bash Petrel/rust/petrel-e2e/ci/install-rustup.sh
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.CARGO_HOME }}/registry
+            ${{ env.CARGO_HOME }}/git
+            catmos/src-tauri/target
+          key: desktop-auth-${{ hashFiles('catmos/src-tauri/Cargo.lock', 'catmos/rust-toolchain.toml') }}-${{ env.PETREL_REF }}
+          restore-keys: desktop-auth-${{ hashFiles('catmos/src-tauri/Cargo.lock', 'catmos/rust-toolchain.toml') }}-
+      - name: Check formatting
+        working-directory: catmos/src-tauri
+        run: cargo fmt --check
+      - name: Run the backend tests, including desktop sign-in
+        working-directory: catmos/src-tauri
+        run: cargo test --locked --lib
+      - name: Confirm the sign-in test ran
+        # The test reports "skipped" instead of failing when the servers are
+        # missing; PETREL_E2E_REQUIRED turns that into a failure, and this
+        # step checks the test name ran at all.
+        working-directory: catmos/src-tauri
+        run: |
+          cargo test --locked --lib desktop_sign_in_through_a_client_assertion_backend -- --nocapture 2>&1 | tee sign-in.log
+          grep -q 'test auth::e2e_tests::desktop_sign_in_through_a_client_assertion_backend ... ok' sign-in.log
+          ! grep -q '^skipped' sign-in.log

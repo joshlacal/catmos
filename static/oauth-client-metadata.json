@@ -8,7 +8,7 @@
   ],
   "response_types": ["code"],
   "grant_types": ["authorization_code", "refresh_token"],
-  "scope": "atproto transition:generic",
+  "scope": "atproto transition:generic blob:*/* repo:blue.catbird.labyrinth.mailboxKeys repo:blue.catbird.chat.device?action=create repo:blue.catbird.chat.deviceRevocation?action=create space:blue.catbird.labyrinth.mailbox?action=create&action=delete&action=read&action=update&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete space:blue.catbird.labyrinth.conversation?action=create&action=delete&action=read&action=update&authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek",
   "token_endpoint_auth_method": "private_key_jwt",
   "token_endpoint_auth_signing_alg": "ES256",
   "jwks_uri": "https://api.catbird.blue/.well-known/jwks.json",
