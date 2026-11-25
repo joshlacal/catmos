@@ -250,11 +250,23 @@ function createAuthStore() {
 		/** Re-authorize with Petrel direct OAuth to grant any missing Spaces/Labyrinth scopes. */
 		async upgradeScopes(
 			_scopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES,
-			_returnTo = '/settings/labyrinth'
+			returnTo = '/settings/labyrinth'
 		) {
 			const current = get({ subscribe });
 			if (!current.user?.did) {
 				throw new Error('Cannot upgrade OAuth scopes without an authenticated session.');
+			}
+			if (
+				!isTauri &&
+				typeof sessionStorage !== 'undefined' &&
+				returnTo.startsWith('/') &&
+				!returnTo.startsWith('//')
+			) {
+				try {
+					sessionStorage.setItem('catmos_oauth_return_to', returnTo);
+				} catch {
+					// Ignore storage errors
+				}
 			}
 			await this.startLogin(current.user.handle || current.user.did);
 		},

@@ -50,7 +50,19 @@
 			}
 
 			await auth.completeOAuthCallbackUrl(rawHref);
-			await goto('/', { replaceState: true });
+			let destination = '/';
+			if (typeof sessionStorage !== 'undefined') {
+				try {
+					const savedReturn = sessionStorage.getItem('catmos_oauth_return_to');
+					sessionStorage.removeItem('catmos_oauth_return_to');
+					if (savedReturn && savedReturn.startsWith('/') && !savedReturn.startsWith('//')) {
+						destination = savedReturn;
+					}
+				} catch {
+					// Ignore storage errors
+				}
+			}
+			await goto(destination, { replaceState: true });
 		} catch (e) {
 			phase = 'error';
 			const raw = e instanceof Error ? e.message : String(e);

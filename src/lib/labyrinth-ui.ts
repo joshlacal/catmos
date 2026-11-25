@@ -113,8 +113,18 @@ export function setMlsOptedInForDid(
 
 const VALID_REPO_RECORD_ACTIONS = new Set(['create', 'update', 'delete']);
 const VALID_SPACE_RECORD_ACTIONS = new Set(['read', 'read_self', 'create', 'update', 'delete']);
+const SPACE_DEFAULT_ACTIONS = ['read', 'create', 'update', 'delete'] as const;
 const VALID_SPACE_MANAGE_ACTIONS = new Set(['create', 'update', 'delete']);
 const VALID_NSID_COLLECTION_RE = /^[A-Za-z0-9.-]+$/;
+
+function decodeScopeParamValue(raw: string): string | null {
+	if (!raw.includes('%')) return raw;
+	try {
+		return decodeURIComponent(raw);
+	} catch {
+		return null;
+	}
+}
 
 function splitOnce(input: string, separator: string): [string, string | null] {
 	const idx = input.indexOf(separator);
@@ -218,10 +228,13 @@ export function scopeGranted(
 			const params: Array<[string, string]> = [];
 			let authority: string | null = null;
 			let skey: string | null = null;
+			let hasExplicitAction = false;
 
 			for (const pair of query.split('&')) {
-				const [key, value] = splitOnce(pair, '=');
-				if (!key || !value) return false;
+				const [key, rawValue] = splitOnce(pair, '=');
+				if (!key || rawValue === null) return false;
+				const value = decodeScopeParamValue(rawValue);
+				if (!value) return false;
 				if (key === 'authority') {
 					if (authority !== null) return false;
 					authority = value;
@@ -232,12 +245,22 @@ export function scopeGranted(
 					if (value !== '*' && !VALID_NSID_COLLECTION_RE.test(value)) return false;
 				} else if (key === 'action') {
 					if (!VALID_SPACE_RECORD_ACTIONS.has(value)) return false;
+					hasExplicitAction = true;
 				} else if (key === 'manage') {
 					if (!VALID_SPACE_MANAGE_ACTIONS.has(value)) return false;
 				} else {
 					return false;
 				}
 				params.push([key, value]);
+			}
+
+			// Per @atproto/oauth-scopes SpacePermission grammar, omitting `action` means
+			// the default action set (`read`, `create`, `update`, `delete`); `collection`
+			// still defaults to empty (no write collections).
+			if (!hasExplicitAction) {
+				for (const defaultAction of SPACE_DEFAULT_ACTIONS) {
+					params.push(['action', defaultAction]);
+				}
 			}
 
 			const effectiveAuthority = authority ?? 'self';
@@ -261,6 +284,9 @@ export function scopeGranted(
 				([reqKey, reqVal]) =>
 					reqKey === 'authority' ||
 					params.some(([pk, pv]) => pk === reqKey && pv === reqVal) ||
+					(reqKey === 'action' &&
+						reqVal === 'read_self' &&
+						params.some(([pk, pv]) => pk === 'action' && pv === 'read')) ||
 					(reqKey === 'collection' &&
 						params.some(([pk, pv]) => pk === 'collection' && pv === '*'))
 			);

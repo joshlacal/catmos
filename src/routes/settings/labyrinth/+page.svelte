@@ -670,12 +670,13 @@
 		</div>
 		{#if activeDid}
 			<p class="subtitle">
-				End-to-end encrypted conversations (`MLS_256_XWING`) and Spaces-backed Labyrinth 1.1 history
-				for <code>{activeDid}</code>.
+				End-to-end encrypted conversations (<code>MLS_256_XWING</code>) and Spaces-backed Labyrinth
+				1.1 history for <code>{activeDid}</code>.
 			</p>
 		{:else}
 			<p class="subtitle">
-				End-to-end encrypted conversations (`MLS_256_XWING`) and Spaces-backed Labyrinth 1.1 history.
+				End-to-end encrypted conversations (<code>MLS_256_XWING</code>) and Spaces-backed Labyrinth
+				1.1 history.
 			</p>
 		{/if}
 	</header>
@@ -1071,6 +1072,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 20px;
+		overflow-x: hidden;
 		overflow-y: auto;
 		height: 100%;
 	}
@@ -1126,6 +1128,8 @@
 		color: var(--text-secondary);
 		line-height: 1.5;
 		margin: 6px 0;
+		overflow-wrap: anywhere;
+		word-break: break-word;
 	}
 
 	.back-link {
@@ -1142,6 +1146,7 @@
 		display: flex;
 		flex-direction: column;
 		gap: 12px;
+		min-width: 0;
 	}
 
 	.danger-card {

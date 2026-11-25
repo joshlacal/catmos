@@ -196,6 +196,31 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 			scopeGranted([convoReq.replace('authority=*', 'authority=self')], convoReq, did),
 			false
 		);
+
+		// Canonical @atproto/oauth-scopes token response: omits default actions
+		// (read, create, update, delete) and resolves authority=self to the user's DID.
+		const serverNormalizedMailbox = `space:blue.catbird.labyrinth.mailbox?authority=${did}&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.circleOwnerState&collection=blue.catbird.labyrinth.device&collection=blue.catbird.labyrinth.epoch&collection=blue.catbird.labyrinth.epochMember&collection=blue.catbird.labyrinth.otcSession&collection=blue.catbird.labyrinth.ownerBatch&collection=blue.catbird.labyrinth.readState&collection=blue.catbird.labyrinth.virtualDevice&manage=create&manage=delete`;
+		const serverNormalizedConvo =
+			'space:blue.catbird.labyrinth.conversation?authority=*&collection=blue.catbird.labyrinth.attachmentManifest&collection=blue.catbird.labyrinth.authorRedaction&collection=blue.catbird.labyrinth.batch&collection=blue.catbird.labyrinth.mek';
+		const serverNormalizedGate = evaluateSpacesGateForUi(
+			true,
+			[...REQUIRED_LABYRINTH_OAUTH_SCOPES.slice(0, 5), serverNormalizedMailbox, serverNormalizedConvo],
+			did
+		);
+		assert.equal(serverNormalizedGate.eligible, true);
+		assert.equal(serverNormalizedGate.missingScopes.length, 0);
+		assert.equal(
+			scopeGranted([serverNormalizedConvo.replace('authority=*', 'authority=%2A')], convoReq, did),
+			true
+		);
+		assert.equal(
+			scopeGranted(
+				[serverNormalizedMailbox.replace(`authority=${did}`, `authority=${encodeURIComponent(did)}`)],
+				mailboxReq,
+				did
+			),
+			true
+		);
 	});
 
 	it('gates Passkey PRF registration on PublicKeyCredential.getClientCapabilities()', async () => {
