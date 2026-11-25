@@ -96,7 +96,7 @@ export function quarantineReasonCopy(reasonTag: string): string {
 		case 'multi_peer_bad_commits':
 			return 'Multiple participants sent invalid commits.';
 		case 'repeated_framing_failures':
-			return 'Recent messages could not be decoded — likely a buggy client.';
+			return 'Recent messages could not be decoded. Likely a buggy client.';
 		default:
 			return 'A participant may be sending invalid messages.';
 	}

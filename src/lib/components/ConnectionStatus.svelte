@@ -1,97 +1,225 @@
 <script lang="ts">
-  import { connection } from '#lib/stores/connection.ts';
-  import { recoveryLabel } from '#lib/recovery.ts';
+	import Icon from '#lib/components/Icon.svelte';
+	import { auth } from '#lib/stores/auth.ts';
+	import { connection } from '#lib/stores/connection.ts';
+	import { conversations } from '#lib/stores/conversations.ts';
+	import { openSettings, resetUi } from '#lib/stores/ui.ts';
+	import { recoveryLabel, type RecoveryCategory } from '#lib/recovery.ts';
 
-  let visible = $derived(
-    $connection.state !== 'connected' && $connection.state !== 'connecting'
-  );
-  let label = $derived($connection.category
-    ? recoveryLabel($connection.category)
-    : $connection.state === 'offline'
-      ? 'Offline'
-      : $connection.state === 'error'
-        ? 'Connection failed'
-        : `Reconnecting${$connection.retryCount > 0 ? ` (${$connection.retryCount})` : ''}...`);
-  let showSpinner = $derived($connection.state === 'reconnecting');
+	const visible = $derived(
+		$connection.state !== 'connected' && $connection.state !== 'connecting'
+	);
+
+	const isError = $derived($connection.state === 'error');
+	const isOffline = $derived($connection.state === 'offline');
+	const isReconnecting = $derived($connection.state === 'reconnecting');
+
+	const label = $derived.by(() => {
+		if ($connection.category && $connection.category !== 'retry') {
+			return recoveryLabel($connection.category);
+		}
+		if (isOffline) {
+			return 'You are offline';
+		}
+		if (isError) {
+			return 'Connection failed';
+		}
+		return $connection.retryCount > 0
+			? `Reconnecting (attempt ${$connection.retryCount})...`
+			: 'Reconnecting...';
+	});
+
+	const detail = $derived.by(() => {
+		const raw = $connection.lastError?.trim();
+		if (!raw) return null;
+		if (raw === label) return null;
+		if ($connection.category === 'retry' && isReconnecting) return null;
+		return raw;
+	});
+
+	function actionLabelFor(category: RecoveryCategory | null): string | null {
+		switch (category) {
+			case 'reauthenticate':
+				return 'Sign in again';
+			case 'rebind':
+				return 'Reconnect device';
+			case 'rejoin':
+				return 'Rejoin';
+			case 'access-ended':
+				return 'Refresh list';
+			case 'retry':
+				return 'Retry';
+			default:
+				return isOffline || isError || isReconnecting ? 'Retry' : null;
+		}
+	}
+
+	const actionLabel = $derived(actionLabelFor($connection.category));
+
+	async function handleAction() {
+		switch ($connection.category) {
+			case 'reauthenticate':
+				await auth.logout();
+				resetUi();
+				break;
+			case 'rebind':
+				openSettings('account');
+				break;
+			case 'access-ended':
+				await conversations.load();
+				break;
+			case 'rejoin':
+			case 'retry':
+			default:
+				connection.retryNow();
+				break;
+		}
+	}
 </script>
 
 {#if visible}
-  <div class="connection-banner" class:error={$connection.state === 'error'}>
-    {#if showSpinner}
-      <span class="spinner"></span>
-    {:else if $connection.state === 'offline'}
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="1" y1="1" x2="23" y2="23" />
-        <path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55" />
-        <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39" />
-        <path d="M10.71 5.05A16 16 0 0 1 22.56 9" />
-        <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88" />
-        <path d="M8.53 16.11a6 6 0 0 1 6.95 0" />
-        <line x1="12" y1="20" x2="12.01" y2="20" />
-      </svg>
-    {/if}
-    <span class="banner-text">{label}</span>
-    {#if $connection.lastError && $connection.category !== 'retry'}
-      <span class="banner-detail">{$connection.lastError}</span>
-    {/if}
-    {#if $connection.category === 'retry'}
-      <button type="button" onclick={() => connection.retryNow()}>Retry</button>
-    {/if}
-  </div>
+	<div
+		class="connection-banner"
+		class:connection-banner--error={isError}
+		class:connection-banner--offline={isOffline}
+		role={isError ? 'alert' : 'status'}
+		aria-live={isError ? 'assertive' : 'polite'}
+	>
+		<div class="banner-body">
+			<span class="banner-icon" aria-hidden="true">
+				{#if isReconnecting}
+					<progress class="catmos-progress banner-progress" aria-label="Reconnecting"></progress>
+				{:else if isOffline}
+					<Icon name="wifi-off" size={16} />
+				{:else}
+					<Icon name="alert-triangle" size={16} />
+				{/if}
+			</span>
+
+			<div class="banner-copy">
+				<span class="banner-label">{label}</span>
+				{#if detail}
+					<span class="banner-detail">{detail}</span>
+				{/if}
+			</div>
+		</div>
+
+		{#if actionLabel}
+			<button
+				type="button"
+				class="banner-action"
+				class:banner-action--error={isError}
+				onclick={handleAction}
+			>
+				{actionLabel}
+			</button>
+		{/if}
+	</div>
 {/if}
 
 <style>
-  .connection-banner {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 8px;
-    padding: 6px 12px;
-    background: var(--bg-hover);
-    border-bottom: 1px solid var(--border);
-    color: var(--text-secondary);
-    font-size: 12px;
-    font-weight: 500;
-    flex-shrink: 0;
-  }
+	.connection-banner {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		flex-wrap: wrap;
+		gap: var(--space-2) var(--space-3);
+		padding: var(--space-2) var(--space-4);
+		background: var(--bg-surface);
+		border-block-end: 1px solid var(--border);
+		color: var(--text-primary);
+		font-size: var(--text-sm);
+		line-height: 1.4;
+		flex-shrink: 0;
+	}
 
-  .connection-banner.error {
-    background: color-mix(in srgb, var(--danger) 15%, transparent);
-    color: var(--danger);
-  }
+	.connection-banner--offline {
+		background: var(--warning-bg);
+		border-block-end-color: var(--warning-border);
+		color: var(--warning-text);
+	}
 
-  .banner-text {
-    line-height: 1;
-  }
+	.connection-banner--error {
+		background: var(--danger-bg);
+		border-block-end-color: var(--danger-text);
+		color: var(--danger-text);
+	}
 
-  .banner-detail {
-    max-width: min(60vw, 560px);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: 400;
-  }
+	.banner-body {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		min-inline-size: 0;
+		flex: 1;
+	}
 
-  button {
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 3px 8px;
-    background: var(--bg);
-    color: inherit;
-    cursor: pointer;
-    font: inherit;
-  }
+	.banner-icon {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+	}
 
-  .spinner {
-    width: 12px;
-    height: 12px;
-    border: 2px solid var(--border);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
+	.banner-progress {
+		inline-size: 0.9375rem;
+		block-size: 0.9375rem;
+		border-width: 2px;
+	}
 
-  @keyframes spin {
-    to { transform: rotate(360deg); }
-  }
+	.banner-copy {
+		display: flex;
+		align-items: baseline;
+		flex-wrap: wrap;
+		gap: var(--space-1) var(--space-2);
+		min-inline-size: 0;
+	}
+
+	.banner-label {
+		font-weight: 600;
+	}
+
+	.banner-detail {
+		font-weight: 400;
+		color: inherit;
+		opacity: 0.92;
+		word-break: break-word;
+	}
+
+	.banner-action {
+		flex-shrink: 0;
+		min-block-size: max(1.875rem, var(--touch-min));
+		padding: var(--space-1) var(--space-3);
+		border-radius: var(--radius-xs);
+		border: 1px solid var(--border-strong);
+		background: var(--bg-elevated);
+		color: var(--text-primary);
+		font-size: var(--text-sm);
+		font-weight: 600;
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out);
+	}
+
+	.banner-action:hover {
+		background: var(--bg-active);
+	}
+
+	.banner-action--error {
+		background: var(--danger-fill);
+		border-color: transparent;
+		color: #ffffff;
+	}
+
+	.banner-action--error:hover {
+		background: var(--danger-hover);
+	}
+
+	@media (forced-colors: active) {
+		.connection-banner {
+			border-block-end: 2px solid CanvasText;
+		}
+		.banner-action {
+			border: 1px solid ButtonText;
+		}
+	}
 </style>

@@ -1,232 +1,457 @@
 <script lang="ts">
 	/**
-	 * Layer 3 quarantine banner. Shown above the message list when a
-	 * conversation is in `Quarantined` state. Two actions:
-	 *
-	 * - `Reset conversation` → calls `confirmManualReset(convoId)`, which
-	 *   reports the user vote to the server's A7 reset pyramid and clears
-	 *   local quarantine. The follow-up server-pushed groupResetEvent is
-	 *   handled by the existing `mls:group-reset` listener in `+page.svelte`.
-	 * - `Learn more` → opens an inline disclosure with the suspected DIDs.
+	 * Layer 3 MLS quarantine banner.
+	 * Shown above the message stream when a conversation is paused due to
+	 * unverified commits or framing failures.
 	 */
-	import type { QuarantineState } from '#lib/tauri.ts';
-	import { confirmManualReset } from '#lib/wasm.ts';
+	import { confirmManualReset, type QuarantineState } from '#lib/wasm.ts';
 	import { quarantineReasonCopy } from '#lib/stores/quarantine.ts';
+	import { profiles, resolveProfileName } from '#lib/stores/profiles.ts';
+	import { formatClockTime, formatSidebarTime } from '#lib/utils/time.ts';
+	import {
+		closeWithReset,
+		useDialogLightDismiss,
+		useDialogSafeAutofocus
+	} from '#lib/utils/dialog.ts';
+	import { announce, showToast } from '#lib/utils/announcer.ts';
+	import Icon from './Icon.svelte';
 
 	let {
 		conversationId,
-		quarantineState
+		state: stateProp,
+		quarantineState: quarantineStateProp,
+		onResetComplete
 	}: {
 		conversationId: string;
-		quarantineState: QuarantineState;
+		state?: QuarantineState;
+		quarantineState?: QuarantineState;
+		onResetComplete?: () => void;
 	} = $props();
 
+	const quarantineState = $derived(stateProp ?? quarantineStateProp ?? null);
+
+	let resetDialog = $state<HTMLDialogElement | null>(null);
 	let resetting = $state(false);
 	let resetError = $state<string | null>(null);
-	let showDetails = $state(false);
 
-	async function handleReset() {
+	$effect(() => {
+		if (quarantineState && quarantineState.suspectedDids.length > 0) {
+			profiles.resolveProfiles(quarantineState.suspectedDids);
+		}
+	});
+
+	$effect(() => {
+		// Reset modal state cleanly when switching conversations.
+		void conversationId;
+		resetError = null;
+		if (resetDialog?.open && !resetting) {
+			closeWithReset(resetDialog);
+		}
+	});
+
+	const pausedSinceLabel = $derived.by(() => {
+		if (!quarantineState) return '';
+		const sidebar = formatSidebarTime(quarantineState.sinceMs);
+		const clock = formatClockTime(quarantineState.sinceMs);
+		if (!sidebar && !clock) return '';
+		if (!sidebar) return clock;
+		if (!clock || sidebar === clock) return `Today, ${clock}`;
+		return `${sidebar}, ${clock}`;
+	});
+
+	function openResetDialog() {
+		resetError = null;
+		if (resetDialog && !resetDialog.open) {
+			resetDialog.showModal();
+		}
+	}
+
+	function cancelReset() {
 		if (resetting) return;
+		resetError = null;
+		closeWithReset(resetDialog, 'cancel');
+	}
+
+	function handleDialogClose() {
+		if (resetDialog) {
+			resetDialog.returnValue = '';
+		}
+		if (!resetting) {
+			resetError = null;
+		}
+	}
+
+	async function confirmReset() {
+		if (resetting) return;
+		const targetConvoId = conversationId;
 		resetting = true;
 		resetError = null;
 		try {
-			await confirmManualReset(conversationId);
-			// Server emits a groupResetEvent on quorum; the page-level
-			// `mls:group-reset` listener picks it up. The orchestrator also
-			// clears local quarantine, which fires `mls://quarantine-cleared`,
-			// so the banner unmounts.
+			await confirmManualReset(targetConvoId);
+			closeWithReset(resetDialog, 'confirmed');
+			onResetComplete?.();
+			showToast({
+				message: 'Conversation encryption reset requested.',
+				tone: 'success'
+			});
 		} catch (err) {
-			resetError = String(err);
-			console.error('[quarantine] manual reset failed:', err);
+			const message = err instanceof Error ? err.message : String(err);
+			resetError = message || 'Could not reset this conversation.';
+			announce(`Reset failed: ${resetError}`, 'assertive');
 		} finally {
 			resetting = false;
 		}
 	}
-
-	let sinceLabel = $derived.by(() => {
-		try {
-			return new Date(quarantineState.sinceMs).toLocaleString();
-		} catch {
-			return '';
-		}
-	});
 </script>
 
-<div class="quarantine-banner" role="alert" aria-live="polite">
-	<div class="banner-row">
-		<svg
-			class="banner-icon"
-			width="18"
-			height="18"
-			viewBox="0 0 24 24"
-			fill="none"
-			stroke="currentColor"
-			stroke-width="2"
-			stroke-linecap="round"
-			stroke-linejoin="round"
-			aria-hidden="true"
-		>
-			<path d="M12 9v4" />
-			<path
-				d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z"
-			/>
-			<path d="M12 17h.01" />
-		</svg>
-		<div class="banner-text">
-			<strong>This conversation is paused</strong>
-			<span>A participant's device may be sending invalid messages.</span>
-		</div>
-		<div class="banner-actions">
+{#if quarantineState}
+	<section class="quarantine-banner" aria-label="Conversation paused notice">
+		<div class="banner-header">
+			<span class="banner-icon" aria-hidden="true">
+				<Icon name="shield-alert" size={18} />
+			</span>
+			<div class="banner-copy">
+				<p class="banner-title">Conversation paused</p>
+				<p class="banner-subtitle">
+					A participant's device sent messages that could not be verified.
+				</p>
+			</div>
 			<button
 				type="button"
-				class="btn-link"
-				onclick={() => (showDetails = !showDetails)}
-				aria-expanded={showDetails}
+				class="reset-trigger"
+				onclick={openResetDialog}
+				disabled={resetting}
 			>
-				{showDetails ? 'Hide' : 'Learn more'}
+				Reset conversation
+			</button>
+		</div>
+
+		<details class="banner-details">
+			<summary class="details-summary">Technical details</summary>
+			<div class="details-body">
+				<p class="reason-copy">{quarantineReasonCopy(quarantineState.reasonTag)}</p>
+				<dl class="details-grid">
+					<dt>Reason code</dt>
+					<dd><code class="mono">{quarantineState.reasonTag}</code></dd>
+					{#if pausedSinceLabel}
+						<dt>Paused since</dt>
+						<dd class="tabular-nums">{pausedSinceLabel}</dd>
+					{/if}
+					<dt>Suspected devices</dt>
+					<dd>
+						{#if quarantineState.suspectedDids.length === 0}
+							<span class="details-muted">
+								None identified. Likely a framing failure burst.
+							</span>
+						{:else}
+							<ul class="suspected-list" role="list">
+								{#each quarantineState.suspectedDids as did (did)}
+									<li class="suspected-item">
+										<span class="suspected-name">
+											{resolveProfileName($profiles.cache, did)}
+										</span>
+										<code class="mono">{did}</code>
+									</li>
+								{/each}
+							</ul>
+						{/if}
+					</dd>
+				</dl>
+			</div>
+		</details>
+	</section>
+{/if}
+
+<dialog
+	bind:this={resetDialog}
+	class="catmos-dialog reset-dialog"
+	closedby="any"
+	use:useDialogLightDismiss
+	onclose={handleDialogClose}
+>
+	<div class="dialog-inner">
+		<h1 class="dialog-title">Reset this conversation?</h1>
+		<p class="dialog-description">
+			Resetting creates a new encrypted epoch for all current members so messaging can resume.
+			Previous messages remain in your local history.
+		</p>
+
+		{#if resetting}
+			<div class="dialog-busy">
+				<progress class="catmos-progress" aria-label="Resetting conversation"></progress>
+				<span>Resetting encryption session...</span>
+			</div>
+		{/if}
+
+		{#if resetError}
+			<div class="dialog-error" role="alert">
+				<Icon name="alert-triangle" size={16} />
+				<span>{resetError}</span>
+			</div>
+		{/if}
+
+		<div class="dialog-actions">
+			<button
+				type="button"
+				class="catmos-btn-secondary"
+				use:useDialogSafeAutofocus
+				disabled={resetting}
+				onclick={cancelReset}
+			>
+				Cancel
 			</button>
 			<button
 				type="button"
-				class="btn-primary"
+				class="catmos-btn-primary"
 				disabled={resetting}
-				onclick={handleReset}
+				onclick={confirmReset}
 			>
-				{resetting ? 'Resetting…' : 'Reset conversation'}
+				{resetting ? 'Resetting...' : 'Reset conversation'}
 			</button>
 		</div>
 	</div>
-	{#if showDetails}
-		<div class="banner-details">
-			<p class="reason">{quarantineReasonCopy(quarantineState.reasonTag)}</p>
-			<dl>
-				<dt>Reason</dt>
-				<dd><code>{quarantineState.reasonTag}</code></dd>
-				{#if sinceLabel}
-					<dt>Paused since</dt>
-					<dd>{sinceLabel}</dd>
-				{/if}
-				<dt>Suspected devices</dt>
-				<dd>
-					{#if quarantineState.suspectedDids.length === 0}
-						<em class="muted">none identified — likely a framing-failure burst</em>
-					{:else}
-						<ul>
-							{#each quarantineState.suspectedDids as did (did)}
-								<li><code>{did}</code></li>
-							{/each}
-						</ul>
-					{/if}
-				</dd>
-			</dl>
-		</div>
-	{/if}
-	{#if resetError}
-		<p class="reset-error">Reset failed: {resetError}</p>
-	{/if}
-</div>
+</dialog>
 
 <style>
 	.quarantine-banner {
-		background: var(--bg-card, #fff8e6);
-		border-left: 3px solid var(--warning, #d97706);
-		padding: 10px 16px;
-		font-size: 13px;
-		color: var(--text-primary, #1f1f1f);
+		background: var(--warning-bg);
+		border-inline-start: 3px solid var(--warning-border);
+		border-block-end: 1px solid var(--border);
+		padding-block: var(--space-3);
+		padding-inline: var(--space-4);
+		color: var(--warning-text);
 	}
-	.banner-row {
+
+	.banner-header {
 		display: flex;
-		align-items: center;
-		gap: 12px;
+		align-items: flex-start;
+		flex-wrap: wrap;
+		gap: var(--space-3);
 	}
+
 	.banner-icon {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		color: var(--warning-text);
+		padding-block-start: 0.125rem;
 		flex-shrink: 0;
-		color: var(--warning, #d97706);
 	}
-	.banner-text {
+
+	.banner-copy {
+		flex: 1 1 14rem;
+		min-inline-size: 0;
 		display: flex;
 		flex-direction: column;
-		flex: 1;
-		min-width: 0;
+		gap: var(--space-fine);
 	}
-	.banner-text strong {
-		font-weight: 600;
+
+	.banner-title {
+		font-size: var(--text-body);
+		font-weight: 650;
+		line-height: 1.3;
+		color: var(--warning-text);
 	}
-	.banner-text span {
-		color: var(--text-secondary, #555);
-		font-size: 12px;
+
+	.banner-subtitle {
+		font-size: var(--text-sm);
+		line-height: 1.4;
+		color: var(--text-primary);
+		max-inline-size: 65ch;
 	}
-	.banner-actions {
-		display: flex;
-		gap: 8px;
+
+	.reset-trigger {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
 		flex-shrink: 0;
+		min-block-size: max(2.25rem, var(--touch-min));
+		padding-inline: var(--space-3);
+		padding-block: var(--space-2);
+		border-radius: var(--radius-sm);
+		background: var(--warning-btn-bg);
+		color: var(--warning-btn-fg);
+		font-size: var(--text-sm);
+		font-weight: 650;
+		line-height: 1.2;
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			opacity var(--dur-fast) var(--ease-out);
 	}
-	.btn-link {
-		background: none;
-		border: none;
-		color: var(--accent, #2563eb);
-		font-size: 13px;
-		font-weight: 500;
-		cursor: pointer;
-		padding: 6px 8px;
+
+	.reset-trigger:hover:not(:disabled) {
+		background: var(--warning-btn-hover);
 	}
-	.btn-link:hover {
-		text-decoration: underline;
-	}
-	.btn-primary {
-		background: var(--warning, #d97706);
-		color: var(--text-on-accent, #fff);
-		border: none;
-		border-radius: var(--radius-sm, 6px);
-		padding: 6px 12px;
-		font-size: 13px;
-		font-weight: 600;
-		cursor: pointer;
-	}
-	.btn-primary:disabled {
+
+	.reset-trigger:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
 	}
+
 	.banner-details {
-		margin-top: 10px;
-		padding: 8px 0 0;
-		border-top: 1px solid var(--border, rgba(0, 0, 0, 0.08));
-		font-size: 12px;
+		margin-block-start: var(--space-2);
+		padding-inline-start: calc(18px + var(--space-3));
 	}
-	.banner-details .reason {
-		margin: 0 0 8px;
-		color: var(--text-secondary, #555);
-	}
-	.banner-details dl {
-		margin: 0;
-		display: grid;
-		grid-template-columns: max-content 1fr;
-		gap: 4px 12px;
-	}
-	.banner-details dt {
+
+	.details-summary {
+		display: inline-flex;
+		align-items: center;
+		gap: var(--space-1);
+		min-block-size: max(1.75rem, var(--touch-min));
+		font-size: var(--text-sm);
 		font-weight: 600;
-		color: var(--text-secondary, #555);
+		color: var(--warning-text);
+		cursor: pointer;
+		list-style: disclosure-closed;
 	}
-	.banner-details dd {
-		margin: 0;
+
+	.banner-details[open] > .details-summary {
+		list-style: disclosure-open;
 	}
-	.banner-details ul {
+
+	.details-summary:hover {
+		text-decoration: underline;
+	}
+
+	.details-body {
+		margin-block-start: var(--space-2);
+		padding-block-start: var(--space-2);
+		border-block-start: 1px solid var(--border);
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-2);
+		color: var(--text-primary);
+		font-size: var(--text-sm);
+	}
+
+	.reason-copy {
+		color: var(--text-primary);
+		line-height: 1.45;
+		max-inline-size: 65ch;
+	}
+
+	.details-grid {
+		display: grid;
+		grid-template-columns: max-content minmax(0, 1fr);
+		gap: var(--space-1) var(--space-4);
+	}
+
+	.details-grid dt {
+		font-weight: 600;
+		color: var(--text-secondary);
+	}
+
+	.details-grid dd {
+		min-inline-size: 0;
+		color: var(--text-primary);
+	}
+
+	.details-muted {
+		color: var(--text-secondary);
+	}
+
+	.suspected-list {
 		list-style: none;
-		padding: 0;
-		margin: 0;
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-1);
 	}
-	.banner-details code {
-		font-family: ui-monospace, SFMono-Regular, monospace;
-		font-size: 11px;
-		background: rgba(0, 0, 0, 0.04);
-		padding: 1px 4px;
-		border-radius: 3px;
+
+	.suspected-item {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: var(--space-2);
 	}
-	.muted {
-		color: var(--text-tertiary, #888);
+
+	.suspected-name {
+		font-weight: 600;
+		color: var(--text-primary);
 	}
-	.reset-error {
-		color: var(--danger, #dc2626);
-		font-size: 12px;
-		margin: 8px 0 0;
+
+	.mono {
+		font-family: var(--font-mono);
+		font-size: var(--text-sm);
+		word-break: break-all;
+		color: var(--text-primary);
+	}
+
+	.reset-dialog {
+		inline-size: min(28rem, calc(100vw - 2rem));
+	}
+
+	.dialog-inner {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-4);
+		padding: var(--space-6);
+	}
+
+	.dialog-title {
+		font-size: var(--text-heading);
+		font-weight: 650;
+		line-height: 1.3;
+		letter-spacing: -0.015em;
+		color: var(--text-primary);
+	}
+
+	.dialog-description {
+		font-size: var(--text-body);
+		line-height: 1.5;
+		color: var(--text-secondary);
+		max-inline-size: 65ch;
+	}
+
+	.dialog-busy {
+		display: flex;
+		align-items: center;
+		gap: var(--space-2);
+		font-size: var(--text-sm);
+		color: var(--text-secondary);
+	}
+
+	.dialog-error {
+		display: flex;
+		align-items: flex-start;
+		gap: var(--space-2);
+		padding: var(--space-3);
+		border-radius: var(--radius-sm);
+		background: var(--danger-bg);
+		color: var(--danger-text);
+		font-size: var(--text-sm);
+		line-height: 1.4;
+	}
+
+	.dialog-actions {
+		display: flex;
+		justify-content: flex-end;
+		flex-wrap: wrap;
+		gap: var(--space-2);
+		padding-block-start: var(--space-1);
+	}
+
+	@media (max-width: 600px) {
+		.banner-details {
+			padding-inline-start: 0;
+		}
+
+		.details-grid {
+			grid-template-columns: 1fr;
+		}
+
+		.details-grid dt {
+			margin-block-start: var(--space-1);
+		}
+	}
+
+	@media (forced-colors: active) {
+		.quarantine-banner {
+			border: 1px solid CanvasText;
+			border-inline-start-width: 4px;
+		}
+
+		.reset-trigger {
+			border: 1px solid ButtonText;
+		}
 	}
 </style>

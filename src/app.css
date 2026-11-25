@@ -1,109 +1,655 @@
-/* ── Theme: Light ── */
-[data-theme='light'] {
-	--bg-app: #f5f5f7;
-	--bg-sidebar: #ffffff;
-	--bg-chat: #f5f5f7;
-	--bg-bubble-own: #5192FF;
-	--bg-bubble-other: #e9e9eb;
-	--bg-bubble-system: transparent;
-	--bg-input: #ffffff;
-	--bg-hover: rgba(0, 0, 0, 0.04);
-	--bg-active: rgba(0, 0, 0, 0.08);
-	--bg-selected: rgba(81, 146, 255, 0.12);
-	--bg-overlay: rgba(0, 0, 0, 0.3);
-	--bg-card: #ffffff;
-	--bg-elevated: #ffffff;
+/*
+ * Catmos Design System & Authoritative Base Stylesheet
+ * Aligned with Catbird brand tokens (src/lib/brand/tokens.json) and WCAG 2.2 AA.
+ */
 
-	--text-primary: #1d1d1f;
-	--text-secondary: #6e6e73;
-	--text-tertiary: #aeaeb2;
-	--text-on-accent: #ffffff;
-	--text-link: #005EFF;
+/* ==========================================================================
+   1. Layout, Spacing, Radius, Typography, and Motion Tokens
+   ========================================================================== */
 
-	--accent: #5192FF;
-	--accent-hover: #005EFF;
-	--danger: #ff3b30;
-	--success: #34c759;
-	--warning: #ff9f0a;
-
-	/* Catbird brand gradient — identical in light and dark modes.
-	   Used for app icon, hero blocks, sent-message bubbles, and
-	   primary gradient buttons. */
-	--brand-gradient: linear-gradient(135deg, #5192FF 0%, #7FAEFF 100%);
-
-	--border: rgba(0, 0, 0, 0.08);
-	--border-strong: rgba(0, 0, 0, 0.15);
-
-	--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
-	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.08);
-	--shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.12);
-
-	--scrollbar-thumb: rgba(0, 0, 0, 0.15);
-	--scrollbar-track: transparent;
-}
-
-/* ── Theme: Dark ── */
-[data-theme='dark'] {
-	--bg-app: #000000;
-	--bg-sidebar: #1c1c1e;
-	--bg-chat: #000000;
-	--bg-bubble-own: #5192FF;
-	--bg-bubble-other: #2c2c2e;
-	--bg-bubble-system: transparent;
-	--bg-input: #2c2c2e;
-	--bg-hover: rgba(255, 255, 255, 0.06);
-	--bg-active: rgba(255, 255, 255, 0.1);
-	--bg-selected: rgba(81, 146, 255, 0.18);
-	--bg-overlay: rgba(0, 0, 0, 0.6);
-	--bg-card: #1c1c1e;
-	--bg-elevated: #2c2c2e;
-
-	--text-primary: #f5f5f7;
-	--text-secondary: #8e8e93;
-	--text-tertiary: #636366;
-	--text-on-accent: #ffffff;
-	--text-link: #5192FF;
-
-	/* Dark-mode accent. #5192FF passes WCAG AA-normal against both
-	   #000 (6.91:1) and the dim dark surface #1D1F26 (4.90:1), so no
-	   lift is needed — the same chrome accent is used in both modes. */
-	--accent: #5192FF;
-	--accent-hover: #7FAEFF;
-	--danger: #ff453a;
-	--success: #30d158;
-	--warning: #ffd60a;
-
-	/* Same gradient as light mode — brand signature stays constant. */
-	--brand-gradient: linear-gradient(135deg, #5192FF 0%, #7FAEFF 100%);
-
-	--border: rgba(255, 255, 255, 0.08);
-	--border-strong: rgba(255, 255, 255, 0.15);
-
-	--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
-	--shadow-md: 0 4px 12px rgba(0, 0, 0, 0.3);
-	--shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
-
-	--scrollbar-thumb: rgba(255, 255, 255, 0.15);
-	--scrollbar-track: transparent;
-}
-
-/* ── Layout tokens ── */
 :root {
+	/* Font families (strictly 2: sans + mono for technical MLS IDs only) */
+	--font-sans: system-ui, 'Inter var', Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+		sans-serif;
+	--font-display: -apple-system, BlinkMacSystemFont, 'Inter var', Inter, system-ui, sans-serif;
+	--font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+	/* Strictly rem type scale (max 3 UI sizes + display role; never < 0.8125rem / 13px) */
+	--text-display: clamp(1.5rem, 1.3rem + 0.8vw, 1.875rem);
+	--text-heading: 1.0625rem;
+	--text-body: 0.9375rem;
+	--text-sm: 0.8125rem;
+
+	/* 4pt spacing scale */
+	--space-fine: 0.125rem;
+	--space-1: 0.25rem;
+	--space-2: 0.5rem;
+	--space-3: 0.75rem;
+	--space-4: 1rem;
+	--space-5: 1.25rem;
+	--space-6: 1.5rem;
+	--space-8: 2rem;
+	--space-10: 2.5rem;
+	--space-12: 3rem;
+
+	/* Radii (aligned with tokens.json) */
+	--radius-xs: 6px;
+	--radius-sm: 10px;
+	--radius-md: 14px;
+	--radius-lg: 20px;
+	--radius-xl: 28px;
+	--radius-full: 9999px;
+
+	/* Motion tokens */
+	--dur-fast: 150ms;
+	--dur-normal: 200ms;
+	--dur-enter: 220ms;
+	--ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+	--transition-fast: 150ms cubic-bezier(0.22, 1, 0.36, 1);
+	--transition-normal: 200ms cubic-bezier(0.22, 1, 0.36, 1);
+	--transition-slow: 220ms cubic-bezier(0.22, 1, 0.36, 1);
+
+	/* Workspace geometry */
 	--sidebar-width: 320px;
 	--sidebar-collapsed-width: 0px;
-	--member-list-width: 260px;
-	--header-height: 56px;
-	--radius-sm: 8px;
-	--radius-md: 12px;
-	--radius-lg: 16px;
-	--radius-xl: 20px;
-	--radius-full: 9999px;
-	--transition-fast: 150ms ease;
-	--transition-normal: 250ms ease;
-	--transition-slow: 350ms cubic-bezier(0.4, 0, 0.2, 1);
+	--inspector-width: 300px;
+	--member-list-width: 300px;
+	--header-height: 60px;
+	--touch-min: 24px;
+
+	/* Density defaults (comfortable) */
+	--density-row-py: 0.625rem;
+	--density-row-px: 0.75rem;
+	--density-bubble-py: 0.5rem;
+	--density-bubble-px: 0.875rem;
+	--density-cluster-gap: 3px;
+	--density-group-gap: 14px;
+
+	/* Catbird brand signature gradient (app mark & hero art only) */
+	--brand-gradient: linear-gradient(135deg, #5192ff 0%, #7faeff 100%);
+
+	/* Default Catbird accent tokens */
+	--accent: #5192ff;
+	--accent-partner: #7faeff;
+	--accent-fill: #005eff;
+	--accent-fill-hover: #004cd1;
+	--accent-hover: #004cd1;
+	--bubble-own-bg: linear-gradient(135deg, #005eff 0%, #004ad9 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-on-accent: #ffffff;
+	--text-on-bubble-own: #ffffff;
+	--text-on-bubble-own-muted: rgba(255, 255, 255, 0.95);
+	--text-link: #6fa4ff;
+	--focus-ring: #6fa4ff;
+
+	color-scheme: light dark;
 }
 
-/* ── Reset ── */
+/* ==========================================================================
+   2. Surface & Semantic Themes: Light, Dim (Default Dark), True Black
+   ========================================================================== */
+
+/* Default dark theme (dim) + legacy [data-theme='dark'] compatibility */
+:root,
+[data-theme='dim'],
+[data-theme='dark'] {
+	color-scheme: dark;
+
+	--bg-app: #111318;
+	--bg-sidebar: #16181f;
+	--bg-chat: #111318;
+	--bg-surface: #1d1f26;
+	--bg-card: #1d1f26;
+	--bg-elevated: #23252d;
+	--bg-bubble-other: #2a2d36;
+	--bg-bubble-system: transparent;
+	--bg-input: #1d1f26;
+	--bg-hover: rgba(255, 255, 255, 0.06);
+	--bg-active: rgba(255, 255, 255, 0.11);
+	--bg-selected: color-mix(in oklab, var(--accent) 18%, transparent);
+	--bg-overlay: rgba(0, 0, 0, 0.62);
+
+	--glass-bg: color-mix(in oklab, #1d1f26 82%, transparent);
+	--glass-bg-strong: color-mix(in oklab, #23252d 88%, transparent);
+	--glass-filter: blur(20px) saturate(1.3);
+	--glass-filter-strong: blur(32px) saturate(1.4);
+
+	--text-primary: #e6e6ec;
+	--text-secondary: #a8a8b0;
+	--text-muted: #9e9ea8;
+	--text-tertiary: #9e9ea8;
+	--text-link: #6fa4ff;
+	--focus-ring: #6fa4ff;
+
+	--border: rgba(255, 255, 255, 0.1);
+	--border-strong: rgba(255, 255, 255, 0.22);
+	--border-input: #6e7382;
+
+	--scrollbar-thumb: #6e7382;
+	--scrollbar-track: transparent;
+
+	--shield: #34c759;
+	--success: #34c759;
+	--success-text: #3bd668;
+	--danger: #ff453a;
+	--danger-fill: #d92d20;
+	--danger-hover: #b42318;
+	--danger-text: #ff6b63;
+	--danger-bg: rgba(217, 45, 32, 0.16);
+	--warning: #ff9f0a;
+	--warning-bg: #241f14;
+	--warning-border: #f59e0b;
+	--warning-text: #ffb84d;
+	--warning-btn-bg: #ffb84d;
+	--warning-btn-fg: #111318;
+	--warning-btn-hover: #ffc870;
+
+	--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.24);
+	--shadow-md: 0 6px 20px rgba(0, 0, 0, 0.36);
+	--shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.52);
+}
+
+/* No-JS light preference fallback */
+@media (prefers-color-scheme: light) {
+	:root:not([data-theme]) {
+		color-scheme: light;
+
+		--bg-app: #ffffff;
+		--bg-sidebar: #f5f5f7;
+		--bg-chat: #ffffff;
+		--bg-surface: #f0f1f4;
+		--bg-card: #ffffff;
+		--bg-elevated: #ffffff;
+		--bg-bubble-other: #f0f1f4;
+		--bg-bubble-system: transparent;
+		--bg-input: #f5f5f7;
+		--bg-hover: rgba(0, 0, 0, 0.045);
+		--bg-active: rgba(0, 0, 0, 0.08);
+		--bg-selected: color-mix(in oklab, var(--accent) 12%, transparent);
+		--bg-overlay: rgba(0, 0, 0, 0.36);
+
+		--glass-bg: color-mix(in oklab, #ffffff 80%, transparent);
+		--glass-bg-strong: color-mix(in oklab, #ffffff 88%, transparent);
+		--glass-filter: blur(20px) saturate(1.3);
+		--glass-filter-strong: blur(32px) saturate(1.4);
+
+		--text-primary: #1d1d1f;
+		--text-secondary: #595960;
+		--text-muted: #686870;
+		--text-tertiary: #686870;
+		--text-link: #005eff;
+		--focus-ring: #005eff;
+
+		--border: rgba(0, 0, 0, 0.1);
+		--border-strong: rgba(0, 0, 0, 0.22);
+		--border-input: #76767e;
+
+		--scrollbar-thumb: #76767e;
+		--scrollbar-track: transparent;
+
+		--shield: #34c759;
+		--success: #34c759;
+		--success-text: #157a33;
+		--danger: #ff3b30;
+		--danger-fill: #c81e1e;
+		--danger-hover: #a61717;
+		--danger-text: #c81e1e;
+		--danger-bg: #fef2f2;
+		--warning: #ff9f0a;
+		--warning-bg: #fef7e6;
+		--warning-border: #b45309;
+		--warning-text: #92400e;
+		--warning-btn-bg: #9a4a00;
+		--warning-btn-fg: #ffffff;
+		--warning-btn-hover: #7d3c00;
+
+		--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+		--shadow-md: 0 4px 16px rgba(0, 0, 0, 0.1);
+		--shadow-lg: 0 12px 36px rgba(0, 0, 0, 0.16);
+	}
+}
+
+/* Theme 1: Light */
+[data-theme='light'] {
+	color-scheme: light;
+
+	--bg-app: #ffffff;
+	--bg-sidebar: #f5f5f7;
+	--bg-chat: #ffffff;
+	--bg-surface: #f0f1f4;
+	--bg-card: #ffffff;
+	--bg-elevated: #ffffff;
+	--bg-bubble-other: #f0f1f4;
+	--bg-bubble-system: transparent;
+	--bg-input: #f5f5f7;
+	--bg-hover: rgba(0, 0, 0, 0.045);
+	--bg-active: rgba(0, 0, 0, 0.08);
+	--bg-selected: color-mix(in oklab, var(--accent) 12%, transparent);
+	--bg-overlay: rgba(0, 0, 0, 0.36);
+
+	--glass-bg: color-mix(in oklab, #ffffff 80%, transparent);
+	--glass-bg-strong: color-mix(in oklab, #ffffff 88%, transparent);
+	--glass-filter: blur(20px) saturate(1.3);
+	--glass-filter-strong: blur(32px) saturate(1.4);
+
+	--text-primary: #1d1d1f;
+	--text-secondary: #595960;
+	--text-muted: #686870;
+	--text-tertiary: #686870;
+	--text-link: #005eff;
+	--focus-ring: #005eff;
+
+	--border: rgba(0, 0, 0, 0.1);
+	--border-strong: rgba(0, 0, 0, 0.22);
+	--border-input: #76767e;
+
+	--scrollbar-thumb: #76767e;
+	--scrollbar-track: transparent;
+
+	--shield: #34c759;
+	--success: #34c759;
+	--success-text: #157a33;
+	--danger: #ff3b30;
+	--danger-fill: #c81e1e;
+	--danger-hover: #a61717;
+	--danger-text: #c81e1e;
+	--danger-bg: #fef2f2;
+	--warning: #ff9f0a;
+	--warning-bg: #fef7e6;
+	--warning-border: #b45309;
+	--warning-text: #92400e;
+	--warning-btn-bg: #9a4a00;
+	--warning-btn-fg: #ffffff;
+	--warning-btn-hover: #7d3c00;
+
+	--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.06);
+	--shadow-md: 0 4px 16px rgba(0, 0, 0, 0.1);
+	--shadow-lg: 0 12px 36px rgba(0, 0, 0, 0.16);
+}
+
+/* Theme 3: True Black OLED (strictly opaque panels, no backdrop blur) */
+[data-theme='black'] {
+	color-scheme: dark;
+
+	--bg-app: #000000;
+	--bg-sidebar: #0a0a0a;
+	--bg-chat: #000000;
+	--bg-surface: #0a0a0a;
+	--bg-card: #0a0a0a;
+	--bg-elevated: #121212;
+	--bg-bubble-other: #1a1a1a;
+	--bg-bubble-system: transparent;
+	--bg-input: #121212;
+	--bg-hover: rgba(255, 255, 255, 0.07);
+	--bg-active: rgba(255, 255, 255, 0.13);
+	--bg-selected: color-mix(in oklab, var(--accent) 20%, transparent);
+	--bg-overlay: rgba(0, 0, 0, 0.78);
+
+	--glass-bg: #0a0a0a;
+	--glass-bg-strong: #121212;
+	--glass-filter: none;
+	--glass-filter-strong: none;
+
+	--text-primary: #f5f5f7;
+	--text-secondary: #9c9ca3;
+	--text-muted: #9c9ca3;
+	--text-tertiary: #9c9ca3;
+	--text-link: #5192ff;
+	--focus-ring: #7faeff;
+
+	--border: rgba(255, 255, 255, 0.13);
+	--border-strong: rgba(255, 255, 255, 0.26);
+	--border-input: #6e6e75;
+
+	--scrollbar-thumb: #6e6e75;
+	--scrollbar-track: transparent;
+
+	--shield: #34c759;
+	--success: #34c759;
+	--success-text: #3bd668;
+	--danger: #ff453a;
+	--danger-fill: #d92d20;
+	--danger-hover: #b42318;
+	--danger-text: #ff6b63;
+	--danger-bg: rgba(217, 45, 32, 0.2);
+	--warning: #ff9f0a;
+	--warning-bg: #1a150b;
+	--warning-border: #f59e0b;
+	--warning-text: #ffb84d;
+	--warning-btn-bg: #ffb84d;
+	--warning-btn-fg: #000000;
+	--warning-btn-hover: #ffc870;
+
+	--shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+	--shadow-md: 0 6px 20px rgba(0, 0, 0, 0.55);
+	--shadow-lg: 0 14px 40px rgba(0, 0, 0, 0.72);
+}
+
+/* ==========================================================================
+   3. All 7 Catbird Accent Palettes (WCAG AA >= 4.5:1 verified fills & links)
+   ========================================================================== */
+
+/* Catbird (default) */
+[data-accent='catbird'] {
+	--accent: #5192ff;
+	--accent-partner: #7faeff;
+	--accent-fill: #005eff;
+	--accent-fill-hover: #004cd1;
+	--accent-hover: #004cd1;
+	--bubble-own-bg: linear-gradient(135deg, #005eff 0%, #004ad9 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+}
+[data-theme='light'][data-accent='catbird'] {
+	--text-link: #005eff;
+	--focus-ring: #005eff;
+}
+[data-theme='dim'][data-accent='catbird'],
+[data-theme='dark'][data-accent='catbird'] {
+	--text-link: #6fa4ff;
+	--focus-ring: #6fa4ff;
+}
+[data-theme='black'][data-accent='catbird'] {
+	--text-link: #5192ff;
+	--focus-ring: #7faeff;
+}
+
+/* Twilight */
+[data-accent='twilight'] {
+	--accent: #9a98ea;
+	--accent-partner: #b8b6f2;
+	--accent-fill: #4a48c4;
+	--accent-fill-hover: #3b39a8;
+	--accent-hover: #3b39a8;
+	--bubble-own-bg: linear-gradient(135deg, #4a48c4 0%, #3d3bb0 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-link: #9a98ea;
+	--focus-ring: #9a98ea;
+}
+[data-theme='light'][data-accent='twilight'] {
+	--accent: #5856d6;
+	--accent-partner: #9a98ea;
+	--text-link: #4a48c4;
+	--focus-ring: #4a48c4;
+}
+
+/* Lavender */
+[data-accent='lavender'] {
+	--accent: #c5a8e5;
+	--accent-partner: #d8c4ee;
+	--accent-fill: #7b4fb5;
+	--accent-fill-hover: #673e9e;
+	--accent-hover: #673e9e;
+	--bubble-own-bg: linear-gradient(135deg, #7b4fb5 0%, #6a3fa3 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-link: #c5a8e5;
+	--focus-ring: #c5a8e5;
+}
+[data-theme='light'][data-accent='lavender'] {
+	--accent: #9b72cf;
+	--accent-partner: #c5a8e5;
+	--text-link: #7b4fb5;
+	--focus-ring: #7b4fb5;
+}
+
+/* Sunrise */
+[data-accent='sunrise'] {
+	--accent: #ffb68c;
+	--accent-partner: #ffd0b5;
+	--accent-fill: #b84a14;
+	--accent-fill-hover: #9b3c0e;
+	--accent-hover: #9b3c0e;
+	--bubble-own-bg: linear-gradient(135deg, #b84a14 0%, #9e3c0c 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-link: #ffb68c;
+	--focus-ring: #ffb68c;
+}
+[data-theme='light'][data-accent='sunrise'] {
+	--accent: #ff955e;
+	--accent-partner: #ffb68c;
+	--text-link: #b84a14;
+	--focus-ring: #b84a14;
+}
+
+/* Aurora */
+[data-accent='aurora'] {
+	--accent: #6fd0ce;
+	--accent-partner: #9ae0df;
+	--accent-fill: #117a78;
+	--accent-fill-hover: #0d6361;
+	--accent-hover: #0d6361;
+	--bubble-own-bg: linear-gradient(135deg, #117a78 0%, #0c6664 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-link: #6fd0ce;
+	--focus-ring: #6fd0ce;
+}
+[data-theme='light'][data-accent='aurora'] {
+	--accent: #30b0ae;
+	--accent-partner: #6fd0ce;
+	--text-link: #117a78;
+	--focus-ring: #117a78;
+}
+
+/* Dusk */
+[data-accent='dusk'] {
+	--accent: #e89ab6;
+	--accent-partner: #f3bdce;
+	--accent-fill: #b03a6b;
+	--accent-fill-hover: #942d58;
+	--accent-hover: #942d58;
+	--bubble-own-bg: linear-gradient(135deg, #b03a6b 0%, #982e5a 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-link: #e89ab6;
+	--focus-ring: #e89ab6;
+}
+[data-theme='light'][data-accent='dusk'] {
+	--accent: #d66091;
+	--accent-partner: #e89ab6;
+	--text-link: #b03a6b;
+	--focus-ring: #b03a6b;
+}
+
+/* Midnight */
+[data-accent='midnight'] {
+	--accent: #7490c9;
+	--accent-partner: #96aedb;
+	--accent-fill: #3154a5;
+	--accent-fill-hover: #254287;
+	--accent-hover: #254287;
+	--bubble-own-bg: linear-gradient(135deg, #3154a5 0%, #26438a 100%);
+	--bg-bubble-own: var(--bubble-own-bg);
+	--text-link: #88a4de;
+	--focus-ring: #88a4de;
+}
+[data-theme='light'][data-accent='midnight'] {
+	--accent: #3154a5;
+	--accent-partner: #7490c9;
+	--text-link: #3154a5;
+	--focus-ring: #3154a5;
+}
+
+/* ==========================================================================
+   4. Density, High Contrast, Reduced Transparency, and Forced Colors
+   ========================================================================== */
+
+[data-density='comfortable'] {
+	--density-row-py: 0.625rem;
+	--density-row-px: 0.75rem;
+	--density-bubble-py: 0.5rem;
+	--density-bubble-px: 0.875rem;
+	--density-cluster-gap: 3px;
+	--density-group-gap: 14px;
+}
+
+[data-density='compact'] {
+	--density-row-py: 0.375rem;
+	--density-row-px: 0.625rem;
+	--density-bubble-py: 0.375rem;
+	--density-bubble-px: 0.75rem;
+	--density-cluster-gap: 2px;
+	--density-group-gap: 10px;
+}
+
+/* High contrast via explicit toggle */
+[data-contrast='more'] {
+	--glass-bg: var(--bg-elevated);
+	--glass-bg-strong: var(--bg-elevated);
+	--glass-filter: none;
+	--glass-filter-strong: none;
+	--bubble-own-bg: var(--accent-fill);
+	--bg-bubble-own: var(--accent-fill);
+}
+
+[data-contrast='more'][data-theme='light'] {
+	--border: #1d1d1f;
+	--border-strong: #000000;
+	--border-input: #000000;
+	--scrollbar-thumb: #000000;
+	--text-primary: #000000;
+	--text-secondary: #1d1d1f;
+	--text-muted: #2c2c2e;
+	--text-tertiary: #2c2c2e;
+	--accent-fill: #0038b8;
+	--accent-fill-hover: #002885;
+	--text-link: #0038b8;
+	--focus-ring: #0038b8;
+}
+
+[data-contrast='more'][data-theme='dim'],
+[data-contrast='more'][data-theme='dark'],
+[data-contrast='more'][data-theme='black'] {
+	--border: #d8d8e0;
+	--border-strong: #ffffff;
+	--border-input: #ffffff;
+	--scrollbar-thumb: #ffffff;
+	--text-primary: #ffffff;
+	--text-secondary: #e6e6ec;
+	--text-muted: #d8d8e0;
+	--text-tertiary: #d8d8e0;
+	--focus-ring: #a9c9ff;
+}
+
+/* High contrast via OS preference */
+@media (prefers-contrast: more) {
+	:root {
+		--glass-bg: var(--bg-elevated);
+		--glass-bg-strong: var(--bg-elevated);
+		--glass-filter: none;
+		--glass-filter-strong: none;
+		--bubble-own-bg: var(--accent-fill);
+		--bg-bubble-own: var(--accent-fill);
+	}
+
+	[data-theme='light'] {
+		--border: #1d1d1f;
+		--border-strong: #000000;
+		--border-input: #000000;
+		--scrollbar-thumb: #000000;
+		--text-primary: #000000;
+		--text-secondary: #1d1d1f;
+		--text-muted: #2c2c2e;
+		--text-tertiary: #2c2c2e;
+		--accent-fill: #0038b8;
+		--accent-fill-hover: #002885;
+		--text-link: #0038b8;
+		--focus-ring: #0038b8;
+	}
+
+	[data-theme='dim'],
+	[data-theme='dark'],
+	[data-theme='black'] {
+		--border: #d8d8e0;
+		--border-strong: #ffffff;
+		--border-input: #ffffff;
+		--scrollbar-thumb: #ffffff;
+		--text-primary: #ffffff;
+		--text-secondary: #e6e6ec;
+		--text-muted: #d8d8e0;
+		--text-tertiary: #d8d8e0;
+		--focus-ring: #a9c9ff;
+	}
+}
+
+/* Reduced transparency disables glass blur */
+@media (prefers-reduced-transparency: reduce) {
+	:root {
+		--glass-bg: var(--bg-elevated);
+		--glass-bg-strong: var(--bg-elevated);
+		--glass-filter: none;
+		--glass-filter-strong: none;
+	}
+}
+
+/* Forced Colors Mode (Windows High Contrast) system color fallbacks */
+@media (forced-colors: active) {
+	:root,
+	[data-theme='light'],
+	[data-theme='dim'],
+	[data-theme='dark'],
+	[data-theme='black'] {
+		--bg-app: Canvas;
+		--bg-sidebar: Canvas;
+		--bg-chat: Canvas;
+		--bg-surface: Canvas;
+		--bg-card: Canvas;
+		--bg-elevated: Canvas;
+		--bg-bubble-other: Canvas;
+		--bg-input: Field;
+		--bg-hover: Canvas;
+		--bg-active: Highlight;
+		--bg-selected: Highlight;
+		--glass-bg: Canvas;
+		--glass-bg-strong: Canvas;
+		--glass-filter: none;
+		--glass-filter-strong: none;
+
+		--text-primary: CanvasText;
+		--text-secondary: CanvasText;
+		--text-muted: GrayText;
+		--text-tertiary: GrayText;
+		--text-on-accent: HighlightText;
+		--text-on-bubble-own: HighlightText;
+		--text-on-bubble-own-muted: HighlightText;
+		--text-link: LinkText;
+
+		--accent: Highlight;
+		--accent-fill: Highlight;
+		--accent-fill-hover: Highlight;
+		--accent-hover: Highlight;
+		--bubble-own-bg: Highlight;
+		--bg-bubble-own: Highlight;
+		--focus-ring: Highlight;
+
+		--border: CanvasText;
+		--border-strong: CanvasText;
+		--border-input: ButtonBorder;
+
+		--shield: Highlight;
+		--success: Highlight;
+		--success-text: CanvasText;
+		--danger: Mark;
+		--danger-fill: ButtonFace;
+		--danger-text: CanvasText;
+		--warning-bg: Canvas;
+		--warning-border: CanvasText;
+		--warning-text: CanvasText;
+		--warning-btn-bg: ButtonFace;
+		--warning-btn-fg: ButtonText;
+	}
+
+	.catmos-dialog,
+	.catmos-popover,
+	.catmos-btn-primary,
+	.catmos-btn-secondary,
+	.catmos-btn-danger,
+	.catmos-switch {
+		border: 1px solid CanvasText;
+	}
+}
+
+/* ==========================================================================
+   5. Base Reset, Typography, Form Controls, and Scrollbars
+   ========================================================================== */
+
 *,
 *::before,
 *::after {
@@ -112,67 +658,74 @@
 	box-sizing: border-box;
 }
 
-html, body {
+html,
+body {
 	height: 100%;
 	min-height: 100dvh;
 	overflow: hidden;
-	font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	font-family: var(--font-sans);
 	font-feature-settings: 'liga' 1, 'calt' 1, 'cv01' 1, 'cv02' 1;
-	font-size: 14px;
-	line-height: 1.5;
+	font-size: 100%;
+	line-height: 1.48;
 	color: var(--text-primary);
 	background: var(--bg-app);
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
-	user-select: none;
+	user-select: text;
 	overscroll-behavior: none;
 }
 
-/* Inter variable font optical sizing */
-@supports (font-variation-settings: normal) {
-	html {
-		font-family: 'Inter var', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+body {
+	font-size: var(--text-body);
+}
+
+/* Scrollbar styling: never animate scrollbar-color; keep scrollbar-width: auto */
+* {
+	scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+	scrollbar-width: auto;
+}
+
+/* Legacy WebKit fallback placed AFTER the base rule */
+@supports not (scrollbar-color: auto) {
+	::-webkit-scrollbar {
+		width: 10px;
+		height: 10px;
+	}
+
+	::-webkit-scrollbar-track {
+		background: var(--scrollbar-track);
+	}
+
+	::-webkit-scrollbar-thumb {
+		background: var(--scrollbar-thumb);
+		border-radius: 9999px;
+		border: 2px solid transparent;
+		background-clip: content-box;
 	}
 }
 
-/* ── Scrollbar ── */
-::-webkit-scrollbar {
-	width: 6px;
-}
-
-::-webkit-scrollbar-track {
-	background: var(--scrollbar-track);
-}
-
-::-webkit-scrollbar-thumb {
-	background: var(--scrollbar-thumb);
-	border-radius: 3px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-	background: var(--scrollbar-thumb);
-	opacity: 0.8;
-}
-
-/* ── Element defaults ── */
+/* Element defaults */
 button {
-	font-family: inherit;
-	font-size: inherit;
+	font: inherit;
 	border: none;
 	cursor: pointer;
 	background: none;
 	color: inherit;
-	line-height: inherit;
+	user-select: none;
 }
 
-input, textarea {
-	font-family: inherit;
-	font-size: inherit;
-	border: none;
-	outline: none;
+input,
+textarea,
+select {
+	font: inherit;
 	color: inherit;
 	background: none;
-	line-height: inherit;
+	border: none;
+}
+
+input,
+textarea {
+	user-select: text;
 }
 
 a {
@@ -184,7 +737,487 @@ a:hover {
 	text-decoration: underline;
 }
 
-/* ── Utility ── */
+::selection {
+	background: var(--accent-fill);
+	color: var(--text-on-accent);
+}
+
+:focus-visible {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: 2px;
+	border-radius: 4px;
+}
+
+/* Coarse pointer touch target & iOS zoom prevention */
+@media (pointer: coarse) {
+	:root {
+		--touch-min: 44px;
+	}
+
+	input,
+	textarea,
+	select {
+		font-size: max(1rem, 1em);
+	}
+}
+
+/* Responsive shell tokens */
+@media (max-width: 1023px) {
+	:root {
+		--sidebar-width: 288px;
+	}
+}
+
+@media (max-width: 767px) {
+	:root {
+		--sidebar-width: 100vw;
+		--inspector-width: min(90vw, 340px);
+		--member-list-width: min(90vw, 340px);
+	}
+}
+
+/* ==========================================================================
+   6. Native <dialog> & [popover] Top-Layer Primitives
+   ========================================================================== */
+
+/* Never set display on dialog unconditionally; scope strictly to dialog[open] */
+dialog:modal {
+	overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+	overscroll-behavior: contain;
+	overflow: hidden;
+	background: var(--bg-overlay);
+}
+
+.catmos-dialog {
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-lg);
+	background: var(--bg-elevated);
+	color: var(--text-primary);
+	box-shadow: var(--shadow-lg);
+	padding: 0;
+	inline-size: min(32rem, calc(100vw - 2rem));
+	max-inline-size: calc(100vw - 2rem);
+	max-block-size: min(85svh, 44rem);
+	margin: auto;
+	overflow: hidden;
+	opacity: 0;
+	transition:
+		opacity var(--dur-normal) var(--ease-out),
+		overlay var(--dur-normal) var(--ease-out),
+		display var(--dur-normal) var(--ease-out);
+	transition-behavior: allow-discrete;
+}
+
+.catmos-dialog[open] {
+	display: flex;
+	flex-direction: column;
+	opacity: 1;
+}
+
+.catmos-dialog::backdrop {
+	opacity: 0;
+	transition:
+		opacity var(--dur-normal) var(--ease-out),
+		overlay var(--dur-normal) var(--ease-out),
+		display var(--dur-normal) var(--ease-out);
+	transition-behavior: allow-discrete;
+}
+
+.catmos-dialog[open]::backdrop {
+	opacity: 1;
+}
+
+@supports (backdrop-filter: blur(1px)) {
+	.catmos-dialog {
+		background: var(--glass-bg-strong);
+		backdrop-filter: var(--glass-filter);
+		-webkit-backdrop-filter: var(--glass-filter);
+	}
+}
+
+.catmos-dialog--drawer {
+	inline-size: min(90vw, 22.5rem);
+	max-inline-size: 92vw;
+	block-size: 100svh;
+	max-block-size: 100svh;
+	margin-block: 0;
+	margin-inline-start: auto;
+	margin-inline-end: 0;
+	border-radius: var(--radius-lg) 0 0 var(--radius-lg);
+	border-inline-end: none;
+	border-block: none;
+}
+
+.catmos-popover {
+	border: 1px solid var(--border-strong);
+	border-radius: var(--radius-md);
+	background: var(--bg-elevated);
+	color: var(--text-primary);
+	box-shadow: var(--shadow-md);
+	padding: var(--space-1);
+	min-inline-size: 11.5rem;
+	max-inline-size: min(20rem, calc(100vw - 1rem));
+	overflow: auto;
+	opacity: 0;
+	transition:
+		opacity var(--dur-fast) var(--ease-out),
+		overlay var(--dur-fast) var(--ease-out),
+		display var(--dur-fast) var(--ease-out);
+	transition-behavior: allow-discrete;
+}
+
+.catmos-popover:popover-open {
+	opacity: 1;
+}
+
+@supports (backdrop-filter: blur(1px)) {
+	.catmos-popover {
+		background: var(--glass-bg-strong);
+		backdrop-filter: var(--glass-filter);
+		-webkit-backdrop-filter: var(--glass-filter);
+	}
+}
+
+/* Gate inset/margin resets for CSS Anchor Positioning strictly inside @supports */
+@supports (position-area: block-end) {
+	.catmos-popover[data-anchored='true'] {
+		inset: auto;
+		margin: 0;
+		position-try-fallbacks: flip-block, flip-inline, flip-block flip-inline;
+	}
+
+	.catmos-popover[data-anchored='true'][data-placement='bottom-end'] {
+		position-area: block-end span-inline-start;
+		margin-block-start: 6px;
+	}
+
+	.catmos-popover[data-anchored='true'][data-placement='bottom-start'] {
+		position-area: block-end span-inline-end;
+		margin-block-start: 6px;
+	}
+
+	.catmos-popover[data-anchored='true'][data-placement='top-end'] {
+		position-area: block-start span-inline-start;
+		margin-block-end: 6px;
+	}
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.catmos-dialog {
+		transform: translateY(8px) scale(0.985);
+		transition:
+			opacity var(--dur-normal) var(--ease-out),
+			transform var(--dur-enter) var(--ease-out),
+			overlay var(--dur-normal) var(--ease-out),
+			display var(--dur-normal) var(--ease-out);
+		transition-behavior: allow-discrete;
+	}
+
+	.catmos-dialog[open] {
+		transform: translateY(0) scale(1);
+	}
+
+	.catmos-dialog--drawer {
+		transform: translateX(100%);
+	}
+
+	.catmos-dialog--drawer[open] {
+		transform: translateX(0);
+	}
+
+	.catmos-popover {
+		transform: translateY(4px) scale(0.97);
+		transition:
+			opacity var(--dur-fast) var(--ease-out),
+			transform var(--dur-fast) var(--ease-out),
+			overlay var(--dur-fast) var(--ease-out),
+			display var(--dur-fast) var(--ease-out);
+		transition-behavior: allow-discrete;
+	}
+
+	.catmos-popover:popover-open {
+		transform: translateY(0) scale(1);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.catmos-dialog,
+	.catmos-dialog::backdrop,
+	.catmos-popover {
+		transition-duration: 100ms;
+	}
+}
+
+@starting-style {
+	.catmos-dialog[open] {
+		opacity: 0;
+	}
+
+	.catmos-dialog[open]::backdrop {
+		opacity: 0;
+	}
+
+	.catmos-popover:popover-open {
+		opacity: 0;
+	}
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	@starting-style {
+		.catmos-dialog[open] {
+			transform: translateY(8px) scale(0.985);
+		}
+
+		.catmos-dialog--drawer[open] {
+			transform: translateX(100%);
+		}
+
+		.catmos-popover:popover-open {
+			transform: translateY(4px) scale(0.97);
+		}
+	}
+}
+
+/* ==========================================================================
+   7. Reusable Base Component Classes
+   ========================================================================== */
+
+.catmos-btn-primary,
+.catmos-btn-secondary,
+.catmos-btn-danger,
+.catmos-btn-ghost {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-2);
+	min-block-size: max(2.375rem, var(--touch-min));
+	padding-inline: var(--space-4);
+	padding-block: var(--space-2);
+	border-radius: var(--radius-sm);
+	font-size: var(--text-body);
+	font-weight: 600;
+	line-height: 1.25;
+	text-decoration: none;
+	user-select: none;
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out),
+		opacity var(--dur-fast) var(--ease-out);
+}
+
+.catmos-btn-primary {
+	background: var(--accent-fill);
+	color: var(--text-on-accent);
+	border: 1px solid transparent;
+}
+
+.catmos-btn-primary:hover:not(:disabled):not([aria-disabled='true']) {
+	background: var(--accent-fill-hover);
+	text-decoration: none;
+}
+
+.catmos-btn-secondary {
+	background: var(--bg-surface);
+	color: var(--text-primary);
+	border: 1px solid var(--border-strong);
+}
+
+.catmos-btn-secondary:hover:not(:disabled):not([aria-disabled='true']) {
+	background: var(--bg-active);
+	text-decoration: none;
+}
+
+.catmos-btn-danger {
+	background: var(--danger-fill);
+	color: #ffffff;
+	border: 1px solid transparent;
+}
+
+.catmos-btn-danger:hover:not(:disabled):not([aria-disabled='true']) {
+	background: var(--danger-hover);
+	text-decoration: none;
+}
+
+.catmos-btn-ghost {
+	background: transparent;
+	color: var(--text-primary);
+	border: 1px solid transparent;
+}
+
+.catmos-btn-ghost:hover:not(:disabled):not([aria-disabled='true']) {
+	background: var(--bg-hover);
+	text-decoration: none;
+}
+
+.catmos-btn-primary:disabled,
+.catmos-btn-secondary:disabled,
+.catmos-btn-danger:disabled,
+.catmos-btn-ghost:disabled,
+.catmos-btn-primary[aria-disabled='true'],
+.catmos-btn-secondary[aria-disabled='true'],
+.catmos-btn-danger[aria-disabled='true'],
+.catmos-btn-ghost[aria-disabled='true'] {
+	opacity: 0.55;
+	cursor: not-allowed;
+}
+
+/* Segmented radio group control */
+.catmos-segmented {
+	display: inline-grid;
+	grid-auto-flow: column;
+	grid-auto-columns: 1fr;
+	gap: 2px;
+	padding: 3px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius-sm);
+	background: var(--bg-surface);
+	user-select: none;
+}
+
+.catmos-segmented label {
+	position: relative;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: var(--space-1);
+	min-block-size: max(1.875rem, var(--touch-min));
+	padding-inline: var(--space-3);
+	padding-block: var(--space-1);
+	border-radius: calc(var(--radius-sm) - 3px);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	color: var(--text-secondary);
+	cursor: pointer;
+	text-align: center;
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		color var(--dur-fast) var(--ease-out);
+}
+
+.catmos-segmented input[type='radio'] {
+	position: absolute;
+	opacity: 0;
+	inset: 0;
+	cursor: pointer;
+	margin: 0;
+}
+
+.catmos-segmented label:hover {
+	color: var(--text-primary);
+}
+
+.catmos-segmented label:has(input[type='radio']:checked) {
+	background: var(--bg-elevated);
+	color: var(--text-primary);
+	font-weight: 600;
+	box-shadow: var(--shadow-sm);
+}
+
+.catmos-segmented label:has(input[type='radio']:focus-visible) {
+	outline: 2px solid var(--focus-ring);
+	outline-offset: -2px;
+}
+
+/* Accessible toggle switch (styled checkbox / role="switch") */
+.catmos-switch {
+	appearance: none;
+	-webkit-appearance: none;
+	position: relative;
+	display: inline-block;
+	flex-shrink: 0;
+	inline-size: 2.75rem;
+	block-size: 1.625rem;
+	border-radius: var(--radius-full);
+	background: var(--bg-surface);
+	border: 1.5px solid var(--border-input);
+	cursor: pointer;
+	user-select: none;
+	transition:
+		background-color var(--dur-fast) var(--ease-out),
+		border-color var(--dur-fast) var(--ease-out);
+}
+
+.catmos-switch::before {
+	content: '';
+	position: absolute;
+	inset-block-start: 2px;
+	inset-inline-start: 2px;
+	inline-size: 1.125rem;
+	block-size: 1.125rem;
+	border-radius: var(--radius-full);
+	background: var(--text-secondary);
+	transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+	.catmos-switch::before {
+		transition:
+			transform var(--dur-fast) var(--ease-out),
+			background-color var(--dur-fast) var(--ease-out);
+	}
+}
+
+.catmos-switch:checked {
+	background: var(--accent-fill);
+	border-color: var(--accent-fill);
+}
+
+.catmos-switch:checked::before {
+	transform: translateX(1.125rem);
+	background: var(--text-on-accent);
+}
+
+.catmos-switch:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+
+/* Native indeterminate <progress> styled as an accessible ring spinner */
+.catmos-progress {
+	appearance: none;
+	-webkit-appearance: none;
+	display: inline-block;
+	inline-size: 1.25rem;
+	block-size: 1.25rem;
+	border: 2.5px solid var(--border-strong);
+	border-top-color: var(--accent-fill);
+	border-radius: var(--radius-full);
+	background: transparent;
+	color: var(--accent-fill);
+	vertical-align: middle;
+	overflow: hidden;
+	animation: catmos-spin 0.85s linear infinite;
+}
+
+.catmos-progress::-webkit-progress-bar,
+.catmos-progress::-webkit-progress-value {
+	background: transparent;
+}
+
+.catmos-progress::-moz-progress-bar {
+	background: transparent;
+}
+
+@keyframes catmos-spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.catmos-progress {
+		animation-duration: 6s;
+	}
+}
+
+/* ==========================================================================
+   8. Utilities
+   ========================================================================== */
+
 .visually-hidden {
 	position: absolute;
 	width: 1px;
@@ -192,28 +1225,48 @@ a:hover {
 	padding: 0;
 	margin: -1px;
 	overflow: hidden;
-	clip: rect(0, 0, 0, 0);
+	clip-path: inset(50%);
 	white-space: nowrap;
 	border-width: 0;
 }
 
-/* ── Selection ── */
-::selection {
-	background: var(--accent);
+.skip-link {
+	position: fixed;
+	inset-block-start: var(--space-3);
+	inset-inline-start: var(--space-3);
+	z-index: 1000;
+	padding: var(--space-2) var(--space-4);
+	border-radius: var(--radius-sm);
+	background: var(--accent-fill);
 	color: var(--text-on-accent);
+	font-weight: 600;
+	font-size: var(--text-body);
+	box-shadow: var(--shadow-md);
+	text-decoration: none;
 }
 
-/* ── Focus visible ── */
-:focus-visible {
-	outline: 2px solid var(--accent);
-	outline-offset: 2px;
-	border-radius: 2px;
+.skip-link:not(:focus):not(:focus-visible) {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip-path: inset(50%);
+	white-space: nowrap;
+	border-width: 0;
 }
 
-/* ── Mobile ── */
-@media (max-width: 768px) {
-	:root {
-		--sidebar-width: 100vw;
-		--member-list-width: min(88vw, 320px);
+.tabular-nums {
+	font-variant-numeric: tabular-nums;
+}
+
+.squircle {
+	border-radius: var(--radius-md);
+}
+
+@supports (corner-shape: squircle) {
+	.squircle {
+		corner-shape: squircle;
 	}
 }

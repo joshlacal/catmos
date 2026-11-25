@@ -1,107 +1,89 @@
 <script lang="ts">
+	import Icon from '#lib/components/Icon.svelte';
 	import { TAB_WAITING_MESSAGE } from '#lib/tab-lock.ts';
 </script>
 
-<div class="tab-blocked-overlay" role="status" aria-live="polite">
-	<div class="tab-blocked-card">
-		<div class="icon" aria-hidden="true">
-			<svg
-				width="48"
-				height="48"
-				viewBox="0 0 24 24"
-				fill="none"
-				stroke="currentColor"
-				stroke-width="1.5"
-				stroke-linecap="round"
-				stroke-linejoin="round"
-			>
-				<rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
-				<line x1="9" y1="3" x2="9" y2="21" />
-				<circle cx="15" cy="12" r="2" />
-			</svg>
-		</div>
+<main id="main-thread" class="tab-blocked-shell" role="status" aria-live="polite">
+	<section class="tab-blocked-panel" aria-labelledby="tab-blocked-heading">
+		<span class="tab-blocked-icon squircle" aria-hidden="true">
+			<Icon name="lock" size={26} />
+		</span>
 
-		<h1>{TAB_WAITING_MESSAGE}</h1>
-		<p>
+		<h1 id="tab-blocked-heading" class="tab-blocked-heading">{TAB_WAITING_MESSAGE}</h1>
+
+		<p class="tab-blocked-body">
 			Encrypted chat uses an exclusive OPFS database handle per account. Close the other active
-			Catmos tab and this window will automatically resume without interrupting encryption state.
+			Catmos tab and this window will automatically resume without interrupting your encryption
+			state.
 		</p>
 
-		<div class="actions">
-			<button type="button" class="btn-secondary" onclick={() => window.close()}>
-				Close this tab
-			</button>
-		</div>
-	</div>
-</div>
+		<button
+			type="button"
+			class="catmos-btn-secondary close-tab-btn"
+			onclick={() => window.close()}
+		>
+			Close this tab
+		</button>
+	</section>
+</main>
 
 <style>
-	.tab-blocked-overlay {
-		position: fixed;
-		inset: 0;
-		z-index: 9999;
+	.tab-blocked-shell {
+		min-block-size: 100dvh;
+		inline-size: 100%;
 		display: flex;
 		align-items: center;
 		justify-content: center;
+		padding: var(--space-6) var(--space-4);
 		background: var(--bg-app);
 	}
 
-	.tab-blocked-card {
-		max-width: 420px;
-		padding: 40px 32px;
+	.tab-blocked-panel {
+		inline-size: 100%;
+		max-inline-size: 26rem;
+		display: flex;
+		flex-direction: column;
+		align-items: center;
 		text-align: center;
-		background: var(--bg-card);
+		gap: var(--space-3);
+		padding: var(--space-8) var(--space-6);
+		background: var(--bg-surface);
 		border: 1px solid var(--border);
 		border-radius: var(--radius-lg);
-		box-shadow: var(--shadow-lg);
+		box-shadow: var(--shadow-md);
 	}
 
-	.icon {
+	.tab-blocked-icon {
+		inline-size: 3.5rem;
+		block-size: 3.5rem;
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		width: 72px;
-		height: 72px;
-		margin-bottom: 20px;
-		border-radius: var(--radius-md);
 		background: var(--bg-elevated);
-		color: var(--text-secondary);
-	}
-
-	h1 {
-		font-size: 18px;
-		font-weight: 600;
-		color: var(--text-primary);
-		margin-bottom: 8px;
-		line-height: 1.3;
-	}
-
-	p {
-		font-size: 14px;
-		color: var(--text-secondary);
-		line-height: 1.5;
-		margin-bottom: 28px;
-	}
-
-	.actions {
-		display: flex;
-		flex-direction: column;
-		gap: 10px;
-	}
-
-	.btn-secondary {
-		padding: 10px 20px;
-		border-radius: var(--radius-sm);
-		background: var(--bg-elevated);
-		color: var(--text-primary);
-		font-weight: 500;
-		font-size: 14px;
 		border: 1px solid var(--border);
-		transition: all var(--transition-fast);
+		color: var(--text-primary);
+		margin-block-end: var(--space-1);
 	}
 
-	.btn-secondary:hover {
-		background: var(--bg-hover);
-		border-color: var(--border-strong);
+	.tab-blocked-heading {
+		font-size: var(--text-heading);
+		font-weight: 650;
+		letter-spacing: -0.015em;
+		line-height: 1.3;
+		color: var(--text-primary);
+		text-wrap: balance;
+	}
+
+	.tab-blocked-body {
+		font-size: var(--text-sm);
+		line-height: 1.5;
+		color: var(--text-secondary);
+		max-inline-size: 40ch;
+		margin-block-end: var(--space-2);
+	}
+
+	.close-tab-btn {
+		inline-size: 100%;
+		min-block-size: 2.75rem;
 	}
 </style>

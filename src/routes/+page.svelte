@@ -1,178 +1,253 @@
 <script lang="ts">
 	import { onDestroy, onMount } from 'svelte';
+	import { get } from 'svelte/store';
+	import AuthScreen from '#lib/components/AuthScreen.svelte';
+	import ChatHeader from '#lib/components/ChatHeader.svelte';
+	import CommandPalette from '#lib/components/CommandPalette.svelte';
+	import Composer from '#lib/components/Composer.svelte';
+	import ConnectionStatus from '#lib/components/ConnectionStatus.svelte';
+	import ConversationInspector from '#lib/components/ConversationInspector.svelte';
+	import EmptyWorkspace from '#lib/components/EmptyWorkspace.svelte';
+	import Icon from '#lib/components/Icon.svelte';
+	import MessageList from '#lib/components/MessageList.svelte';
+	import NewConversationDialog from '#lib/components/NewConversationDialog.svelte';
+	import QuarantineBanner from '#lib/components/QuarantineBanner.svelte';
+	import SettingsDialog from '#lib/components/SettingsDialog.svelte';
+	import Sidebar from '#lib/components/Sidebar.svelte';
 	import { isSameAccountDid, stripDidFragment } from '#lib/did.ts';
-	import { auth } from '#lib/stores/auth.ts';
 	import { isMlsOptedInForDid } from '#lib/labyrinth-ui.ts';
+	import { notifyIncomingMessage, setNotificationSelectHandler } from '#lib/notifications.ts';
+	import { auth } from '#lib/stores/auth.ts';
+	import { connection } from '#lib/stores/connection.ts';
 	import {
 		conversations,
-		selectedConversation,
-		reconcileBlockedConversations
+		reconcileBlockedConversations,
+		selectedConversation
 	} from '#lib/stores/conversations.ts';
+	import { getCursor, saveCursor } from '#lib/stores/cursors.ts';
 	import { messages } from '#lib/stores/messages.ts';
-	import { saveCursor, getCursor } from '#lib/stores/cursors.ts';
-	import * as api from '#lib/wasm.ts';
-	import { listenForEvent, isTauri } from '#lib/wasm.ts';
-	import type {
-		Message,
-		PreparedImageUpload,
-		ReactionEvent,
-		TypingEvent,
-		GroupResetEvent,
-		QuarantineEnteredEvent,
-		QuarantineClearedEvent
-	} from '#lib/tauri.ts';
-	import MessageList from '#lib/components/MessageList.svelte';
-	import Composer from '#lib/components/Composer.svelte';
-	import MemberList from '#lib/components/MemberList.svelte';
-	import ReplyPreview from '#lib/components/ReplyPreview.svelte';
-	import ConnectionStatus from '#lib/components/ConnectionStatus.svelte';
-	import SearchPanel from '#lib/components/SearchPanel.svelte';
-	import QuarantineBanner from '#lib/components/QuarantineBanner.svelte';
-	import type { ReplyInfo } from '#lib/components/MessageBubble.svelte';
-	import { connection } from '#lib/stores/connection.ts';
-	import { notifyIncomingMessage } from '#lib/notifications.ts';
-	import { profiles } from '#lib/stores/profiles.ts';
+	import { profiles, resolveProfileName } from '#lib/stores/profiles.ts';
 	import { quarantine } from '#lib/stores/quarantine.ts';
-	import type { Conversation } from '#lib/tauri.ts';
+	import {
+		closeCommandPalette,
+		closeNewConversation,
+		closeSettings,
+		openCommandPalette,
+		openNewConversation,
+		openSettings,
+		resetUi,
+		setHighlightMessageId,
+		setShowInspector,
+		toggleInspector,
+		toggleSidebar,
+		ui
+	} from '#lib/stores/ui.ts';
+	import type {
+		Conversation,
+		GroupResetEvent,
+		Message,
+		QuarantineClearedEvent,
+		QuarantineEnteredEvent,
+		ReactionEvent,
+		TypingEvent
+	} from '#lib/tauri.ts';
+	import { announce, showToast } from '#lib/utils/announcer.ts';
+	import {
+		closeWithReset,
+		useDialogLightDismiss,
+		useDialogSafeAutofocus
+	} from '#lib/utils/dialog.ts';
+	import * as api from '#lib/wasm.ts';
+	import { isTauri, listenForEvent } from '#lib/wasm.ts';
 
-	let loginIdentifier = $state('');
-	let replyingTo = $state<ReplyInfo | null>(null);
-	let showMembers = $state(false);
-	let showSearch = $state(false);
+	let replyingTo = $state<Message | null>(null);
+	let signOutDialog = $state<HTMLDialogElement | null>(null);
+	let signingOut = $state(false);
+
 	let unlistenMessage: (() => void) | null = null;
+	let unlistenMessagesChanged: (() => void) | null = null;
 	let unlistenReaction: (() => void) | null = null;
 	let unlistenTyping: (() => void) | null = null;
 	let unlistenGroupReset: (() => void) | null = null;
-	let unlistenMessagesChanged: (() => void) | null = null;
 	let unlistenQuarantined: (() => void) | null = null;
 	let unlistenQuarantineCleared: (() => void) | null = null;
 	let unlistenRecovery: (() => void) | null = null;
-	let subscribedConvoId: string | null = null;
-	let blockReconcileRan = false;
-	let subscription = Symbol();
 
-	function handleGlobalKeydown(e: KeyboardEvent) {
-		if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-			e.preventDefault();
-			showSearch = !showSearch;
+	let mounted = true;
+	let subscribedConvoId: string | null = null;
+	let subscription = Symbol();
+	let activeSwitchToken = 0;
+	let blockReconcileRan = false;
+	let lastInitializedDid: string | null = null;
+	let highlightClearTimer: ReturnType<typeof setTimeout> | null = null;
+	const bootstrappedGroupIds = new Set<string>();
+
+	const currentConversation = $derived($selectedConversation);
+	const currentQuarantine = $derived(
+		currentConversation ? ($quarantine[currentConversation.id] ?? null) : null
+	);
+	const currentMessages = $derived(
+		currentConversation
+			? ($messages.byConversation.get(currentConversation.id) ?? [])
+			: []
+	);
+
+	function isDemoActive(): boolean {
+		return (
+			import.meta.env.DEV &&
+			typeof document !== 'undefined' &&
+			document.documentElement.dataset.catmosDemo === 'true'
+		);
+	}
+
+	function normalizeWsStatus(rawStatus: unknown): { type: string; reason?: string } {
+		const type =
+			typeof rawStatus === 'string'
+				? rawStatus
+				: ((rawStatus as { type?: string } | null | undefined)?.type ?? 'unknown');
+		if (rawStatus && typeof rawStatus === 'object') {
+			const record = rawStatus as { reason?: unknown; error?: unknown };
+			const reason =
+				typeof record.reason === 'string'
+					? record.reason
+					: typeof record.error === 'string'
+						? record.error
+						: undefined;
+			return { type, reason };
+		}
+		return { type };
+	}
+
+	function resolvedDisplayName(convo: Conversation): string {
+		if (convo.isGroup) return convo.displayName;
+		const otherRaw =
+			convo.members.find((did) => !isSameAccountDid(did, $auth.user?.did)) ?? convo.members[0];
+		const otherDid = stripDidFragment(otherRaw);
+		if (otherDid) {
+			return resolveProfileName($profiles.cache, otherDid);
+		}
+		return convo.displayName;
+	}
+
+	const currentDisplayName = $derived(
+		currentConversation ? resolvedDisplayName(currentConversation) : ''
+	);
+
+	function runMobileNavigationTransition(direction: 'forward' | 'backward', update: () => void) {
+		if (
+			typeof document === 'undefined' ||
+			typeof window === 'undefined' ||
+			!('startViewTransition' in document)
+		) {
+			update();
 			return;
 		}
-		// Escape — close any open panel/dialog
-		if (e.key === 'Escape') {
-			if (showSearch) {
-				showSearch = false;
-				return;
-			}
-			if (showMembers) {
-				showMembers = false;
-				return;
-			}
+		const isMobile = window.matchMedia('(max-width: 767px)').matches;
+		const prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+		if (!isMobile || prefersReduced) {
+			update();
+			return;
+		}
+		const docWithTransition = document as Document & {
+			startViewTransition: (cb: () => void) => { finished: Promise<void> };
+		};
+		document.documentElement.dataset.navDirection = direction;
+		try {
+			const transition = docWithTransition.startViewTransition(update);
+			transition.finished
+				.catch(() => {})
+				.finally(() => {
+					delete document.documentElement.dataset.navDirection;
+				});
+		} catch {
+			delete document.documentElement.dataset.navDirection;
+			update();
 		}
 	}
 
-	onMount(() => {
-		window.addEventListener('keydown', handleGlobalKeydown);
-
-		listenForEvent<Message>('mls-incoming-message', (payload) => {
-			void messages.refreshLocal(payload.conversationId);
-			saveCursor(payload.conversationId, payload.id);
-			notifyIncomingMessage(payload.senderHandle, payload.content, payload.conversationId);
-		}).then((unlisten) => {
-			unlistenMessage = unlisten;
+	function handleSelectConvo(convoId: string) {
+		if ($conversations.selectedId === convoId) return;
+		runMobileNavigationTransition('forward', () => {
+			conversations.select(convoId);
 		});
+	}
 
-		listenForEvent<'ConversationsUpdated' | { MessagesUpdated?: { conversation_id: string } }>('mls://platform-change', (event) => {
-			if (event === 'ConversationsUpdated') {
-				void messages.refreshCached($selectedConversation?.id);
-			} else if (typeof event === 'object' && event.MessagesUpdated) {
-				void messages.refreshLocal(event.MessagesUpdated.conversation_id);
+	function handleMobileBack() {
+		runMobileNavigationTransition('backward', () => {
+			setShowInspector(false);
+			conversations.select(null);
+		});
+	}
+
+	function findLatestConfirmedMessageId(convoId: string): string | null {
+		const list = get(messages).byConversation.get(convoId) ?? [];
+		for (let i = list.length - 1; i >= 0; i--) {
+			const msg = list[i];
+			if (msg && msg.id && !msg.id.startsWith('temp-')) {
+				return msg.id;
 			}
-		}).then((unlisten) => { unlistenMessagesChanged = unlisten; });
+		}
+		return null;
+	}
 
-		listenForEvent<ReactionEvent>('mls-reaction-event', (payload) => {
-			messages.applyReaction(payload);
-		}).then((unlisten) => {
-			unlistenReaction = unlisten;
-		});
-
-		listenForEvent<TypingEvent>('mls-typing-event', (payload) => {
-			messages.applyTyping(payload);
-		}).then((unlisten) => {
-			unlistenTyping = unlisten;
-		});
-
-		listenForEvent<GroupResetEvent>('mls:group-reset', (payload) => {
-			console.log('[catmos] Group reset event:', payload);
-			// Refresh the conversation list to pick up new group state
-			conversations.load();
-			// If we're viewing the reset conversation, refresh its messages
-			if ($selectedConversation?.id === payload.convoId) {
-				messages.fetchFromServer(payload.convoId);
-			}
-		}).then((unlisten) => {
-			unlistenGroupReset = unlisten;
-		});
-
-		// Layer 3 quarantine: live entry/exit events + a refresh on app load
-		// for the active conversation so a restart with a pre-existing
-		// quarantined row paints the banner on first frame.
-		listenForEvent<QuarantineEnteredEvent>('mls://quarantined', (payload) => {
-			console.warn('[catmos] Conversation quarantined:', payload);
-			quarantine.applyEnteredEvent(payload);
-		}).then((unlisten) => {
-			unlistenQuarantined = unlisten;
-		});
-
-		listenForEvent<QuarantineClearedEvent>('mls://quarantine-cleared', (payload) => {
-			console.log('[catmos] Quarantine cleared:', payload);
-			quarantine.applyClearedEvent(payload);
-		}).then((unlisten) => {
-			unlistenQuarantineCleared = unlisten;
-		});
-
-		// Backend reconnect loops stop on explicit auth/device/MLS failures;
-		// surface the stable category so the banner can offer the correct next
-		// action without clearing persisted credentials.
-		listenForEvent<string>('mls-ws-recovery', (payload) => {
-			connection.setDisconnected(payload);
-		}).then((unlisten) => {
-			unlistenRecovery = unlisten;
-		});
-	});
-
-	async function subscribeToConversation(convoId: string, force = false) {
+	async function subscribeToConversation(
+		convoId: string,
+		options: { force?: boolean; switchToken?: number; throwOnError?: boolean } = {}
+	) {
+		const { force = false, switchToken, throwOnError = false } = options;
 		if (!force && subscribedConvoId === convoId) return;
+
 		const request = Symbol();
 		subscription = request;
-		const account = $auth.user?.did;
-		const isCurrent = () => subscription === request && $auth.user?.did === account && $selectedConversation?.id === convoId;
+		const account = get(auth).user?.did;
+		const isCurrent = () =>
+			mounted &&
+			subscription === request &&
+			(switchToken === undefined || switchToken === activeSwitchToken) &&
+			get(auth).user?.did === account &&
+			get(conversations).selectedId === convoId;
+
 		// On Tauri, the global WS started on login already covers this convo;
-		// spawning an extra per-convo WS here would just open a duplicate
-		// connection. Still tear down any prior per-convo handle and update
-		// the read cursor.
+		// still tear down any prior per-convo handle and advance the read cursor.
 		if (subscribedConvoId) {
-			await api.unsubscribeConversation(subscribedConvoId).catch(() => {});
+			const previousId = subscribedConvoId;
+			subscribedConvoId = null;
+			await api.unsubscribeConversation(previousId).catch(() => {});
 		}
 		if (!isCurrent()) return;
 		subscribedConvoId = convoId;
 
 		if (!isTauri) {
-			// Browser/WASM path: no global WS yet, keep using per-convo
-			// subscribeConversation with its callback-driven delivery.
 			const savedCursor = getCursor(convoId);
-			await api
-				.subscribeConversation(
+			try {
+				await api.subscribeConversation(
 					convoId,
 					(msg) => {
 						if (!isCurrent()) return;
-						const m = msg as Message;
+						const incoming = msg as Message;
 						void messages.refreshLocal(convoId);
-						saveCursor(convoId, m.id);
-						notifyIncomingMessage(m.senderHandle, m.content, convoId);
+						saveCursor(convoId, incoming.id);
+						const currentUserDid = get(auth).user?.did;
+						conversations.applyMessageActivity(convoId, {
+							text: incoming.content,
+							timestamp: incoming.timestamp,
+							isOwn: isSameAccountDid(incoming.senderDid, currentUserDid),
+							isSelected: true
+						});
+						const senderLabel = resolveProfileName(
+							get(profiles).cache,
+							incoming.senderDid,
+							incoming.senderHandle
+						);
+						notifyIncomingMessage(senderLabel, incoming.content, convoId, {
+							senderDid: incoming.senderDid,
+							currentUserDid,
+							onSelectConversation: handleSelectConvo
+						});
 					},
 					(event) => {
 						if (!isCurrent()) return;
-						const e = event as { type: string; data: unknown };
+						const e = event as { type: string; data: unknown; reason?: string };
 						if (e?.type === 'reaction') {
 							messages.applyReaction(e.data as ReactionEvent);
 						} else if (e?.type === 'typing') {
@@ -180,134 +255,388 @@
 						} else if (e?.type === 'messagesChanged') {
 							void messages.refreshCached(convoId);
 						} else if (e?.type === 'fetchNeeded') {
-							const reason = (e as { reason?: string }).reason ?? 'unknown';
+							const reason = e.reason ?? 'unknown';
 							console.warn(`[catmos] WS decrypt failed (${reason}), fetching via HTTP`);
 							messages.fetchFromServer(convoId);
 						}
 					},
-					(status) => {
+					(rawStatus) => {
 						if (!isCurrent()) return;
-						const s = status as { type?: string };
-						if (s?.type === 'connected' || s?.type === 'open') {
+						const normalized = normalizeWsStatus(rawStatus);
+						if (normalized.type === 'connected' || normalized.type === 'open') {
+							if (
+								isDemoActive() &&
+								get(connection).state !== 'connecting' &&
+								get(connection).state !== 'connected'
+							) {
+								return;
+							}
 							connection.setConnected();
-						} else if (s?.type === 'closed' || s?.type === 'error') {
-							connection.setDisconnected(s.type);
+						} else if (
+							normalized.type === 'closed' ||
+							normalized.type === 'error' ||
+							normalized.type === 'disconnected'
+						) {
+							connection.setDisconnected(normalized.reason ?? normalized.type);
 						}
 					},
 					savedCursor ?? undefined
-				)
-				.catch((e: unknown) => {
-					console.error('WebSocket subscribe failed:', e);
-					connection.setDisconnected(String(e));
-				});
+				);
+			} catch (err) {
+				console.error('[catmos] WebSocket subscribe failed:', err);
+				if (subscribedConvoId === convoId) {
+					subscribedConvoId = null;
+				}
+				connection.setDisconnected(err instanceof Error ? err.message : String(err));
+				if (throwOnError) {
+					throw err;
+				}
+				return;
+			}
+		} else if (get(connection).state === 'connecting') {
+			connection.setConnected();
 		}
+
 		if (!isCurrent()) return;
-		connection.setConnected();
-		api.updateCursor(convoId, '').catch(() => {});
+
+		const latestConfirmedId = findLatestConfirmedMessageId(convoId);
+		if (latestConfirmedId) {
+			saveCursor(convoId, latestConfirmedId);
+			api.updateCursor(convoId, latestConfirmedId).catch(() => {});
+		}
 		conversations.markConversationRead(convoId);
 	}
 
-	// Wire reconnect: re-subscribe the active conversation on reconnect
-	connection.onReconnect(async () => {
-		if (subscribedConvoId) {
-			await messages.fetchFromServer(subscribedConvoId);
-			await subscribeToConversation(subscribedConvoId, true);
+	async function bootstrapMetadataIfNeeded(convoId: string, switchToken: number) {
+		if (isDemoActive()) return;
+		const convo = get(conversations).items.find((c) => c.id === convoId);
+		if (!convo || !convo.isGroup || !convo.groupId) return;
+		if (bootstrappedGroupIds.has(convo.groupId)) return;
+		if (convo.avatarDataUrl && convo.description) {
+			bootstrappedGroupIds.add(convo.groupId);
+			return;
 		}
-	});
 
-	async function handleLogin(e: SubmitEvent) {
-		e.preventDefault();
-		await auth.startLogin(loginIdentifier);
+		bootstrappedGroupIds.add(convo.groupId);
+		try {
+			const meta = await api.bootstrapGroupMetadata(convo.groupId);
+			if (switchToken !== activeSwitchToken || !meta) return;
+			const latest = get(conversations).items.find((c) => c.id === convoId);
+			if (!latest) return;
+			const avatarDataUrl =
+				meta.avatarBytesBase64 && meta.avatarContentType
+					? `data:${meta.avatarContentType};base64,${meta.avatarBytesBase64}`
+					: latest.avatarDataUrl;
+			conversations.updateConversation({
+				...latest,
+				displayName: meta.title || latest.displayName,
+				description: meta.description || latest.description,
+				avatarDataUrl
+			});
+		} catch {
+			bootstrappedGroupIds.delete(convo.groupId);
+		}
 	}
 
-	$effect(() => {
-		messages.setAccount($auth.user?.did);
-		if ($auth.user) {
-			// Open a single global WS so we receive events for every convo
-			// the user belongs to, not just the currently-selected one.
-			// Matches iOS/Android/CLI; without it, messages landing in a
-			// background conversation were invisible until the user clicked
-			// into it, which caused the "only see messages from same-account
-			// other-device" symptom.
-			api.subscribeAllEvents().catch((e) =>
-				console.warn('[catmos] subscribeAllEvents failed', e)
-			);
-			conversations.load().then(() => {
-				// Startup reconciliation: leave any group containing a DID the
-				// user has blocked (from another client or a previous interrupted
-				// blockAndLeave). Run once per session.
-				if (!blockReconcileRan) {
-					blockReconcileRan = true;
-					reconcileBlockedConversations().catch((e) =>
-						console.warn('[catmos] block reconciliation failed', e)
-					);
-				}
+	async function handleQuarantineReset(convoId: string) {
+		await quarantine.refresh(convoId);
+		await conversations.load();
+		await messages.fetchFromServer(convoId);
+	}
+
+	function handleLeftConversation() {
+		setShowInspector(false);
+		replyingTo = null;
+		if (subscribedConvoId) {
+			const prev = subscribedConvoId;
+			subscribedConvoId = null;
+			api.unsubscribeConversation(prev).catch(() => {});
+		}
+	}
+
+	async function handleResetLocalStorage() {
+		await auth.logout();
+		resetUi();
+		window.location.reload();
+	}
+
+	function handleSignOutDialogClose() {
+		if (signOutDialog) {
+			signOutDialog.returnValue = '';
+		}
+	}
+
+	async function confirmSignOut() {
+		if (signingOut) return;
+		signingOut = true;
+		try {
+			closeWithReset(signOutDialog, 'confirm');
+			activeSwitchToken += 1;
+			subscription = Symbol();
+			if (subscribedConvoId) {
+				const prev = subscribedConvoId;
+				subscribedConvoId = null;
+				await api.unsubscribeConversation(prev).catch(() => {});
+			}
+			replyingTo = null;
+			blockReconcileRan = false;
+			lastInitializedDid = null;
+			bootstrappedGroupIds.clear();
+			await auth.logout();
+			resetUi();
+			announce('Signed out of Catmos');
+		} catch (err) {
+			showToast({
+				message: err instanceof Error ? err.message : 'Could not sign out cleanly.',
+				tone: 'error'
+			});
+		} finally {
+			signingOut = false;
+		}
+	}
+
+	onMount(() => {
+		mounted = true;
+		setNotificationSelectHandler(handleSelectConvo);
+
+		if (!isDemoActive()) {
+			connection.onReconnect(async () => {
+				if (!mounted || !subscribedConvoId) return;
+				const targetId = subscribedConvoId;
+				await messages.fetchFromServer(targetId);
+				await subscribeToConversation(targetId, { force: true, throwOnError: true });
 			});
 		}
+
+		listenForEvent<Message>('mls-incoming-message', (payload) => {
+			void messages.refreshLocal(payload.conversationId);
+			saveCursor(payload.conversationId, payload.id);
+			const currentUserDid = get(auth).user?.did;
+			conversations.applyMessageActivity(payload.conversationId, {
+				text: payload.content,
+				timestamp: payload.timestamp,
+				isOwn: isSameAccountDid(payload.senderDid, currentUserDid),
+				isSelected: get(conversations).selectedId === payload.conversationId
+			});
+			const senderLabel = resolveProfileName(
+				get(profiles).cache,
+				payload.senderDid,
+				payload.senderHandle
+			);
+			notifyIncomingMessage(senderLabel, payload.content, payload.conversationId, {
+				senderDid: payload.senderDid,
+				currentUserDid,
+				onSelectConversation: handleSelectConvo
+			});
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenMessage = unlisten;
+		});
+
+		listenForEvent<'ConversationsUpdated' | { MessagesUpdated?: { conversation_id: string } }>(
+			'mls://platform-change',
+			(event) => {
+				if (event === 'ConversationsUpdated') {
+					void messages.refreshCached(get(selectedConversation)?.id);
+				} else if (typeof event === 'object' && event.MessagesUpdated) {
+					void messages.refreshLocal(event.MessagesUpdated.conversation_id);
+				}
+			}
+		).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenMessagesChanged = unlisten;
+		});
+
+		listenForEvent<ReactionEvent>('mls-reaction-event', (payload) => {
+			messages.applyReaction(payload);
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenReaction = unlisten;
+		});
+
+		listenForEvent<TypingEvent>('mls-typing-event', (payload) => {
+			messages.applyTyping(payload);
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenTyping = unlisten;
+		});
+
+		listenForEvent<GroupResetEvent>('mls:group-reset', (payload) => {
+			console.log('[catmos] Group reset event:', payload);
+			conversations.load();
+			if (get(conversations).selectedId === payload.convoId) {
+				messages.fetchFromServer(payload.convoId);
+			}
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenGroupReset = unlisten;
+		});
+
+		// Layer 3 quarantine live transitions
+		listenForEvent<QuarantineEnteredEvent>('mls://quarantined', (payload) => {
+			console.warn('[catmos] Conversation quarantined:', payload);
+			quarantine.applyEnteredEvent(payload);
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenQuarantined = unlisten;
+		});
+
+		listenForEvent<QuarantineClearedEvent>('mls://quarantine-cleared', (payload) => {
+			console.log('[catmos] Quarantine cleared:', payload);
+			quarantine.applyClearedEvent(payload);
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenQuarantineCleared = unlisten;
+		});
+
+		// Backend reconnect loops stop on explicit auth/device/MLS failures;
+		// surface the stable category so the banner offers the right recovery action.
+		listenForEvent<string>('mls-ws-recovery', (payload) => {
+			connection.setDisconnected(payload);
+		}).then((unlisten) => {
+			if (!mounted) {
+				unlisten();
+				return;
+			}
+			unlistenRecovery = unlisten;
+		});
 	});
 
-	let currentConversation = $derived($selectedConversation);
-	let selectedRoomId = $derived(currentConversation?.id);
-	let selectedAccountDid = $derived($auth.user?.did);
-
-	/** Resolve display name for 1:1 conversations using profile data. */
-	function resolvedDisplayName(convo: Conversation): string {
-		if (convo.isGroup) return convo.displayName;
-		const otherRaw =
-			convo.members.find((did) => !isSameAccountDid(did, $auth.user?.did)) ?? convo.members[0];
-		const otherDid = stripDidFragment(otherRaw);
-		if (otherDid) {
-			const profile = $profiles.cache.get(otherDid);
-			if (profile) return profile.displayName ?? profile.handle;
-		}
-		if (convo.displayName.startsWith('did:') && otherDid) {
-			return otherDid.slice(0, 20) + '…';
-		}
-		return convo.displayName;
-	}
-
-	let currentDisplayName = $derived(
-		currentConversation ? resolvedDisplayName(currentConversation) : ''
-	);
-
-	// MARK: - Window title
+	// Scope message cache per DID and initialize subscriptions & conversation list on login
 	$effect(() => {
-		document.title = currentConversation
-			? `${currentDisplayName} — Catmos`
-			: 'Catmos';
+		const activeDid = $auth.user?.did;
+		if (isDemoActive()) {
+			return;
+		}
+		messages.setAccount(activeDid);
+		if (!activeDid) {
+			lastInitializedDid = null;
+			blockReconcileRan = false;
+			return;
+		}
+		// ctl #2: never spawn browser MLS worker or call DS until user opts in
+		if (!isTauri && !isMlsOptedInForDid(activeDid)) {
+			return;
+		}
+		if (lastInitializedDid === activeDid) return;
+		lastInitializedDid = activeDid;
+
+		api.subscribeAllEvents().catch((err) => {
+			console.warn('[catmos] subscribeAllEvents failed:', err);
+		});
+
+		conversations.load().then(() => {
+			if (!blockReconcileRan) {
+				blockReconcileRan = true;
+				reconcileBlockedConversations().catch((err) => {
+					console.warn('[catmos] block reconciliation failed:', err);
+				});
+			}
+		});
 	});
 
+	// Window title (zero em-dashes)
 	$effect(() => {
-		const convoId = selectedRoomId;
-		const did = selectedAccountDid;
-		let active = true;
+		if (typeof document === 'undefined') return;
+		document.title = currentConversation ? `${currentDisplayName} · Catmos` : 'Catmos';
+	});
+
+	// Drop stale reply context if the target message leaves the visible window
+	$effect(() => {
+		if (replyingTo && !currentMessages.some((message) => message.id === replyingTo?.id)) {
+			replyingTo = null;
+		}
+	});
+
+	// Track ONLY selectedId + account DID with stale-switch cancellation & cleanup
+	$effect(() => {
+		const selectedId = $conversations.selectedId;
+		const activeDid = $auth.user?.did;
 		replyingTo = null;
-		if (did && convoId) {
-			(async () => {
-				await messages.load(convoId);
-				if (!active) return;
-				await messages.fetchFromServer(convoId);
-				if (!active) return;
-				await subscribeToConversation(convoId);
-				if (active) await quarantine.refresh(convoId);
-			})();
+
+		if (!activeDid || !selectedId) {
+			activeSwitchToken += 1;
+			return;
 		}
+
+		const switchToken = ++activeSwitchToken;
+		const demo = isDemoActive();
+		let active = true;
+
+		(async () => {
+			const existingLoaded = get(messages).byConversation.get(selectedId);
+			if (!demo || !existingLoaded || existingLoaded.length === 0) {
+				await messages.load(selectedId);
+			}
+			if (!active || switchToken !== activeSwitchToken) return;
+
+			if (!demo) {
+				await messages.fetchFromServer(selectedId);
+				if (!active || switchToken !== activeSwitchToken) return;
+			}
+
+			await subscribeToConversation(selectedId, { switchToken });
+			if (!active || switchToken !== activeSwitchToken) return;
+
+			if (!demo) {
+				await quarantine.refresh(selectedId);
+				if (!active || switchToken !== activeSwitchToken) return;
+				await bootstrapMetadataIfNeeded(selectedId, switchToken);
+			}
+		})();
+
 		return () => {
 			active = false;
 			subscription = Symbol();
 			if (subscribedConvoId) {
-				void api.unsubscribeConversation(subscribedConvoId).catch(() => {});
+				const prev = subscribedConvoId;
 				subscribedConvoId = null;
+				void api.unsubscribeConversation(prev).catch(() => {});
 			}
 		};
 	});
 
-	let activeQuarantine = $derived(
-		currentConversation ? ($quarantine[currentConversation.id] ?? null) : null
-	);
+	// Auto-clear search highlight after animation window so repeated jumps work cleanly
+	$effect(() => {
+		const id = $ui.highlightMessageId;
+		if (highlightClearTimer !== null) {
+			clearTimeout(highlightClearTimer);
+			highlightClearTimer = null;
+		}
+		if (id) {
+			highlightClearTimer = setTimeout(() => {
+				setHighlightMessageId(null);
+			}, 2600);
+		}
+	});
 
 	onDestroy(() => {
-		window.removeEventListener('keydown', handleGlobalKeydown);
+		mounted = false;
+		setNotificationSelectHandler(null);
+		if (highlightClearTimer !== null) {
+			clearTimeout(highlightClearTimer);
+		}
 		unlistenMessage?.();
 		unlistenMessagesChanged?.();
 		unlistenReaction?.();
@@ -318,585 +647,364 @@
 		unlistenRecovery?.();
 		if (subscribedConvoId) {
 			api.unsubscribeConversation(subscribedConvoId).catch(() => {});
+			subscribedConvoId = null;
 		}
 	});
-
-	let currentMessages = $derived(
-		currentConversation
-			? ($messages.byConversation.get(currentConversation.id) ?? [])
-			: []
-	);
-	$effect(() => {
-		if (replyingTo && !currentMessages.some((message) => message.id === replyingTo?.messageId)) replyingTo = null;
-	});
-	let currentTypingUsers = $derived(
-		currentConversation
-			? ($messages.typingByConversation.get(currentConversation.id) ?? []).filter(
-					(did) => !isSameAccountDid(did, $auth.user?.did)
-				)
-			: []
-	);
-
-	async function handleSend(content: string) {
-		if (!currentConversation) return;
-		let finalContent = content;
-		if (replyingTo) {
-			finalContent = JSON.stringify({
-				text: content,
-				reply: {
-					messageId: replyingTo.messageId,
-					senderDid: replyingTo.senderDid,
-					preview: replyingTo.preview
-				}
-			});
-			replyingTo = null;
-		}
-		await messages.send(currentConversation.id, finalContent);
-	}
-
-	async function handleSendImage(content: string, image: PreparedImageUpload) {
-		if (currentConversation) {
-			await messages.sendImage(currentConversation.id, content, image);
-		}
-	}
-
-	async function handleSendVoice(
-		audioData: Uint8Array,
-		durationMs: number,
-		waveform: number[],
-		contentType: string
-	) {
-		if (currentConversation) {
-			await messages.sendVoice(
-				currentConversation.id,
-				audioData,
-				durationMs,
-				waveform,
-				contentType
-			);
-		}
-	}
-
-	async function handleTypingChanged(isTyping: boolean) {
-		if (!currentConversation) return;
-		try {
-			await api.sendTyping(currentConversation.id, isTyping);
-		} catch (e) {
-			console.error('Failed to send typing indicator:', e);
-		}
-	}
-
-	function handleSearchNavigate(conversationId: string, messageId: string) {
-		conversations.select(conversationId);
-		// After conversation loads, scroll to the target message
-		requestAnimationFrame(() => {
-			setTimeout(() => {
-				const el = document.querySelector(`[data-message-id="${messageId}"]`);
-				if (el) {
-					el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-					el.classList.add('search-highlight');
-					setTimeout(() => el.classList.remove('search-highlight'), 2000);
-				}
-			}, 300);
-		});
-	}
 </script>
 
 {#if !$auth.user}
-	<div class="login-card">
-		<div class="login-logo">
-			<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-				<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-			</svg>
+	<AuthScreen />
+{:else}
+	<div
+		class="app-shell"
+		class:sidebar-collapsed={$ui.sidebarCollapsed}
+		class:mobile-chat-view={Boolean(currentConversation)}
+	>
+		<div class="sidebar-pane">
+			<Sidebar
+				onSelectConversation={handleSelectConvo}
+				onOpenNewConversation={openNewConversation}
+				onOpenCommandPalette={openCommandPalette}
+				onOpenSettings={openSettings}
+				onOpenInspector={(id: string) => {
+					handleSelectConvo(id);
+					setShowInspector(true);
+				}}
+				onToggleCollapse={toggleSidebar}
+				onRequestSignOut={() => signOutDialog?.showModal()}
+			/>
 		</div>
-		<h1 class="login-title">Catmos</h1>
-		<p class="login-subtitle">End-to-end encrypted messaging on AT Protocol</p>
-		{#if $auth.waitingForOAuth}
-			<div class="oauth-waiting">
-				<div class="oauth-spinner"></div>
-				<p class="oauth-message">Waiting for authentication...</p>
-				<p class="oauth-hint">Complete sign in in your browser</p>
-				<button class="btn btn-secondary" onclick={() => auth.cancelLogin()}>
+
+		<main id="main-thread" class="main-content">
+			<ConnectionStatus />
+
+			{#if currentConversation}
+				<div class="thread-workspace">
+					<div class="thread-column">
+						<ChatHeader
+							conversation={currentConversation}
+							sidebarCollapsed={$ui.sidebarCollapsed}
+							showInspector={$ui.showInspector}
+							onBack={handleMobileBack}
+							onExpandSidebar={toggleSidebar}
+							onOpenSearch={openCommandPalette}
+							onToggleInspector={toggleInspector}
+						/>
+
+						{#if currentQuarantine}
+							<QuarantineBanner
+								conversationId={currentConversation.id}
+								state={currentQuarantine}
+								onResetComplete={() => handleQuarantineReset(currentConversation.id)}
+							/>
+						{/if}
+
+						<MessageList
+							conversation={currentConversation}
+							highlightMessageId={$ui.highlightMessageId}
+							onReply={(msg) => {
+								replyingTo = msg;
+							}}
+						/>
+
+						<Composer
+							conversationId={currentConversation.id}
+							replyTo={replyingTo}
+							disabled={Boolean(currentQuarantine)}
+							disabledReason={currentQuarantine
+								? 'This conversation is paused until its encryption session is reset.'
+								: null}
+							onCancelReply={() => {
+								replyingTo = null;
+							}}
+						/>
+					</div>
+
+					<ConversationInspector
+						conversation={currentConversation}
+						open={$ui.showInspector}
+						onClose={() => setShowInspector(false)}
+						onLeftConversation={handleLeftConversation}
+					/>
+				</div>
+			{:else}
+				<div class="empty-column">
+					{#if $ui.sidebarCollapsed}
+						<div class="empty-toolbar">
+							<button
+								type="button"
+								class="catmos-btn-ghost expand-sidebar-btn"
+								onclick={toggleSidebar}
+								aria-label="Show sidebar"
+								title="Show sidebar"
+							>
+								<Icon name="sidebar" size={18} />
+								<span>Conversations</span>
+							</button>
+						</div>
+					{/if}
+					<EmptyWorkspace
+						onOpenNewConversation={openNewConversation}
+						onOpenCommandPalette={openCommandPalette}
+					/>
+				</div>
+			{/if}
+		</main>
+	</div>
+
+	<NewConversationDialog
+		open={$ui.showNewConversation}
+		onClose={closeNewConversation}
+		onCreated={(id: string) => {
+			handleSelectConvo(id);
+			closeNewConversation();
+		}}
+	/>
+
+	<CommandPalette
+		open={$ui.showCommandPalette}
+		onClose={closeCommandPalette}
+		onSelectConversation={(id: string) => {
+			handleSelectConvo(id);
+			closeCommandPalette();
+		}}
+		onJumpToMessage={(convoId: string, msgId: string) => {
+			handleSelectConvo(convoId);
+			setHighlightMessageId(msgId);
+			closeCommandPalette();
+		}}
+		onOpenNewConversation={() => {
+			closeCommandPalette();
+			openNewConversation();
+		}}
+		onOpenSettings={() => {
+			closeCommandPalette();
+			openSettings();
+		}}
+		onToggleInspector={() => {
+			closeCommandPalette();
+			toggleInspector();
+		}}
+	/>
+
+	<SettingsDialog
+		open={$ui.showSettings}
+		initialTab={$ui.settingsTab}
+		onClose={closeSettings}
+		onRequestSignOut={() => {
+			closeSettings();
+			signOutDialog?.showModal();
+		}}
+		onResetLocalStorage={handleResetLocalStorage}
+	/>
+
+	<dialog
+		bind:this={signOutDialog}
+		class="catmos-dialog sign-out-dialog"
+		closedby="any"
+		use:useDialogLightDismiss
+		onclose={handleSignOutDialogClose}
+	>
+		<div class="dialog-inner">
+			<h1 class="dialog-title">Sign out of Catmos?</h1>
+			<p class="dialog-copy">
+				You will need to sign in with Bluesky again to read or send encrypted messages on this
+				device.
+			</p>
+			<div class="dialog-actions">
+				<button
+					type="button"
+					class="catmos-btn-secondary"
+					use:useDialogSafeAutofocus
+					onclick={() => closeWithReset(signOutDialog, 'cancel')}
+				>
 					Cancel
 				</button>
-			</div>
-		{:else}
-			<form onsubmit={handleLogin}>
-				<input
-					type="text"
-					placeholder="Handle or email"
-					bind:value={loginIdentifier}
-					class="login-input"
-				/>
-				{#if $auth.error}
-					<p class="login-error" role="alert">{$auth.error}</p>
-					<button type="button" class="btn btn-secondary restore-btn" onclick={() => auth.tryRestore()}>
-						Try restoring session
-					</button>
-				{/if}
-				<button type="submit" class="btn btn-primary login-btn" disabled={$auth.loading || !loginIdentifier}>
-					Sign in with Bluesky
-				</button>
-			</form>
-		{/if}
-	</div>
-{:else if currentConversation}
-	<div class="chat-area">
-		<header class="chat-header">
-			<div class="chat-header-left">
 				<button
-					class="mobile-back"
-					onclick={() => {
-						showMembers = false;
-						conversations.select(null);
-					}}
-					title="Back to conversations"
-					aria-label="Back to conversations"
+					type="button"
+					class="catmos-btn-danger"
+					disabled={signingOut}
+					onclick={confirmSignOut}
 				>
-					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<polyline points="15 18 9 12 15 6" />
-					</svg>
+					{signingOut ? 'Signing out...' : 'Sign out'}
 				</button>
-				{#if currentConversation.avatarDataUrl}
-					<img
-						class="chat-header-avatar"
-						src={currentConversation.avatarDataUrl}
-						alt=""
-					/>
-				{/if}
-				<div class="chat-header-info">
-					<h2 class="chat-title">{currentDisplayName}</h2>
-					<div class="chat-subtitle">
-						{#if currentConversation.isGroup}
-							<span class="e2ee-badge">
-								<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-									<path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/>
-								</svg>
-								E2EE
-							</span>
-							<span class="header-divider">&middot;</span>
-							<span class="member-count">{currentConversation.members.length} members</span>
-						{:else}
-							<span class="e2ee-badge">
-								<svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-									<path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zM12 17c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1s3.1 1.39 3.1 3.1v2z"/>
-								</svg>
-								E2EE
-							</span>
-						{/if}
-						{#if currentConversation.description}
-							<span class="header-divider">&middot;</span>
-							<span class="group-description">{currentConversation.description}</span>
-						{/if}
-					</div>
-				</div>
 			</div>
-			<div class="chat-header-actions">
-				<button
-					class="icon-btn"
-					onclick={() => (showSearch = true)}
-					title="Search messages (Cmd+K)"
-				>
-					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-						<circle cx="11" cy="11" r="8" />
-						<line x1="21" y1="21" x2="16.65" y2="16.65" />
-					</svg>
-				</button>
-				{#if currentConversation.isGroup}
-					<button
-						class="icon-btn"
-						class:active={showMembers}
-						onclick={() => (showMembers = !showMembers)}
-						title="Toggle member list"
-					>
-						<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-							<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-							<circle cx="9" cy="7" r="4" />
-							<path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-							<path d="M16 3.13a4 4 0 0 1 0 7.75" />
-						</svg>
-					</button>
-				{/if}
-			</div>
-		</header>
-		<ConnectionStatus />
-		{#if activeQuarantine}
-			<QuarantineBanner
-				conversationId={currentConversation.id}
-				quarantineState={activeQuarantine}
-			/>
-		{/if}
-		<div class="chat-body">
-			<MessageList messages={currentMessages} typingUsers={currentTypingUsers} onReply={(info) => { replyingTo = info; }} />
-			{#if showMembers && currentConversation.isGroup}
-				<MemberList conversationId={currentConversation.id} quarantine={activeQuarantine} />
-			{/if}
 		</div>
-		{#if replyingTo}
-			<ReplyPreview
-				senderName={replyingTo.senderName}
-				preview={replyingTo.preview}
-				onCancel={() => { replyingTo = null; }}
-			/>
-		{/if}
-		<Composer
-			conversationId={currentConversation.id}
-			onSend={handleSend}
-			onSendImage={handleSendImage}
-			onSendVoice={handleSendVoice}
-			onTypingChanged={handleTypingChanged}
-			disabled={activeQuarantine !== null}
-			disabledPlaceholder={activeQuarantine ? 'Conversation paused. Reset to continue.' : undefined}
-		/>
-	</div>
-	<SearchPanel
-		open={showSearch}
-		onClose={() => { showSearch = false; }}
-		onNavigate={handleSearchNavigate}
-	/>
-{:else}
-	<div class="empty-state">
-		<div class="empty-state-content">
-			<svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="var(--text-tertiary)" stroke-width="0.75" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.4; margin-bottom: 16px;">
-				<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-			</svg>
-			<h2>Welcome to Catmos</h2>
-			{#if $auth.user?.did && !isMlsOptedInForDid($auth.user.did)}
-				<p>
-					Encrypted Chat &amp; Labyrinth Backup is off by default on fresh sign-in. Enable it to
-					sync conversations and restore your encrypted PDS history.
-				</p>
-				<a
-					href="/settings/labyrinth"
-					class="btn btn-primary"
-					style="display: inline-block; margin-top: 16px; text-decoration: none;"
-				>
-					Set Up Encrypted Chat &amp; Restore History
-				</a>
-			{:else}
-				<p>Select a conversation or start a new one</p>
-			{/if}
-		</div>
-	</div>
+	</dialog>
 {/if}
 
 <style>
-	/* ── Login ── */
-	.login-card {
-		background: var(--bg-card);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-xl);
-		padding: 40px;
-		width: 380px;
-		text-align: center;
-		box-shadow: var(--shadow-lg);
-	}
-
-	.login-logo {
-		margin-bottom: 16px;
-	}
-
-	.login-title {
-		color: var(--text-primary);
-		font-size: 24px;
-		font-weight: 700;
-		letter-spacing: -0.03em;
-		margin-bottom: 6px;
-	}
-
-	.login-subtitle {
-		color: var(--text-secondary);
-		font-size: 14px;
-		margin-bottom: 28px;
-	}
-
-	.login-input {
-		display: block;
-		width: 100%;
-		padding: 12px 16px;
-		background: var(--bg-input);
-		border: 1px solid var(--border);
-		border-radius: var(--radius-sm);
-		margin-bottom: 12px;
-		color: var(--text-primary);
-		font-size: 15px;
-		transition: border-color var(--transition-fast);
-	}
-
-	.login-input:focus {
-		border-color: var(--accent);
-		outline: none;
-	}
-
-	.login-input::placeholder {
-		color: var(--text-tertiary);
-	}
-
-	.login-error {
-		color: var(--danger);
-		font-size: 13px;
-		margin-bottom: 12px;
-	}
-
-	.btn {
-		padding: 10px 20px;
-		border-radius: var(--radius-sm);
-		font-weight: 600;
-		font-size: 14px;
-		transition: all var(--transition-fast);
-	}
-
-	.btn-primary {
-		background: var(--accent);
-		color: var(--text-on-accent);
-	}
-
-	.btn-primary:hover:not(:disabled) {
-		background: var(--accent-hover);
-	}
-
-	.btn-primary:disabled {
-		opacity: 0.5;
-		cursor: not-allowed;
-	}
-
-	.btn-secondary {
-		background: var(--bg-hover);
-		color: var(--text-primary);
-	}
-
-	.btn-secondary:hover {
-		background: var(--bg-active);
-	}
-
-	.login-btn {
-		width: 100%;
-	}
-
-	.restore-btn {
-		width: 100%;
-		margin-bottom: 12px;
-	}
-
-	.oauth-waiting {
+	.app-shell {
 		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 8px;
+		block-size: 100dvh;
+		inline-size: 100vw;
+		overflow: hidden;
+		background: var(--bg-app);
 	}
 
-	.oauth-spinner {
-		width: 32px;
-		height: 32px;
-		border: 3px solid var(--border);
-		border-top: 3px solid var(--accent);
-		border-radius: var(--radius-full);
-		animation: spin 0.8s linear infinite;
-		margin-bottom: 8px;
-	}
-
-	@keyframes spin {
-		to { transform: rotate(360deg); }
-	}
-
-	.oauth-message {
-		color: var(--text-primary);
-		font-weight: 600;
-	}
-
-	.oauth-hint {
-		color: var(--text-secondary);
-		font-size: 13px;
-		margin-bottom: 8px;
-	}
-
-	/* ── Chat area ── */
-	.chat-area {
-		flex: 1;
+	.sidebar-pane {
 		display: flex;
-		flex-direction: column;
-		background: var(--bg-chat);
-		min-width: 0;
-	}
-
-	.chat-header {
-		height: var(--header-height);
-		padding: 0 20px;
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		border-bottom: 1px solid var(--border);
 		flex-shrink: 0;
-		background: var(--bg-sidebar);
+		inline-size: var(--sidebar-width);
+		block-size: 100%;
+		min-inline-size: 0;
 	}
 
-	.chat-header-left {
-		display: flex;
-		align-items: center;
-		gap: 8px;
-		min-width: 0;
-		flex: 1;
-	}
-
-	.mobile-back {
+	.app-shell.sidebar-collapsed .sidebar-pane {
 		display: none;
-		width: 34px;
-		height: 34px;
-		align-items: center;
-		justify-content: center;
-		border-radius: var(--radius-sm);
-		color: var(--accent);
-		flex-shrink: 0;
 	}
 
-	.mobile-back:hover {
-		background: var(--bg-hover);
-	}
-
-	.chat-header-info {
-		min-width: 0;
-	}
-
-	.chat-header-avatar {
-		width: 32px;
-		height: 32px;
-		border-radius: 50%;
-		object-fit: cover;
-		flex-shrink: 0;
-	}
-
-	.chat-title {
-		font-size: 15px;
-		font-weight: 700;
-		color: var(--text-primary);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		letter-spacing: -0.01em;
-	}
-
-	.chat-subtitle {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		margin-top: 1px;
-	}
-
-	.e2ee-badge {
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		font-size: 11px;
-		font-weight: 600;
-		color: var(--success);
-	}
-
-	.header-divider {
-		color: var(--text-tertiary);
-		font-size: 11px;
-	}
-
-	.member-count {
-		font-size: 12px;
-		color: var(--text-secondary);
-	}
-
-	.group-description {
-		font-size: 12px;
-		color: var(--text-secondary);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-		max-width: 240px;
-	}
-
-	.chat-header-actions {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		flex-shrink: 0;
-	}
-
-	.icon-btn {
-		width: 34px;
-		height: 34px;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		border-radius: var(--radius-sm);
-		color: var(--text-secondary);
-		transition: all var(--transition-fast);
-		flex-shrink: 0;
-	}
-
-	.icon-btn:hover {
-		color: var(--text-primary);
-		background: var(--bg-hover);
-	}
-
-	.icon-btn.active {
-		color: var(--accent);
-		background: var(--bg-selected);
-	}
-
-	.chat-body {
+	.main-content {
 		flex: 1;
 		display: flex;
-		overflow: hidden;
-		min-height: 0;
-	}
-
-	/* ── Empty state ── */
-	.empty-state {
-		flex: 1;
-		display: flex;
-		align-items: center;
-		justify-content: center;
+		flex-direction: column;
+		min-inline-size: 0;
+		min-block-size: 0;
+		block-size: 100%;
 		background: var(--bg-chat);
+		position: relative;
 	}
 
-	.empty-state-content {
-		text-align: center;
+	.thread-workspace {
+		flex: 1;
+		display: flex;
+		min-inline-size: 0;
+		min-block-size: 0;
+		overflow: hidden;
 	}
 
-	.empty-state-content h2 {
-		color: var(--text-primary);
-		font-size: 20px;
-		font-weight: 700;
-		margin-bottom: 6px;
-		letter-spacing: -0.02em;
+	.thread-column {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		min-inline-size: 0;
+		min-block-size: 0;
+		overflow: hidden;
 	}
 
-	.empty-state-content p {
+	.empty-column {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+		min-inline-size: 0;
+		min-block-size: 0;
+	}
+
+	.empty-toolbar {
+		display: flex;
+		align-items: center;
+		padding: var(--space-3) var(--space-4) 0;
+	}
+
+	.expand-sidebar-btn {
+		font-size: var(--text-sm);
+		font-weight: 500;
 		color: var(--text-secondary);
-		font-size: 14px;
 	}
 
-	:global(.search-highlight) {
-		animation: highlight-flash 2s ease-out;
+	.expand-sidebar-btn:hover {
+		color: var(--text-primary);
 	}
 
-	@keyframes highlight-flash {
-		0%, 20% { background-color: var(--accent-hover); }
-		100% { background-color: transparent; }
+	/* Sign-out confirmation modal */
+	.sign-out-dialog {
+		inline-size: min(25rem, calc(100vw - 2rem));
 	}
 
-	@media (max-width: 768px) {
-		.login-card {
-			width: min(100%, 420px);
-			padding: 28px;
+	.dialog-inner {
+		display: flex;
+		flex-direction: column;
+		gap: var(--space-3);
+		padding: var(--space-6);
+	}
+
+	.dialog-title {
+		font-size: var(--text-heading);
+		font-weight: 650;
+		letter-spacing: -0.015em;
+		line-height: 1.3;
+		color: var(--text-primary);
+	}
+
+	.dialog-copy {
+		font-size: var(--text-sm);
+		line-height: 1.5;
+		color: var(--text-secondary);
+		max-inline-size: 48ch;
+	}
+
+	.dialog-actions {
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: var(--space-2);
+		margin-block-start: var(--space-2);
+	}
+
+	/* Mobile drill-down (< 768px) */
+	@media (max-width: 767px) {
+		.sidebar-pane {
+			inline-size: 100%;
 		}
 
-		.chat-header {
-			padding: 0 12px;
+		.app-shell.sidebar-collapsed .sidebar-pane {
+			display: flex;
 		}
 
-		.mobile-back {
-			display: inline-flex;
+		.app-shell.mobile-chat-view .sidebar-pane {
+			display: none;
 		}
 
-		.chat-area {
-			padding-bottom: env(safe-area-inset-bottom);
+		.app-shell:not(.mobile-chat-view) .main-content {
+			display: none;
+		}
+
+		.empty-toolbar {
+			display: none;
+		}
+	}
+
+	/* Progressive directional view transitions on mobile navigation */
+	@media (prefers-reduced-motion: no-preference) {
+		:global(html[data-nav-direction='forward'])::view-transition-old(root) {
+			animation: catmos-slide-out-start 180ms var(--ease-out) both;
+		}
+		:global(html[data-nav-direction='forward'])::view-transition-new(root) {
+			animation: catmos-slide-in-end 200ms var(--ease-out) both;
+		}
+		:global(html[data-nav-direction='backward'])::view-transition-old(root) {
+			animation: catmos-slide-out-end 180ms var(--ease-out) both;
+		}
+		:global(html[data-nav-direction='backward'])::view-transition-new(root) {
+			animation: catmos-slide-in-start 200ms var(--ease-out) both;
+		}
+	}
+
+	@keyframes catmos-slide-out-start {
+		to {
+			transform: translateX(-8%);
+			opacity: 0.7;
+		}
+	}
+
+	@keyframes catmos-slide-in-end {
+		from {
+			transform: translateX(12%);
+			opacity: 0.7;
+		}
+	}
+
+	@keyframes catmos-slide-out-end {
+		to {
+			transform: translateX(12%);
+			opacity: 0.7;
+		}
+	}
+
+	@keyframes catmos-slide-in-start {
+		from {
+			transform: translateX(-8%);
+			opacity: 0.7;
 		}
 	}
 </style>

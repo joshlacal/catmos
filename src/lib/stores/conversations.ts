@@ -4,21 +4,86 @@ import { dedupeAccountDids, isSameAccountDid, stripDidFragment } from '#lib/did.
 import * as api from '#lib/wasm.ts';
 import { createBlock, listOwnBlocks } from '#lib/wasm.ts';
 
-interface ConversationsStore {
+export interface ConversationsStore {
 	items: Conversation[];
 	selectedId: string | null;
 	loading: boolean;
+	error: string | null;
+}
+
+export interface MessageActivityUpdate {
+	text: string;
+	timestamp: string;
+	isOwn: boolean;
+	isSelected?: boolean;
+}
+
+/**
+ * Unwrap structured JSON message content (reply envelopes or embeds) into a
+ * single-line preview string so raw JSON never leaks into sidebars or search.
+ */
+export function extractMessagePreview(content: string | undefined | null): string {
+	if (!content) return '';
+	const trimmed = content.trim();
+	if (!trimmed) return '';
+	if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+		try {
+			const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+			if (typeof parsed.text === 'string' && parsed.text.trim()) {
+				return parsed.text.trim();
+			}
+			if (typeof parsed.content === 'string' && parsed.content.trim()) {
+				return parsed.content.trim();
+			}
+			const embed = parsed.embed as { type?: string } | undefined;
+			if (embed && typeof embed.type === 'string') {
+				switch (embed.type) {
+					case 'image':
+						return 'Photo';
+					case 'audio':
+						return 'Voice message';
+					case 'gif':
+						return 'GIF';
+					case 'post':
+						return 'Shared post';
+					case 'link':
+						return 'Shared link';
+				}
+			}
+		} catch {
+			// Fall through to raw string
+		}
+	}
+	return trimmed;
+}
+
+function sortByRecent(items: Conversation[]): Conversation[] {
+	return [...items].sort((a, b) => {
+		const ta = a.lastMessageAt ? Date.parse(a.lastMessageAt) : 0;
+		const tb = b.lastMessageAt ? Date.parse(b.lastMessageAt) : 0;
+		const safeA = Number.isFinite(ta) ? ta : 0;
+		const safeB = Number.isFinite(tb) ? tb : 0;
+		return safeB - safeA;
+	});
 }
 
 function createConversationsStore() {
 	const { subscribe, set, update } = writable<ConversationsStore>({
 		items: [],
 		selectedId: null,
-		loading: false
+		loading: false,
+		error: null
 	});
 
-	let currentState: ConversationsStore = { items: [], selectedId: null, loading: false };
-	subscribe((s) => { currentState = s; });
+	let currentState: ConversationsStore = {
+		items: [],
+		selectedId: null,
+		loading: false,
+		error: null
+	};
+	subscribe((s) => {
+		currentState = s;
+	});
 
 	return {
 		subscribe,
@@ -33,33 +98,47 @@ function createConversationsStore() {
 			return match?.id ?? null;
 		},
 		async load() {
-			update((s) => ({ ...s, loading: true }));
+			update((s) => ({ ...s, loading: true, error: null }));
 			try {
 				const raw = await api.getConversations();
-				// Deduplicate by ID to prevent Svelte {#each} key collisions
 				const seen = new Set<string>();
-				const items = raw.filter((c) => {
-					if (seen.has(c.id)) return false;
-					seen.add(c.id);
-					return true;
-				});
-				update((s) => ({ ...s, items, loading: false }));
-			} catch {
-				update((s) => ({ ...s, loading: false }));
+				const items = raw
+					.filter((c) => {
+						if (seen.has(c.id)) return false;
+						seen.add(c.id);
+						return true;
+					})
+					.map((c) => ({
+						...c,
+						lastMessage: c.lastMessage ? extractMessagePreview(c.lastMessage) : c.lastMessage
+					}));
+				update((s) => ({ ...s, items, loading: false, error: null }));
+			} catch (err) {
+				const message = err instanceof Error ? err.message : 'Unable to load conversations.';
+				update((s) => ({ ...s, loading: false, error: message }));
 			}
 		},
 		select(id: string | null) {
 			update((s) => ({ ...s, selectedId: id }));
 		},
+		setItems(items: Conversation[], selectedId?: string | null) {
+			update((s) => ({
+				...s,
+				items,
+				selectedId: selectedId === undefined ? s.selectedId : selectedId,
+				loading: false,
+				error: null
+			}));
+		},
 		async createGroup(name: string, memberDids: string[], description?: string) {
 			const conversation = await api.createGroup(name, memberDids, description);
 			update((s) => ({
 				...s,
-				// Avoid duplicate if conversation already in list from a prior load()
 				items: s.items.some((c) => c.id === conversation.id)
 					? s.items
 					: [conversation, ...s.items],
-				selectedId: conversation.id
+				selectedId: conversation.id,
+				error: null
 			}));
 			return conversation;
 		},
@@ -69,13 +148,30 @@ function createConversationsStore() {
 				items: s.items.map((c) => (c.id === conversation.id ? conversation : c))
 			}));
 		},
+		applyMessageActivity(conversationId: string, activity: MessageActivityUpdate) {
+			const preview = extractMessagePreview(activity.text);
+			update((s) => {
+				const idx = s.items.findIndex((c) => c.id === conversationId);
+				if (idx < 0) return s;
+				const isSelected = activity.isSelected ?? s.selectedId === conversationId;
+				const updated = s.items.map((c) => {
+					if (c.id !== conversationId) return c;
+					const nextUnread = activity.isOwn || isSelected ? 0 : (c.unreadCount ?? 0) + 1;
+					return {
+						...c,
+						lastMessage: preview || c.lastMessage,
+						lastMessageAt: activity.timestamp || c.lastMessageAt,
+						unreadCount: nextUnread
+					};
+				});
+				return { ...s, items: sortByRecent(updated) };
+			});
+		},
 		markConversationRead(conversationId: string) {
 			if (!currentState.items.find((room) => room.id === conversationId)?.unreadCount) return;
 			update((s) => ({
 				...s,
-				items: s.items.map((c) =>
-					c.id === conversationId ? { ...c, unreadCount: 0 } : c
-				)
+				items: s.items.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c))
 			}));
 		},
 		async leaveConversation(id: string) {
@@ -85,42 +181,29 @@ function createConversationsStore() {
 				items: s.items.filter((c) => c.id !== id),
 				selectedId: s.selectedId === id ? null : s.selectedId
 			}));
+		},
+		reset() {
+			set({ items: [], selectedId: null, loading: false, error: null });
 		}
 	};
 }
 
 export const conversations = createConversationsStore();
 
-export const selectedConversation = derived(conversations, ($c) =>
-	$c.items.find((item) => item.id === $c.selectedId) ?? null
+export const selectedConversation = derived(
+	conversations,
+	($c) => $c.items.find((item) => item.id === $c.selectedId) ?? null
 );
 
-/**
- * Find every conversation whose member list contains `did`.
- * Used to show "blocking will leave N conversations" UX.
- *
- * Note: `Conversation.members` is `string[]` of DIDs in catmos (not
- * `{did: string}[]` like some other clients).
- */
 export function affectedConversationsFor(did: string): Conversation[] {
 	const state = get(conversations);
-	return state.items.filter((c) => c.members.some((memberDid) => isSameAccountDid(memberDid, did)));
+	return state.items.filter((c) =>
+		c.members.some((memberDid) => isSameAccountDid(memberDid, did))
+	);
 }
 
-/**
- * Publish an `app.bsky.graph.block` for `targetDid`, then leave every shared
- * MLS conversation. The block record is published FIRST so that if a leave
- * fails (or the app crashes mid-flow), the block survives and the startup
- * reconciliation pass (`reconcileBlockedConversations`) will catch up on
- * any remaining groups the next time the app launches.
- *
- * Returns the list of conversation IDs we successfully left.
- */
 export async function blockAndLeave(targetDid: string): Promise<string[]> {
 	const affected = affectedConversationsFor(targetDid);
-
-	// Publish the block first — a failed leave can be retried by startup
-	// reconciliation, but a missing block would leave the UX inconsistent.
 	await createBlock(targetDid);
 
 	const leftIds: string[] = [];
@@ -135,22 +218,12 @@ export async function blockAndLeave(targetDid: string): Promise<string[]> {
 	return leftIds;
 }
 
-/**
- * Startup reconciliation: leave any MLS conversation that contains a DID
- * the current user has blocked. Catches up on blocks made from other
- * clients (iOS, another browser session, etc.) and on any leaves that
- * failed during a previous `blockAndLeave` call.
- *
- * Call this ONCE per app launch after the initial `conversations.load()`
- * has populated the store. Safe to call again if new data arrives, but
- * should be guarded by a flag to avoid repeated API traffic.
- */
 export async function reconcileBlockedConversations(): Promise<number> {
 	let blocked: Set<string>;
 	try {
 		blocked = await listOwnBlocks();
 	} catch (e) {
-		console.warn('[catmos] block reconciliation skipped — listOwnBlocks failed', e);
+		console.warn('[catmos] block reconciliation skipped: listOwnBlocks failed', e);
 		return 0;
 	}
 	if (blocked.size === 0) return 0;

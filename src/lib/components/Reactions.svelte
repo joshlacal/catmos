@@ -1,36 +1,111 @@
+<script module lang="ts">
+	export const QUICK_REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🔥'] as const;
+
+	let nextPickerUid = 0;
+</script>
+
 <script lang="ts">
 	import * as api from '#lib/wasm.ts';
 	import {
 		foldReactionsByAccount,
 		hasAccountReacted,
+		isSameAccountDid,
 		stripDidFragment
 	} from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
 	import { messages } from '#lib/stores/messages.ts';
+	import { profiles, resolveProfileName } from '#lib/stores/profiles.ts';
+	import {
+		positionPopoverFallback,
+		useRovingMenu,
+		type PopoverPlacement
+	} from '#lib/utils/popover.ts';
+	import { announce, showToast } from '#lib/utils/announcer.ts';
+	import Icon from './Icon.svelte';
 
 	let {
 		reactions = {},
 		conversationId,
-		messageId
+		messageId,
+		isOwn = false,
+		showAddTrigger = true
 	}: {
 		reactions: Record<string, string[]>;
 		conversationId: string;
 		messageId: string;
+		isOwn?: boolean;
+		showAddTrigger?: boolean;
 	} = $props();
 
-	let showPicker = $state(false);
+	const pickerUid = ++nextPickerUid;
+	const pickerId = `catmos-react-picker-${pickerUid}`;
+	const anchorName = `--catmos-react-anchor-${pickerUid}`;
+
+	let triggerEl: HTMLButtonElement | undefined = $state();
+	let pickerEl: HTMLDivElement | undefined = $state();
+
+	let placement = $derived<PopoverPlacement>(isOwn ? 'top-end' : 'bottom-start');
+
 	let foldedReactions = $derived(foldReactionsByAccount(reactions));
 
-	const quickEmojis = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+	let reactionEntries = $derived(
+		Object.entries(foldedReactions).filter(([, users]) => users.length > 0)
+	);
+
+	let allVoterDids = $derived.by(() => {
+		const dids = new Set<string>();
+		for (const [, users] of reactionEntries) {
+			for (const did of users) {
+				const bare = stripDidFragment(did);
+				if (bare) dids.add(bare);
+			}
+		}
+		return Array.from(dids);
+	});
+
+	$effect(() => {
+		if (allVoterDids.length > 0) {
+			profiles.resolveProfiles(allVoterDids);
+		}
+	});
 
 	function hasReacted(emoji: string): boolean {
 		return hasAccountReacted(foldedReactions, emoji, $auth.user?.did);
 	}
 
+	function resolveVoterList(dids: string[]): string {
+		const myDid = $auth.user?.did;
+		const names = dids.map((did) =>
+			isSameAccountDid(did, myDid) ? 'You' : resolveProfileName($profiles.cache, did)
+		);
+		return names.join(', ');
+	}
+
+	function closePicker() {
+		try {
+			if (pickerEl && typeof pickerEl.hidePopover === 'function' && pickerEl.matches(':popover-open')) {
+				pickerEl.hidePopover();
+			}
+		} catch {
+			// Ignore if popover API is unavailable in test DOM
+		}
+	}
+
+	function handlePickerToggle(event: Event) {
+		const toggleEvent = event as ToggleEvent;
+		if (toggleEvent.newState === 'open' && pickerEl && triggerEl) {
+			positionPopoverFallback(pickerEl, triggerEl, placement, 6);
+			requestAnimationFrame(() => {
+				const firstBtn = pickerEl?.querySelector<HTMLButtonElement>('button');
+				firstBtn?.focus();
+			});
+		}
+	}
+
 	async function toggleReaction(emoji: string) {
 		const userDid = stripDidFragment($auth.user?.did);
 		if (!userDid) return;
-		const action = hasReacted(emoji) ? 'remove' : 'add';
+		const action: 'add' | 'remove' = hasReacted(emoji) ? 'remove' : 'add';
 
 		messages.applyReaction({
 			conversationId,
@@ -39,12 +114,13 @@
 			emoji,
 			action
 		});
-		showPicker = false;
+		closePicker();
+		announce(action === 'add' ? `Added ${emoji} reaction` : `Removed ${emoji} reaction`);
 
 		try {
 			await api.sendReaction(conversationId, messageId, emoji, action);
-		} catch (e) {
-			console.error('Failed to send reaction:', e);
+		} catch (err) {
+			console.error('[catmos] Failed to send reaction:', err);
 			messages.applyReaction({
 				conversationId,
 				messageId,
@@ -52,49 +128,65 @@
 				emoji,
 				action: action === 'add' ? 'remove' : 'add'
 			});
+			showToast({
+				message: 'Could not update reaction.',
+				tone: 'error'
+			});
 		}
-	}
-
-	function handlePickerKeydown(e: KeyboardEvent) {
-		if (e.key === 'Escape') showPicker = false;
 	}
 </script>
 
-<div class="reactions-container" class:has-reactions={Object.keys(foldedReactions).length > 0}>
-	{#each Object.entries(foldedReactions) as [emoji, users]}
-		<button
-			class="reaction-pill"
-			class:reacted={hasReacted(emoji)}
-			onclick={() => toggleReaction(emoji)}
-			title={users.join(', ')}
-		>
-			<span class="reaction-emoji">{emoji}</span>
-			<span class="reaction-count">{users.length}</span>
-		</button>
-	{/each}
+{#if reactionEntries.length > 0 || showAddTrigger}
+	<div class="reactions-row" class:own={isOwn}>
+		{#each reactionEntries as [emoji, users] (emoji)}
+			{@const reacted = hasReacted(emoji)}
+			{@const voterNames = resolveVoterList(users)}
+			<button
+				type="button"
+				class="reaction-pill"
+				aria-pressed={reacted}
+				onclick={() => toggleReaction(emoji)}
+				title={voterNames}
+				aria-label={`${emoji} ${users.length}, reacted by ${voterNames}. ${
+					reacted ? 'Remove your reaction' : 'Add your reaction'
+				}`}
+			>
+				<span class="reaction-emoji" aria-hidden="true">{emoji}</span>
+				<span class="reaction-count tabular-nums">{users.length}</span>
+			</button>
+		{/each}
 
-	<div class="reaction-add-wrapper">
-		<button
-			class="reaction-add-btn"
-			onclick={() => (showPicker = !showPicker)}
-			title="Add reaction"
-		>
-			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-				<circle cx="12" cy="12" r="10" />
-				<path d="M8 14s1.5 2 4 2 4-2 4-2" />
-				<line x1="9" y1="9" x2="9.01" y2="9" />
-				<line x1="15" y1="9" x2="15.01" y2="9" />
-			</svg>
-		</button>
-
-		{#if showPicker}
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="reaction-picker" onkeydown={handlePickerKeydown}>
-				{#each quickEmojis as emoji}
+		{#if showAddTrigger}
+			<button
+				bind:this={triggerEl}
+				type="button"
+				class="reaction-add-btn"
+				popovertarget={pickerId}
+				style={`anchor-name: ${anchorName};`}
+				aria-label="Add reaction"
+				title="Add reaction"
+			>
+				<Icon name="smile" size={15} />
+			</button>
+			<div
+				bind:this={pickerEl}
+				id={pickerId}
+				popover="auto"
+				class="catmos-popover reaction-picker"
+				data-anchored="true"
+				data-placement={placement}
+				style={`position-anchor: ${anchorName};`}
+				ontoggle={handlePickerToggle}
+				use:useRovingMenu={{ orientation: 'horizontal' }}
+			>
+				{#each QUICK_REACTION_EMOJIS as emoji (emoji)}
+					{@const active = hasReacted(emoji)}
 					<button
+						type="button"
 						class="picker-emoji"
-						class:reacted={hasReacted(emoji)}
+						aria-pressed={active}
 						onclick={() => toggleReaction(emoji)}
+						aria-label={active ? `Remove ${emoji} reaction` : `React with ${emoji}`}
 					>
 						{emoji}
 					</button>
@@ -102,113 +194,129 @@
 			</div>
 		{/if}
 	</div>
-</div>
+{/if}
 
 <style>
-	.reactions-container {
+	.reactions-row {
 		display: flex;
 		flex-wrap: wrap;
-		gap: 4px;
-		margin-top: 4px;
-		min-height: 0;
+		align-items: center;
+		gap: var(--space-1);
+		margin-block-start: var(--space-1);
 	}
 
-	.reactions-container:not(.has-reactions) .reaction-add-wrapper {
-		opacity: 0;
-		transition: opacity var(--transition-fast);
-	}
-
-	:global(.message-row:hover) .reactions-container .reaction-add-wrapper {
-		opacity: 1;
+	.reactions-row.own {
+		justify-content: flex-end;
 	}
 
 	.reaction-pill {
 		display: inline-flex;
 		align-items: center;
-		gap: 4px;
-		padding: 3px 10px;
+		gap: var(--space-1);
+		min-block-size: max(1.75rem, var(--touch-min));
+		padding-block: 0.1875rem;
+		padding-inline: 0.625rem;
 		border-radius: var(--radius-full);
-		background: var(--bg-hover);
-		font-size: 13px;
-		transition: all var(--transition-fast);
-		cursor: pointer;
+		background: var(--bg-surface);
+		border: 1px solid var(--border);
+		color: var(--text-primary);
+		font-size: var(--text-sm);
+		line-height: 1.2;
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
 	}
 
 	.reaction-pill:hover {
-		background: var(--bg-active);
+		background: var(--bg-hover);
+		border-color: var(--border-strong);
 	}
 
-	.reaction-pill.reacted {
+	.reaction-pill[aria-pressed='true'] {
 		background: var(--bg-selected);
-		outline: 1.5px solid var(--accent);
-	}
-
-	.reaction-emoji {
-		font-size: 14px;
-	}
-
-	.reaction-count {
-		font-size: 12px;
-		color: var(--text-secondary);
-		font-weight: 500;
-	}
-
-	.reaction-pill.reacted .reaction-count {
+		border-color: var(--accent-fill);
 		color: var(--text-link);
 	}
 
-	.reaction-add-wrapper {
-		position: relative;
+	.reaction-emoji {
+		font-size: var(--text-body);
+		line-height: 1;
 	}
 
-	.reaction-add-btn {
-		width: 28px;
-		height: 26px;
-		border-radius: var(--radius-full);
-		background: var(--bg-hover);
-		color: var(--text-tertiary);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		transition: all var(--transition-fast);
-	}
-
-	.reaction-add-btn:hover {
-		background: var(--bg-active);
+	.reaction-count {
+		font-size: var(--text-sm);
+		font-weight: 600;
 		color: var(--text-secondary);
 	}
 
-	.reaction-picker {
-		position: absolute;
-		bottom: calc(100% + 6px);
-		left: 0;
-		display: flex;
-		gap: 2px;
-		padding: 6px;
-		background: var(--bg-card);
+	.reaction-pill[aria-pressed='true'] .reaction-count {
+		color: var(--text-link);
+	}
+
+	.reaction-add-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		min-inline-size: max(1.75rem, var(--touch-min));
+		min-block-size: max(1.75rem, var(--touch-min));
+		border-radius: var(--radius-full);
+		background: var(--bg-surface);
 		border: 1px solid var(--border);
-		border-radius: var(--radius-md);
-		box-shadow: var(--shadow-md);
-		z-index: 10;
+		color: var(--text-secondary);
+		transition:
+			background-color var(--dur-fast) var(--ease-out),
+			border-color var(--dur-fast) var(--ease-out),
+			color var(--dur-fast) var(--ease-out);
+	}
+
+	.reaction-add-btn:hover {
+		background: var(--bg-hover);
+		border-color: var(--border-strong);
+		color: var(--text-primary);
+	}
+
+	.reaction-picker {
+		min-inline-size: auto;
+		padding: var(--space-1);
+		border-radius: var(--radius-full);
+	}
+
+	.reaction-picker:popover-open {
+		display: flex;
+		align-items: center;
+		gap: 2px;
 	}
 
 	.picker-emoji {
-		width: 34px;
-		height: 34px;
-		border-radius: var(--radius-sm);
-		font-size: 18px;
-		display: flex;
+		min-inline-size: max(2.25rem, var(--touch-min));
+		min-block-size: max(2.25rem, var(--touch-min));
+		border-radius: var(--radius-full);
+		font-size: 1.125rem;
+		line-height: 1;
+		display: inline-flex;
 		align-items: center;
 		justify-content: center;
-		transition: all var(--transition-fast);
+		transition: background-color var(--dur-fast) var(--ease-out);
+	}
+
+	@media (prefers-reduced-motion: no-preference) {
+		.picker-emoji {
+			transition:
+				background-color var(--dur-fast) var(--ease-out),
+				transform var(--dur-fast) var(--ease-out);
+		}
+
+		.picker-emoji:hover {
+			transform: scale(1.12);
+		}
 	}
 
 	.picker-emoji:hover {
 		background: var(--bg-hover);
-		transform: scale(1.15);
 	}
 
-	.picker-emoji.reacted {
+	.picker-emoji[aria-pressed='true'] {
 		background: var(--bg-selected);
 	}
 </style>
