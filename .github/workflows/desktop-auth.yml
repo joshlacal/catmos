@@ -21,8 +21,8 @@ concurrency:
 env:
   # Sibling checkouts the backend builds against (src-tauri/Cargo.toml path
   # dependencies). Move these together when a dependency changes.
-  PETREL_REF: 05e4f3a38ff319b1fa062372837693df427f83ec
-  PETREL_CATBIRD_REF: 2178d0efca18002848f116efcf8245a2bd104653
+  PETREL_REF: a4d5d480d709e2d3a3195884f9cbbeff878ce5f3
+  PETREL_CATBIRD_REF: 09bc34c06120fcfe5da4cdce6de639c5fb295994
   CATBIRD_MLS_REF: d0ef581ff62dced92807d9117668aee2e4b865b2
   CATBIRD_ATPROTO_REF: 6a179680c1ab3e84c5866cdeb5035a4663b4cc09
   LABYRINTH_REF: ccf596d66cb6760d1f1593154db247eb5f5190d2

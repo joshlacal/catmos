@@ -4,8 +4,8 @@
     "catbird-mls-web": "221fc07b38eccaff628caa14442d6721af170dfd",
     "catbird-atproto": "e3356fd4f3349de1d647e3558964d08449c03b13",
     "labyrinth": "a484e9ef14ddb42d7d7212f1c9eb468ee152acd7",
-    "Petrel": "05e4f3a38ff319b1fa062372837693df427f83ec",
-    "PetrelCatbird": "2178d0efca18002848f116efcf8245a2bd104653"
+    "Petrel": "a4d5d480d709e2d3a3195884f9cbbeff878ce5f3",
+    "PetrelCatbird": "09bc34c06120fcfe5da4cdce6de639c5fb295994"
   },
   "sha256": {
     "src-tauri/Cargo.lock": "ada53b918ca9bd6d548f521c6fe9fa6d0ccf4c284d8288f8e1e67a7f70e87cab",
