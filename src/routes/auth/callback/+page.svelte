@@ -36,11 +36,27 @@
 				return;
 			}
 
+			if (!validated.state || !validated.iss) {
+				if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+					void navigator.serviceWorker
+						.getRegistration()
+						.then((reg) => reg?.update())
+						.catch(() => {});
+				}
+				phase = 'error';
+				errorMessage =
+					'This sign-in was started from an older cached version of Catmos or has expired. Go back to sign in again.';
+				return;
+			}
+
 			await auth.completeOAuthCallbackUrl(rawHref);
 			await goto('/', { replaceState: true });
 		} catch (e) {
 			phase = 'error';
-			errorMessage = `Sign-in failed: ${e instanceof Error ? e.message : String(e)}`;
+			const raw = e instanceof Error ? e.message : String(e);
+			errorMessage = /^Sign-in (?:failed|was cancelled)/i.test(raw)
+				? raw
+				: `Sign-in failed: ${raw}`;
 		}
 	});
 </script>

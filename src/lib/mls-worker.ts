@@ -110,35 +110,47 @@ async function oauthSecretDispatch(
 
 	if (op === 'get') {
 		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readonly');
+		const done = idbTxComplete(tx);
 		const raw = await idbRequest(tx.objectStore(OAUTH_SECRETS_STORE).get(compoundKey));
-		await idbTxComplete(tx);
+		await done;
 		return toUint8ArrayOrNull(raw);
 	}
 	if (op === 'put') {
 		if (!value) throw new Error('OAuth secret store put requires bytes');
 		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		const done = idbTxComplete(tx);
 		tx.objectStore(OAUTH_SECRETS_STORE).put(new Uint8Array(value), compoundKey);
-		await idbTxComplete(tx);
+		await done;
 		return undefined;
 	}
 	if (op === 'delete') {
 		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		const done = idbTxComplete(tx);
 		tx.objectStore(OAUTH_SECRETS_STORE).delete(compoundKey);
-		await idbTxComplete(tx);
+		await done;
 		return undefined;
 	}
 	if (op === 'take') {
 		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		const done = idbTxComplete(tx);
 		const store = tx.objectStore(OAUTH_SECRETS_STORE);
-		const raw = await idbRequest(store.get(compoundKey));
-		if (raw !== undefined) {
-			store.delete(compoundKey);
-		}
-		await idbTxComplete(tx);
+		const raw = await new Promise<unknown>((resolve, reject) => {
+			const req = store.get(compoundKey);
+			req.onsuccess = () => {
+				const found = req.result;
+				if (found !== undefined) {
+					store.delete(compoundKey);
+				}
+				resolve(found);
+			};
+			req.onerror = () => reject(req.error ?? new Error('IndexedDB take get failed'));
+		});
+		await done;
 		return toUint8ArrayOrNull(raw);
 	}
 	if (op === 'delete_namespace') {
 		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		const done = idbTxComplete(tx);
 		const store = tx.objectStore(OAUTH_SECRETS_STORE);
 		const range = IDBKeyRange.bound(prefix, `${ns}\x01`, false, true);
 		await new Promise<void>((resolve, reject) => {
@@ -154,7 +166,7 @@ async function oauthSecretDispatch(
 			};
 			cursorReq.onerror = () => reject(cursorReq.error ?? new Error('Cursor delete failed'));
 		});
-		await idbTxComplete(tx);
+		await done;
 		return undefined;
 	}
 	throw new Error(`Unsupported OAuth secret store operation: ${op}`);
@@ -168,24 +180,27 @@ async function oauthDpopKeyDispatch(
 	const db = await openOAuthIdb();
 	if (op === 'get') {
 		const tx = db.transaction(OAUTH_DPOP_KEYS_STORE, 'readonly');
+		const done = idbTxComplete(tx);
 		const raw = await idbRequest(tx.objectStore(OAUTH_DPOP_KEYS_STORE).get(id));
-		await idbTxComplete(tx);
+		await done;
 		return raw ?? null;
 	}
 	if (op === 'put') {
 		if (!value) throw new Error('DPoP key store put requires entry');
 		const tx = db.transaction(OAUTH_DPOP_KEYS_STORE, 'readwrite');
+		const done = idbTxComplete(tx);
 		tx.objectStore(OAUTH_DPOP_KEYS_STORE).put(
 			{ key: value.key, x: value.x, y: value.y },
 			id
 		);
-		await idbTxComplete(tx);
+		await done;
 		return undefined;
 	}
 	if (op === 'delete') {
 		const tx = db.transaction(OAUTH_DPOP_KEYS_STORE, 'readwrite');
+		const done = idbTxComplete(tx);
 		tx.objectStore(OAUTH_DPOP_KEYS_STORE).delete(id);
-		await idbTxComplete(tx);
+		await done;
 		return undefined;
 	}
 	throw new Error(`Unsupported DPoP key store operation: ${op}`);

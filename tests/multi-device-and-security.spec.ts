@@ -666,4 +666,22 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 		await logout();
 		assert.equal(loggedOutDid, aliceDid, 'logout must revoke Petrel OAuth session upstream');
 	});
+
+	it('keeps HTML navigations network-first and bypasses OAuth routes in the service worker', () => {
+		const swSource = fs.readFileSync(
+			path.join(CATMOS_ROOT, 'src/service-worker/index.ts'),
+			'utf8'
+		);
+		assert.ok(swSource.includes("url.pathname.startsWith('/auth/')"));
+		assert.ok(swSource.includes("url.pathname.startsWith('/oauth/')"));
+		assert.ok(swSource.includes("request.mode === 'navigate'"));
+		assert.ok(swSource.includes("url.pathname.startsWith('/_app/immutable/')"));
+
+		const callbackPage = fs.readFileSync(
+			path.join(CATMOS_ROOT, 'src/routes/auth/callback/+page.svelte'),
+			'utf8'
+		);
+		assert.ok(callbackPage.includes('!validated.state || !validated.iss'));
+		assert.ok(callbackPage.includes('older cached version of Catmos'));
+	});
 });
