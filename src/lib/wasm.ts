@@ -683,6 +683,13 @@ export function clearBrowserAuth(): void {
 	clearPendingOAuthUpgrade();
 }
 
+/** Abandons a pending desktop sign-in, so finishing it in the browser signs no one in. */
+export async function cancelLogin(): Promise<void> {
+	if (isTauri) {
+		return tauriInvoke('cancel_login');
+	}
+}
+
 export async function startLogin(identifier: string): Promise<void> {
 	if (isTauri) {
 		return tauriInvoke('start_login', { identifier });

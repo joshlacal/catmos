@@ -577,7 +577,9 @@ async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Resul
 
 /// Opens the account's sign-in page in the browser and finishes the flow in
 /// the background. The UI hears the result as `oauth-signed-in` or
-/// `oauth-error`.
+/// `oauth-error`. Starting another sign-in, [`cancel_login`] or [`logout`]
+/// makes this flow stale: it then stops waiting, emits nothing and never
+/// activates its account, even if the browser tab is still completed.
 #[tauri::command]
 pub async fn start_login(
     app: tauri::AppHandle,
@@ -586,10 +588,14 @@ pub async fn start_login(
 ) -> Result<(), String> {
     let auth = state.auth().map_err(actionable_error)?;
 
+    let generation = {
+        let _gate = state.login_gate.lock().await;
+        state.invalidate_pending_login()
+    };
+    let mut current = state.login_generation.subscribe();
+
     let bind_port = auth.fixed_callback_port().unwrap_or(0);
-    let listener = TcpListener::bind(("127.0.0.1", bind_port))
-        .await
-        .map_err(|e| format!("Failed to bind callback server: {}", e))?;
+    let listener = bind_callback_listener(bind_port).await?;
     let port = listener
         .local_addr()
         .map_err(|e| format!("Failed to get port: {}", e))?
@@ -610,13 +616,24 @@ pub async fn start_login(
 
     let app_handle = app.clone();
     tokio::spawn(async move {
-        let outcome = match tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            wait_for_callback(listener, &flow.state),
-        )
-        .await
-        {
-            Ok(Ok(query)) => auth.finish_login(&query).await,
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                wait_for_callback(listener, &flow.state),
+            ) => waited,
+            () = async { let _ = current.wait_for(|latest| *latest != generation).await; } => {
+                auth.cancel_login(&flow.state).await;
+                return;
+            }
+        };
+        let is_current =
+            |current: &tokio::sync::watch::Receiver<u64>| *current.borrow() == generation;
+        let outcome = match waited {
+            Ok(Ok(query)) if is_current(&current) => auth.finish_login(&query).await,
+            Ok(Ok(_)) => {
+                auth.cancel_login(&flow.state).await;
+                return;
+            }
             Ok(Err(e)) => {
                 auth.cancel_login(&flow.state).await;
                 Err(e)
@@ -627,6 +644,17 @@ pub async fn start_login(
             }
         };
         let state = app_handle.state::<AppState>();
+        let _gate = state.login_gate.lock().await;
+        if !is_current(&current) {
+            // Cancelled while the authorization was being completed: drop the
+            // session it just stored rather than leave it for the next launch.
+            if let Ok(signed_in) = &outcome {
+                if let Err(e) = auth.logout(&signed_in.did).await {
+                    log_catmos!("A cancelled sign-in could not clear its session: {}", e);
+                }
+            }
+            return;
+        }
         match outcome {
             Ok(signed_in) => {
                 let response = activate_session(&state, &auth, signed_in).await;
@@ -639,6 +667,32 @@ pub async fn start_login(
         }
     });
 
+    Ok(())
+}
+
+/// Binds the loopback callback listener. A fixed port can still be held for a
+/// moment by the sign-in this one replaced, which releases it as soon as it
+/// sees that it is stale.
+async fn bind_callback_listener(port: u16) -> Result<TcpListener, String> {
+    let mut attempts = 0;
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if port != 0 && e.kind() == std::io::ErrorKind::AddrInUse && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(format!("Failed to bind callback server: {}", e)),
+        }
+    }
+}
+
+/// Abandons the pending desktop sign-in, if any. A browser tab that is still
+/// completed afterwards signs no one in.
+#[tauri::command]
+pub async fn cancel_login(state: State<'_, AppState>) -> Result<(), String> {
+    let _gate = state.login_gate.lock().await;
+    state.invalidate_pending_login();
     Ok(())
 }
 
@@ -828,6 +882,10 @@ pub async fn try_restore_session(
 
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let _gate = state.login_gate.lock().await;
+        state.invalidate_pending_login();
+    }
     stop_background_tasks_and_subscriptions(&state).await;
     if let Ok(did) = require_authenticated_did(&state) {
         let mgr = state.mls_manager.clone();
@@ -2691,5 +2749,39 @@ mod tests {
             br#"{"error":"XRPCNotSupported"}"#
         ));
         assert!(!classify_pds_spaces_probe_response(500, b""));
+    }
+}
+
+#[cfg(test)]
+mod login_flow_tests {
+    use super::bind_callback_listener;
+
+    #[tokio::test]
+    async fn a_fixed_callback_port_is_rebound_once_the_stale_flow_releases_it() {
+        let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = held.local_addr().unwrap().port();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            drop(held);
+        });
+        let rebound = bind_callback_listener(port).await.unwrap();
+        assert_eq!(rebound.local_addr().unwrap().port(), port);
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stale_flow_sees_its_generation_end() {
+        let (generation, _) = tokio::sync::watch::channel(0u64);
+        let started = *generation.borrow();
+        let mut current = generation.subscribe();
+        generation.send_modify(|g| *g += 1);
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            current.wait_for(|latest| *latest != started),
+        )
+        .await;
+        assert!(matches!(ended, Ok(Ok(_))));
     }
 }

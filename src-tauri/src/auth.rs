@@ -402,8 +402,10 @@ impl DesktopAuth {
             .map(|(bytes, content_type)| XrpcBody::bytes(bytes, &content_type))
             .transpose()
             .map_err(|e| e.to_string())?;
-        let mut options = CallOptions::default();
-        options.headers = headers;
+        let mut options = CallOptions {
+            headers,
+            ..CallOptions::default()
+        };
         options.transport.timeout = Some(PDS_TIMEOUT);
         options.transport.max_response_bytes = Some(MAX_PDS_RESPONSE_BYTES);
         options.transport.allow_loopback = self.allow_loopback;

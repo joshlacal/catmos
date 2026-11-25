@@ -95,9 +95,10 @@ function createAuthStore() {
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
-		cancelLogin() {
+		async cancelLogin() {
 			cleanupOAuthListeners();
 			set(initialState);
+			await api.cancelLogin().catch(() => undefined);
 		},
 		async logout() {
 			cleanupOAuthListeners();

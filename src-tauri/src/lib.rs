@@ -53,9 +53,24 @@ pub struct AppState {
     pub kp_monitor: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub sync_loop: Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub data_dir: std::path::PathBuf,
+    /// Bumped whenever a pending desktop sign-in stops being the current one:
+    /// a new sign-in, Cancel, or sign-out. A flow only finishes, emits or
+    /// activates its account while the generation it started with is current.
+    pub(crate) login_generation: tokio::sync::watch::Sender<u64>,
+    /// Held while a flow checks that it is current and activates its account,
+    /// and while Cancel or sign-out invalidates it, so the two cannot interleave.
+    pub(crate) login_gate: Mutex<()>,
 }
 
 impl AppState {
+    /// Makes any pending desktop sign-in stale. The caller holds `login_gate`
+    /// when the invalidation must not race an activation.
+    pub(crate) fn invalidate_pending_login(&self) -> u64 {
+        self.login_generation
+            .send_modify(|generation| *generation += 1);
+        *self.login_generation.borrow()
+    }
+
     pub(crate) fn set_session_did(&self, did: String) {
         if let Ok(mut guard) = self.session_did.write() {
             *guard = Some(did);
@@ -113,6 +128,8 @@ pub fn run() {
         kp_monitor: Mutex::new(None),
         sync_loop: Mutex::new(None),
         data_dir,
+        login_generation: tokio::sync::watch::Sender::new(0),
+        login_gate: Mutex::new(()),
     };
 
     tauri::Builder::default()
@@ -120,6 +137,7 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::start_login,
+            commands::cancel_login,
             commands::try_restore_session,
             commands::logout,
             commands::delete_account_data,
