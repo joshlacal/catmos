@@ -628,6 +628,11 @@ pub async fn start_login(
         };
         let is_current =
             |current: &tokio::sync::watch::Receiver<u64>| *current.borrow() == generation;
+        let state = app_handle.state::<AppState>();
+        // One flow at a time from here: a flow that is still current exchanges
+        // its code and, if it became stale meanwhile, clears its session before
+        // a replacement flow can store one for the same account.
+        let _completion = state.login_completion.lock().await;
         let outcome = match waited {
             Ok(Ok(query)) if is_current(&current) => auth.finish_login(&query).await,
             Ok(Ok(_)) => {
@@ -643,7 +648,6 @@ pub async fn start_login(
                 Err("Login timed out".to_string())
             }
         };
-        let state = app_handle.state::<AppState>();
         let _gate = state.login_gate.lock().await;
         if !is_current(&current) {
             // Cancelled while the authorization was being completed: drop the

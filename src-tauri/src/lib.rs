@@ -60,6 +60,10 @@ pub struct AppState {
     /// Held while a flow checks that it is current and activates its account,
     /// and while Cancel or sign-out invalidates it, so the two cannot interleave.
     pub(crate) login_gate: Mutex<()>,
+    /// Held by a flow from its last currency check through the token exchange
+    /// and any cleanup, so a replaced flow's cleanup never runs after the flow
+    /// that replaced it has stored a session for the same account.
+    pub(crate) login_completion: Mutex<()>,
 }
 
 impl AppState {
@@ -130,6 +134,7 @@ pub fn run() {
         data_dir,
         login_generation: tokio::sync::watch::Sender::new(0),
         login_gate: Mutex::new(()),
+        login_completion: Mutex::new(()),
     };
 
     tauri::Builder::default()
