@@ -1,16 +1,16 @@
-use base64::engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL};
+use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use catbird_atproto::jacquard_common::IntoStatic;
 use catbird_mls::payload_types::{MLSMessagePayload, MLSMessageType};
+use petrel::xrpc::{CallOptions, XrpcBody, XrpcClient};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tauri::{Emitter, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::auth::{AuthFailure, DesktopAuth, SessionSigner, SignedIn};
 use crate::recovery::actionable_error;
-use crate::types::string::Did;
 use crate::{AppState, WsHandle};
 
 fn log_file_path() -> std::path::PathBuf {
@@ -152,10 +152,13 @@ fn require_authenticated_did(state: &AppState) -> Result<String, String> {
         })
 }
 
-fn require_auth_token(state: &AppState) -> Result<String, String> {
-    state
-        .current_token()
-        .ok_or_else(|| "Not authenticated".to_string())
+/// The OAuth client and the DID of the account signed in to it.
+fn require_session(state: &AppState) -> Result<(Arc<DesktopAuth>, String), String> {
+    let did = state
+        .current_did()
+        .filter(|did| !did.trim().is_empty())
+        .ok_or_else(|| "Not authenticated".to_string())?;
+    Ok((state.auth()?, did))
 }
 
 fn extract_message_text_and_type(plaintext_json: &str) -> (String, String) {
@@ -364,61 +367,12 @@ pub struct AuthResponse {
     pub granted_scopes: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-struct SessionInfo {
-    did: String,
-    handle: String,
-    granted_scopes: Vec<String>,
-}
-
 fn clear_saved_session_credentials() {
     for key in ["session_id", "user_did", "chat_dpop_jkt"] {
         if let Ok(entry) = crate::native_keyring::entry("catmos", key) {
             let _ = entry.delete_credential();
         }
     }
-}
-
-async fn fetch_session_info(session_id: &str) -> Result<SessionInfo, String> {
-    let nest_url = crate::nest_url();
-
-    let resp = reqwest::Client::new()
-        .get(format!("{}/auth/session", nest_url))
-        .bearer_auth(session_id)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to fetch session info: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Session rejected by nest ({}): {}", status, body));
-    }
-
-    let info: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to decode session info: {}", e))?;
-    let did = info["did"]
-        .as_str()
-        .filter(|did| !did.is_empty())
-        .ok_or_else(|| "Session response missing DID".to_string())?
-        .to_string();
-    let handle = info["handle"].as_str().unwrap_or(&did).to_string();
-    let granted_scopes = info["granted_scopes"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(SessionInfo {
-        did,
-        handle,
-        granted_scopes,
-    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,36 +463,6 @@ pub struct GroupMember {
     pub role: String,
 }
 
-const FIXED_UPGRADE_CALLBACK_HOST: &str = "catbird.blue";
-const FIXED_UPGRADE_CALLBACK_PATH: &str = "/oauth/permission-callback";
-
-fn generate_browser_nonce() -> Result<String, String> {
-    let mut bytes = [0u8; 32];
-    getrandom::fill(&mut bytes).map_err(|e| format!("Failed to generate browser nonce: {e}"))?;
-    Ok(B64URL.encode(bytes))
-}
-
-fn build_desktop_login_url(
-    nest_url: &str,
-    identifier: &str,
-    redirect_to: &str,
-    browser_nonce: &str,
-    client_override: Option<&str>,
-) -> String {
-    let mut url = format!(
-        "{}/auth/login?identifier={}&redirect_to={}&browser_nonce={}",
-        nest_url.trim_end_matches('/'),
-        urlencoding::encode(identifier),
-        urlencoding::encode(redirect_to),
-        urlencoding::encode(browser_nonce),
-    );
-    if let Some(client) = client_override.map(str::trim).filter(|c| !c.is_empty()) {
-        url.push_str("&client=");
-        url.push_str(&urlencoding::encode(client));
-    }
-    url
-}
-
 fn classify_pds_spaces_probe_response(status: u16, body: &[u8]) -> bool {
     let err_code = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
@@ -552,148 +476,42 @@ fn classify_pds_spaces_probe_response(status: u16, body: &[u8]) -> bool {
     status == 200 || status == 400
 }
 
-fn parse_permission_callback_url(url: &reqwest::Url) -> Option<Result<String, String>> {
-    if url.scheme() != "https"
-        || url.host_str() != Some(FIXED_UPGRADE_CALLBACK_HOST)
-        || url.path() != FIXED_UPGRADE_CALLBACK_PATH
-    {
-        return None;
-    }
-    let mut code: Option<String> = None;
-    let mut error: Option<String> = None;
-    let mut error_description: Option<String> = None;
-    for (k, v) in url.query_pairs() {
-        match k.as_ref() {
-            "code" if !v.is_empty() => code = Some(v.into_owned()),
-            "error" if !v.is_empty() => error = Some(v.into_owned()),
-            "error_description" if !v.is_empty() => error_description = Some(v.into_owned()),
+const CALLBACK_PAGE_SIGNED_IN: &str = r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Almost there</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#;
+const CALLBACK_PAGE_CANCELLED: &str = r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Sign-in cancelled</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#;
+
+/// What the callback listener makes of one request line's query string.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CallbackQuery {
+    /// Not an answer to this sign-in: keep listening.
+    Ignore,
+    /// The authorization server's answer, to hand to the OAuth client.
+    Answer { denied: bool },
+}
+
+/// Accepts only a callback that names this sign-in's `state`. Anything else
+/// on the loopback port (another local process, a stale tab) is ignored, so
+/// it cannot end the wait.
+pub(crate) fn classify_callback_query(query: &str, expected_state: &str) -> CallbackQuery {
+    let mut state_matches = false;
+    let mut has_code = false;
+    let mut has_error = false;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "state" => state_matches = value == expected_state,
+            "code" => has_code = !value.is_empty(),
+            "error" => has_error = !value.is_empty(),
             _ => {}
         }
     }
-    if let Some(err) = error {
-        let msg = match error_description {
-            Some(desc) => format!("{err}: {desc}"),
-            None => err,
-        };
-        return Some(Err(msg));
+    if !state_matches || !(has_code || has_error) {
+        return CallbackQuery::Ignore;
     }
-    match code {
-        Some(c) => Some(Ok(c)),
-        None => Some(Err(
-            "Permission upgrade callback missing authorization code".to_string(),
-        )),
-    }
+    CallbackQuery::Answer { denied: has_error }
 }
 
-async fn exchange_oauth_code(
-    nest_url: &str,
-    code: &str,
-    browser_nonce: &str,
-    callback_origin: &str,
-) -> Result<String, String> {
-    let resp = reqwest::Client::new()
-        .post(format!("{}/auth/exchange", nest_url.trim_end_matches('/')))
-        .header("Origin", callback_origin)
-        .json(&serde_json::json!({
-            "code": code,
-            "browser_nonce": browser_nonce,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Authentication exchange request failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Authentication exchange failed ({status}): {body}"));
-    }
-    let data: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to decode authentication exchange response: {e}"))?;
-    data["session_id"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| "Authentication exchange response missing session_id".to_string())
-}
-
-enum CallbackOutcome {
-    Code(String),
-    SessionId(String),
-}
-
-#[tauri::command]
-pub async fn start_login(app: tauri::AppHandle, identifier: String) -> Result<(), String> {
-    let nest_url = crate::nest_url();
-    let browser_nonce = generate_browser_nonce()?;
-
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| format!("Failed to bind callback server: {}", e))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to get port: {}", e))?
-        .port();
-
-    let callback_origin = format!("http://127.0.0.1:{}", port);
-    let redirect_to = format!("{}/callback", callback_origin);
-    // Default to the `catbird` OAuth client profile (which already declares all 6 Labyrinth/Spaces
-    // scopes on prod nest) unless `CATMOS_OAUTH_CLIENT` explicitly overrides it.
-    let client_override = std::env::var("CATMOS_OAUTH_CLIENT").ok();
-    let login_url = build_desktop_login_url(
-        &nest_url,
-        &identifier,
-        &redirect_to,
-        &browser_nonce,
-        client_override.as_deref(),
-    );
-
-    #[allow(deprecated)]
-    {
-        app.shell()
-            .open(&login_url, None)
-            .map_err(|e| e.to_string())?;
-    }
-
-    let app_handle = app.clone();
-    tokio::spawn(async move {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            wait_for_callback(listener),
-        )
-        .await
-        {
-            Ok(Ok(CallbackOutcome::Code(code))) => {
-                match exchange_oauth_code(&nest_url, &code, &browser_nonce, &callback_origin).await
-                {
-                    Ok(session_id) => {
-                        let _ = app_handle.emit("oauth-callback", &session_id);
-                    }
-                    Err(e) => {
-                        log_catmos!("OAuth code exchange error: {}", e);
-                        let _ = app_handle.emit("oauth-error", &e);
-                    }
-                }
-            }
-            Ok(Ok(CallbackOutcome::SessionId(session_id))) => {
-                let _ = app_handle.emit("oauth-callback", &session_id);
-            }
-            Ok(Err(e)) => {
-                log_catmos!("OAuth callback error: {}", e);
-                let _ = app_handle.emit("oauth-error", &e);
-            }
-            Err(_) => {
-                log_catmos!("OAuth callback timed out");
-                let _ = app_handle.emit("oauth-error", "Login timed out");
-            }
-        }
-    });
-
-    Ok(())
-}
-
-async fn wait_for_callback(listener: TcpListener) -> Result<CallbackOutcome, String> {
+/// Waits for the browser to deliver the authorization server's answer and
+/// returns its query string unchanged.
+async fn wait_for_callback(listener: TcpListener, expected_state: &str) -> Result<String, String> {
     const MAX_REQUEST_SIZE: usize = 8192;
 
     loop {
@@ -704,345 +522,209 @@ async fn wait_for_callback(listener: TcpListener) -> Result<CallbackOutcome, Str
 
         let mut buf = vec![0u8; MAX_REQUEST_SIZE];
         let mut total = 0;
-        loop {
+        let complete = loop {
             if total >= MAX_REQUEST_SIZE {
-                return Err("OAuth callback request too large".to_string());
+                break false;
             }
-            let n = stream
-                .read(&mut buf[total..])
-                .await
-                .map_err(|e| format!("Read failed: {}", e))?;
-            if n == 0 {
-                break;
+            match stream.read(&mut buf[total..]).await {
+                Ok(0) | Err(_) => break false,
+                Ok(n) => total += n,
             }
-            total += n;
             if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
+                break true;
             }
-        }
+        };
 
         let mut headers = [httparse::EMPTY_HEADER; 32];
         let mut req = httparse::Request::new(&mut headers);
-        if req.parse(&buf[..total]).is_err() {
-            continue;
-        }
+        let answer = if complete && req.parse(&buf[..total]).is_ok() {
+            req.path
+                .and_then(|path| path.split_once('?'))
+                .filter(|(route, _)| *route == "/callback")
+                .map(|(_, query)| {
+                    (
+                        query.to_string(),
+                        classify_callback_query(query, expected_state),
+                    )
+                })
+        } else {
+            None
+        };
 
-        let path = match req.path {
-            Some(p) => p,
-            None => continue,
-        };
-        let (route, query) = match path.split_once('?') {
-            Some((r, q)) => (r, Some(q)),
-            None => (path, None),
-        };
-        if route != "/callback" {
+        let Some((query, CallbackQuery::Answer { denied })) = answer else {
             let not_found =
                 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(not_found.as_bytes()).await;
             let _ = stream.flush().await;
             continue;
-        }
-
-        let query = query.ok_or("No query string in callback URL")?;
-        let mut code: Option<String> = None;
-        let mut session_id: Option<String> = None;
-        let mut error: Option<String> = None;
-        let mut error_description: Option<String> = None;
-        for param in query.split('&') {
-            if let Some(v) = param.strip_prefix("code=") {
-                let decoded = urlencoding::decode(v)
-                    .unwrap_or_else(|_| v.into())
-                    .into_owned();
-                if !decoded.is_empty() {
-                    code = Some(decoded);
-                }
-            } else if let Some(v) = param.strip_prefix("session_id=") {
-                let decoded = urlencoding::decode(v)
-                    .unwrap_or_else(|_| v.into())
-                    .into_owned();
-                if !decoded.is_empty() {
-                    session_id = Some(decoded);
-                }
-            } else if let Some(v) = param.strip_prefix("error=") {
-                let decoded = urlencoding::decode(v)
-                    .unwrap_or_else(|_| v.into())
-                    .into_owned();
-                if !decoded.is_empty() {
-                    error = Some(decoded);
-                }
-            } else if let Some(v) = param.strip_prefix("error_description=") {
-                let decoded = urlencoding::decode(v)
-                    .unwrap_or_else(|_| v.into())
-                    .into_owned();
-                if !decoded.is_empty() {
-                    error_description = Some(decoded);
-                }
-            }
-        }
-
-        let (html, outcome) = if let Some(err) = error {
-            let detail = match error_description {
-                Some(desc) => format!("{err}: {desc}"),
-                None => err,
-            };
-            (
-                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Sign-in cancelled</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#,
-                Err(detail),
-            )
-        } else if let Some(c) = code {
-            (
-                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Signed in</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#,
-                Ok(CallbackOutcome::Code(c)),
-            )
-        } else if let Some(sid) = session_id {
-            (
-                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Signed in</h1><p>You can close this tab and return to Catmos.</p></div></body></html>"#,
-                Ok(CallbackOutcome::SessionId(sid)),
-            )
-        } else {
-            (
-                r#"<!DOCTYPE html><html><body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;background:#1a1a2e;color:#e0e0e0"><div style="text-align:center"><h1>Sign-in failed</h1><p>Missing authorization code. Return to Catmos to retry.</p></div></body></html>"#,
-                Err("No authorization code or session_id in callback".to_string()),
-            )
         };
 
+        let html = if denied {
+            CALLBACK_PAGE_CANCELLED
+        } else {
+            CALLBACK_PAGE_SIGNED_IN
+        };
         let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             html.len(),
             html
         );
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.flush().await;
-        return outcome;
+        return Ok(query);
     }
 }
 
+/// Opens the account's sign-in page in the browser and finishes the flow in
+/// the background. The UI hears the result as `oauth-signed-in` or
+/// `oauth-error`. Starting another sign-in, [`cancel_login`] or [`logout`]
+/// makes this flow stale: it then stops waiting, emits nothing and never
+/// activates its account, even if the browser tab is still completed.
 #[tauri::command]
-pub async fn upgrade_oauth_scopes(
+pub async fn start_login(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    additional_scopes: Vec<String>,
-) -> Result<AuthResponse, String> {
-    let current_did = require_authenticated_did(&state)?;
-    let current_session_id = require_auth_token(&state)?;
-    let nest_url = crate::nest_url();
+    identifier: String,
+) -> Result<(), String> {
+    let auth = state.auth().map_err(actionable_error)?;
 
-    let mut deduped: Vec<String> = Vec::new();
-    for raw in additional_scopes {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed == "atproto" || deduped.iter().any(|s| s == trimmed) {
-            continue;
-        }
-        deduped.push(trimmed.to_string());
-    }
-    if deduped.is_empty() {
-        return Err("No additional OAuth scopes requested for upgrade.".to_string());
-    }
+    let generation = {
+        let _gate = state.login_gate.lock().await;
+        state.invalidate_pending_login()
+    };
+    let mut current = state.login_generation.subscribe();
 
-    let browser_nonce = generate_browser_nonce()?;
-    let http = reqwest::Client::new();
-    let start_resp = http
-        .post(format!("{}/auth/upgrade", nest_url.trim_end_matches('/')))
-        .bearer_auth(&current_session_id)
-        .json(&serde_json::json!({
-            "additional_scopes": deduped,
-            "browser_nonce": browser_nonce,
-        }))
-        .send()
+    let bind_port = auth.fixed_callback_port().unwrap_or(0);
+    let listener = bind_callback_listener(bind_port).await?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| format!("Failed to get port: {}", e))?
+        .port();
+
+    let flow = auth
+        .begin_login(&identifier, port)
         .await
-        .map_err(|e| format!("Permission upgrade initiation failed: {e}"))?;
+        .map_err(actionable_error)?;
 
-    if !start_resp.status().is_success() {
-        let status = start_resp.status();
-        let body = start_resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Permission upgrade initiation failed ({status}): {body}"
-        ));
-    }
-
-    let start_json: serde_json::Value = start_resp
-        .json()
-        .await
-        .map_err(|e| format!("Decode /auth/upgrade response failed: {e}"))?;
-    let raw_auth_url = start_json["authorization_url"]
-        .as_str()
-        .map(str::trim)
-        .filter(|u| !u.is_empty() && !u.bytes().any(|b| b < 0x20 || b == 0x7f))
-        .ok_or_else(|| "Invalid authorization_url returned from /auth/upgrade".to_string())?;
-    let parsed_auth_url = reqwest::Url::parse(raw_auth_url)
-        .map_err(|e| format!("Malformed authorization_url from /auth/upgrade: {e}"))?;
-    if parsed_auth_url.scheme() != "https"
-        || !parsed_auth_url.username().is_empty()
-        || parsed_auth_url.password().is_some()
+    #[allow(deprecated)]
     {
-        return Err("Insecure authorization_url returned from /auth/upgrade".to_string());
+        if let Err(e) = app.shell().open(flow.authorize_url.as_str(), None) {
+            auth.cancel_login(&flow.state).await;
+            return Err(e.to_string());
+        }
     }
 
-    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, String>>();
-    let tx_nav = Arc::new(std::sync::Mutex::new(Some(tx)));
-    let tx_close = Arc::clone(&tx_nav);
-    let label = format!("oauth-upgrade-{}", uuid::Uuid::new_v4());
-
-    let popup = WebviewWindowBuilder::new(&app, &label, WebviewUrl::External(parsed_auth_url))
-        .title("Grant Spaces Permissions")
-        .inner_size(540.0, 760.0)
-        .resizable(true)
-        .on_navigation(move |url| {
-            if let Some(result) = parse_permission_callback_url(url) {
-                if let Some(sender) = tx_nav.lock().ok().and_then(|mut g| g.take()) {
-                    let _ = sender.send(result);
-                }
-                return false;
+    let app_handle = app.clone();
+    tokio::spawn(async move {
+        let waited = tokio::select! {
+            waited = tokio::time::timeout(
+                std::time::Duration::from_secs(300),
+                wait_for_callback(listener, &flow.state),
+            ) => waited,
+            () = async { let _ = current.wait_for(|latest| *latest != generation).await; } => {
+                auth.cancel_login(&flow.state).await;
+                return;
             }
-            true
-        })
-        .build()
-        .map_err(|e| format!("Failed to open permission upgrade window: {e}"))?;
-
-    popup.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
-            if let Some(sender) = tx_close.lock().ok().and_then(|mut g| g.take()) {
-                let _ = sender.send(Err("Permission upgrade cancelled.".to_string()));
+        };
+        let is_current =
+            |current: &tokio::sync::watch::Receiver<u64>| *current.borrow() == generation;
+        let state = app_handle.state::<AppState>();
+        // One flow at a time from here: a flow that is still current exchanges
+        // its code and, if it became stale meanwhile, clears its session before
+        // a replacement flow can store one for the same account.
+        let _completion = state.login_completion.lock().await;
+        let outcome = match waited {
+            Ok(Ok(query)) if is_current(&current) => auth.finish_login(&query).await,
+            Ok(Ok(_)) => {
+                auth.cancel_login(&flow.state).await;
+                return;
+            }
+            Ok(Err(e)) => {
+                auth.cancel_login(&flow.state).await;
+                Err(e)
+            }
+            Err(_) => {
+                auth.cancel_login(&flow.state).await;
+                Err("Login timed out".to_string())
+            }
+        };
+        let _gate = state.login_gate.lock().await;
+        if !is_current(&current) {
+            // Cancelled while the authorization was being completed: drop the
+            // session it just stored rather than leave it for the next launch.
+            if let Ok(signed_in) = &outcome {
+                if let Err(e) = auth.logout(&signed_in.did).await {
+                    log_catmos!("A cancelled sign-in could not clear its session: {}", e);
+                }
+            }
+            return;
+        }
+        match outcome {
+            Ok(signed_in) => {
+                let response = activate_session(&state, &auth, signed_in).await;
+                let _ = app_handle.emit("oauth-signed-in", &response);
+            }
+            Err(e) => {
+                log_catmos!("OAuth sign-in error: {}", e);
+                let _ = app_handle.emit("oauth-error", &actionable_error(e));
             }
         }
     });
 
-    let code_result = tokio::time::timeout(std::time::Duration::from_secs(300), rx).await;
-    if let Some(win) = tauri::Manager::get_webview_window(&app, &label) {
-        let _ = win.close();
-    }
-    let code = code_result
-        .map_err(|_| "Permission upgrade timed out".to_string())?
-        .map_err(|_| "Permission upgrade cancelled.".to_string())??;
-
-    // Exchange authorization code for candidate session
-    // nest's POST /auth/upgrade/exchange requires Origin: https://catbird.blue matching the fixed
-    // permission callback URL.
-    let ex_resp = http
-        .post(format!(
-            "{}/auth/upgrade/exchange",
-            nest_url.trim_end_matches('/')
-        ))
-        .header("Origin", "https://catbird.blue")
-        .bearer_auth(&current_session_id)
-        .json(&serde_json::json!({
-            "code": code,
-            "browser_nonce": browser_nonce,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("Permission upgrade exchange failed: {e}"))?;
-    if !ex_resp.status().is_success() {
-        let status = ex_resp.status();
-        let body = ex_resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Permission upgrade exchange failed ({status}): {body}"
-        ));
-    }
-    let ex_json: serde_json::Value = ex_resp
-        .json()
-        .await
-        .map_err(|e| format!("Decode /auth/upgrade/exchange failed: {e}"))?;
-    let candidate_session_id = ex_json["candidate_session_id"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "Permission upgrade exchange missing candidate_session_id".to_string())?
-        .to_string();
-    let ex_did = ex_json["did"].as_str().unwrap_or_default();
-    if !ex_did.eq_ignore_ascii_case(&current_did) {
-        return Err("Permission upgrade exchange DID mismatch.".to_string());
-    }
-
-    // Commit candidate session (with one retry on 5xx per nest contract)
-    let commit_url = format!("{}/auth/upgrade/commit", nest_url.trim_end_matches('/'));
-    let mut commit_resp = http
-        .post(&commit_url)
-        .bearer_auth(&candidate_session_id)
-        .send()
-        .await
-        .map_err(|e| format!("Permission upgrade commit failed: {e}"))?;
-    if commit_resp.status().is_server_error() {
-        commit_resp = http
-            .post(&commit_url)
-            .bearer_auth(&candidate_session_id)
-            .send()
-            .await
-            .map_err(|e| format!("Permission upgrade commit retry failed: {e}"))?;
-    }
-    if !commit_resp.status().is_success() {
-        let status = commit_resp.status();
-        let body = commit_resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "Permission upgrade commit failed ({status}): {body}"
-        ));
-    }
-    let commit_json: serde_json::Value = commit_resp
-        .json()
-        .await
-        .map_err(|e| format!("Decode /auth/upgrade/commit failed: {e}"))?;
-    if commit_json["status"].as_str() != Some("committed") {
-        return Err("Permission upgrade commit returned unexpected status.".to_string());
-    }
-    let committed_session_id = commit_json["session_id"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| *s == candidate_session_id)
-        .ok_or_else(|| "Committed session_id did not match candidate_session_id.".to_string())?
-        .to_string();
-    let commit_did = commit_json["did"].as_str().unwrap_or_default();
-    if !commit_did.eq_ignore_ascii_case(&current_did) {
-        return Err("Committed session DID mismatch.".to_string());
-    }
-
-    // Fetch authoritative upgraded session info once
-    let session = fetch_session_info(&committed_session_id)
-        .await
-        .map_err(actionable_error)?;
-    state.set_session_auth(session.did.clone(), committed_session_id.clone());
-    state.mls_manager.set_account_did(Some(session.did.clone()));
-    state
-        .mls_manager
-        .set_session_token(Some(committed_session_id.clone()));
-
-    if let Ok(entry) = crate::native_keyring::entry("catmos", "session_id") {
-        let _ = entry.set_password(&committed_session_id);
-    }
-    if let Ok(entry) = crate::native_keyring::entry("catmos", "user_did") {
-        let _ = entry.set_password(&session.did);
-    }
-
-    Ok(AuthResponse {
-        did: session.did,
-        handle: session.handle,
-        display_name: None,
-        avatar: None,
-        granted_scopes: session.granted_scopes,
-    })
+    Ok(())
 }
 
+/// Binds the loopback callback listener. A fixed port can still be held for a
+/// moment by the sign-in this one replaced, which releases it as soon as it
+/// sees that it is stale.
+async fn bind_callback_listener(port: u16) -> Result<TcpListener, String> {
+    let mut attempts = 0;
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if port != 0 && e.kind() == std::io::ErrorKind::AddrInUse && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(format!("Failed to bind callback server: {}", e)),
+        }
+    }
+}
+
+/// Abandons the pending desktop sign-in, if any. A browser tab that is still
+/// completed afterwards signs no one in.
+#[tauri::command]
+pub async fn cancel_login(state: State<'_, AppState>) -> Result<(), String> {
+    let _gate = state.login_gate.lock().await;
+    state.invalidate_pending_login();
+    Ok(())
+}
+
+/// Whether the account's server implements Spaces. A server that does
+/// answers a request with no `space` parameter with 400, not "not supported".
 #[tauri::command]
 pub async fn labyrinth_probe_pds_spaces(state: State<'_, AppState>) -> Result<bool, String> {
-    let session_id = match state.current_token() {
-        Some(tok) if !tok.trim().is_empty() => tok,
-        _ => return Ok(false),
+    let Ok((auth, did)) = require_session(&state) else {
+        return Ok(false);
     };
-    let nest_url = crate::nest_url();
-    let resp = match reqwest::Client::new()
-        .get(format!(
-            "{}/xrpc/com.atproto.space.getSpace",
-            nest_url.trim_end_matches('/')
-        ))
-        .bearer_auth(&session_id)
-        .send()
+    let response = match auth
+        .pds_exchange(
+            &did,
+            http::Method::GET,
+            "com.atproto.space.getSpace",
+            Vec::new(),
+            http::HeaderMap::new(),
+            None,
+        )
         .await
     {
-        Ok(r) => r,
+        Ok(response) => response,
         Err(_) => return Ok(false),
     };
-    let status = resp.status().as_u16();
-    let body = resp.bytes().await.unwrap_or_default();
-    Ok(classify_pds_spaces_probe_response(status, &body))
+    Ok(classify_pds_spaces_probe_response(
+        response.status().as_u16(),
+        response.body(),
+    ))
 }
 
 #[tauri::command]
@@ -1115,142 +797,114 @@ pub async fn labyrinth_restore_conversation_history(
     Ok(count)
 }
 
-#[tauri::command]
-pub async fn complete_login(
-    state: State<'_, AppState>,
-    session_id: String,
-) -> Result<AuthResponse, String> {
-    let session = fetch_session_info(&session_id)
-        .await
-        .map_err(actionable_error)?;
-
-    state.set_session_auth(session.did.clone(), session_id.clone());
-    state.mls_manager.set_account_did(Some(session.did.clone()));
+/// Binds the app to a signed-in account: the transport signs with its
+/// session, and background sync starts if the account has opted in.
+async fn activate_session(
+    state: &AppState,
+    auth: &Arc<DesktopAuth>,
+    signed_in: SignedIn,
+) -> AuthResponse {
+    state.set_session_did(signed_in.did.clone());
     state
         .mls_manager
-        .set_session_token(Some(session_id.clone()));
+        .set_account_did(Some(signed_in.did.clone()));
+    state.mls_manager.set_account_auth(Some((
+        signed_in.pds.clone(),
+        Arc::new(SessionSigner::new(Arc::clone(auth), signed_in.did.clone())),
+    )));
 
     // ctl #2: Chat/Spaces is strictly OFF by default on fresh sign-ins.
-    if state.mls_manager.is_opted_in(&session.did) {
+    if state.mls_manager.is_opted_in(&signed_in.did) {
         let mgr = state.mls_manager.clone();
-        let did_for_sync = session.did.clone();
+        let did_for_sync = signed_in.did.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Err(e) = mgr.sync(&did_for_sync) {
                 log_catmos!("Initial unified MLS sync warning: {}", e);
             }
         })
         .await;
-        start_kp_monitor(&state, session.did.clone()).await;
-        start_sync_loop(&state, session.did.clone()).await;
+        start_kp_monitor(state, signed_in.did.clone()).await;
+        start_sync_loop(state, signed_in.did.clone()).await;
     }
 
-    if let Ok(entry) = crate::native_keyring::entry("catmos", "session_id") {
-        let _ = entry.set_password(&session_id);
-    }
     if let Ok(entry) = crate::native_keyring::entry("catmos", "user_did") {
-        let _ = entry.set_password(&session.did);
+        let _ = entry.set_password(&signed_in.did);
     }
 
-    Ok(AuthResponse {
-        did: session.did,
-        handle: session.handle,
+    AuthResponse {
+        did: signed_in.did,
+        handle: signed_in.handle,
         display_name: None,
         avatar: None,
-        granted_scopes: session.granted_scopes,
-    })
+        granted_scopes: signed_in.granted_scopes,
+    }
+}
+
+fn sign_out_locally(state: &AppState) {
+    state.mls_manager.set_account_did(None);
+    state.mls_manager.set_account_auth(None);
+    state.clear_session_auth();
+    clear_saved_session_credentials();
 }
 
 #[tauri::command]
 pub async fn try_restore_session(
     state: State<'_, AppState>,
 ) -> Result<Option<AuthResponse>, String> {
-    let session_id = crate::native_keyring::entry("catmos", "session_id")
-        .and_then(|e| e.get_password())
-        .ok();
-    let did = crate::native_keyring::entry("catmos", "user_did")
-        .and_then(|e| e.get_password())
-        .ok();
+    // A session id from the gateway this app used to sign in through is of
+    // no use to the direct client. Dropping it means one more sign-in.
+    if let Ok(entry) = crate::native_keyring::entry("catmos", "session_id") {
+        let _ = entry.delete_credential();
+    }
 
-    match (session_id, did) {
-        (Some(sid), stored_did) => {
-            let session = match fetch_session_info(&sid).await {
-                Ok(session) => session,
-                Err(e) => {
-                    if crate::session_restore::session_error_invalidates_credentials(&e) {
-                        log_catmos!("Stored session was rejected; clearing saved login: {}", e);
-                        clear_saved_session_credentials();
-                        state.clear_session_auth();
-                        state.mls_manager.set_account_did(None);
-                        state.mls_manager.set_session_token(None);
-                        return Ok(None);
-                    }
-                    log_catmos!(
-                        "Stored session could not be restored yet; keeping saved login: {}",
-                        e
-                    );
-                    return Err(actionable_error(e));
-                }
-            };
-
-            if let Some(ref d) = stored_did {
-                if d != &session.did {
-                    log_catmos!(
-                        "Saved DID {} did not match nest session DID {}; using nest session DID",
-                        d,
-                        session.did
-                    );
-                }
-            }
-            log_catmos!("Restoring session for DID: {}", session.did);
-            state.set_session_auth(session.did.clone(), sid.clone());
-            state.mls_manager.set_account_did(Some(session.did.clone()));
-            state.mls_manager.set_session_token(Some(sid.clone()));
-
-            // ctl #2: Only initialize MLS runtime + background sync if explicitly opted in.
-            if state.mls_manager.is_opted_in(&session.did) {
-                let mgr = state.mls_manager.clone();
-                let did_for_sync = session.did.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = mgr.sync(&did_for_sync) {
-                        log_catmos!("Restored unified MLS sync warning: {}", e);
-                    }
-                })
-                .await;
-                start_kp_monitor(&state, session.did.clone()).await;
-                start_sync_loop(&state, session.did.clone()).await;
-            }
-
-            if let Ok(entry) = crate::native_keyring::entry("catmos", "user_did") {
-                let _ = entry.set_password(&session.did);
-            }
-            log_catmos!("Session restored: handle={}", session.handle);
-
-            Ok(Some(AuthResponse {
-                did: session.did,
-                handle: session.handle,
-                display_name: None,
-                avatar: None,
-                granted_scopes: session.granted_scopes,
-            }))
+    let auth = state.auth().map_err(actionable_error)?;
+    match auth.restore().await {
+        Ok(Some(signed_in)) => {
+            log_catmos!("Restoring session for DID: {}", signed_in.did);
+            let response = activate_session(&state, &auth, signed_in).await;
+            log_catmos!("Session restored: handle={}", response.handle);
+            Ok(Some(response))
         }
-        _ => Ok(None),
+        Ok(None) => Ok(None),
+        Err(AuthFailure::SignedOut(reason)) => {
+            log_catmos!(
+                "Stored session is no longer usable; clearing saved login: {}",
+                reason
+            );
+            sign_out_locally(&state);
+            Ok(None)
+        }
+        Err(AuthFailure::Retryable(reason)) => {
+            log_catmos!(
+                "Stored session could not be restored yet; keeping saved login: {}",
+                reason
+            );
+            Err(actionable_error(reason))
+        }
     }
 }
 
 #[tauri::command]
 pub async fn logout(state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let _gate = state.login_gate.lock().await;
+        state.invalidate_pending_login();
+    }
     stop_background_tasks_and_subscriptions(&state).await;
     if let Ok(did) = require_authenticated_did(&state) {
         let mgr = state.mls_manager.clone();
+        let did_for_wipe = did.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            let _ = mgr.sign_out_and_wipe(&did);
+            let _ = mgr.sign_out_and_wipe(&did_for_wipe);
         })
         .await;
+        if let Ok(auth) = state.auth() {
+            if let Err(e) = auth.logout(&did).await {
+                log_catmos!("Sign-out could not clear the saved session: {}", e);
+            }
+        }
     }
-    state.mls_manager.set_account_did(None);
-    state.mls_manager.set_session_token(None);
-    state.clear_session_auth();
-    clear_saved_session_credentials();
+    sign_out_locally(&state);
     Ok(())
 }
 
@@ -1295,10 +949,12 @@ pub async fn delete_account_data(
     }
 
     stop_background_tasks_and_subscriptions(&state).await;
-    state.mls_manager.set_account_did(None);
-    state.mls_manager.set_session_token(None);
-    state.clear_session_auth();
-    clear_saved_session_credentials();
+    if let Ok(auth) = state.auth() {
+        if let Err(e) = auth.logout(&target_did).await {
+            log_catmos!("Account deletion could not clear the saved session: {}", e);
+        }
+    }
+    sign_out_locally(&state);
     Ok(())
 }
 
@@ -1814,51 +1470,43 @@ pub async fn fetch_new_messages(
     Ok(messages)
 }
 
+const PUBLIC_APPVIEW: &str = "https://public.api.bsky.app";
+/// `app.bsky.actor.getProfiles` accepts at most this many actors per call.
+const PROFILES_PER_REQUEST: usize = 25;
+
 #[tauri::command]
 pub async fn get_profiles(
     state: State<'_, AppState>,
     dids: Vec<String>,
 ) -> Result<Vec<ProfileView>, String> {
+    use petrel_api::generated::app::bsky::actor::get_profiles::{GetProfiles, Parameters};
+
     if dids.is_empty() {
         return Ok(vec![]);
     }
-
-    let token = require_auth_token(&state)?;
-    let client = reqwest::Client::new();
-    let mut url =
-        reqwest::Url::parse("https://public.api.bsky.app/xrpc/app.bsky.actor.getProfiles")
-            .map_err(|e| e.to_string())?;
-
-    for did in &dids {
-        url.query_pairs_mut().append_pair("actors", did);
+    let (auth, _) = require_session(&state)?;
+    // Public profile data: sent without the account's credentials.
+    let client = auth.public_client(PUBLIC_APPVIEW)?;
+    let mut profiles = Vec::with_capacity(dids.len());
+    for chunk in dids.chunks(PROFILES_PER_REQUEST) {
+        let actors = chunk
+            .iter()
+            .map(|did| {
+                petrel_core::AtIdentifier::parse(did.as_str())
+                    .map_err(|e| format!("invalid actor `{did}`: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = client
+            .send::<GetProfiles>(Parameters::new(actors), (), &CallOptions::default())
+            .await
+            .map_err(|e| format!("Profile fetch failed: {e}"))?;
+        profiles.extend(output.profiles.into_iter().map(|p| ProfileView {
+            did: p.did.to_string(),
+            handle: p.handle.to_string(),
+            display_name: p.display_name,
+            avatar: p.avatar.map(|uri| uri.to_string()),
+        }));
     }
-
-    let resp = client
-        .get(url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| format!("Profile fetch failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Profile fetch failed: {}", resp.status()));
-    }
-
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let profiles = data["profiles"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|p| ProfileView {
-                    did: p["did"].as_str().unwrap_or("").to_string(),
-                    handle: p["handle"].as_str().unwrap_or("").to_string(),
-                    display_name: p["displayName"].as_str().map(|s| s.to_string()),
-                    avatar: p["avatar"].as_str().map(|s| s.to_string()),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     Ok(profiles)
 }
 
@@ -1942,18 +1590,6 @@ pub async fn update_cursor(
     Ok(())
 }
 
-fn parse_did(s: &str) -> Result<Did, String> {
-    Did::new_owned(s).map_err(|e| format!("invalid DID `{s}`: {e}"))
-}
-
-fn parse_lexicon_json<'de, T>(body: &'de [u8]) -> std::result::Result<T::Output, String>
-where
-    T: serde::Deserialize<'de> + IntoStatic,
-{
-    let parsed: T = serde_json::from_slice(body).map_err(|e| e.to_string())?;
-    Ok(parsed.into_static())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResult {
@@ -1968,45 +1604,54 @@ pub async fn search_users(
     state: State<'_, AppState>,
     query: String,
 ) -> Result<Vec<SearchResult>, String> {
+    use petrel_api::generated::app::bsky::actor::search_actors_typeahead::{
+        Parameters, SearchActorsTypeahead,
+    };
+
     if query.trim().is_empty() {
         return Ok(vec![]);
     }
-
-    let token = require_auth_token(&state)?;
-    let client = reqwest::Client::new();
-    let url = reqwest::Url::parse_with_params(
-        "https://public.api.bsky.app/xrpc/app.bsky.actor.searchActorsTypeahead",
-        &[("q", query.as_str()), ("limit", "10")],
-    )
-    .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get(url)
-        .bearer_auth(&token)
-        .send()
+    let (auth, _) = require_session(&state)?;
+    let client = auth.public_client(PUBLIC_APPVIEW)?;
+    let mut parameters = Parameters::new();
+    parameters.q = Some(query);
+    parameters.limit = 10;
+    let output = client
+        .send::<SearchActorsTypeahead>(parameters, (), &CallOptions::default())
         .await
-        .map_err(|e| format!("Search failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Search failed: {}", resp.status()));
-    }
-
-    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-    let results = data["actors"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .map(|a| SearchResult {
-                    did: a["did"].as_str().unwrap_or("").to_string(),
-                    handle: a["handle"].as_str().unwrap_or("").to_string(),
-                    display_name: a["displayName"].as_str().map(|s| s.to_string()),
-                    avatar: a["avatar"].as_str().map(|s| s.to_string()),
-                })
-                .collect()
+        .map_err(|e| format!("Search failed: {e}"))?;
+    Ok(output
+        .actors
+        .into_iter()
+        .map(|a| SearchResult {
+            did: a.did.to_string(),
+            handle: a.handle.to_string(),
+            display_name: a.display_name,
+            avatar: a.avatar.map(|uri| uri.to_string()),
         })
-        .unwrap_or_default();
+        .collect())
+}
 
-    Ok(results)
+/// An XRPC client for the delivery service and the options that carry a
+/// token the account's server minted for `method`.
+async fn delivery_service_call(
+    auth: &DesktopAuth,
+    did: &str,
+    method: &str,
+) -> Result<(XrpcClient, CallOptions), String> {
+    let audience = format!(
+        "{}#{}",
+        crate::mls::TauriMlsManager::home_ds_did(),
+        crate::auth::DELIVERY_SERVICE_ID
+    );
+    let token = auth.service_token(did, &audience, method).await?;
+    let mut bearer = http::HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| "service token is not a valid header value".to_string())?;
+    bearer.set_sensitive(true);
+    let mut options = CallOptions::default();
+    options.headers.insert(http::header::AUTHORIZATION, bearer);
+    let client = auth.public_client(&crate::mls::TauriMlsManager::home_ds_endpoint())?;
+    Ok((client, options))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2021,69 +1666,29 @@ pub async fn check_opt_in_status(
     state: State<'_, AppState>,
     dids: Vec<String>,
 ) -> Result<Vec<OptInStatusResult>, String> {
+    use petrel_api::generated::com::atproto::repo::list_records::{ListRecords, Parameters};
+    use petrel_catbird::generated::blue::catbird::chat::get_devices;
+
     if dids.is_empty() {
         return Ok(vec![]);
     }
-
-    let token = require_auth_token(&state)?;
-    let client = reqwest::Client::new();
-    let home_ds_did = crate::mls::TauriMlsManager::home_ds_did();
-    let home_ds_url = crate::mls::TauriMlsManager::home_ds_endpoint();
-    let sa_resp = client
-        .get(format!(
-            "{}/xrpc/com.atproto.server.getServiceAuth",
-            crate::nest_url().trim_end_matches('/')
-        ))
-        .query(&[
-            ("aud", home_ds_did.as_str()),
-            ("lxm", "blue.catbird.chat.getDevices"),
-        ])
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| format!("getServiceAuth for getDevices failed: {e}"))?;
-
-    if !sa_resp.status().is_success() {
-        return Err(format!(
-            "getServiceAuth for getDevices failed: {}",
-            sa_resp.status()
-        ));
-    }
-    let sa_json: serde_json::Value = sa_resp.json().await.map_err(|e| e.to_string())?;
-    let service_jwt = sa_json
-        .get("token")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "getServiceAuth missing token".to_string())?;
-
-    let url = format!(
-        "{}/xrpc/blue.catbird.chat.getDevices",
-        home_ds_url.trim_end_matches('/')
-    );
-    let parsed_dids: Vec<Did> = dids
+    let (auth, own_did) = require_session(&state)?;
+    let parsed_dids = dids
         .iter()
-        .map(|did| parse_did(did))
+        .map(|did| crate::auth::parse_did(did))
         .collect::<Result<Vec<_>, _>>()?;
-    let query_params: Vec<(&str, &str)> = parsed_dids
-        .iter()
-        .map(|d| ("userDids", d.as_str()))
-        .collect();
 
-    let resp = client
-        .get(&url)
-        .query(&query_params)
-        .bearer_auth(service_jwt)
-        .send()
+    let (ds, options) = delivery_service_call(&auth, &own_did, get_devices::NSID).await?;
+    let response = ds
+        .query(
+            get_devices::NSID,
+            parsed_dids.iter().map(|did| ("userDids", did.as_str())),
+            &options,
+        )
         .await
-        .map_err(|e| format!("Opt-in check failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Opt-in check failed: {}", resp.status()));
-    }
-
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    let output = parse_lexicon_json::<
-        catbird_atproto::blue_catbird::chat::get_devices::GetDevicesOutput<String>,
-    >(body.as_ref())?;
+        .map_err(|e| format!("Opt-in check failed: {e}"))?;
+    let output: get_devices::Output =
+        petrel_core::from_json(&response.body).map_err(|e| e.to_string())?;
 
     let mut active_dids: std::collections::HashSet<String> = output
         .devices
@@ -2091,34 +1696,25 @@ pub async fn check_opt_in_status(
         .map(|d| d.user_did.as_str().to_string())
         .collect();
 
-    for did in &dids {
+    let pds = auth.pds_client(&own_did)?;
+    let collection: petrel_core::Nsid = "blue.catbird.chat.device"
+        .parse()
+        .map_err(|_| "invalid collection".to_string())?;
+    for did in &parsed_dids {
         if active_dids.contains(did.as_str()) {
             continue;
         }
-        if let Ok(pds_resp) = client
-            .get(format!(
-                "{}/xrpc/com.atproto.repo.listRecords",
-                crate::nest_url().trim_end_matches('/')
-            ))
-            .query(&[
-                ("repo", did.as_str()),
-                ("collection", "blue.catbird.chat.device"),
-                ("limit", "1"),
-            ])
-            .bearer_auth(&token)
-            .send()
+        let mut parameters = Parameters::new(
+            petrel_core::AtIdentifier::Did(did.clone()),
+            collection.clone(),
+        );
+        parameters.limit = 1;
+        if let Ok(page) = pds
+            .send::<ListRecords>(parameters, (), &CallOptions::default())
             .await
         {
-            if pds_resp.status().is_success() {
-                if let Ok(json) = pds_resp.json::<serde_json::Value>().await {
-                    if json
-                        .get("records")
-                        .and_then(|r| r.as_array())
-                        .is_some_and(|arr| !arr.is_empty())
-                    {
-                        active_dids.insert(did.clone());
-                    }
-                }
+            if !page.records.is_empty() {
+                active_dids.insert(did.as_str().to_string());
             }
         }
     }
@@ -2354,33 +1950,8 @@ pub async fn report_spam(
     reported_did: String,
     reason: Option<String>,
 ) -> Result<(), String> {
-    let token = require_auth_token(&state)?;
-    let client = reqwest::Client::new();
-    let home_ds_did = crate::mls::TauriMlsManager::home_ds_did();
-    let home_ds_url = crate::mls::TauriMlsManager::home_ds_endpoint();
-    let sa_resp = client
-        .get(format!(
-            "{}/xrpc/com.atproto.server.getServiceAuth",
-            crate::nest_url().trim_end_matches('/')
-        ))
-        .query(&[
-            ("aud", home_ds_did.as_str()),
-            ("lxm", "blue.catbird.chat.reportSpam"),
-        ])
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| format!("getServiceAuth for reportSpam failed: {e}"))?;
-    if !sa_resp.status().is_success() {
-        return Err(format!(
-            "getServiceAuth for reportSpam failed: {}",
-            sa_resp.status()
-        ));
-    }
-    let sa_json: serde_json::Value = sa_resp.json().await.map_err(|e| e.to_string())?;
-    let service_jwt = sa_json["token"]
-        .as_str()
-        .ok_or_else(|| "getServiceAuth missing token".to_string())?;
+    const METHOD: &str = "blue.catbird.chat.reportSpam";
+    let (auth, did) = require_session(&state)?;
 
     let mut body = serde_json::json!({
         "convoId": conversation_id,
@@ -2389,22 +1960,17 @@ pub async fn report_spam(
     if let Some(r) = reason {
         body["reason"] = serde_json::Value::String(r);
     }
+    let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
 
-    let resp = client
-        .post(format!(
-            "{}/xrpc/blue.catbird.chat.reportSpam",
-            home_ds_url.trim_end_matches('/')
-        ))
-        .bearer_auth(service_jwt)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("reportSpam failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("reportSpam failed ({status}): {text}"));
-    }
+    let (ds, options) = delivery_service_call(&auth, &did, METHOD).await?;
+    ds.procedure(
+        METHOD,
+        std::iter::empty::<(&str, &str)>(),
+        Some(XrpcBody::json(body)),
+        &options,
+    )
+    .await
+    .map_err(|e| format!("reportSpam failed: {e}"))?;
     Ok(())
 }
 
@@ -2431,115 +1997,73 @@ pub async fn republish_group_metadata(
     Ok(())
 }
 
+const BLOCK_COLLECTION: &str = "app.bsky.graph.block";
+
 #[tauri::command]
 pub async fn create_block(
     state: State<'_, AppState>,
     subject_did: String,
 ) -> Result<String, String> {
-    let token = require_auth_token(&state)?;
-    let did = require_authenticated_did(&state)?;
-    let nest_url = crate::nest_url();
+    use petrel_api::generated::app::bsky::graph::block::Block;
+    use petrel_api::generated::com::atproto::repo::create_record::{CreateRecord, Input};
+    use petrel_core::ToValue;
 
-    let body = serde_json::json!({
-        "repo": did,
-        "collection": "app.bsky.graph.block",
-        "record": {
-            "$type": "app.bsky.graph.block",
-            "subject": subject_did,
-            "createdAt": chrono::Utc::now().to_rfc3339(),
-        },
-    });
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/xrpc/com.atproto.repo.createRecord", nest_url))
-        .bearer_auth(&token)
-        .json(&body)
-        .send()
+    let (auth, did) = require_session(&state)?;
+    let record = Block::new(
+        crate::auth::parse_did(&subject_did)?,
+        petrel_core::Datetime::now().map_err(|e| e.to_string())?,
+    )
+    .to_value()
+    .map_err(|e| e.to_string())?;
+    let input = Input::new(
+        petrel_core::AtIdentifier::Did(crate::auth::parse_did(&did)?),
+        BLOCK_COLLECTION
+            .parse()
+            .map_err(|_| "invalid collection".to_string())?,
+        record,
+    );
+    let output = auth
+        .pds_client(&did)?
+        .send::<CreateRecord>((), input, &CallOptions::default())
         .await
-        .map_err(|e| format!("createBlock request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status().as_u16();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("createBlock failed: {} {}", status, body));
-    }
-
-    let result: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse createBlock response: {}", e))?;
-
-    let uri = result
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "createBlock response missing `uri`".to_string())?
-        .to_string();
-
-    Ok(uri)
+        .map_err(|e| format!("createBlock failed: {e}"))?;
+    Ok(output.uri.to_string())
 }
 
 #[tauri::command]
 pub async fn list_own_blocks(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let token = require_auth_token(&state)?;
-    let did = require_authenticated_did(&state)?;
-    let nest_url = crate::nest_url();
+    use petrel_api::generated::com::atproto::repo::list_records::{ListRecords, Parameters};
 
-    let client = reqwest::Client::new();
+    let (auth, did) = require_session(&state)?;
+    let client = auth.pds_client(&did)?;
+    let repo = petrel_core::AtIdentifier::Did(crate::auth::parse_did(&did)?);
+    let collection: petrel_core::Nsid = BLOCK_COLLECTION
+        .parse()
+        .map_err(|_| "invalid collection".to_string())?;
+
     let mut blocked: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
-
     for _page in 0..1000 {
-        let mut req = client
-            .get(format!("{}/xrpc/com.atproto.repo.listRecords", nest_url))
-            .bearer_auth(&token)
-            .query(&[
-                ("repo", did.as_str()),
-                ("collection", "app.bsky.graph.block"),
-                ("limit", "100"),
-            ]);
-        if let Some(c) = cursor.as_deref() {
-            req = req.query(&[("cursor", c)]);
-        }
-
-        let resp = req
-            .send()
+        let mut parameters = Parameters::new(repo.clone(), collection.clone());
+        parameters.limit = 100;
+        parameters.cursor = cursor.clone();
+        let page = client
+            .send::<ListRecords>(parameters, (), &CallOptions::default())
             .await
-            .map_err(|e| format!("listOwnBlocks request failed: {}", e))?;
+            .map_err(|e| format!("listOwnBlocks failed: {e}"))?;
 
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("listOwnBlocks failed: {} {}", status, body));
-        }
-
-        let page: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse listRecords page: {}", e))?;
-
-        let records = page.get("records").and_then(|v| v.as_array());
-        let record_count = records.map(|r| r.len()).unwrap_or(0);
-        if let Some(recs) = records {
-            for rec in recs {
-                if let Some(subject) = rec
-                    .get("value")
-                    .and_then(|v| v.get("subject"))
-                    .and_then(|v| v.as_str())
-                {
-                    blocked.push(subject.to_string());
+        let record_count = page.records.len();
+        for record in page.records {
+            if let petrel_core::Value::Object(mut fields) = record.value {
+                if let Some(petrel_core::Value::String(subject)) = fields.remove("subject") {
+                    blocked.push(subject);
                 }
             }
         }
-
-        let next = page
-            .get("cursor")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if next.is_none() || record_count == 0 {
+        if page.cursor.is_none() || record_count == 0 || page.cursor == cursor {
             break;
         }
-        cursor = next;
+        cursor = page.cursor;
     }
 
     Ok(blocked)
@@ -2962,8 +2486,8 @@ pub async fn labyrinth_list_circle_owner_states(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_desktop_login_url, classify_pds_spaces_probe_response, cleanup_ws_handle,
-        generate_browser_nonce, parse_permission_callback_url, ui_message_from_row,
+        classify_callback_query, classify_pds_spaces_probe_response, cleanup_ws_handle,
+        ui_message_from_row, wait_for_callback, CallbackQuery,
     };
     use catbird_mls::payload_types::{
         MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload,
@@ -3146,27 +2670,63 @@ mod tests {
     }
 
     #[test]
-    fn desktop_login_url_includes_43_char_browser_nonce_and_omits_client_by_default() {
-        let nonce = generate_browser_nonce().expect("browser nonce");
-        assert_eq!(nonce.len(), 43);
-        let default_url = build_desktop_login_url(
-            "https://api.catbird.blue",
-            "swan.place",
-            "http://127.0.0.1:43210/callback",
-            &nonce,
-            None,
+    fn callback_listener_accepts_only_this_sign_ins_state() {
+        let state = "49152.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        assert_eq!(
+            classify_callback_query(
+                &format!("code=abc&state={state}&iss=https%3A%2F%2Fas"),
+                state
+            ),
+            CallbackQuery::Answer { denied: false }
         );
-        assert!(default_url.contains("browser_nonce="));
-        assert!(!default_url.contains("client=catmos"));
+        assert_eq!(
+            classify_callback_query(&format!("error=access_denied&state={state}"), state),
+            CallbackQuery::Answer { denied: true }
+        );
+        assert_eq!(
+            classify_callback_query("code=abc&state=49152.someone-elses", state),
+            CallbackQuery::Ignore
+        );
+        assert_eq!(
+            classify_callback_query(&format!("state={state}"), state),
+            CallbackQuery::Ignore
+        );
+        assert_eq!(
+            classify_callback_query("code=abc", state),
+            CallbackQuery::Ignore
+        );
+    }
 
-        let override_url = build_desktop_login_url(
-            "https://api.catbird.blue",
-            "swan.place",
-            "http://127.0.0.1:43210/callback",
-            &nonce,
-            Some("catmos"),
-        );
-        assert!(override_url.contains("&client=catmos"));
+    #[tokio::test]
+    async fn callback_listener_ignores_strangers_and_returns_the_query_unchanged() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let state = "49152.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let waiting = tokio::spawn(async move { wait_for_callback(listener, state).await });
+
+        async fn get(addr: std::net::SocketAddr, path: &str) -> String {
+            let mut socket = TcpStream::connect(addr).await.unwrap();
+            socket
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = String::new();
+            socket.read_to_string(&mut response).await.unwrap();
+            response
+        }
+
+        assert!(get(addr, "/favicon.ico").await.starts_with("HTTP/1.1 404"));
+        assert!(get(addr, "/callback?code=forged&state=1.forged")
+            .await
+            .starts_with("HTTP/1.1 404"));
+        let query = format!("code=real&state={state}&iss=https%3A%2F%2Fas.example");
+        assert!(get(addr, &format!("/callback?{query}"))
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(waiting.await.unwrap(), Ok(query));
     }
 
     #[test]
@@ -3194,64 +2754,38 @@ mod tests {
         ));
         assert!(!classify_pds_spaces_probe_response(500, b""));
     }
+}
 
-    #[test]
-    fn permission_callback_parser_matches_fixed_catbird_blue_callback_only() {
-        let ok_url =
-            reqwest::Url::parse("https://catbird.blue/oauth/permission-callback?code=abc123")
-                .unwrap();
-        assert_eq!(
-            parse_permission_callback_url(&ok_url),
-            Some(Ok("abc123".to_string()))
-        );
+#[cfg(test)]
+mod login_flow_tests {
+    use super::bind_callback_listener;
 
-        let err_url = reqwest::Url::parse(
-            "https://catbird.blue/oauth/permission-callback?error=access_denied&error_description=User%20cancelled",
-        )
-        .unwrap();
-        assert_eq!(
-            parse_permission_callback_url(&err_url),
-            Some(Err("access_denied: User cancelled".to_string()))
-        );
-
-        let other_url = reqwest::Url::parse("https://swan.place/oauth/authorize?foo=bar").unwrap();
-        assert_eq!(parse_permission_callback_url(&other_url), None);
+    #[tokio::test]
+    async fn a_fixed_callback_port_is_rebound_once_the_stale_flow_releases_it() {
+        let held = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = held.local_addr().unwrap().port();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            drop(held);
+        });
+        let rebound = bind_callback_listener(port).await.unwrap();
+        assert_eq!(rebound.local_addr().unwrap().port(), port);
+        release.await.unwrap();
     }
 
     #[tokio::test]
-    async fn exchange_oauth_code_sends_matching_origin_header() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let expected_origin = "http://127.0.0.1:42424";
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut buf = vec![0u8; 4096];
-            let n = socket.read(&mut buf).await.unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]).to_string();
-            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"session_id\":\"sess-ok-123456\"}";
-            socket.write_all(resp.as_bytes()).await.unwrap();
-            req
-        });
-
-        let session_id = super::exchange_oauth_code(
-            &format!("http://{}", addr),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-            expected_origin,
+    async fn a_stale_flow_sees_its_generation_end() {
+        let (generation, _) = tokio::sync::watch::channel(0u64);
+        let started = *generation.borrow();
+        let mut current = generation.subscribe();
+        generation.send_modify(|g| *g += 1);
+        let ended = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            current.wait_for(|latest| *latest != started),
         )
-        .await
-        .expect("exchange should succeed");
-        assert_eq!(session_id, "sess-ok-123456");
-
-        let raw_req = server.await.unwrap();
-        assert!(
-            raw_req
-                .lines()
-                .any(|l| l.eq_ignore_ascii_case(&format!("origin: {expected_origin}"))),
-            "POST /auth/exchange must send Origin header matching callback origin; got:\n{raw_req}"
-        );
+        .await;
+        assert!(matches!(ended, Ok(Ok(_))));
     }
 }

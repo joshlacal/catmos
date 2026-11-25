@@ -40,6 +40,10 @@ for package, relative in {
     "atproto-spaces": "catbird-atproto/atproto-spaces/Cargo.toml",
     "labyrinth": "labyrinth/Cargo.toml",
     "labyrinth-protocol": "labyrinth/labyrinth-protocol/Cargo.toml",
+    "petrel": "Petrel/rust/petrel/Cargo.toml",
+    "petrel-core": "Petrel/rust/petrel-core/Cargo.toml",
+    "petrel-api": "Petrel/rust/petrel-api/Cargo.toml",
+    "petrel-catbird": "PetrelCatbird/rust/petrel-catbird/Cargo.toml",
 }.items():
     manifests = [Path(p["manifest_path"]).resolve() for p in metadata["packages"] if p["name"] == package]
     if manifests != [(root.parent / relative).resolve()]:

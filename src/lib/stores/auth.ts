@@ -2,10 +2,7 @@ import { get, writable } from 'svelte/store';
 import * as api from '#lib/wasm.ts';
 import { listenForEvent, isTauri } from '#lib/wasm.ts';
 import { REQUIRED_LABYRINTH_OAUTH_SCOPES } from '#lib/labyrinth-ui.ts';
-import {
-	normalizeSessionId,
-	parseTauriOAuthCallbackPayload
-} from '#lib/oauth-callback.ts';
+import { normalizeSessionId } from '#lib/oauth-callback.ts';
 import type { AuthState } from '#lib/tauri.ts';
 import { profiles } from './profiles.ts';
 
@@ -58,22 +55,11 @@ function createAuthStore() {
 			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
 			try {
 				if (isTauri) {
-					// Tauri: validate oauth-callback IPC payload before completing login
-					unlistenOAuth = await listenForEvent<string>('oauth-callback', async (rawPayload) => {
+					// Tauri: the desktop backend finishes the OAuth flow itself and
+					// reports the signed-in account. Validate the IPC payload first.
+					unlistenOAuth = await listenForEvent<unknown>('oauth-signed-in', async (rawPayload) => {
 						try {
-							const parsed = parseTauriOAuthCallbackPayload(rawPayload);
-							if (parsed.kind === 'error') {
-								throw new Error(
-									parsed.errorDescription
-										? `${parsed.error}: ${parsed.errorDescription}`
-										: parsed.error
-								);
-							}
-							const sessionId =
-								parsed.kind === 'code'
-									? await api.exchangeOAuthCode(parsed.code)
-									: parsed.sessionId;
-							const user = await api.completeLogin(sessionId);
+							const user = api.parseDesktopSignIn(rawPayload);
 							await fetchOwnProfile(user);
 							set({ user, loading: false, error: null, waitingForOAuth: false });
 						} catch (e) {
@@ -101,6 +87,7 @@ function createAuthStore() {
 						cleanupOAuthListeners();
 					});
 				}
+				// Desktop: opens the account's sign-in page in the system browser.
 				// Browser: startLogin redirects to nest OAuth — page navigates away.
 				await api.startLogin(identifier);
 			} catch (e) {
@@ -108,9 +95,10 @@ function createAuthStore() {
 				set({ user: null, loading: false, error: String(e), waitingForOAuth: false });
 			}
 		},
-		cancelLogin() {
+		async cancelLogin() {
 			cleanupOAuthListeners();
 			set(initialState);
+			await api.cancelLogin().catch(() => undefined);
 		},
 		async logout() {
 			cleanupOAuthListeners();
@@ -152,17 +140,10 @@ function createAuthStore() {
 				throw new Error('Cannot upgrade OAuth scopes without an authenticated session.');
 			}
 			if (isTauri) {
-				update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
-				try {
-					const user = await api.upgradeOAuthScopesDesktop(scopes);
-					await fetchOwnProfile(user);
-					set({ user, loading: false, error: null, waitingForOAuth: false });
-					return;
-				} catch (e) {
-					const message = e instanceof Error ? e.message : String(e);
-					update((s) => ({ ...s, loading: false, error: message, waitingForOAuth: false }));
-					throw e;
-				}
+				// The desktop app asks for every permission at sign-in, so a
+				// missing one means the grant predates it: sign in again.
+				await this.startLogin(current.user.handle || current.user.did);
+				return;
 			}
 			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
 			try {

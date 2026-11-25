@@ -683,6 +683,13 @@ export function clearBrowserAuth(): void {
 	clearPendingOAuthUpgrade();
 }
 
+/** Abandons a pending desktop sign-in, so finishing it in the browser signs no one in. */
+export async function cancelLogin(): Promise<void> {
+	if (isTauri) {
+		return tauriInvoke('cancel_login');
+	}
+}
+
 export async function startLogin(identifier: string): Promise<void> {
 	if (isTauri) {
 		return tauriInvoke('start_login', { identifier });
@@ -792,24 +799,24 @@ export async function probePdsSpacesSupport(
 }
 
 /**
- * Run progressive OAuth scope upgrade (`POST /auth/upgrade` -> native popup callback
- * -> `exchange` -> `commit`) inside the Tauri desktop host without touching prod `nest`.
+ * Validate the account the desktop backend reports on its `oauth-signed-in`
+ * event after it has completed the OAuth flow.
  */
-export async function upgradeOAuthScopesDesktop(
-	requestedScopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES
-): Promise<AuthState> {
-	const additionalScopes = buildUpgradeAdditionalScopes(requestedScopes);
-	if (additionalScopes.length === 0) {
-		throw new Error('No additional OAuth scopes requested for upgrade.');
+export function parseDesktopSignIn(payload: unknown): AuthState {
+	if (typeof payload !== 'object' || payload === null) {
+		throw new Error('Invalid desktop sign-in payload');
 	}
-	const raw = await tauriInvoke<AuthState & { granted_scopes?: unknown }>('upgrade_oauth_scopes', {
-		additionalScopes
-	});
-	const grantedScopes = raw.grantedScopes ?? parseGrantedScopes(raw.granted_scopes);
+	const raw = payload as Record<string, unknown>;
+	if (typeof raw.did !== 'string') {
+		throw new Error('Desktop sign-in payload is missing the account DID');
+	}
+	const did = normalizeAccountDid(raw.did);
+	const handle =
+		typeof raw.handle === 'string' && raw.handle.trim() ? raw.handle.trim().slice(0, 253) : did;
 	return {
-		...raw,
-		did: normalizeAccountDid(raw.did),
-		grantedScopes
+		did,
+		handle,
+		grantedScopes: parseGrantedScopes(raw.grantedScopes ?? raw.granted_scopes)
 	};
 }
 
@@ -1063,15 +1070,7 @@ export async function completeOAuthScopeUpgrade(
 export async function completeLogin(sessionId: string): Promise<AuthState> {
 	const validatedSessionId = normalizeSessionId(sessionId);
 	if (isTauri) {
-		const raw = await tauriInvoke<AuthState & { granted_scopes?: unknown }>('complete_login', {
-			sessionId: validatedSessionId
-		});
-		const grantedScopes = raw.grantedScopes ?? parseGrantedScopes(raw.granted_scopes);
-		return {
-			...raw,
-			did: normalizeAccountDid(raw.did),
-			grantedScopes
-		};
+		throw new Error('The desktop app completes sign-in in its backend.');
 	}
 	const resp = await bffFetch('/auth/session', { method: 'GET' }, validatedSessionId);
 	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
