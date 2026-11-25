@@ -37,11 +37,10 @@ import {
 import {
 	__setWorkerFactoryForTests,
 	BROWSER_DEVICE_ID_PREFIX,
-	completeLogin,
-	completeOAuthScopeUpgrade,
-	consumePendingUpgradeReturnPath,
+	completeOAuthRedirect,
 	deleteAccountData,
 	enableMlsAndEnroll,
+	getBrowserOAuthConfig,
 	getOrCreateBrowserDeviceId,
 	getOrCreateMlsDbKey,
 	initWasm,
@@ -50,7 +49,6 @@ import {
 	probePdsSpacesSupport,
 	readBrowserAuth,
 	readBrowserDeviceId,
-	startOAuthScopeUpgrade,
 	tryRestoreSession
 } from '../src/lib/wasm.ts';
 import type { WorkerApi } from '../src/lib/mls-worker.ts';
@@ -504,6 +502,9 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 		]);
 		assert.deepEqual(CATMOS_SVELTEKIT_CSP_DIRECTIVES['object-src'], ['none']);
 		assert.deepEqual(CATMOS_SVELTEKIT_CSP_DIRECTIVES['frame-ancestors'], ['none']);
+		assert.ok(CATMOS_WEB_CONNECT_ORIGINS.includes('https:'));
+		assert.ok(CATMOS_WEB_CONNECT_ORIGINS.includes('https://api.catbird.blue'));
+		assert.ok(CATMOS_WEB_CONNECT_ORIGINS.includes('https://cloudflare-dns.com'));
 		assert.ok(CATMOS_WEB_CONNECT_ORIGINS.includes('https://chat.catbird.blue'));
 		assert.ok(CATMOS_WEB_CONNECT_ORIGINS.includes('wss://chat.catbird.blue'));
 
@@ -526,7 +527,7 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 		assert.ok(!tauriCsp.includes("'unsafe-eval'"));
 	});
 
-	it('normalizes DIDs per catbird-mls, fails closed on missing OAuth scopes, and runs progressive /auth/upgrade -> exchange -> commit', async () => {
+	it('normalizes DIDs per catbird-mls, fails closed on missing OAuth scopes, and runs direct Petrel CAB OAuth + Spaces probe', async () => {
 		assert.equal(normalizeAccountDid('  DID:PLC:AbCdEf987#dev-1 '), 'did:plc:AbCdEf987');
 		assert.equal(
 			normalizeAccountDid('did:key:z6MkpTHR8VNsBxYAAWHut2Geadd9jSwuBV8xRoAnwWsdvktH#dev-2'),
@@ -540,18 +541,57 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 			assert.throws(() => normalizeAccountDid(invalidDid));
 		}
 
-		const aliceDid = 'did:plc:UpgradeUser01';
-		const initialSessionId = '77777777-7777-4777-8777-777777777777';
-		const candidateSessionId = '88888888-8888-4888-8888-888888888888';
+		const metadata = JSON.parse(
+			fs.readFileSync(path.join(CATMOS_ROOT, 'static/oauth/client-metadata.json'), 'utf8')
+		) as { client_id: string; jwks_uri: string; scope: string; redirect_uris: string[] };
+		const browserOAuth = getBrowserOAuthConfig();
+		assert.equal(browserOAuth.clientId, metadata.client_id);
+		assert.equal(`${browserOAuth.cabUrl}/.well-known/jwks.json`, metadata.jwks_uri);
+		assert.ok(metadata.redirect_uris.includes('https://catmos.catbird.blue/auth/callback'));
+		assert.ok(!metadata.scope.includes('transition:generic'));
+		assert.ok(metadata.scope.includes('rpc:*?aud=did:web:chat.catbird.blue%23atproto_mls'));
 
-		let workerOpened = false;
+		const aliceDid = 'did:plc:UpgradeUser01';
+		let unifiedClientOpened = false;
+		let capturedPdsEndpoint = '';
+		let activeScopes: string[] = ['atproto'];
+		let pdsProbeResponse: { status: number; body: Record<string, unknown> } = {
+			status: 401,
+			body: { error: 'AuthRequired' }
+		};
+		let loggedOutDid: string | null = null;
+
 		__setWorkerFactoryForTests(() => {
-			workerOpened = true;
 			const api: Partial<WorkerApi> = {
-				openUnifiedClient: async (params) => ({
-					accountDid: params.accountDid,
-					accountDidHash: await accountDidHashHex(params.accountDid)
+				oauthCompleteLogin: async () => ({
+					did: aliceDid,
+					handle: 'alice.bsky.social',
+					pds: 'https://pds.example.test',
+					grantedScopes: [...activeScopes]
 				}),
+				oauthRestoreSession: async () => ({
+					did: aliceDid,
+					handle: 'alice.bsky.social',
+					pds: 'https://pds.example.test',
+					grantedScopes: [...activeScopes]
+				}),
+				oauthLogout: async (did: string) => {
+					loggedOutDid = did;
+				},
+				oauthPdsExchange: async () => ({
+					status: pdsProbeResponse.status,
+					contentType: 'application/json',
+					headers: [['content-type', 'application/json']],
+					body: new TextEncoder().encode(JSON.stringify(pdsProbeResponse.body))
+				}),
+				openUnifiedClient: async (params) => {
+					unifiedClientOpened = true;
+					capturedPdsEndpoint = params.pdsEndpoint;
+					return {
+						accountDid: params.accountDid,
+						accountDidHash: await accountDidHashHex(params.accountDid)
+					};
+				},
 				enrollUnifiedDevice: async () => ({
 					mailbox_space_uri: `at:space://${aliceDid}/blue.catbird.labyrinth.mailbox/self`,
 					epoch_seq: 1,
@@ -560,9 +600,11 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 					active_device_ids: ['99999999-9999-4999-8999-999999999999']
 				}),
 				startBackgroundTasks: async () => {},
+				stopBackgroundTasks: async () => {},
 				retireCurrentDevice: async () => true,
 				clearContentRootKey: async () => {},
 				clearAuth: async () => {},
+				closeUnifiedClient: async () => {},
 				labyrinthStatus: async () => ({
 					mailbox_space_uri: `at:space://${aliceDid}/blue.catbird.labyrinth.mailbox/self`,
 					epoch_seq: 1,
@@ -574,179 +616,54 @@ describe('Multi-device DID fragment normalization, reaction folding, logout/dele
 			return { worker: api as unknown as Remote<WorkerApi> };
 		});
 
-		const origFetch = globalThis.fetch;
-		try {
-			// 1. Fresh login with base ['atproto'] scope populates grantedScopes on AuthState
-			globalThis.fetch = (async (input: RequestInfo | URL) => {
-				const url = String(input);
-				if (url.endsWith('/auth/session')) {
-					return new Response(
-						JSON.stringify({
-							did: aliceDid,
-							handle: 'alice.bsky.social',
-							created_at: '2026-11-14T00:00:00Z',
-							granted_scopes: ['atproto']
-						}),
-						{ status: 200, headers: { 'Content-Type': 'application/json' } }
-					);
-				}
-				if (url.endsWith('/auth/logout')) {
-					return new Response(JSON.stringify({ success: true }), { status: 200 });
-				}
-				throw new Error(`Unexpected fetch during login: ${url}`);
-			}) as typeof fetch;
+		// 1. Fresh direct CAB callback with base ['atproto'] scope populates grantedScopes without opening MLS DB (ctl #2)
+		const loggedIn = await completeOAuthRedirect(
+			'https://catmos.catbird.blue/auth/callback?code=cod_test_12345678&state=state_12345678&iss=https%3A%2F%2Fpds.example.test'
+		);
+		assert.equal(loggedIn.did, aliceDid);
+		assert.deepEqual(loggedIn.grantedScopes, ['atproto']);
+		assert.equal(readBrowserAuth()?.pds, 'https://pds.example.test');
+		assert.equal(unifiedClientOpened, false, 'ctl #2: must not open MLS DB before opt-in');
 
-			const loggedIn = await completeLogin(initialSessionId);
-			assert.equal(loggedIn.did, aliceDid);
-			assert.deepEqual(loggedIn.grantedScopes, ['atproto']);
+		const restored = await tryRestoreSession();
+		assert.deepEqual(restored?.grantedScopes, ['atproto']);
+		assert.equal(unifiedClientOpened, false);
 
-			const restored = await tryRestoreSession();
-			assert.deepEqual(restored?.grantedScopes, ['atproto']);
+		// 2. Fail-closed enableMlsAndEnroll when called with defaults or missing scopes (zero MLS DB opens)
+		await assert.rejects(() => enableMlsAndEnroll(aliceDid), /PDS|Spaces/i);
+		await assert.rejects(
+			() => enableMlsAndEnroll(aliceDid, true, loggedIn.grantedScopes ?? []),
+			/Grant required OAuth scopes/i
+		);
+		assert.equal(unifiedClientOpened, false, 'must not open MLS DB when I15 gate rejects');
+		assert.equal(isMlsOptedInForDid(aliceDid), false);
 
-			// 2. Fail-closed enableMlsAndEnroll when called with defaults or missing scopes (zero worker/DB opens)
-			await assert.rejects(() => enableMlsAndEnroll(aliceDid), /PDS|Spaces/i);
-			await assert.rejects(
-				() => enableMlsAndEnroll(aliceDid, true, loggedIn.grantedScopes ?? []),
-				/Grant required OAuth scopes/i
-			);
-			assert.equal(workerOpened, false, 'must not open MLS worker when I15 gate rejects');
-			assert.equal(isMlsOptedInForDid(aliceDid), false);
+		// 3. Direct PDS Spaces capability probe fails closed on 401/501 and succeeds on 400 InvalidRequest
+		pdsProbeResponse = { status: 401, body: { error: 'AuthRequired' } };
+		assert.equal(await probePdsSpacesSupport(), false);
+		pdsProbeResponse = { status: 501, body: { error: 'XRPCNotSupported' } };
+		assert.equal(await probePdsSpacesSupport(), false);
+		pdsProbeResponse = { status: 400, body: { error: 'InvalidRequest' } };
+		assert.equal(await probePdsSpacesSupport(), true);
 
-			// 3. PDS Spaces capability probe fails closed on 401/404/501 and succeeds on 400 InvalidRequest
-			assert.equal(
-				await probePdsSpacesSupport(async () =>
-					new Response(JSON.stringify({ error: 'AuthRequired' }), { status: 401 })
-				),
-				false
-			);
-			assert.equal(
-				await probePdsSpacesSupport(async () =>
-					new Response(JSON.stringify({ error: 'XRPCNotSupported' }), { status: 501 })
-				),
-				false
-			);
-			assert.equal(
-				await probePdsSpacesSupport(async () =>
-					new Response(JSON.stringify({ error: 'InvalidRequest' }), { status: 400 })
-				),
-				true
-			);
+		// 4. Direct CAB callback with full scoped permissions unlocks opt-in enrollment against the user's PDS directly
+		activeScopes = [...REQUIRED_LABYRINTH_OAUTH_SCOPES];
+		const scopedUser = await completeOAuthRedirect(
+			'https://catmos.catbird.blue/auth/callback?code=cod_scoped_12345678&state=state_scoped_12345678&iss=https%3A%2F%2Fpds.example.test'
+		);
+		assert.deepEqual(scopedUser.grantedScopes, [...REQUIRED_LABYRINTH_OAUTH_SCOPES]);
 
-			// 4. Progressive OAuth upgrade (/auth/upgrade -> /oauth/permission-callback -> exchange -> commit -> session)
-			let capturedAdditionalScopes: string[] = [];
-			let capturedStartNonce = '';
-			let commitAttempts = 0;
-			let navigatedTo = '';
+		const enrolledStatus = await enableMlsAndEnroll(
+			aliceDid,
+			true,
+			scopedUser.grantedScopes ?? []
+		);
+		assert.equal(unifiedClientOpened, true);
+		assert.equal(capturedPdsEndpoint, 'https://pds.example.test');
+		assert.equal(enrolledStatus.epoch_seq, 1);
+		assert.equal(isMlsOptedInForDid(aliceDid), true);
 
-			const mockUpgradeFetch: typeof fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-				const url = String(input);
-				const headers = new Headers(init?.headers ?? {});
-				if (url.endsWith('/auth/upgrade')) {
-					assert.equal(headers.get('Authorization'), `Bearer ${initialSessionId}`);
-					const body = JSON.parse(String(init?.body ?? '{}')) as {
-						additional_scopes: string[];
-						browser_nonce: string;
-					};
-					capturedAdditionalScopes = body.additional_scopes;
-					capturedStartNonce = body.browser_nonce;
-					return new Response(
-						JSON.stringify({
-							authorization_url: 'https://bsky.social/oauth/authorize?request_uri=urn:ietf:params:oauth:request_uri:test123'
-						}),
-						{ status: 200, headers: { 'Content-Type': 'application/json' } }
-					);
-				}
-				if (url.endsWith('/auth/upgrade/exchange')) {
-					assert.equal(headers.get('Authorization'), `Bearer ${initialSessionId}`);
-					const body = JSON.parse(String(init?.body ?? '{}')) as {
-						code: string;
-						browser_nonce: string;
-					};
-					assert.equal(body.code, 'upgrade_code_12345678');
-					assert.equal(body.browser_nonce, capturedStartNonce);
-					return new Response(
-						JSON.stringify({
-							candidate_session_id: candidateSessionId,
-							did: aliceDid,
-							granted_scopes: [...REQUIRED_LABYRINTH_OAUTH_SCOPES]
-						}),
-						{ status: 200, headers: { 'Content-Type': 'application/json' } }
-					);
-				}
-				if (url.endsWith('/auth/upgrade/commit')) {
-					assert.equal(headers.get('Authorization'), `Bearer ${candidateSessionId}`);
-					commitAttempts += 1;
-					if (commitAttempts === 1) {
-						return new Response('Retryable push CAS failure', { status: 500 });
-					}
-					return new Response(
-						JSON.stringify({
-							status: 'committed',
-							session_id: candidateSessionId,
-							did: aliceDid,
-							granted_scopes: [...REQUIRED_LABYRINTH_OAUTH_SCOPES]
-						}),
-						{ status: 200, headers: { 'Content-Type': 'application/json' } }
-					);
-				}
-				if (url.endsWith('/auth/session')) {
-					assert.equal(headers.get('Authorization'), `Bearer ${candidateSessionId}`);
-					return new Response(
-						JSON.stringify({
-							did: aliceDid,
-							handle: 'alice.bsky.social',
-							created_at: '2026-11-14T00:01:00Z',
-							granted_scopes: [...REQUIRED_LABYRINTH_OAUTH_SCOPES]
-						}),
-						{ status: 200, headers: { 'Content-Type': 'application/json' } }
-					);
-				}
-				throw new Error(`Unexpected URL in upgrade flow: ${url}`);
-			}) as typeof fetch;
-
-			const authUrl = await startOAuthScopeUpgrade(REQUIRED_LABYRINTH_OAUTH_SCOPES, {
-				returnTo: '/settings/labyrinth',
-				fetchImpl: mockUpgradeFetch,
-				navigate: (url) => {
-					navigatedTo = url;
-				}
-			});
-			assert.match(authUrl, /^https:\/\/bsky\.social\/oauth\/authorize/);
-			assert.equal(navigatedTo, authUrl);
-			assert.ok(!capturedAdditionalScopes.includes('atproto'));
-			assert.ok(capturedAdditionalScopes.includes('repo:blue.catbird.labyrinth.mailboxKeys'));
-			assert.ok(
-				!capturedAdditionalScopes.includes(
-					'repo:blue.catbird.labyrinth.mailboxKeys?action=create'
-				)
-			);
-
-			const permCb = validateWebPermissionCallbackUrl(
-				'https://catbird.blue/oauth/permission-callback?code=upgrade_code_12345678',
-				'https://catbird.blue'
-			);
-			assert.equal(permCb.kind, 'code');
-			if (permCb.kind !== 'code') throw new Error('expected code');
-
-			const upgradedUser = await completeOAuthScopeUpgrade(permCb.code, {
-				fetchImpl: mockUpgradeFetch
-			});
-			assert.equal(commitAttempts, 2, 'must retry once on transient 500 from /auth/upgrade/commit');
-			assert.equal(readBrowserAuth()?.sessionId, candidateSessionId);
-			assert.equal(consumePendingUpgradeReturnPath(), '/settings/labyrinth');
-			assert.deepEqual(upgradedUser.grantedScopes, [...REQUIRED_LABYRINTH_OAUTH_SCOPES]);
-
-			const enrolledStatus = await enableMlsAndEnroll(
-				aliceDid,
-				true,
-				upgradedUser.grantedScopes ?? []
-			);
-			assert.equal(workerOpened, true);
-			assert.equal(enrolledStatus.epoch_seq, 1);
-			assert.equal(isMlsOptedInForDid(aliceDid), true);
-			await logout();
-		} finally {
-			globalThis.fetch = origFetch;
-		}
+		await logout();
+		assert.equal(loggedOutDid, aliceDid, 'logout must revoke Petrel OAuth session upstream');
 	});
 });

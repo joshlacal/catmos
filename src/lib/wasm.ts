@@ -53,9 +53,8 @@ import type {
 } from './tauri.ts';
 
 import { wrap, proxy, type Remote } from 'comlink';
-import type { WorkerApi } from './mls-worker.ts';
+import type { BrowserOAuthConfig, WorkerApi } from './mls-worker.ts';
 import { normalizeAccountDid, stripDidFragment } from './did.ts';
-import { normalizeSessionId } from './oauth-callback.ts';
 import {
 	accountDidHashHex,
 	deleteAccountKeyStoreEntries,
@@ -64,10 +63,8 @@ import {
 } from './webcrypto-keystore.ts';
 import {
 	assertCanRevokeLabyrinthDevice,
-	buildUpgradeAdditionalScopes,
 	evaluateSpacesGateForUi,
 	isMlsOptedInForDid,
-	REQUIRED_LABYRINTH_OAUTH_SCOPES,
 	setMlsOptedInForDid
 } from './labyrinth-ui.ts';
 
@@ -243,20 +240,27 @@ async function installContentRootKey(did: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Nest BFF URL
+// Direct ATProto OAuth via Petrel Client Assertion Backend (CAB)
 // ---------------------------------------------------------------------------
 
-/** Nest BFF gateway URL — resolve from current hostname. */
-const NEST_URL = (() => {
-	if (typeof window === 'undefined') return 'https://api.catbird.blue';
-	const { hostname } = window.location;
-	if (hostname === 'catmos.catbird.blue') return 'https://api.catbird.blue';
-	// Cloudflare Pages previews and localhost use dev API
-	return 'https://api.catbird.blue';
-})();
-
+const CATMOS_OAUTH_CLIENT_ID = 'https://catmos.catbird.blue/oauth/client-metadata.json';
+const CATMOS_CAB_URL = 'https://api.catbird.blue/cab/catmos';
 const HOME_DS_DID = 'did:web:chat.catbird.blue';
+const HOME_DS_SERVICE_AUDIENCE = `${HOME_DS_DID}#atproto_mls`;
 const HOME_DS_URL = 'https://chat.catbird.blue';
+
+export function getBrowserOAuthConfig(): BrowserOAuthConfig {
+	const origin =
+		typeof window !== 'undefined' && window.location?.origin
+			? window.location.origin
+			: 'https://catmos.catbird.blue';
+	return {
+		clientId: CATMOS_OAUTH_CLIENT_ID,
+		redirectUri: `${origin}/auth/callback`,
+		cabUrl: CATMOS_CAB_URL,
+		deliveryServiceDid: HOME_DS_DID
+	};
+}
 const UUID_V4_LOWER_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -478,42 +482,18 @@ export async function purgeAccountOpfsDatabase(
 	return removedCount;
 }
 
-async function mintChatServiceAuthToken(sessionId: string, lxm: string): Promise<string> {
-	const params = new URLSearchParams({
-		aud: HOME_DS_DID,
-		lxm
-	});
-	const resp = await fetch(`${NEST_URL}/xrpc/com.atproto.server.getServiceAuth?${params.toString()}`, {
-		method: 'GET',
-		headers: {
-			Accept: 'application/json',
-			Authorization: `Bearer ${sessionId}`
-		}
-	});
-	if (!resp.ok) {
-		const text = await resp.text();
-		throw new Error(`getServiceAuth failed (${resp.status}): ${text}`);
+async function mintChatServiceAuthToken(did: string, lxm: string): Promise<string> {
+	const w = getWorker();
+	const token = await w.oauthServiceToken(
+		did,
+		HOME_DS_SERVICE_AUDIENCE,
+		lxm,
+		getBrowserOAuthConfig()
+	);
+	if (typeof token !== 'string' || !token.trim()) {
+		throw new Error(`getServiceAuth(${lxm}) returned an empty service token`);
 	}
-	const data = (await resp.json()) as { token?: string };
-	if (typeof data.token !== 'string' || !data.token.trim() || data.token === sessionId) {
-		throw new Error('getServiceAuth response missing a separate service token');
-	}
-	return data.token;
-}
-
-export async function bffFetch(
-	path: string,
-	init: RequestInit = {},
-	sessionId?: string
-): Promise<Response> {
-	const headers = new Headers(init.headers ?? {});
-	if (sessionId) {
-		headers.set('Authorization', `Bearer ${sessionId}`);
-	}
-	return fetch(`${NEST_URL}${path}`, {
-		...init,
-		headers
-	});
+	return token;
 }
 
 // ---------------------------------------------------------------------------
@@ -587,13 +567,18 @@ export async function listenForEvent<T>(
 // Browser session storage helpers (per-DID namespace isolation)
 // ---------------------------------------------------------------------------
 
-/** Base keys -- the DID key is unnamespaced (bootstrap). */
+/** Base key — stores only the active account DID for per-DID tab/storage scoping (never tokens). */
 const SS_ACTIVE_DID = 'catbird_mls_active_did';
-const SS_PENDING_BROWSER_NONCE = 'catbird_mls_pending_browser_nonce';
-const SS_PENDING_UPGRADE_NONCE = 'catbird_mls_pending_upgrade_nonce';
-const SS_PENDING_UPGRADE_DID = 'catbird_mls_pending_upgrade_did';
-const SS_PENDING_UPGRADE_RETURN_TO = 'catbird_mls_pending_upgrade_return_to';
-const OAUTH_CODE_FORMAT_RE = /^[A-Za-z0-9._~+/-]{8,512}={0,2}$/;
+
+export interface BrowserAuthSessionSummary {
+	did: string;
+	sessionId: string;
+	handle?: string;
+	pds?: string;
+	grantedScopes?: string[];
+}
+
+let _browserSession: BrowserAuthSessionSummary | null = null;
 
 function parseGrantedScopes(raw: unknown): string[] {
 	if (!Array.isArray(raw)) return [];
@@ -601,14 +586,6 @@ function parseGrantedScopes(raw: unknown): string[] {
 		.filter((entry): entry is string => typeof entry === 'string')
 		.map((s) => s.trim())
 		.filter(Boolean);
-}
-
-function sanitizeReturnPath(rawPath: string | null | undefined): string {
-	const trimmed = typeof rawPath === 'string' ? rawPath.trim() : '';
-	if (!trimmed || !trimmed.startsWith('/') || trimmed.startsWith('//') || /[\u0000-\u001f\u007f\\]/.test(trimmed)) {
-		return '/settings/labyrinth';
-	}
-	return trimmed;
 }
 
 /** Generate a cryptographically secure 32-byte unpadded base64url challenge nonce (43 chars). */
@@ -625,62 +602,58 @@ export function generateBrowserNonce(): string {
 		.replace(/=+$/, '');
 }
 
-/** Clear any pending browser OAuth nonce from sessionStorage. */
+/** Clear any legacy pending browser OAuth nonce left from prior Nest builds. */
 export function clearPendingOAuthLogin(): void {
 	if (typeof sessionStorage === 'undefined') return;
-	sessionStorage.removeItem(SS_PENDING_BROWSER_NONCE);
+	sessionStorage.removeItem('catbird_mls_pending_browser_nonce');
 }
 
-export function hasPendingOAuthUpgrade(): boolean {
-	if (typeof sessionStorage === 'undefined') return false;
-	return Boolean(sessionStorage.getItem(SS_PENDING_UPGRADE_NONCE));
-}
-
-export function clearPendingOAuthUpgrade(): void {
-	if (typeof sessionStorage === 'undefined') return;
-	sessionStorage.removeItem(SS_PENDING_UPGRADE_NONCE);
-	sessionStorage.removeItem(SS_PENDING_UPGRADE_DID);
-	sessionStorage.removeItem(SS_PENDING_UPGRADE_RETURN_TO);
-}
-
-export function consumePendingUpgradeReturnPath(): string {
-	if (typeof sessionStorage === 'undefined') return '/settings/labyrinth';
-	const raw = sessionStorage.getItem(SS_PENDING_UPGRADE_RETURN_TO);
-	sessionStorage.removeItem(SS_PENDING_UPGRADE_RETURN_TO);
-	return sanitizeReturnPath(raw);
-}
-
-/** Return a per-DID namespaced key for browser sessionStorage. */
+/** Return a per-DID namespaced key for legacy browser sessionStorage cleanup. */
 function didKey(did: string, suffix: string): string {
 	return `catbird_mls:${did}:${suffix}`;
 }
 
-/** Persist auth credentials in sessionStorage, namespaced by DID. */
-export function persistBrowserAuth(did: string, sessionId: string): void {
+/** Record the active authenticated DID (and in-memory PDS/session metadata). */
+export function persistBrowserAuth(
+	did: string,
+	sessionId = 'petrel-oauth',
+	meta?: { handle?: string; pds?: string; grantedScopes?: string[] }
+): void {
 	const canonicalDid = normalizeAccountDid(did);
-	sessionStorage.setItem(SS_ACTIVE_DID, canonicalDid);
-	sessionStorage.setItem(didKey(canonicalDid, 'session_id'), sessionId);
+	_browserSession = {
+		did: canonicalDid,
+		sessionId,
+		handle: meta?.handle,
+		pds: meta?.pds,
+		grantedScopes: meta?.grantedScopes
+	};
+	if (typeof sessionStorage !== 'undefined') {
+		sessionStorage.setItem(SS_ACTIVE_DID, canonicalDid);
+		sessionStorage.removeItem(didKey(canonicalDid, 'session_id'));
+	}
 }
 
-/** Read stored session for the active DID. Returns null if nothing saved. */
-export function readBrowserAuth(): { did: string; sessionId: string } | null {
+/** Read the active browser session summary. Returns null if not signed in. */
+export function readBrowserAuth(): BrowserAuthSessionSummary | null {
+	if (_browserSession) return _browserSession;
 	if (typeof sessionStorage === 'undefined') return null;
 	const did = sessionStorage.getItem(SS_ACTIVE_DID);
 	if (!did) return null;
-	const sessionId = sessionStorage.getItem(didKey(did, 'session_id'));
-	if (!sessionId) return null;
-	return { did, sessionId };
+	return { did, sessionId: 'petrel-oauth' };
 }
 
-/** Clear the active DID's credentials from sessionStorage. */
+/** Clear the active DID's in-memory and sessionStorage markers. */
 export function clearBrowserAuth(): void {
-	if (typeof sessionStorage === 'undefined') return;
-	const did = sessionStorage.getItem(SS_ACTIVE_DID);
-	if (did) {
-		sessionStorage.removeItem(didKey(did, 'session_id'));
+	const prevDid =
+		_browserSession?.did ??
+		(typeof sessionStorage !== 'undefined' ? sessionStorage.getItem(SS_ACTIVE_DID) : null);
+	_browserSession = null;
+	if (typeof sessionStorage !== 'undefined') {
+		if (prevDid) {
+			sessionStorage.removeItem(didKey(prevDid, 'session_id'));
+		}
+		sessionStorage.removeItem(SS_ACTIVE_DID);
 	}
-	sessionStorage.removeItem(SS_ACTIVE_DID);
-	clearPendingOAuthUpgrade();
 }
 
 /** Abandons a pending desktop sign-in, so finishing it in the browser signs no one in. */
@@ -694,93 +667,42 @@ export async function startLogin(identifier: string): Promise<void> {
 	if (isTauri) {
 		return tauriInvoke('start_login', { identifier });
 	}
-	const redirectTo = `${window.location.origin}/auth/callback`;
-	const browserNonce = generateBrowserNonce();
-	sessionStorage.setItem(SS_PENDING_BROWSER_NONCE, browserNonce);
-
-	const isLoopback =
-		window.location.hostname === 'localhost' ||
-		window.location.hostname === '127.0.0.1' ||
-		window.location.hostname === '[::1]';
-	const clientParam = isLoopback ? '' : '&client=catmos';
-	const loginUrl =
-		`${NEST_URL}/auth/login` +
-		`?identifier=${encodeURIComponent(identifier)}` +
-		clientParam +
-		`&redirect_to=${encodeURIComponent(redirectTo)}` +
-		`&browser_nonce=${encodeURIComponent(browserNonce)}`;
-	window.location.href = loginUrl;
-}
-
-/**
- * Exchange a one-time OAuth code for a session ID using the single-use browser nonce.
- * Consumes and clears the pending nonce immediately upon attempt.
- */
-export async function exchangeOAuthCode(code: string): Promise<string> {
-	if (!code || typeof code !== 'string' || !OAUTH_CODE_FORMAT_RE.test(code)) {
-		clearPendingOAuthLogin();
-		throw new Error('Invalid OAuth authorization code.');
-	}
-	const browserNonce = sessionStorage.getItem(SS_PENDING_BROWSER_NONCE);
-	// Single-use: clear pending nonce immediately
-	clearPendingOAuthLogin();
-
-	if (!browserNonce) {
-		throw new Error('Missing or expired browser login nonce. Please try signing in again.');
-	}
-
-	const resp = await fetch(`${NEST_URL}/auth/exchange`, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify({
-			code,
-			browser_nonce: browserNonce
-		})
-	});
-
-	if (!resp.ok) {
-		const errText = await resp.text().catch(() => '');
-		throw new Error(`Authentication exchange failed (${resp.status}): ${errText || resp.statusText}`);
-	}
-
-	const data = await resp.json();
-	if (!data || typeof data.session_id !== 'string' || !data.session_id.trim()) {
-		throw new Error('Invalid exchange response from auth gateway: missing session_id');
-	}
-
-	return normalizeSessionId(data.session_id);
+	const w = getWorker();
+	const authorizeUrl = await w.oauthStartLogin(identifier, getBrowserOAuthConfig());
+	window.location.href = authorizeUrl;
 }
 
 /**
  * Probe whether the authenticated account's PDS implements `com.atproto.space.*` (`I15`),
  * matching `catbird-mls/src/client/spaces_gate.rs:272-290` (`getSpace` probe).
+ * Sends a direct DPoP-bound XRPC request to the account's PDS via Petrel.
  * Fails closed (`false`) when unauthenticated or on network / 5xx errors.
  */
-export async function probePdsSpacesSupport(
-	fetchImpl: typeof fetch = fetch
-): Promise<boolean> {
+export async function probePdsSpacesSupport(): Promise<boolean> {
 	if (isTauri) {
 		try {
 			return await tauriInvoke<boolean>('labyrinth_probe_pds_spaces');
 		} catch {
-			// Tauri desktop evaluates `probe_and_check_spaces_eligibility` directly in Rust during enrollment;
-			// fall back to authenticated BFF probe when no dedicated IPC probe command is registered.
+			return false;
 		}
 	}
 	const saved = readBrowserAuth();
 	if (!saved) return false;
 	try {
-		const resp = await fetchImpl(`${NEST_URL}/xrpc/com.atproto.space.getSpace`, {
-			method: 'GET',
-			headers: {
-				Authorization: `Bearer ${saved.sessionId}`
-			}
-		});
+		const w = getWorker();
+		const resp = await w.oauthPdsExchange(
+			saved.did,
+			'GET',
+			'/xrpc/com.atproto.space.getSpace',
+			[],
+			null,
+			null,
+			getBrowserOAuthConfig()
+		);
 		let errCode = '';
 		try {
-			const parsed = (await resp.json()) as { error?: unknown };
+			const text = new TextDecoder().decode(resp.body);
+			const parsed = JSON.parse(text) as { error?: unknown };
 			if (typeof parsed?.error === 'string') {
 				errCode = parsed.error;
 			}
@@ -821,280 +743,28 @@ export function parseDesktopSignIn(payload: unknown): AuthState {
 }
 
 /**
- * Initiate progressive OAuth scope upgrade (`POST /auth/upgrade`) on `nest`
- * for `REQUIRED_LABYRINTH_OAUTH_SCOPES` (excluding `'atproto'`, which is carried
- * forward from the active session).
+ * Complete direct Petrel CAB OAuth browser callback (`/auth/callback?code=...&state=...&iss=...`).
+ * Respects `ctl #2`: zero MLS DB opens, PDS/DS calls, or KeyPackage uploads on fresh sign-in
+ * until explicit opt-in.
  */
-export async function startOAuthScopeUpgrade(
-	requestedScopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES,
-	options: {
-		returnTo?: string;
-		fetchImpl?: typeof fetch;
-		navigate?: (authorizationUrl: string) => void;
-	} = {}
-): Promise<string> {
-	const saved = readBrowserAuth();
-	if (!saved) {
-		throw new Error('Cannot upgrade OAuth permissions without an active authenticated session.');
-	}
-	const additionalScopes = buildUpgradeAdditionalScopes(requestedScopes);
-	if (additionalScopes.length === 0) {
-		throw new Error(
-			'Active session is missing base atproto scope; please sign out and sign in again.'
-		);
-	}
-
-	const browserNonce = generateBrowserNonce();
-	sessionStorage.setItem(SS_PENDING_UPGRADE_NONCE, browserNonce);
-	sessionStorage.setItem(SS_PENDING_UPGRADE_DID, saved.did);
-	sessionStorage.setItem(
-		SS_PENDING_UPGRADE_RETURN_TO,
-		sanitizeReturnPath(options.returnTo ?? '/settings/labyrinth')
-	);
-
-	const doFetch = options.fetchImpl ?? fetch;
-	let resp: Response;
-	try {
-		resp = await doFetch(`${NEST_URL}/auth/upgrade`, {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${saved.sessionId}`,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify({
-				additional_scopes: additionalScopes,
-				browser_nonce: browserNonce
-			})
-		});
-	} catch (err) {
-		clearPendingOAuthUpgrade();
-		throw err;
-	}
-
-	if (!resp.ok) {
-		clearPendingOAuthUpgrade();
-		const errText = await resp.text().catch(() => '');
-		throw new Error(
-			`Permission upgrade initiation failed (${resp.status}): ${errText || resp.statusText}`
-		);
-	}
-
-	const data = (await resp.json()) as { authorization_url?: unknown };
-	const rawAuthUrl = typeof data?.authorization_url === 'string' ? data.authorization_url.trim() : '';
-	if (!rawAuthUrl || /[\u0000-\u001f\u007f]/.test(rawAuthUrl)) {
-		clearPendingOAuthUpgrade();
-		throw new Error('Invalid authorization_url returned from /auth/upgrade');
-	}
-
-	let parsedAuthUrl: URL;
-	try {
-		parsedAuthUrl = new URL(rawAuthUrl);
-	} catch {
-		clearPendingOAuthUpgrade();
-		throw new Error('Malformed authorization_url returned from /auth/upgrade');
-	}
-	if (parsedAuthUrl.protocol !== 'https:' || parsedAuthUrl.username || parsedAuthUrl.password) {
-		clearPendingOAuthUpgrade();
-		throw new Error('Insecure authorization_url returned from /auth/upgrade');
-	}
-
-	const authHref = parsedAuthUrl.toString();
-	if (options.navigate) {
-		options.navigate(authHref);
-	} else if (typeof window !== 'undefined' && window.location) {
-		window.location.href = authHref;
-	}
-	return authHref;
-}
-
-/**
- * Complete progressive OAuth scope upgrade (`POST /auth/upgrade/exchange` ->
- * `POST /auth/upgrade/commit` -> session promotion), fenced to the active DID.
- */
-export async function completeOAuthScopeUpgrade(
-	code: string,
-	options: {
-		fetchImpl?: typeof fetch;
-	} = {}
-): Promise<AuthState> {
-	if (!code || typeof code !== 'string' || !OAUTH_CODE_FORMAT_RE.test(code)) {
-		clearPendingOAuthUpgrade();
-		throw new Error('Invalid OAuth upgrade authorization code.');
-	}
-
-	const browserNonce =
-		typeof sessionStorage !== 'undefined'
-			? sessionStorage.getItem(SS_PENDING_UPGRADE_NONCE)
-			: null;
-	const expectedDidRaw =
-		typeof sessionStorage !== 'undefined'
-			? sessionStorage.getItem(SS_PENDING_UPGRADE_DID)
-			: null;
-	// Single-use: clear nonce and expected DID immediately (preserve returnTo for caller navigation)
-	if (typeof sessionStorage !== 'undefined') {
-		sessionStorage.removeItem(SS_PENDING_UPGRADE_NONCE);
-		sessionStorage.removeItem(SS_PENDING_UPGRADE_DID);
-	}
-
-	if (!browserNonce || !expectedDidRaw) {
-		clearPendingOAuthUpgrade();
-		throw new Error('Missing or expired OAuth permission upgrade nonce.');
-	}
-
-	const saved = readBrowserAuth();
-	if (!saved) {
-		clearPendingOAuthUpgrade();
-		throw new Error('Session expired or signed out during OAuth permission upgrade.');
-	}
-
-	const canonicalDid = normalizeAccountDid(saved.did);
-	if (canonicalDid !== normalizeAccountDid(expectedDidRaw)) {
-		clearPendingOAuthUpgrade();
-		throw new Error('Active account changed during OAuth permission upgrade.');
-	}
-
-	const doFetch = options.fetchImpl ?? fetch;
-	const exResp = await doFetch(`${NEST_URL}/auth/upgrade/exchange`, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${saved.sessionId}`,
-			'Content-Type': 'application/json'
-		},
-		body: JSON.stringify({
-			code,
-			browser_nonce: browserNonce
-		})
-	});
-	if (!exResp.ok) {
-		const errText = await exResp.text().catch(() => '');
-		throw new Error(
-			`Permission upgrade exchange failed (${exResp.status}): ${errText || exResp.statusText}`
-		);
-	}
-
-	const exData = (await exResp.json()) as {
-		candidate_session_id?: unknown;
-		did?: unknown;
-		granted_scopes?: unknown;
-	};
-	const candidateSessionId = normalizeSessionId(exData?.candidate_session_id);
-	const exDid = typeof exData?.did === 'string' ? normalizeAccountDid(exData.did) : '';
-	if (exDid !== canonicalDid) {
-		throw new Error('Permission upgrade exchange DID mismatch.');
-	}
-
-	let commitResp = await doFetch(`${NEST_URL}/auth/upgrade/commit`, {
-		method: 'POST',
-		headers: {
-			Authorization: `Bearer ${candidateSessionId}`
-		}
-	});
-	if (commitResp.status >= 500) {
-		// Retryable side-effect failure (e.g. push registry CAS) per nest `upgrade_commit` contract
-		commitResp = await doFetch(`${NEST_URL}/auth/upgrade/commit`, {
-			method: 'POST',
-			headers: {
-				Authorization: `Bearer ${candidateSessionId}`
-			}
-		});
-	}
-	if (!commitResp.ok) {
-		const errText = await commitResp.text().catch(() => '');
-		throw new Error(
-			`Permission upgrade commit failed (${commitResp.status}): ${errText || commitResp.statusText}`
-		);
-	}
-
-	const commitData = (await commitResp.json()) as {
-		status?: unknown;
-		session_id?: unknown;
-		did?: unknown;
-		granted_scopes?: unknown;
-	};
-	if (commitData?.status !== 'committed') {
-		throw new Error('Permission upgrade commit returned unexpected status.');
-	}
-	const committedSessionId = normalizeSessionId(commitData.session_id);
-	if (committedSessionId !== candidateSessionId) {
-		throw new Error('Committed session_id did not match candidate session_id.');
-	}
-	const commitDid = typeof commitData.did === 'string' ? normalizeAccountDid(commitData.did) : '';
-	if (commitDid !== canonicalDid) {
-		throw new Error('Committed session DID mismatch.');
-	}
-
-	// Re-verify session was not logged out or switched while commit was in flight
-	const stillActive = readBrowserAuth();
-	if (!stillActive || stillActive.sessionId !== saved.sessionId || normalizeAccountDid(stillActive.did) !== canonicalDid) {
-		throw new Error('Active session changed while committing permission upgrade.');
-	}
-
-	const committedScopes = parseGrantedScopes(commitData.granted_scopes);
-	const sessionResp = await doFetch(`${NEST_URL}/auth/session`, {
-		method: 'GET',
-		headers: {
-			Authorization: `Bearer ${committedSessionId}`
-		}
-	});
-	if (!sessionResp.ok) {
-		throw new Error(`Failed to verify upgraded session: ${sessionResp.status}`);
-	}
-	const sessionInfo = (await sessionResp.json()) as {
-		did?: unknown;
-		handle?: unknown;
-		granted_scopes?: unknown;
-	};
-	const verifiedDid =
-		typeof sessionInfo?.did === 'string' ? normalizeAccountDid(sessionInfo.did) : '';
-	if (verifiedDid !== canonicalDid) {
-		throw new Error('Upgraded session verification DID mismatch.');
-	}
-	const grantedScopes =
-		Array.isArray(sessionInfo?.granted_scopes)
-			? parseGrantedScopes(sessionInfo.granted_scopes)
-			: committedScopes;
-	const handle = typeof sessionInfo?.handle === 'string' && sessionInfo.handle ? sessionInfo.handle : canonicalDid;
-
-	persistBrowserAuth(canonicalDid, committedSessionId);
-	if (isMlsOptedInForDid(canonicalDid) && _worker && _workerDid === canonicalDid) {
-		await _worker.setAuth(canonicalDid, committedSessionId);
-	}
-
-	return {
-		did: canonicalDid,
-		handle,
-		grantedScopes
-	};
-}
-
-export async function completeLogin(sessionId: string): Promise<AuthState> {
-	const validatedSessionId = normalizeSessionId(sessionId);
+export async function completeOAuthRedirect(callbackUrl: string): Promise<AuthState> {
 	if (isTauri) {
 		throw new Error('The desktop app completes sign-in in its backend.');
 	}
-	const resp = await bffFetch('/auth/session', { method: 'GET' }, validatedSessionId);
-	if (!resp.ok) throw new Error(`Failed to fetch session: ${resp.status}`);
-	const info = await resp.json();
-	const rawDid = typeof info?.did === 'string' ? info.did : '';
-	if (!stripDidFragment(rawDid)) {
-		throw new Error('Invalid session response from auth gateway: missing did');
-	}
-	const did = normalizeAccountDid(rawDid);
-	const handle: string = info.handle ?? did;
-	const grantedScopes = parseGrantedScopes(info?.granted_scopes);
+	const w = getWorker();
+	const signedIn = await w.oauthCompleteLogin(callbackUrl, getBrowserOAuthConfig());
+	const did = normalizeAccountDid(signedIn.did);
+	const handle = signedIn.handle?.trim() || did;
+	const pds = signedIn.pds?.trim() || '';
+	const grantedScopes = parseGrantedScopes(signedIn.grantedScopes);
 
 	try {
-		// 1. Persist browser auth first so active DID is established
-		persistBrowserAuth(did, validatedSessionId);
+		persistBrowserAuth(did, 'petrel-oauth', { handle, pds, grantedScopes });
 		// ctl #2: Chat/Spaces off by default — zero MLS DB opens, PDS/DS calls, or KeyPackage uploads on fresh sign-in
 		if (!isMlsOptedInForDid(did)) {
 			return { did, handle, grantedScopes };
 		}
-		// 2. Initialize WASM Worker for `did` (terminating any Worker bound to a different DID)
 		await initWasm(did);
-		// 3. Push credentials and complete MLS setup on the DID-scoped Worker
-		const w = getWorker();
-		await w.setAuth(did, validatedSessionId);
 		await installContentRootKey(did);
 		await w.setup();
 
@@ -1264,10 +934,31 @@ export async function submitPreparedRequest(
 		: '';
 	const isDirectChatDs = nsid.startsWith('blue.catbird.chat.') || nsid.startsWith('blue.catbird.labyrinth.');
 
-	const url = isDirectChatDs ? `${HOME_DS_URL}${prepared.path}` : `${NEST_URL}${prepared.path}`;
-	const authToken = isDirectChatDs
-		? await mintChatServiceAuthToken(saved.sessionId, nsid)
-		: saved.sessionId;
+	if (!isDirectChatDs) {
+		const w = getWorker();
+		const bodyBytes = prepared.body ? new TextEncoder().encode(prepared.body) : null;
+		const resp = await w.oauthPdsExchange(
+			saved.did,
+			prepared.method,
+			prepared.path,
+			[],
+			bodyBytes,
+			prepared.body ? 'application/json' : null,
+			getBrowserOAuthConfig()
+		);
+		const current = readBrowserAuth();
+		if (!current || current.did !== saved.did) {
+			throw new Error('Session changed during request execution');
+		}
+		return {
+			status: resp.status,
+			contentType: resp.contentType ?? null,
+			body: new TextDecoder().decode(resp.body)
+		};
+	}
+
+	const url = `${HOME_DS_URL}${prepared.path}`;
+	const authToken = await mintChatServiceAuthToken(saved.did, nsid);
 	const headers: Record<string, string> = {
 		Authorization: `Bearer ${authToken}`
 	};
@@ -1283,7 +974,7 @@ export async function submitPreparedRequest(
 
 	// Re-verify session has not changed while request was in-flight
 	const current = readBrowserAuth();
-	if (!current || current.did !== saved.did || current.sessionId !== saved.sessionId) {
+	if (!current || current.did !== saved.did) {
 		throw new Error('Session changed during request execution');
 	}
 
@@ -1331,44 +1022,30 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 			grantedScopes
 		};
 	}
-	const saved = readBrowserAuth();
-	if (!saved) return null;
-	const { sessionId } = saved;
-
 	try {
-		const resp = await bffFetch('/auth/session', { method: 'GET' }, sessionId);
-		if (!resp.ok) {
-			if (resp.status === 401 || resp.status === 403) {
-				clearBrowserAuth();
-				terminateWorkerInstance();
-				return null;
-			}
-			throw new Error(`Failed to restore session: ${resp.status}`);
+		const w = getWorker();
+		const signedIn = await w.oauthRestoreSession(getBrowserOAuthConfig());
+		if (!signedIn) {
+			clearBrowserAuth();
+			return null;
 		}
-		const info = await resp.json();
-		const rawDid = typeof info?.did === 'string' ? info.did.trim() : '';
-		if (!stripDidFragment(rawDid)) {
-			throw new Error('Invalid restored session response: missing did');
-		}
-		const restoredDid = normalizeAccountDid(rawDid);
-		const grantedScopes = parseGrantedScopes(info?.granted_scopes);
+		const restoredDid = normalizeAccountDid(signedIn.did);
+		const handle = signedIn.handle?.trim() || restoredDid;
+		const pds = signedIn.pds?.trim() || '';
+		const grantedScopes = parseGrantedScopes(signedIn.grantedScopes);
 
-		persistBrowserAuth(restoredDid, sessionId);
+		persistBrowserAuth(restoredDid, 'petrel-oauth', { handle, pds, grantedScopes });
 		if (!isMlsOptedInForDid(restoredDid)) {
-			return { did: restoredDid, handle: info.handle ?? restoredDid, grantedScopes };
+			return { did: restoredDid, handle, grantedScopes };
 		}
 		await initWasm(restoredDid);
-
-		// Push restored credentials to Worker
-		const w = getWorker();
-		await w.setAuth(restoredDid, sessionId);
 		await installContentRootKey(restoredDid);
 		await w.setup();
 
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
 
-		return { did: restoredDid, handle: info.handle ?? restoredDid, grantedScopes };
+		return { did: restoredDid, handle, grantedScopes };
 	} catch (error) {
 		if (_replenishInterval) {
 			clearInterval(_replenishInterval);
@@ -1454,10 +1131,10 @@ export async function logout(options?: AccountCleanupOptions): Promise<void> {
 		_replenishInterval = null;
 	}
 
-	// Best-effort bounded (~3s) device retirement BEFORE wiping local device keys & OPFS DB
+	// Best-effort bounded device retirement + upstream OAuth token revocation BEFORE wiping local keys & OPFS DB
 	try {
-		if (_worker) {
-			const w = _worker;
+		const w = _worker ?? (activeDid ? getWorker() : null);
+		if (w) {
 			await withBoundedTimeout(
 				(async () => {
 					try {
@@ -1469,6 +1146,13 @@ export async function logout(options?: AccountCleanupOptions): Promise<void> {
 						await w.retireCurrentDevice();
 					} catch (e) {
 						console.warn('[catmos] retireCurrentDevice skipped or failed during logout:', e);
+					}
+					if (activeDid && typeof w.oauthLogout === 'function') {
+						try {
+							await w.oauthLogout(activeDid, getBrowserOAuthConfig());
+						} catch (e) {
+							console.warn('[catmos] oauthLogout warning during logout:', e);
+						}
 					}
 					try {
 						await w.clearContentRootKey();
@@ -1548,6 +1232,13 @@ export async function deleteAccountData(
 			await w.clearContentRootKey?.();
 		} catch {
 			// Ignore post-delete cleanup warnings
+		}
+		if (targetDid && typeof w.oauthLogout === 'function') {
+			try {
+				await withBoundedTimeout(w.oauthLogout(targetDid, getBrowserOAuthConfig()), 3_000);
+			} catch {
+				// Ignore post-delete upstream revocation warning
+			}
 		}
 		try {
 			await w.clearAuth?.();
@@ -1890,8 +1581,14 @@ export async function checkOptInStatus(dids: string[]): Promise<OptInStatus[]> {
 	if (isTauri) {
 		return tauriInvoke('check_opt_in_status', { dids });
 	}
+	const saved = readBrowserAuth();
 	const w = getWorker();
-	return w.checkOptInStatus(dids) as Promise<OptInStatus[]>;
+	return w.checkOptInStatus(dids, {
+		did: saved?.did,
+		homeDsDid: HOME_DS_DID,
+		homeDsEndpoint: HOME_DS_URL,
+		oauthConfig: getBrowserOAuthConfig()
+	}) as Promise<OptInStatus[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2064,7 +1761,7 @@ export async function reportSpam(
 	const body: Record<string, string> = { convoId: conversationId, reportedDid };
 	if (reason) body.reason = reason;
 	const serviceJwt = await mintChatServiceAuthToken(
-		saved.sessionId,
+		saved.did,
 		'blue.catbird.chat.reportSpam'
 	);
 	const resp = await fetch(`${HOME_DS_URL}/xrpc/blue.catbird.chat.reportSpam`, {
@@ -2084,15 +1781,12 @@ export async function reportSpam(
 // ---------------------------------------------------------------------------
 // Blocks (app.bsky.graph.block)
 //
-// Both runtimes call `com.atproto.repo.createRecord` / `listRecords` via the
-// nest BFF. Browser mode uses the session bearer directly from sessionStorage;
-// Tauri mode routes through dedicated IPC commands that use the keychained
-// session on the Rust side.
+// Both runtimes call `com.atproto.repo.createRecord` / `listRecords` directly
+// against the user's PDS with DPoP-bound OAuth credentials via Petrel.
 // ---------------------------------------------------------------------------
 
 /**
  * Publish an `app.bsky.graph.block` record for `targetDid`.
- * Uses `com.atproto.repo.createRecord` via the nest BFF. Returns the AT-URI.
  */
 export async function createBlock(targetDid: string): Promise<void> {
 	if (isTauri) {
@@ -2110,16 +1804,18 @@ export async function createBlock(targetDid: string): Promise<void> {
 			createdAt: new Date().toISOString()
 		}
 	};
-	const resp = await fetch(`${NEST_URL}/xrpc/com.atproto.repo.createRecord`, {
-		method: 'POST',
-		headers: {
-			'Content-Type': 'application/json',
-			Authorization: `Bearer ${saved.sessionId}`
-		},
-		body: JSON.stringify(body)
-	});
-	if (!resp.ok) {
-		const text = await resp.text();
+	const w = getWorker();
+	const resp = await w.oauthPdsExchange(
+		saved.did,
+		'POST',
+		'/xrpc/com.atproto.repo.createRecord',
+		[],
+		new TextEncoder().encode(JSON.stringify(body)),
+		'application/json',
+		getBrowserOAuthConfig()
+	);
+	if (resp.status < 200 || resp.status >= 300) {
+		const text = new TextDecoder().decode(resp.body);
 		throw new Error(`createBlock failed: ${resp.status} ${text}`);
 	}
 }
@@ -2139,6 +1835,7 @@ export async function listOwnBlocks(): Promise<Set<string>> {
 	const saved = readBrowserAuth();
 	if (!saved) return blocked;
 
+	const w = getWorker();
 	let cursor: string | undefined;
 	// Safety cap to prevent runaway pagination (1000 entries * 100 per page = 100k DIDs).
 	for (let page = 0; page < 1000; page++) {
@@ -2148,15 +1845,20 @@ export async function listOwnBlocks(): Promise<Set<string>> {
 			limit: '100'
 		});
 		if (cursor) params.set('cursor', cursor);
-		const resp = await fetch(
-			`${NEST_URL}/xrpc/com.atproto.repo.listRecords?${params.toString()}`,
-			{ headers: { Authorization: `Bearer ${saved.sessionId}` } }
+		const resp = await w.oauthPdsExchange(
+			saved.did,
+			'GET',
+			`/xrpc/com.atproto.repo.listRecords?${params.toString()}`,
+			[],
+			null,
+			null,
+			getBrowserOAuthConfig()
 		);
-		if (!resp.ok) {
-			const text = await resp.text();
+		if (resp.status < 200 || resp.status >= 300) {
+			const text = new TextDecoder().decode(resp.body);
 			throw new Error(`listOwnBlocks failed: ${resp.status} ${text}`);
 		}
-		const data = (await resp.json()) as {
+		const data = JSON.parse(new TextDecoder().decode(resp.body)) as {
 			records?: Array<{ value?: { subject?: string } }>;
 			cursor?: string;
 		};
@@ -2348,16 +2050,18 @@ async function ensureUnifiedBrowserClientOpen(did: string): Promise<Remote<Worke
 	if (savedAuth && normalizeAccountDid(savedAuth.did) !== accountDid) {
 		throw new Error('The signed-in account changed before the encrypted chat client opened.');
 	}
-	const authToken = savedAuth?.sessionId ?? null;
+	const authToken =
+		savedAuth?.sessionId && savedAuth.sessionId !== 'petrel-oauth' ? savedAuth.sessionId : null;
 	const w = getWorker();
 	await w.openUnifiedClient({
 		accountDid,
 		deviceId: getOrCreateBrowserDeviceId(didHash),
 		homeDsDid: HOME_DS_DID,
 		homeDsEndpoint: HOME_DS_URL,
-		pdsEndpoint: NEST_URL,
+		pdsEndpoint: savedAuth?.pds ?? '',
 		dbKeyHex,
-		authToken
+		authToken,
+		oauthConfig: getBrowserOAuthConfig()
 	});
 	return w;
 }

@@ -891,6 +891,36 @@ export function createDemoWorkerFactory(
 	});
 
 	const demoWorker = {
+		oauthStartLogin: async (identifier: string) =>
+			`https://bsky.social/oauth/authorize?login_hint=${encodeURIComponent(identifier)}`,
+		oauthCompleteLogin: async () => ({
+			did: dataset.user.did,
+			handle: dataset.user.handle,
+			pds: 'https://bsky.social',
+			grantedScopes: dataset.user.grantedScopes ?? []
+		}),
+		oauthRestoreSession: async () => ({
+			did: dataset.user.did,
+			handle: dataset.user.handle,
+			pds: 'https://bsky.social',
+			grantedScopes: dataset.user.grantedScopes ?? []
+		}),
+		oauthLogout: async () => {},
+		oauthServiceToken: async () => 'demo-service-auth-jwt',
+		oauthPdsExchange: async (_did: string, _method: string, path: string) => {
+			let payload: unknown = {};
+			if (path.includes('com.atproto.repo.listRecords')) {
+				payload = { records: [] };
+			} else if (path.includes('com.atproto.repo.createRecord')) {
+				payload = { uri: `at://${dataset.user.did}/app.bsky.graph.block/demo` };
+			}
+			return {
+				status: 200,
+				contentType: 'application/json',
+				headers: [['content-type', 'application/json']],
+				body: new TextEncoder().encode(JSON.stringify(payload))
+			};
+		},
 		runDeferredRecovery: async () => 0,
 		startBackgroundTasks: async () => {},
 		stopBackgroundTasks: async () => {},

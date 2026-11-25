@@ -5,7 +5,7 @@
 
 const UUID_V4_RE =
 	/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const OAUTH_CODE_RE = /^[A-Za-z0-9._~+/-]{8,512}={0,2}$/;
+const OAUTH_CODE_RE = /^[A-Za-z0-9._~:/+-]{8,512}={0,2}$/;
 const OAUTH_STATE_RE = /^[A-Za-z0-9._~-]{8,256}$/;
 const OAUTH_ERROR_CODE_RE = /^[A-Za-z0-9_.-]{1,64}$/;
 

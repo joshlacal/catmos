@@ -417,20 +417,34 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		);
 	});
 
-	it('routes browser chat XRPC directly to chat.catbird.blue with getServiceAuth and canonical UUIDv4 deviceId (D1, G3)', () => {
+	it('routes browser auth through Petrel CAB and chat XRPC directly to chat.catbird.blue with #atproto_mls service auth (D1, G3)', () => {
 		const wasmTsPath = path.join(CATMOS_ROOT, 'src/lib/wasm.ts');
 		const wasmTs = fs.readFileSync(wasmTsPath, 'utf8');
 		assert.ok(
-			!wasmTs.includes('#atproto_mls'),
-			'wasm.ts must never send legacy #atproto_mls proxy headers through nest (D1)'
+			wasmTs.includes('https://api.catbird.blue/cab/catmos'),
+			'wasm.ts must target the Petrel CAB backend at api.catbird.blue/cab/catmos'
+		);
+		assert.ok(
+			wasmTs.includes('https://catmos.catbird.blue/oauth/client-metadata.json'),
+			'wasm.ts must use the CAB client_id metadata document'
+		);
+		assert.ok(
+			wasmTs.includes('#atproto_mls'),
+			'wasm.ts must mint getServiceAuth JWTs for did:web:chat.catbird.blue#atproto_mls'
+		);
+		assert.ok(
+			wasmTs.includes('oauthServiceToken'),
+			'wasm.ts must mint service auth tokens via Petrel direct OAuth'
+		);
+		assert.ok(
+			!wasmTs.includes('/auth/login') &&
+				!wasmTs.includes('/auth/exchange') &&
+				!wasmTs.includes('/auth/upgrade'),
+			'wasm.ts must not call legacy nest /auth/* endpoints'
 		);
 		assert.ok(
 			!wasmTs.includes('mlschat.catbird.blue'),
 			'wasm.ts must target canonical chat.catbird.blue, never legacy mlschat.catbird.blue'
-		);
-		assert.ok(
-			wasmTs.includes('com.atproto.server.getServiceAuth'),
-			'wasm.ts must mint getServiceAuth JWTs for blue.catbird.chat.* calls'
 		);
 		assert.ok(
 			wasmTs.includes('crypto.randomUUID().toLowerCase()'),

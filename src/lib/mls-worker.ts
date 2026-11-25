@@ -18,6 +18,214 @@ let unifiedDeviceId: string | null = null;
 let latestAuthToken: string | null = null;
 let backgroundSyncTimer: ReturnType<typeof setInterval> | null = null;
 
+export interface BrowserOAuthConfig {
+	clientId?: string;
+	redirectUri?: string;
+	cabUrl?: string;
+	deliveryServiceDid?: string;
+}
+
+export interface BrowserSignedInAccount {
+	did: string;
+	handle: string;
+	pds: string;
+	grantedScopes: string[];
+}
+
+export interface BrowserPdsExchangeResponse {
+	status: number;
+	contentType?: string | null;
+	headers: Array<[string, string]>;
+	body: Uint8Array;
+}
+
+let petrelAuthClient: wasm.WasmAuthClient | null = null;
+let petrelAuthConfigKey: string | null = null;
+let activeOAuthDid: string | null = null;
+let activeOAuthPds: string | null = null;
+
+const OAUTH_IDB_NAME = 'catmos-oauth-v1';
+const OAUTH_IDB_VERSION = 1;
+const OAUTH_SECRETS_STORE = 'secrets';
+const OAUTH_DPOP_KEYS_STORE = 'dpop_keys';
+
+let oauthDbPromise: Promise<IDBDatabase> | null = null;
+
+function openOAuthIdb(): Promise<IDBDatabase> {
+	if (oauthDbPromise) return oauthDbPromise;
+	oauthDbPromise = new Promise<IDBDatabase>((resolve, reject) => {
+		const req = indexedDB.open(OAUTH_IDB_NAME, OAUTH_IDB_VERSION);
+		req.onupgradeneeded = () => {
+			const db = req.result;
+			if (!db.objectStoreNames.contains(OAUTH_SECRETS_STORE)) {
+				db.createObjectStore(OAUTH_SECRETS_STORE);
+			}
+			if (!db.objectStoreNames.contains(OAUTH_DPOP_KEYS_STORE)) {
+				db.createObjectStore(OAUTH_DPOP_KEYS_STORE);
+			}
+		};
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => {
+			oauthDbPromise = null;
+			reject(req.error ?? new Error('Failed to open catmos-oauth-v1 IndexedDB'));
+		};
+	});
+	return oauthDbPromise;
+}
+
+function idbRequest<T>(req: IDBRequest<T>): Promise<T> {
+	return new Promise<T>((resolve, reject) => {
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error ?? new Error('IndexedDB request failed'));
+	});
+}
+
+function idbTxComplete(tx: IDBTransaction): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		tx.oncomplete = () => resolve();
+		tx.onerror = () => reject(tx.error ?? new Error('IndexedDB transaction failed'));
+		tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+	});
+}
+
+function toUint8ArrayOrNull(value: unknown): Uint8Array | null {
+	if (value == null) return null;
+	if (value instanceof Uint8Array) return new Uint8Array(value);
+	if (value instanceof ArrayBuffer) return new Uint8Array(value);
+	if (ArrayBuffer.isView(value)) {
+		return new Uint8Array(value.buffer, value.byteOffset, value.byteLength).slice();
+	}
+	return null;
+}
+
+async function oauthSecretDispatch(
+	op: string,
+	ns: string,
+	key: string | null,
+	value: Uint8Array | null
+): Promise<Uint8Array | null | undefined> {
+	const db = await openOAuthIdb();
+	const prefix = `${ns}\0`;
+	const compoundKey = key != null ? `${prefix}${key}` : '';
+
+	if (op === 'get') {
+		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readonly');
+		const raw = await idbRequest(tx.objectStore(OAUTH_SECRETS_STORE).get(compoundKey));
+		await idbTxComplete(tx);
+		return toUint8ArrayOrNull(raw);
+	}
+	if (op === 'put') {
+		if (!value) throw new Error('OAuth secret store put requires bytes');
+		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		tx.objectStore(OAUTH_SECRETS_STORE).put(new Uint8Array(value), compoundKey);
+		await idbTxComplete(tx);
+		return undefined;
+	}
+	if (op === 'delete') {
+		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		tx.objectStore(OAUTH_SECRETS_STORE).delete(compoundKey);
+		await idbTxComplete(tx);
+		return undefined;
+	}
+	if (op === 'take') {
+		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		const store = tx.objectStore(OAUTH_SECRETS_STORE);
+		const raw = await idbRequest(store.get(compoundKey));
+		if (raw !== undefined) {
+			store.delete(compoundKey);
+		}
+		await idbTxComplete(tx);
+		return toUint8ArrayOrNull(raw);
+	}
+	if (op === 'delete_namespace') {
+		const tx = db.transaction(OAUTH_SECRETS_STORE, 'readwrite');
+		const store = tx.objectStore(OAUTH_SECRETS_STORE);
+		const range = IDBKeyRange.bound(prefix, `${ns}\x01`, false, true);
+		await new Promise<void>((resolve, reject) => {
+			const cursorReq = store.openCursor(range);
+			cursorReq.onsuccess = () => {
+				const cursor = cursorReq.result;
+				if (cursor) {
+					cursor.delete();
+					cursor.continue();
+				} else {
+					resolve();
+				}
+			};
+			cursorReq.onerror = () => reject(cursorReq.error ?? new Error('Cursor delete failed'));
+		});
+		await idbTxComplete(tx);
+		return undefined;
+	}
+	throw new Error(`Unsupported OAuth secret store operation: ${op}`);
+}
+
+async function oauthDpopKeyDispatch(
+	op: string,
+	id: string,
+	value: { key: CryptoKey; x: string; y: string } | null
+): Promise<{ key: CryptoKey; x: string; y: string } | null | undefined> {
+	const db = await openOAuthIdb();
+	if (op === 'get') {
+		const tx = db.transaction(OAUTH_DPOP_KEYS_STORE, 'readonly');
+		const raw = await idbRequest(tx.objectStore(OAUTH_DPOP_KEYS_STORE).get(id));
+		await idbTxComplete(tx);
+		return raw ?? null;
+	}
+	if (op === 'put') {
+		if (!value) throw new Error('DPoP key store put requires entry');
+		const tx = db.transaction(OAUTH_DPOP_KEYS_STORE, 'readwrite');
+		tx.objectStore(OAUTH_DPOP_KEYS_STORE).put(
+			{ key: value.key, x: value.x, y: value.y },
+			id
+		);
+		await idbTxComplete(tx);
+		return undefined;
+	}
+	if (op === 'delete') {
+		const tx = db.transaction(OAUTH_DPOP_KEYS_STORE, 'readwrite');
+		tx.objectStore(OAUTH_DPOP_KEYS_STORE).delete(id);
+		await idbTxComplete(tx);
+		return undefined;
+	}
+	throw new Error(`Unsupported DPoP key store operation: ${op}`);
+}
+
+async function ensurePetrelAuthClient(config?: BrowserOAuthConfig): Promise<wasm.WasmAuthClient> {
+	await wasmReady;
+	const key = JSON.stringify({
+		clientId: config?.clientId ?? null,
+		redirectUri: config?.redirectUri ?? null,
+		cabUrl: config?.cabUrl ?? null,
+		deliveryServiceDid: config?.deliveryServiceDid ?? null
+	});
+	if (petrelAuthClient && petrelAuthConfigKey === key) {
+		return petrelAuthClient;
+	}
+	if (petrelAuthClient) {
+		try {
+			petrelAuthClient.free();
+		} catch {
+			// Ignore free error
+		}
+		petrelAuthClient = null;
+	}
+	petrelAuthClient = new wasm.WasmAuthClient(
+		config?.clientId ?? null,
+		config?.redirectUri ?? null,
+		config?.cabUrl ?? null,
+		config?.deliveryServiceDid ?? null,
+		oauthSecretDispatch as unknown as (...args: unknown[]) => unknown,
+		oauthDpopKeyDispatch as unknown as (...args: unknown[]) => unknown
+	);
+	petrelAuthConfigKey = key;
+	return petrelAuthClient;
+}
+
+function hasLiveAuth(): boolean {
+	return Boolean(activeOAuthDid || latestAuthToken);
+}
+
 // WASM return values may contain non-cloneable JsValue handles or BigInt (from Rust i64).
 // Strip them to plain JSON-safe objects for structured clone across Worker boundary.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -92,7 +300,7 @@ function mapMessageRowToUi(rawRow: any) {
 }
 
 function bestEffortAdvanceReadState(convoId: string, maxSeq: number) {
-	if (!unifiedClient || !latestAuthToken || maxSeq < 1) return;
+	if (!unifiedClient || !hasLiveAuth() || maxSeq < 1) return;
 	unifiedClient.advanceReadState(convoId, BigInt(Math.trunc(maxSeq))).catch(() => {});
 }
 
@@ -170,6 +378,97 @@ const api = {
 			backgroundSyncTimer = null;
 		}
 	},
+	// Petrel direct OAuth via Client Assertion Backend (CAB)
+	oauthStartLogin: async (identifier: string, config?: BrowserOAuthConfig): Promise<string> => {
+		const client = await ensurePetrelAuthClient(config);
+		return client.startLogin(identifier);
+	},
+	oauthCompleteLogin: async (
+		callbackUrl: string,
+		config?: BrowserOAuthConfig
+	): Promise<BrowserSignedInAccount> => {
+		const client = await ensurePetrelAuthClient(config);
+		const result = plain(await client.completeLogin(callbackUrl)) as BrowserSignedInAccount;
+		activeOAuthDid = result.did;
+		activeOAuthPds = result.pds;
+		if (unifiedClient && unifiedClient.accountDid() === result.did.trim().toLowerCase()) {
+			unifiedClient.bindPetrelAuth(client);
+		}
+		return result;
+	},
+	oauthRestoreSession: async (
+		config?: BrowserOAuthConfig
+	): Promise<BrowserSignedInAccount | null> => {
+		const client = await ensurePetrelAuthClient(config);
+		const raw = await client.restoreSession();
+		if (!raw) {
+			activeOAuthDid = null;
+			activeOAuthPds = null;
+			return null;
+		}
+		const result = plain(raw) as BrowserSignedInAccount;
+		activeOAuthDid = result.did;
+		activeOAuthPds = result.pds;
+		if (unifiedClient && unifiedClient.accountDid() === result.did.trim().toLowerCase()) {
+			unifiedClient.bindPetrelAuth(client);
+		}
+		return result;
+	},
+	oauthLogout: async (did: string, config?: BrowserOAuthConfig): Promise<void> => {
+		const client = await ensurePetrelAuthClient(config);
+		try {
+			await client.logout(did);
+		} finally {
+			activeOAuthDid = null;
+			activeOAuthPds = null;
+			if (unifiedClient) {
+				unifiedClient.clearPetrelAuth();
+			}
+		}
+	},
+	oauthServiceToken: async (
+		did: string,
+		audience: string,
+		method: string,
+		config?: BrowserOAuthConfig
+	): Promise<string> => {
+		const client = await ensurePetrelAuthClient(config);
+		return client.serviceToken(did, audience, method);
+	},
+	oauthPdsExchange: async (
+		did: string,
+		method: string,
+		path: string,
+		headers?: Array<[string, string]>,
+		body?: Uint8Array | null,
+		contentType?: string | null,
+		config?: BrowserOAuthConfig
+	): Promise<BrowserPdsExchangeResponse> => {
+		const client = await ensurePetrelAuthClient(config);
+		const raw = (await client.pdsExchange(
+			did,
+			method,
+			path,
+			headers ?? null,
+			body ?? null,
+			contentType ?? null
+		)) as {
+			status: number;
+			contentType?: string | null;
+			headers?: Array<[string, string]>;
+			body?: number[] | Uint8Array;
+		};
+		const bodyBytes =
+			raw.body instanceof Uint8Array
+				? raw.body
+				: new Uint8Array(Array.isArray(raw.body) ? raw.body : []);
+		return {
+			status: Number(raw.status),
+			contentType: raw.contentType ?? null,
+			headers: Array.isArray(raw.headers) ? raw.headers : [],
+			body: bodyBytes
+		};
+	},
 	// Init & auth — void returns, discard WASM internals
 	init: async (_config: object) => {
 		await wasmReady;
@@ -182,12 +481,15 @@ const api = {
 	},
 	clearAuth: () => {
 		latestAuthToken = null;
+		activeOAuthDid = null;
+		activeOAuthPds = null;
 		if (backgroundSyncTimer) {
 			clearInterval(backgroundSyncTimer);
 			backgroundSyncTimer = null;
 		}
 		if (unifiedClient) {
 			unifiedClient.setAuthToken(null);
+			unifiedClient.clearPetrelAuth();
 		}
 	},
 	setSignerBridge: async (
@@ -610,12 +912,38 @@ const api = {
 	},
 
 	// Profiles & search
-	getProfiles: async (dids: string[]) =>
-		plain(await wasm.catbird_mls_get_profiles(dids)),
-	searchUsers: async (query: string) =>
-		plain(await wasm.catbird_mls_search_users(query)),
-	checkOptInStatus: async (dids: string[]) =>
-		plain(await wasm.catbird_mls_check_opt_in_status(dids)),
+	getProfiles: async (dids: string[]) => {
+		await wasmReady;
+		return plain(await wasm.catbird_mls_get_profiles(dids));
+	},
+	searchUsers: async (query: string) => {
+		await wasmReady;
+		return plain(await wasm.catbird_mls_search_users(query));
+	},
+	checkOptInStatus: async (
+		dids: string[],
+		opts?: {
+			did?: string;
+			homeDsDid?: string;
+			homeDsEndpoint?: string;
+			oauthConfig?: BrowserOAuthConfig;
+		}
+	) => {
+		await wasmReady;
+		const actorDid = opts?.did ?? activeOAuthDid;
+		if (actorDid && (petrelAuthClient || opts?.oauthConfig)) {
+			const client = await ensurePetrelAuthClient(opts?.oauthConfig);
+			return plain(
+				await client.checkOptInStatus(
+					actorDid,
+					opts?.homeDsDid ?? 'did:web:chat.catbird.blue',
+					opts?.homeDsEndpoint ?? 'https://chat.catbird.blue',
+					dids
+				)
+			);
+		}
+		return plain(await wasm.catbird_mls_check_opt_in_status(dids));
+	},
 
 	// Group metadata
 	getGroupMetadata: async (convoId: string) => {
@@ -711,14 +1039,22 @@ const api = {
 		pdsEndpoint: string;
 		dbKeyHex: string;
 		authToken?: string | null;
+		oauthConfig?: BrowserOAuthConfig;
 	}) => {
 		await wasmReady;
 		if (params.authToken !== undefined) {
 			latestAuthToken = params.authToken;
 		}
+		const effectivePds = params.pdsEndpoint.trim() || activeOAuthPds || '';
+		const authClient =
+			petrelAuthClient ??
+			(params.oauthConfig ? await ensurePetrelAuthClient(params.oauthConfig) : null);
 		const normalizedTarget = params.accountDid.trim().toLowerCase();
 		if (unifiedClient && unifiedClient.accountDid() === normalizedTarget) {
 			unifiedDeviceId = params.deviceId;
+			if (authClient && activeOAuthDid?.trim().toLowerCase() === normalizedTarget) {
+				unifiedClient.bindPetrelAuth(authClient);
+			}
 			if (latestAuthToken !== null) {
 				unifiedClient.setAuthToken(latestAuthToken);
 			}
@@ -741,10 +1077,13 @@ const api = {
 			params.deviceId,
 			params.homeDsDid,
 			params.homeDsEndpoint,
-			params.pdsEndpoint,
+			effectivePds,
 			params.dbKeyHex
 		);
 		unifiedDeviceId = params.deviceId;
+		if (authClient && activeOAuthDid?.trim().toLowerCase() === normalizedTarget) {
+			unifiedClient.bindPetrelAuth(authClient);
+		}
 		if (latestAuthToken !== null) {
 			unifiedClient.setAuthToken(latestAuthToken);
 		}
@@ -795,7 +1134,7 @@ const api = {
 	setupRecoveryCode: async () => {
 		await wasmReady;
 		const client = requireUnified();
-		if (latestAuthToken) {
+		if (hasLiveAuth()) {
 			return client.createRecoveryCodeLive();
 		}
 		return client.setupRecoveryCode();
@@ -803,7 +1142,7 @@ const api = {
 	restoreWithRecoveryCode: async (recoveryCodeInput: string) => {
 		await wasmReady;
 		const client = requireUnified();
-		if (latestAuthToken) {
+		if (hasLiveAuth()) {
 			return plain(await client.restoreWithRecoveryCodeLive(recoveryCodeInput));
 		}
 		return plain(client.restoreWithRecoveryCode(recoveryCodeInput));
@@ -811,7 +1150,7 @@ const api = {
 	registerPasskeyPrf: async (credentialId: Uint8Array, prfOutput32: Uint8Array) => {
 		await wasmReady;
 		const client = requireUnified();
-		if (latestAuthToken) {
+		if (hasLiveAuth()) {
 			return plain(await client.registerPasskeyPrfLive(credentialId, prfOutput32));
 		}
 		return plain(client.registerPasskeyPrf(credentialId, prfOutput32));
@@ -882,7 +1221,7 @@ const api = {
 	completeOtcPairing: async (sixDigitCode: string) => {
 		await wasmReady;
 		const client = requireUnified();
-		if (latestAuthToken) {
+		if (hasLiveAuth()) {
 			return plain(await client.completeLiveOtcPairing(sixDigitCode));
 		}
 		return plain(client.completeOtcPairing(sixDigitCode));

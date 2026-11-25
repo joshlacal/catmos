@@ -11,18 +11,22 @@ type SvelteKitCspDirectives = NonNullable<NonNullable<Config['csp']>['directives
  * - Zero `'unsafe-inline'` or `'unsafe-eval'` in `script-src`; only `'self'`
  *   and `'wasm-unsafe-eval'` (required for WebAssembly instantiation of OpenMLS),
  *   plus SvelteKit's compile-time SHA-256 bootstrap hash (`mode: 'hash'`).
- * - Tightly allowlisted `connect-src` (no wildcard `https:` or `wss:`).
+ * - `connect-src` allows direct HTTPS calls to users' Personal Data Servers,
+ *   ATProto Authorization Servers, the Petrel CAB (`https://api.catbird.blue`),
+ *   DNS-over-HTTPS (`https://cloudflare-dns.com`), and our delivery service
+ *   (`https://chat.catbird.blue` / `wss://chat.catbird.blue`).
  * - `object-src 'none'`, `base-uri 'self'`, `form-action 'self'`, and
  *   `frame-ancestors 'none'` block plugin execution, base-tag hijacking,
  *   credential-exfiltrating form posts, and clickjacking frames.
  */
 export const CATMOS_WEB_CONNECT_ORIGINS = [
 	'self',
+	'https:',
 	'https://api.catbird.blue',
-	'wss://api.catbird.blue',
 	'https://chat.catbird.blue',
 	'wss://chat.catbird.blue',
-	'https://public.api.bsky.app'
+	'https://public.api.bsky.app',
+	'https://cloudflare-dns.com'
 ] as const;
 
 export const CATMOS_TAURI_CONNECT_ORIGINS = [

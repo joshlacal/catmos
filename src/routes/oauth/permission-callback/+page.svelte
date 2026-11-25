@@ -1,83 +1,33 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
-	import { page } from '$app/state';
-	import Icon from '#lib/components/Icon.svelte';
-	import { validateWebPermissionCallbackUrl } from '#lib/oauth-callback.ts';
-	import { clearPendingOAuthUpgrade, consumePendingUpgradeReturnPath } from '#lib/wasm.ts';
-	import { auth } from '#lib/stores/auth.ts';
 
-	let phase = $state<'loading' | 'error'>('loading');
-	let errorMessage = $state('');
-
-	onMount(async () => {
-		const rawHref = page.url.toString();
-		const expectedOrigin = typeof window !== 'undefined' ? window.location.origin : undefined;
-
-		if (typeof window !== 'undefined' && window.history?.replaceState) {
-			window.history.replaceState({}, '', '/oauth/permission-callback');
-		}
-
-		try {
-			const validated = validateWebPermissionCallbackUrl(rawHref, expectedOrigin);
-			if (validated.kind === 'error') {
-				clearPendingOAuthUpgrade();
-				const detail = validated.errorDescription
-					? `${validated.error}: ${validated.errorDescription}`
-					: validated.error;
-				phase = 'error';
-				errorMessage = `Permission upgrade cancelled or denied: ${detail}`;
-				return;
-			}
-			if (validated.kind !== 'code') {
-				clearPendingOAuthUpgrade();
-				phase = 'error';
-				errorMessage = 'Permission upgrade failed: expected authorization code callback.';
-				return;
-			}
-
-			await auth.completeOAuthUpgradeCallback(validated.code);
-			await goto(consumePendingUpgradeReturnPath(), { replaceState: true });
-		} catch (e) {
-			clearPendingOAuthUpgrade();
-			phase = 'error';
-			errorMessage = `Permission upgrade failed: ${e instanceof Error ? e.message : String(e)}`;
-		}
+	onMount(() => {
+		void goto('/settings/labyrinth', { replaceState: true });
 	});
 </script>
 
 <svelte:head>
-	<title>Completing permission upgrade · Catmos</title>
+	<title>Redirecting · Catmos</title>
 </svelte:head>
 
 <main id="main-thread" class="callback-shell">
 	<section class="callback-card" aria-live="polite">
-		{#if phase === 'loading'}
-			<div class="callback-state" role="status">
-				<progress
-					class="catmos-progress callback-progress"
-					aria-label="Completing permission upgrade"
-				></progress>
-				<h1 class="callback-heading">Completing permission upgrade</h1>
-				<p class="callback-body">
-					Updating your Bluesky OAuth scopes for encrypted chat and backup.
-				</p>
+		<div class="callback-state" role="status">
+			<progress
+				class="catmos-progress callback-progress"
+				aria-label="Redirecting to Encrypted Chat settings"
+			></progress>
+			<h1 class="callback-heading">Redirecting</h1>
+			<p class="callback-body">
+				Permissions are now requested directly during Bluesky sign-in.
+			</p>
+			<div class="callback-actions">
+				<a class="catmos-btn-primary callback-link" href="/settings/labyrinth">
+					Open backup settings
+				</a>
 			</div>
-		{:else}
-			<div class="callback-state" role="alert">
-				<span class="callback-icon squircle" aria-hidden="true">
-					<Icon name="shield-alert" size={24} />
-				</span>
-				<h1 class="callback-heading">Permission upgrade failed</h1>
-				<p class="callback-error">{errorMessage}</p>
-				<div class="callback-actions">
-					<a class="catmos-btn-primary callback-link" href="/settings/labyrinth">
-						Return to backup settings
-					</a>
-					<a class="catmos-btn-secondary callback-link" href="/">Back to Catmos</a>
-				</div>
-			</div>
-		{/if}
+		</div>
 	</section>
 </main>
 
@@ -117,17 +67,6 @@
 		block-size: 1.75rem;
 	}
 
-	.callback-icon {
-		inline-size: 3.25rem;
-		block-size: 3.25rem;
-		display: inline-flex;
-		align-items: center;
-		justify-content: center;
-		background: var(--danger-bg);
-		color: var(--danger-text);
-		margin-block-end: var(--space-1);
-	}
-
 	.callback-heading {
 		font-size: var(--text-heading);
 		font-weight: 650;
@@ -142,14 +81,6 @@
 		line-height: 1.48;
 		color: var(--text-secondary);
 		max-inline-size: 38ch;
-	}
-
-	.callback-error {
-		font-size: var(--text-sm);
-		line-height: 1.48;
-		color: var(--danger-text);
-		word-break: break-word;
-		max-inline-size: 40ch;
 	}
 
 	.callback-actions {

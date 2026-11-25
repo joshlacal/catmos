@@ -4,11 +4,6 @@
 	import { page } from '$app/state';
 	import Icon from '#lib/components/Icon.svelte';
 	import { validateWebOAuthCallbackUrl } from '#lib/oauth-callback.ts';
-	import {
-		consumePendingUpgradeReturnPath,
-		exchangeOAuthCode,
-		hasPendingOAuthUpgrade
-	} from '#lib/wasm.ts';
 	import { auth } from '#lib/stores/auth.ts';
 
 	let phase = $state<'loading' | 'error'>('loading');
@@ -19,7 +14,7 @@
 		const expectedOrigin = typeof window !== 'undefined' ? window.location.origin : undefined;
 
 		// Scrub OAuth query parameters from browser history immediately so one-time
-		// codes or session tokens do not linger in the address bar or Referer header.
+		// authorization codes do not linger in the address bar or Referer header.
 		if (typeof window !== 'undefined' && window.history?.replaceState) {
 			window.history.replaceState({}, '', '/auth/callback');
 		}
@@ -35,18 +30,13 @@
 				return;
 			}
 
-			if (validated.kind === 'code' && hasPendingOAuthUpgrade()) {
-				await auth.completeOAuthUpgradeCallback(validated.code);
-				await goto(consumePendingUpgradeReturnPath(), { replaceState: true });
+			if (validated.kind !== 'code') {
+				phase = 'error';
+				errorMessage = 'Sign-in failed: expected an OAuth authorization code callback.';
 				return;
 			}
 
-			const sessionId =
-				validated.kind === 'code'
-					? await exchangeOAuthCode(validated.code)
-					: validated.sessionId;
-
-			await auth.completeOAuthCallback(sessionId);
+			await auth.completeOAuthCallbackUrl(rawHref);
 			await goto('/', { replaceState: true });
 		} catch (e) {
 			phase = 'error';

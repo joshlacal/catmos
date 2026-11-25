@@ -2,7 +2,6 @@ import { get, writable } from 'svelte/store';
 import * as api from '#lib/wasm.ts';
 import { listenForEvent, isTauri } from '#lib/wasm.ts';
 import { REQUIRED_LABYRINTH_OAUTH_SCOPES } from '#lib/labyrinth-ui.ts';
-import { normalizeSessionId } from '#lib/oauth-callback.ts';
 import { stripDidFragment } from '#lib/did.ts';
 import type { AuthState } from '#lib/tauri.ts';
 import { profiles } from './profiles.ts';
@@ -248,52 +247,26 @@ function createAuthStore() {
 				});
 			}
 		},
-		/** Initiate progressive `/auth/upgrade` for missing Spaces/Labyrinth scopes. */
+		/** Re-authorize with Petrel direct OAuth to grant any missing Spaces/Labyrinth scopes. */
 		async upgradeScopes(
-			scopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES,
-			returnTo = '/settings/labyrinth'
+			_scopes: readonly string[] = REQUIRED_LABYRINTH_OAUTH_SCOPES,
+			_returnTo = '/settings/labyrinth'
 		) {
 			const current = get({ subscribe });
 			if (!current.user?.did) {
 				throw new Error('Cannot upgrade OAuth scopes without an authenticated session.');
 			}
-			if (isTauri) {
-				await this.startLogin(current.user.handle || current.user.did);
-				return;
-			}
-			update((s) => ({ ...s, loading: true, error: null, waitingForOAuth: true }));
-			try {
-				await api.startOAuthScopeUpgrade(scopes, { returnTo });
-			} catch (e) {
-				const message = e instanceof Error ? e.message : String(e);
-				update((s) => ({ ...s, loading: false, error: message, waitingForOAuth: false }));
-				throw e;
-			}
+			await this.startLogin(current.user.handle || current.user.did);
 		},
-		/** Called from `/oauth/permission-callback` after progressive scope upgrade completes. */
-		async completeOAuthUpgradeCallback(code: string) {
+		/** Complete direct Petrel CAB OAuth redirect callback on `/auth/callback`. */
+		async completeOAuthCallbackUrl(callbackUrl: string) {
 			update((s) => ({ ...s, loading: true, error: null }));
 			try {
-				const user = await api.completeOAuthScopeUpgrade(code);
+				const user = await api.completeOAuthRedirect(callbackUrl);
 				await fetchOwnProfile(user);
 				syncUserScope(user);
 				set({ user, loading: false, error: null, waitingForOAuth: false });
 				return user;
-			} catch (e) {
-				const message = e instanceof Error ? e.message : String(e);
-				update((s) => ({ ...s, loading: false, error: message, waitingForOAuth: false }));
-				throw e;
-			}
-		},
-		/** Called from /auth/callback route after browser OAuth completes. */
-		async completeOAuthCallback(sessionId: string) {
-			update((s) => ({ ...s, loading: true, error: null }));
-			try {
-				const validatedSessionId = normalizeSessionId(sessionId);
-				const user = await api.completeLogin(validatedSessionId);
-				await fetchOwnProfile(user);
-				syncUserScope(user);
-				set({ user, loading: false, error: null, waitingForOAuth: false });
 			} catch (e) {
 				const message = e instanceof Error ? e.message : String(e);
 				set({ user: null, loading: false, error: message, waitingForOAuth: false });
