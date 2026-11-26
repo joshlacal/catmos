@@ -248,6 +248,19 @@ describe('Labyrinth Svelte settings UI, Spaces gate (I15), ctl #2 default-off, a
 		assert.match(mapWebAuthnErrorToMessage({ name: 'SecurityError' }), /origin|RP ID/i);
 	});
 
+	it('shows the reason when a step after the passkey prompt fails', () => {
+		// The WASM client rejects with a plain string, not an Error.
+		assert.equal(
+			mapWebAuthnErrorToMessage('wasm_space_getDelegationToken: HTTP 400 InvalidRequest'),
+			'wasm_space_getDelegationToken: HTTP 400 InvalidRequest'
+		);
+		assert.equal(mapWebAuthnErrorToMessage(new Error('no PRF output')), 'no PRF output');
+		assert.equal(mapWebAuthnErrorToMessage({ message: 'worker said no' }), 'worker said no');
+		for (const empty of ['', '   ', null, undefined, 42, {}, { message: 7 }]) {
+			assert.equal(mapWebAuthnErrorToMessage(empty), 'Passkey operation failed.');
+		}
+	});
+
 	it('binds a verified, backup-eligible passkey to the relying party and ceremony', async () => {
 		const rpId = LABYRINTH_PASSKEY_RP_ID;
 		const data = new Uint8Array(37);
