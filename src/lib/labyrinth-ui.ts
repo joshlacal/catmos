@@ -780,8 +780,17 @@ export function mapWebAuthnErrorToMessage(err: unknown): string {
 			return 'Passkey operation requires a secure HTTPS origin matching the RP ID.';
 		case 'AbortError':
 			return 'Passkey ceremony was superseded by a newer request.';
-		default:
-			return err instanceof Error ? err.message : 'Passkey operation failed.';
+		default: {
+			// The WASM client throws plain strings, and a failure after the passkey prompt
+			// (saving the recovery key to the PDS) arrives here too. Show what it said.
+			const detail =
+				typeof err === 'string'
+					? err
+					: typeof err === 'object' && err !== null && 'message' in err
+						? (err as { message?: unknown }).message
+						: null;
+			return typeof detail === 'string' && detail.trim() ? detail.trim() : 'Passkey operation failed.';
+		}
 	}
 }
 
