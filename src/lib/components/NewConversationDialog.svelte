@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { describeCreateConversationError } from '#lib/chat-errors.ts';
 	import type { SearchResult } from '#lib/wasm.ts';
 	import { stripDidFragment } from '#lib/did.ts';
 	import { auth } from '#lib/stores/auth.ts';
@@ -140,7 +141,8 @@
 			onCreated?.(created.id);
 		} catch (err) {
 			creating = false;
-			submitError = err instanceof Error ? err.message : 'Could not create conversation.';
+			console.error('[catmos] create conversation failed', err);
+			submitError = describeCreateConversationError(err, mode).message;
 		}
 	}
 
