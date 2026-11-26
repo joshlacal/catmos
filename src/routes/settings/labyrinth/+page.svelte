@@ -7,11 +7,15 @@
 	import {
 		approveLabyrinthSiblingDevice,
 		completeLabyrinthOtcPairing,
+		DEVICE_RECORD_PENDING_MESSAGE,
+		DeviceRecordPendingError,
 		enableMlsAndEnroll,
 		getCurrentLabyrinthDeviceId,
 		getLabyrinthStatus,
 		initiateLabyrinthOtcPairing,
 		isLabyrinthDevicePendingApproval,
+		isLabyrinthDeviceRecordPending,
+		onDeviceRecordSaved,
 		isTauri,
 		listRegisteredLabyrinthDevices,
 		probePdsSpacesSupport,
@@ -158,6 +162,11 @@
 		if (optedIn) {
 			try {
 				await refreshDeviceIdentityAndStatus(did);
+				if (!isTauri && (await isLabyrinthDeviceRecordPending(did))) {
+					if (activeDid === did && session === accountSession) {
+						errorBanner = DEVICE_RECORD_PENDING_MESSAGE;
+					}
+				}
 			} catch (err) {
 				errorBanner = err instanceof Error ? err.message : String(err);
 			}
@@ -166,6 +175,16 @@
 			currentDeviceId = null;
 		}
 	}
+
+	onMount(() =>
+		onDeviceRecordSaved((did) => {
+			if (!activeDid || normalizeAccountDid(activeDid) !== did) return;
+			if (errorBanner === DEVICE_RECORD_PENDING_MESSAGE) errorBanner = null;
+			statusBanner = 'Encrypted Chat and Labyrinth 1.1 Spaces history enabled on this device.';
+			void refreshDeviceIdentityAndStatus(activeDid).catch(() => {});
+			void conversations.load();
+		})
+	);
 
 	onMount(async () => {
 		if (isTauri) {
@@ -263,6 +282,12 @@
 			statusBanner = 'Encrypted Chat and Labyrinth 1.1 Spaces history enabled on this device.';
 		} catch (err) {
 			if (session !== accountSession) return;
+			if (err instanceof DeviceRecordPendingError) {
+				// Enrolled with the chat service; `wasm.ts` keeps the opt-in and retries the PDS write.
+				optedIn = true;
+				errorBanner = err.message;
+				return;
+			}
 			if (did) {
 				setMlsOptedInForDid(did, false);
 			}

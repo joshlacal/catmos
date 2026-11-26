@@ -1146,6 +1146,10 @@ const api = {
 		await wasmReady;
 		return requireUnified().isDevicePendingApproval();
 	},
+	isDeviceRecordPending: async () => {
+		await wasmReady;
+		return requireUnified().isDeviceRecordPending();
+	},
 	setupRecoveryCode: async () => {
 		await wasmReady;
 		const client = requireUnified();

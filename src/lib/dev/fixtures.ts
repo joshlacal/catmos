@@ -959,6 +959,7 @@ export function createDemoWorkerFactory(
 		labyrinthStatus: async () => buildLabyrinthStatus(),
 		enableLabyrinthLive: async () => buildLabyrinthStatus(),
 		isDevicePendingApproval: async () => false,
+		isDeviceRecordPending: async () => false,
 		setupRecoveryCode: async () => 'DEMO-ABCD-EFGH-JKLM-NPQR-STUV-WXYZ-1234',
 		restoreWithRecoveryCode: async () => buildLabyrinthStatus(),
 		registerPasskeyPrf: async () => buildLabyrinthStatus(),

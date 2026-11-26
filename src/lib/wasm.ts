@@ -137,6 +137,7 @@ function terminateWorkerInstance(): void {
 	_worker = null;
 	_workerDid = null;
 	_wasmReady = null;
+	cancelDeviceRecordRetry();
 }
 
 function getWorker(): Remote<WorkerApi> {
@@ -770,6 +771,7 @@ export async function completeOAuthRedirect(callbackUrl: string): Promise<AuthSt
 
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
+		void resumePendingDeviceRecord(did, grantedScopes);
 
 		return { did, handle, grantedScopes };
 	} catch (error) {
@@ -1044,6 +1046,7 @@ export async function tryRestoreSession(): Promise<AuthState | null> {
 
 		replenishKeyPackages();
 		startKeyPackageReplenishment();
+		void resumePendingDeviceRecord(restoredDid, grantedScopes);
 
 		return { did: restoredDid, handle, grantedScopes };
 	} catch (error) {
@@ -2086,6 +2089,7 @@ export async function enableMlsAndEnroll(
 		throw new Error(gate.message);
 	}
 	setMlsOptedInForDid(accountDid, true);
+	cancelDeviceRecordRetry();
 	try {
 		const w = await ensureUnifiedBrowserClientOpen(accountDid);
 		await w.enrollUnifiedDevice(Boolean(pdsSupportsSpaces), plainScopes);
@@ -2093,9 +2097,132 @@ export async function enableMlsAndEnroll(
 		await w.startBackgroundTasks(30_000);
 		return (await w.labyrinthStatus()) as LabyrinthBackupStatusView;
 	} catch (err) {
+		// The chat service already holds this device: dropping the opt-in would strand it there
+		// with no PDS record, and phone approval would keep failing. Keep it and keep retrying.
+		if (await deviceRecordPending(accountDid)) {
+			console.warn('[catmos] device record write failed; retrying in the background:', err);
+			scheduleDeviceRecordRetry(accountDid, Boolean(pdsSupportsSpaces), plainScopes, 0);
+			throw new DeviceRecordPendingError();
+		}
 		setMlsOptedInForDid(accountDid, false);
 		throw err;
 	}
+}
+
+export const DEVICE_RECORD_PENDING_MESSAGE =
+	'This device is registered for encrypted chat, but saving its record to your account server failed. Catmos will keep retrying. You can approve this device from your phone once the record is saved.';
+
+/**
+ * Thrown by `enableMlsAndEnroll` when the chat service enrolled this device but its
+ * `blue.catbird.chat.device` record could not be saved to the account's PDS. The opt-in is kept
+ * and the write is retried in the background and after a reload.
+ */
+export class DeviceRecordPendingError extends Error {
+	constructor() {
+		super(DEVICE_RECORD_PENDING_MESSAGE);
+		this.name = 'DeviceRecordPendingError';
+	}
+}
+
+const DEVICE_RECORD_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000, 120_000, 300_000];
+let _deviceRecordRetryDelays = DEVICE_RECORD_RETRY_DELAYS_MS;
+let _deviceRecordRetryTimer: ReturnType<typeof setTimeout> | null = null;
+const _deviceRecordSavedListeners = new Set<(did: string) => void>();
+
+/** Test-only hook replacing the background retry waits (`null` restores the defaults). */
+export function __setDeviceRecordRetryDelaysForTests(delays: readonly number[] | null): void {
+	_deviceRecordRetryDelays = delays ?? DEVICE_RECORD_RETRY_DELAYS_MS;
+}
+
+/** Calls `listener` when a background retry has saved the device record. Returns unsubscribe. */
+export function onDeviceRecordSaved(listener: (did: string) => void): () => void {
+	_deviceRecordSavedListeners.add(listener);
+	return () => {
+		_deviceRecordSavedListeners.delete(listener);
+	};
+}
+
+function cancelDeviceRecordRetry(): void {
+	if (_deviceRecordRetryTimer) clearTimeout(_deviceRecordRetryTimer);
+	_deviceRecordRetryTimer = null;
+}
+
+/**
+ * Whether the chat service holds this device while its PDS record is unwritten. `unknown` is the
+ * answer when the worker cannot say.
+ */
+async function deviceRecordPending(accountDid: string, unknown = false): Promise<boolean> {
+	try {
+		const w = await ensureUnifiedBrowserClientOpen(accountDid);
+		return Boolean(await w.isDeviceRecordPending());
+	} catch {
+		return unknown;
+	}
+}
+
+/** `true` while this browser still owes the account's PDS its device record. */
+export async function isLabyrinthDeviceRecordPending(did: string): Promise<boolean> {
+	if (isTauri || !isMlsOptedInForDid(did)) return false;
+	return deviceRecordPending(normalizeAccountDid(did));
+}
+
+function scheduleDeviceRecordRetry(
+	accountDid: string,
+	pdsSupportsSpaces: boolean,
+	grantedScopes: readonly string[],
+	attempt: number,
+	delayMs?: number
+): void {
+	cancelDeviceRecordRetry();
+	const delays = _deviceRecordRetryDelays;
+	const wait = delayMs ?? delays[Math.min(attempt, delays.length - 1)];
+	_deviceRecordRetryTimer = setTimeout(() => {
+		_deviceRecordRetryTimer = null;
+		void retryDeviceRecord(accountDid, pdsSupportsSpaces, grantedScopes, attempt);
+	}, wait);
+}
+
+async function retryDeviceRecord(
+	accountDid: string,
+	pdsSupportsSpaces: boolean,
+	grantedScopes: readonly string[],
+	attempt: number
+): Promise<void> {
+	const savedDid = readBrowserAuth()?.did;
+	if (!savedDid || normalizeAccountDid(savedDid) !== accountDid) return;
+	if (!isMlsOptedInForDid(accountDid)) return;
+	try {
+		const w = await ensureUnifiedBrowserClientOpen(accountDid);
+		await w.enrollUnifiedDevice(pdsSupportsSpaces, [...grantedScopes]);
+		startKeyPackageReplenishment();
+		await w.startBackgroundTasks(30_000);
+	} catch (err) {
+		// A worker that cannot answer counts as still pending: never drop the opt-in on a guess.
+		if (await deviceRecordPending(accountDid, true)) {
+			console.warn('[catmos] device record retry failed; will retry:', err);
+			scheduleDeviceRecordRetry(accountDid, pdsSupportsSpaces, grantedScopes, attempt + 1);
+			return;
+		}
+		// Nothing is owed any more, yet enrollment failed for good (for example the PDS holds
+		// this device ID under another key): same outcome as a failed first enrollment.
+		console.error('[catmos] device enrollment failed after the device record retry:', err);
+		setMlsOptedInForDid(accountDid, false);
+		return;
+	}
+	for (const listener of _deviceRecordSavedListeners) listener(accountDid);
+}
+
+/**
+ * After a reload: if an earlier enrollment left the PDS device record unwritten, retry at once.
+ * The marker is only ever set after this device passed the Spaces gate, hence `true`.
+ */
+async function resumePendingDeviceRecord(
+	did: string,
+	grantedScopes: readonly string[]
+): Promise<void> {
+	const accountDid = normalizeAccountDid(did);
+	if (_deviceRecordRetryTimer || !(await deviceRecordPending(accountDid))) return;
+	scheduleDeviceRecordRetry(accountDid, true, grantedScopes, 0, 0);
 }
 
 export async function getLabyrinthStatus(did: string): Promise<LabyrinthBackupStatusView | null> {
