@@ -13,13 +13,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
-use atproto_spaces::{
-    did_resolver::DidDocument,
-    http_signature::sign_credential_request_minimal,
-    is_valid_did,
-    kem::{encode_p256_did_key, P256SecretKey},
-    SpaceUri,
-};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use catbird_mls::blob_crypto::decrypt_blob;
@@ -33,6 +26,9 @@ use catbird_mls::client::{
 };
 use catbird_mls::payload_types::{MLSAudioEmbed, MLSEmbedData, MLSImageEmbed, MLSMessagePayload};
 use catbird_mls::MLSError;
+use petrel::identity::{DidDocument, ServiceKind};
+use petrel_core::{AtUri, Did, SpaceRef};
+use petrel_spaces::{did_document_url, sign_credential_request_minimal, SigningKeyPair};
 use tauri::{AppHandle, Emitter};
 
 const KEYRING_SERVICE: &str = "blue.catbird.catmos.clean-slate";
@@ -412,24 +408,12 @@ pub(crate) fn home_ds_resolve_did_fallback_url(
 }
 
 async fn resolve_did_pds_endpoint(client: &reqwest::Client, did: &str) -> Result<String, MLSError> {
-    let url = if did.starts_with("did:plc:") {
-        format!("https://plc.directory/{}", urlencoding::encode(did))
-    } else if let Some(rest) = did.strip_prefix("did:web:") {
-        if rest.is_empty() || rest.contains('/') || rest.contains('?') || rest.contains('#') {
-            return Err(MLSError::invalid_input(format!(
-                "unsupported did:web for PDS lookup: {did}"
-            )));
-        }
-        let host = urlencoding::decode(rest).map_err(|_| {
-            MLSError::invalid_input(format!("invalid did:web host encoding: {did}"))
-        })?;
-        format!("https://{host}/.well-known/did.json")
-    } else {
-        return Err(MLSError::invalid_input(format!(
-            "unsupported DID method for PDS lookup: {did}"
-        )));
-    };
-    let resp = client.get(&url).send().await.map_err(|e| {
+    let did = Did::parse(did)
+        .map_err(|e| MLSError::invalid_input(format!("invalid DID for PDS lookup: {e}")))?;
+    let directory = url::Url::parse("https://plc.directory").expect("valid PLC directory URL");
+    let url = did_document_url(&did, &directory, false)
+        .map_err(|e| MLSError::invalid_input(format!("unsupported DID for PDS lookup: {e}")))?;
+    let mut resp = client.get(url).send().await.map_err(|e| {
         MLSError::Internal(format!(
             "resolve DID document for {did}: {}",
             format_reqwest_error(&e)
@@ -441,17 +425,27 @@ async fn resolve_did_pds_endpoint(client: &reqwest::Client, did: &str) -> Result
             resp.status().as_u16()
         )));
     }
-    let body = resp.bytes().await.map_err(|e| {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
         MLSError::Internal(format!(
             "read DID document for {did}: {}",
             format_reqwest_error(&e)
         ))
-    })?;
-    let doc = DidDocument::parse_json(did, &body)
+    })? {
+        if body.len() + chunk.len() > 256 * 1024 {
+            return Err(MLSError::Internal("DID document exceeds 256 KiB".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let doc: DidDocument = serde_json::from_slice(&body)
         .map_err(|e| MLSError::Internal(format!("parse DID document for {did}: {e}")))?;
-    doc.pds_endpoint()
-        .map(str::to_owned)
-        .map_err(|e| MLSError::Internal(format!("DID document for {did} missing PDS: {e}")))
+    if doc.id != did {
+        return Err(MLSError::invalid_input("DID document subject mismatch"));
+    }
+    doc.validated_service_endpoint_with_development(ServiceKind::Pds, cfg!(test))
+        .map_err(|e| MLSError::invalid_input(format!("invalid PDS for {did}: {e}")))?
+        .map(|url| url.to_string())
+        .ok_or_else(|| MLSError::invalid_input(format!("DID document for {did} missing PDS")))
 }
 
 /// Persistent multi-threaded Tokio runtime dedicated to `TauriTransport`'s
@@ -1804,15 +1798,15 @@ impl TauriMlsManager {
                 "invalid Space attachment locator `{locator}`: expected \"{{spaceURI}}|{{repoDID}}|{{cid}}\" or \"{{spaceURI}}/{{repoDID}}#{{cid}}\""
             )
         })?;
-        if !is_valid_did(repo_did) {
+        if Did::parse(repo_did).is_err() {
             return Err(format!("invalid Space attachment writer DID: {repo_did}"));
         }
-        let space = SpaceUri::parse_hedged(space_raw)
+        let space = attachment_space(space_raw)
             .map_err(|e| format!("invalid Space attachment URI `{space_raw}`: {e}"))?;
-        if space.space_type != "blue.catbird.labyrinth.conversation" {
+        if space.space_type().as_str() != "blue.catbird.labyrinth.conversation" {
             return Err(format!(
                 "unsupported attachment Space type: {}",
-                space.space_type
+                space.space_type()
             ));
         }
 
@@ -1822,20 +1816,11 @@ impl TauriMlsManager {
         let pds_endpoint = self.account_pds_endpoint()?;
         let home_ds_endpoint = Self::home_ds_endpoint();
 
-        let pop_key = {
-            let mut found = None;
-            for _ in 0..128 {
-                let mut entropy = [0u8; 32];
-                getrandom::fill(&mut entropy)
-                    .map_err(|e| format!("generate Space attachment PoP entropy: {e}"))?;
-                if let Ok(sk) = P256SecretKey::from_slice(&entropy) {
-                    found = Some(sk);
-                    break;
-                }
-            }
-            found.ok_or_else(|| "generate Space attachment PoP key exhausted".to_string())?
-        };
-        let cnf_kid = encode_p256_did_key(&pop_key.public_key());
+        let pop_key = SigningKeyPair::generate_p256()
+            .map_err(|e| format!("generate Space attachment PoP key: {e}"))?;
+        let cnf_kid = pop_key
+            .did_key()
+            .map_err(|e| format!("encode Space attachment PoP key: {e}"))?;
 
         let deleg_resp = self
             .transport
@@ -1844,7 +1829,7 @@ impl TauriMlsManager {
                 url: format!(
                     "{}/xrpc/com.atproto.space.getDelegationToken?space={}",
                     pds_endpoint.trim_end_matches('/'),
-                    urlencoding::encode(&space.raw),
+                    urlencoding::encode(space.as_str()),
                 ),
                 headers: Vec::new(),
                 body: None,
@@ -1866,8 +1851,8 @@ impl TauriMlsManager {
 
         let cred_body = serde_json::to_vec(&serde_json::json!({
             "actorDeviceId": device_id,
-            "authorityDid": space.authority,
-            "space": space.raw,
+            "authorityDid": space.space_did(),
+            "space": space.as_str(),
             "delegationToken": delegation_token,
             "cnfKey": cnf_kid,
         }))
@@ -1901,13 +1886,13 @@ impl TauriMlsManager {
             .filter(|t| !t.is_empty())
             .ok_or_else(|| "relaySpaceCredential response missing credential".to_string())?;
 
-        let signed = sign_credential_request_minimal(&pop_key, credential_jwt, repo_did)
+        let signed = sign_credential_request_minimal(credential_jwt, &pop_key, repo_did)
             .map_err(|e| format!("sign Space getBlob credential PoP: {e}"))?;
         let query = format!(
             "cid={}&repo={}&space={}",
             urlencoding::encode(cid),
             urlencoding::encode(repo_did),
-            urlencoding::encode(&space.raw),
+            urlencoding::encode(space.as_str()),
         );
         let read_body = serde_json::to_vec(&serde_json::json!({
             "actorDeviceId": device_id,
@@ -3249,6 +3234,13 @@ mod tests {
     }
 }
 
+// Older messages contain alpha Space URIs. Normalize only when reading a stored
+// attachment locator so the credential request and signed read use the current URI.
+fn attachment_space(stored: &str) -> Result<SpaceRef, petrel_core::SyntaxError> {
+    let current = AtUri::from_legacy_space_uri(stored);
+    SpaceRef::parse(current.as_deref().unwrap_or(stored))
+}
+
 /// Split a Space attachment locator into `(spaceURI, repoDID, cid)`.
 ///
 /// Accepts both shapes Catbird iOS reads (`MLSSpaceBlobLocator.parse`):
@@ -3272,6 +3264,14 @@ mod attachment_locator_tests {
 
     const SPACE: &str =
         "at://did:web:chat.catbird.blue/space/blue.catbird.labyrinth.conversation/abc";
+
+    #[test]
+    fn legacy_and_current_attachment_spaces_use_the_same_wire_value() {
+        let current = "at:space/did:web:chat.catbird.blue/blue.catbird.labyrinth.conversation/abc";
+        assert_eq!(super::attachment_space(SPACE).unwrap().as_str(), current);
+        assert_eq!(super::attachment_space(current).unwrap().as_str(), current);
+        assert!(super::attachment_space(&format!("{SPACE}/unexpected")).is_err());
+    }
 
     #[test]
     fn splits_pipe_locator() {

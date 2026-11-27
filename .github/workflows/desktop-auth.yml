@@ -21,11 +21,11 @@ concurrency:
 env:
   # Sibling checkouts the backend builds against (src-tauri/Cargo.toml path
   # dependencies). Move these together when a dependency changes.
-  PETREL_REF: a4d5d480d709e2d3a3195884f9cbbeff878ce5f3
-  PETREL_CATBIRD_REF: 09bc34c06120fcfe5da4cdce6de639c5fb295994
-  CATBIRD_MLS_REF: 89cdf3955509c307d3fe310f6603dae3d4077d4d
-  CATBIRD_ATPROTO_REF: 4299c438ff92d13cd554cdf686ca74156c987f84
-  LABYRINTH_REF: f53b4c6dff681b8b81e3755dbaadb356803eb5ed
+  PETREL_REF: 76bf7c8beb83fbb861183d04948fa5a061698772
+  PETREL_CATBIRD_REF: 7658265cdc4eebd6cbb37b30fc1f385892168b19
+  CATBIRD_MLS_REF: ae1f1a1605912e0d4c8287aaac299f167ef0ee45
+  CATBIRD_ATPROTO_REF: aed64f2c6decd58696f482b9d024dafc407d3aa2
+  LABYRINTH_REF: 9e457eff07373969de4240b849a900e46d42a122
 
 jobs:
   rust:
@@ -40,8 +40,6 @@ jobs:
       PETREL_E2E_REQUIRED: '1'
       CARGO_INCREMENTAL: '0'
       CARGO_TERM_COLOR: always
-      # Fetch git dependencies with the git CLI so the jacquard mirror below
-      # applies, and retry slow transfers.
       CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
       CARGO_NET_RETRY: '10'
       GIT_HTTP_LOW_SPEED_LIMIT: '1000'
@@ -102,11 +100,6 @@ jobs:
           ref: ${{ env.LABYRINTH_REF }}
           path: labyrinth
           persist-credentials: false
-      - name: Fetch jacquard from its GitHub mirror
-        # catbird-atproto pins jacquard on tangled.org, which stalls or resets
-        # clones. joshlacal/jacquard carries the pinned rev; Cargo.lock is
-        # unchanged.
-        run: git config --global url."https://github.com/joshlacal/jacquard".insteadOf "https://tangled.org/nonbinary.computer/jacquard"
       - name: Build the Swift test servers
         run: |
           swift build --package-path Petrel/Server --product petrel-oauth-server-example
