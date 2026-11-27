@@ -34,10 +34,15 @@ for name, revision in pins["sources"].items():
 # Path dependencies have no repository identity in Cargo.lock. Check the selected
 # manifests from the same desktop graph that the Tauri build will compile.
 metadata = json.loads(run(root / "src-tauri", "cargo", "metadata", "--locked", "--format-version", "1"))
+for package in metadata["packages"]:
+    name = package["name"]
+    if name == "catbird-atproto" or name == "jacquard" or name.startswith(("jacquard-", "jacquard_")):
+        sys.exit(f"Cargo selected a retired dependency: {name}")
+
 for package, relative in {
     "catbird_mls": "catbird-mls/Cargo.toml",
-    "catbird-atproto": "catbird-atproto/Cargo.toml",
     "atproto-spaces": "catbird-atproto/atproto-spaces/Cargo.toml",
+    "petrel-spaces": "Petrel/rust/petrel-spaces/Cargo.toml",
     "labyrinth": "labyrinth/Cargo.toml",
     "labyrinth-protocol": "labyrinth/labyrinth-protocol/Cargo.toml",
     "petrel": "Petrel/rust/petrel/Cargo.toml",
